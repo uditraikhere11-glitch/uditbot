@@ -1,26 +1,64 @@
 """
 System Configuration & Environment Management.
-Reads from environment variables and protected .env files.
+Reads from environment variables and protected .env files with automatic file parsing.
+Robust against formatting artifacts (braces, quotes, multi-value inputs).
 """
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Any
 from src.models import TradingMode, ProductType
 
 
-def _bool(val: str, default: bool = False) -> bool:
+def load_env_file(path: str = ".env") -> None:
+    """Parses .env file directly into os.environ with zero external dependencies."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if not (v.startswith('"') and v.endswith('"')) and not (v.startswith("'") and v.endswith("'")):
+                    v = v.split("#")[0].strip()
+                v = v.strip("'\"")
+                if k:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+def _bool(val: Any, default: bool = False) -> bool:
     if val is None:
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _int_list(val: str) -> List[int]:
+def _clean_int(val: Any, default: int = 0) -> int:
+    """Safely parses integers from strings, stripping brackets, braces, and trailing items."""
+    if not val:
+        return default
+    cleaned = str(val).strip().strip("{}[]()\"' ")
+    if "," in cleaned:
+        cleaned = cleaned.split(",")[0].strip().strip("{}[]()\"' ")
+    try:
+        return int(cleaned)
+    except (ValueError, TypeError):
+        return default
+
+
+def _int_list(val: Any) -> List[int]:
+    """Safely parses a comma-separated list of integers, stripping brackets and braces."""
     if not val:
         return []
+    cleaned = str(val).strip().strip("{}[]()\"' ")
     res = []
-    for part in val.split(","):
-        part = part.strip()
+    for part in cleaned.split(","):
+        part = part.strip().strip("{}[]()\"' ")
         if part:
             try:
                 res.append(int(part))
@@ -45,7 +83,7 @@ class AppConfig:
     test_group_id: int = 0
     log_group_id: int = 0
     authorized_operator_id: int = 0
-    ignore_backlog_on_restart: bool = True  # Confirmed by Udit
+    ignore_backlog_on_restart: bool = True
 
     # Dhan Credentials
     dhan_client_id: str = ""
@@ -56,16 +94,16 @@ class AppConfig:
 
     # Equity Sizing & Order Setup
     equity_product_type: ProductType = ProductType.CNC
-    equity_sizing_mode: str = "BUDGET"  # BUDGET | FIXED_QTY
+    equity_sizing_mode: str = "BUDGET"
     equity_budget_inr: float = 25000.0
     equity_fixed_qty: int = 10
-    equity_price_markup_pct: float = 0.5  # Entered via setup defaults
+    equity_price_markup_pct: float = 0.5
 
     # Stock Options Sizing
-    fno_sizing_mode: str = "BUDGET"     # BUDGET | FIXED_LOTS
+    fno_sizing_mode: str = "BUDGET"
     fno_capital_per_trade: float = 20000.0
     fno_fixed_lots: int = 1
-    fno_max_lots: int = 3               # 0 = no cap
+    fno_max_lots: int = 3
 
     # Protection (Post-Fill)
     sl_pct: float = 3.0
@@ -79,22 +117,23 @@ class AppConfig:
     max_total_exposure_inr: float = 150000.0
     max_open_positions: int = 5
     max_daily_trades: int = 10
-    insufficient_funds_policy: str = "HARD_REJECT"  # Confirmed by Udit: Hard reject
-    mode_switch_position_policy: str = "REMAIN_UNTOUCHED"  # Confirmed by Udit: Untouched under Forever OCO
+    insufficient_funds_policy: str = "HARD_REJECT"
+    mode_switch_position_policy: str = "REMAIN_UNTOUCHED"
 
-    # Timing & Lifetimes (Confirmed by Udit)
+    # Timing & Lifetimes
     max_message_age_sec: float = 60.0
     dedup_window_sec: float = 20.0
     order_timeout_sec: float = 60.0
-    max_quote_age_sec: float = 2.0               # Confirmed: 2 seconds
-    partial_fill_retry_timeout_sec: float = 2.0   # Confirmed: 2 seconds
+    max_quote_age_sec: float = 2.0
+    partial_fill_retry_timeout_sec: float = 2.0
 
     # Storage Paths
     data_dir: str = os.path.join(os.getcwd(), "data")
     journal_db_path: str = os.path.join(os.getcwd(), "data", "trade_journal.db")
 
     @classmethod
-    def from_env(cls, env: dict = None) -> "AppConfig":
+    def from_env(cls, env: Optional[dict] = None, env_file: str = ".env") -> "AppConfig":
+        load_env_file(env_file)
         if env is None:
             env = os.environ
 
@@ -109,14 +148,14 @@ class AppConfig:
             equity_active=_bool(env.get("EQUITY_ACTIVE", "true"), default=True),
             fno_active=_bool(env.get("FNO_ACTIVE", "true"), default=True),
 
-            tg_api_id=int(env.get("TG_API_ID", "0") or "0"),
+            tg_api_id=_clean_int(env.get("TG_API_ID", "0")),
             tg_api_hash=env.get("TG_API_HASH", "").strip(),
             tg_phone=env.get("TG_PHONE", "").strip(),
             tg_session_string=env.get("TG_SESSION_STRING", "").strip(),
             monitored_channel_ids=_int_list(env.get("MONITORED_CHANNEL_IDS", "")),
-            test_group_id=int(env.get("TEST_GROUP_ID", "0") or "0"),
-            log_group_id=int(env.get("LOG_GROUP_ID", "0") or "0"),
-            authorized_operator_id=int(env.get("AUTHORIZED_OPERATOR_TG_ID", "0") or "0"),
+            test_group_id=_clean_int(env.get("TEST_GROUP_ID", "0")),
+            log_group_id=_clean_int(env.get("LOG_GROUP_ID", "0")),
+            authorized_operator_id=_clean_int(env.get("AUTHORIZED_OPERATOR_TG_ID", "0")),
             ignore_backlog_on_restart=_bool(env.get("IGNORE_TELEGRAM_BACKLOG_ON_RESTART", "true"), default=True),
 
             dhan_client_id=env.get("DHAN_CLIENT_ID", "").strip(),

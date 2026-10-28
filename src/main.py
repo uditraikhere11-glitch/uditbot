@@ -6,6 +6,7 @@ Integrates visual Telegram Log Group card formatting.
 """
 
 import logging
+import os
 import time
 import uuid
 from typing import Optional, Tuple
@@ -37,6 +38,8 @@ class TradingBotPipeline:
         self.db = JournalDB(config.journal_db_path)
         self.dedup = DuplicateFilter(window_sec=config.dedup_window_sec)
         self.resolver = InstrumentResolver()
+        scrip_cache = os.path.join(config.data_dir, "scrip_master.csv")
+        self.resolver.load_dhan_master(scrip_cache)
         self.risk_manager = RiskManager(config)
         self.broker = DhanClient(config)
         self.notifier = TelegramNotifier(config)
@@ -64,7 +67,6 @@ class TradingBotPipeline:
             reason = f"Message too old ({age:.1f}s > {self.cfg.max_message_age_sec}s)"
             self.db.record_signal(channel_id, message_id, "UNKNOWN", "", "BLOCKED", text, "REJECTED", reason)
             
-            # Format and notify
             log_card = format_trade_log(
                 symbol="UNKNOWN",
                 source_name=source_name,
@@ -139,23 +141,19 @@ class TradingBotPipeline:
         """Processes a validated stock option signal with exact visual log output."""
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
 
-        # Product active toggle
         if not self.cfg.fno_active:
             reason = "Stock Options processing is currently INACTIVE in configuration"
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
-        # 20-second cross-group deduplication
         is_dup, dup_reason = self.dedup.is_duplicate(sig.symbol, sig.channel_id, sig.message_id, event_time=now)
         if is_dup:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "DUPLICATE", dup_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=dup_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
-        # Contract resolution
         contract, res_reason = self.resolver.resolve_option(sig.symbol, sig.strike, sig.option_type, sig.expiry_month)
         heads_up_note = None
         if not contract:
-            # Check if instrument is unverified vs missing
             heads_up_note = "Instrument unverified"
             res_reason = f"Instrument unverified: {res_reason}"
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "UNRESOLVED", res_reason)
@@ -174,10 +172,8 @@ class TradingBotPipeline:
             self.notifier.send_log_message(rej_card)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
-        # Limit price ceiling: entry_max * 1.04 floored to tick
         limit_price = calculate_option_limit_price(sig.entry_max, contract.tick_size)
 
-        # Sizing
         sizing = size_option(
             sizing_mode=self.cfg.fno_sizing_mode,
             capital_per_trade=self.cfg.fno_capital_per_trade,
@@ -190,14 +186,12 @@ class TradingBotPipeline:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=sizing.error_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
-        # Risk validation
         _, avail_funds, _ = self.broker.get_fund_limits()
         risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, avail_funds)
         if not risk_passed:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", risk_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=risk_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
-        # Audit persistence
         sig_id = self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BUY_ENTRY", sig.raw_text, "ACCEPTED", "Passed all validations")
         self.db.record_validation(sig_id, sig.symbol, limit_price, sizing.units, sizing.total_quantity, sizing.total_cost, True, "Approved")
 
@@ -216,7 +210,6 @@ class TradingBotPipeline:
         )
 
         if self.cfg.trading_mode == TradingMode.TEST:
-            # TEST mode: Record validation in SQLite, NO broker order, NO fake fills
             self.db.record_order(
                 correlation_id=correlation_id,
                 trading_mode="TEST",
@@ -230,7 +223,6 @@ class TradingBotPipeline:
                 status="TEST_VALIDATED",
             )
             
-            # Format exact visual notification matching image
             log_card = format_trade_log(
                 symbol=sig.symbol,
                 source_name=source_name,
@@ -257,7 +249,6 @@ class TradingBotPipeline:
                 calculated_exposure=sizing.total_cost,
             )
         else:
-            # LIVE mode: submit to Dhan
             ok, broker_id, msg = self.broker.place_order(order_req)
             status = "PENDING" if ok else "REJECTED"
             order_details = f"[Order ID: {broker_id} / Status: {status}]" if broker_id else f"[Rejected: {msg}]"
@@ -305,19 +296,16 @@ class TradingBotPipeline:
         """Processes a validated cash equity signal with exact visual log output."""
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
 
-        # Product active toggle
         if not self.cfg.equity_active:
             reason = "Equity Cash processing is currently INACTIVE in configuration"
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
-        # 20-second cross-group deduplication
         is_dup, dup_reason = self.dedup.is_duplicate(sig.symbol, sig.channel_id, sig.message_id, event_time=now)
         if is_dup:
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "DUPLICATE", dup_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=dup_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
-        # Equity instrument resolution
         inst, res_reason = self.resolver.resolve_equity(sig.symbol)
         heads_up_note = None
         if not inst:
@@ -339,16 +327,13 @@ class TradingBotPipeline:
             self.notifier.send_log_message(rej_card)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
-        # Determine reference price (stated price or live CMP)
         ref_price = sig.stated_price
         if ref_price <= 0:
             ok, ltp, _ = self.broker.get_ltp(inst.exchange_segment, inst.security_id)
-            ref_price = ltp if ok and ltp > 0 else 1000.0  # Fallback for standalone test
+            ref_price = ltp if ok and ltp > 0 else 1000.0
 
-        # Limit price = ref_price * (1 + markup_pct / 100)
         limit_price = calculate_equity_limit_price(ref_price, self.cfg.equity_price_markup_pct, inst.tick_size)
 
-        # Sizing
         sizing = size_equity(
             sizing_mode=self.cfg.equity_sizing_mode,
             budget_inr=self.cfg.equity_budget_inr,
@@ -359,14 +344,12 @@ class TradingBotPipeline:
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=sizing.error_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
-        # Risk validation
         _, avail_funds, _ = self.broker.get_fund_limits()
         risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, avail_funds)
         if not risk_passed:
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", risk_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=risk_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
-        # Audit persistence
         sig_id = self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BUY_ENTRY", sig.raw_text, "ACCEPTED", "Passed all validations")
         self.db.record_validation(sig_id, sig.symbol, limit_price, sizing.units, sizing.total_quantity, sizing.total_cost, True, "Approved")
 
@@ -466,3 +449,72 @@ class TradingBotPipeline:
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
             )
+
+
+async def start_telegram_listener(pipeline: TradingBotPipeline):
+    cfg = pipeline.cfg
+    logger.info("Initializing Telegram Client Listener...")
+
+    if not cfg.tg_api_id or not cfg.tg_api_hash:
+        logger.error("TG_API_ID or TG_API_HASH not configured in .env!")
+        return
+
+    session_file = os.path.join(cfg.data_dir, "tg_userbot.session")
+    from telethon import TelegramClient, events
+    from telethon.sessions import StringSession
+
+    session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else session_file
+    client = TelegramClient(session, cfg.tg_api_id, cfg.tg_api_hash)
+
+    await client.start()
+    me = await client.get_me()
+    logger.info(f"Connected to Telegram as: {me.first_name} (@{me.username or 'No username'})")
+    logger.info(f"Operating Mode: {cfg.trading_mode.value}")
+    logger.info(f"Monitored Channels: {cfg.monitored_channel_ids}")
+
+    @client.on(events.NewMessage(chats=cfg.monitored_channel_ids or None))
+    async def on_new_message(event):
+        if getattr(event.message, 'edit_date', None):
+            return
+
+        text = event.message.message or ''
+        if not text.strip():
+            return
+
+        chat = await event.get_chat()
+        source_name = getattr(chat, 'title', str(event.chat_id))
+        msg_ts = event.message.date.timestamp() if hasattr(event.message, 'date') and event.message.date else time.time()
+
+        logger.info(f"Incoming message from '{source_name}' ({event.chat_id}): {text[:60]}...")
+        result = pipeline.process_raw_message(
+            text=text,
+            channel_id=event.chat_id,
+            message_id=event.id,
+            msg_timestamp=msg_ts,
+            source_name=source_name,
+        )
+        logger.info(f"Evaluation outcome: is_valid={result.is_valid}, action={result.action.value}, reason={result.reason}")
+
+    print(f"\n🚀 Bot is actively listening for trade signals in {cfg.trading_mode.value} mode...")
+    print(f"📡 Monitored channels: {cfg.monitored_channel_ids}")
+    print(f"📊 Logging destination: {cfg.log_group_id}\n")
+
+    await client.run_until_disconnected()
+
+
+def run():
+    import sys
+    import asyncio
+    cfg = AppConfig.from_env()
+
+    if len(sys.argv) > 1 and sys.argv[1] in ('--login', 'login'):
+        from src.tg_login import interactive_login
+        asyncio.run(interactive_login(cfg))
+        return
+
+    pipeline = TradingBotPipeline(cfg)
+    asyncio.run(start_telegram_listener(pipeline))
+
+
+if __name__ == '__main__':
+    run()

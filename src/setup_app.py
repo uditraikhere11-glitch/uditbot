@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-app = FastAPI(title="AuditBot Setup System")
+app = FastAPI(title="UditBot Setup System")
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">

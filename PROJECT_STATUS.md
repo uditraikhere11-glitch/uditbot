@@ -5,7 +5,7 @@
 **Target Environment**: Google Compute Engine (GCE) VM, Debian 12 / Ubuntu 24.04  
 **Broker**: DhanHQ API v2  
 **Current Master Switch**: `TRADING_MODE=TEST` (Default)  
-**GitHub Repository**: `https://github.com/uditraikhere11-glitch/auditbot.git`
+**GitHub Repository**: `https://github.com/uditraikhere11-glitch/uditbot.git`
 
 ---
 
@@ -27,7 +27,7 @@
 | **Broker Client (Dhan v2)** | **Design Ready** | Clean REST interface for auth, LTP, orders, Forever OCO, static IP compliance. | Awaiting GCE VM static IP. |
 | **Telegram Listener** | **Design Ready** | Telethon client with reconnect, channel filters, session protection. | Ready for VM session setup. |
 | **Live Broker Connectivity** | **Pending Approval** | Prohibited until TEST verification passes and explicit written sign-off is given. | Operator live sign-off. |
-| **GitHub Integration** | **Configured** | Remote `origin` linked to `auditbot.git`; commits staged on `main`. | Push to GitHub via VM or local push. |
+| **GitHub Integration** | **Configured** | Remote `origin` linked to `uditbot.git`; commits staged on `main`. | Push to GitHub via VM or local push. |
 | **VM Deployment** | **Ready for TEST Mode** | GCE specs and systemd scripts ready. Operator will setup VM upon request. | Ready to deploy on GCE VM. |
 
 ---
@@ -68,7 +68,7 @@
 - [x] Setup web application (`src/setup_app.py` / `bot web`).
 - [x] SSH Terminal CLI (`bot` script) specifications for status, mode, risk, and emergency stop.
 - [x] Systemd service and 08:00 IST token refresh timer unit files.
-- [x] GitHub repository remote linked to `https://github.com/uditraikhere11-glitch/auditbot.git`.
+- [x] GitHub repository remote linked to `https://github.com/uditraikhere11-glitch/uditbot.git`.
 - [ ] GCE VM provisioning with static external IP (pending operator setup).
 
 ---
