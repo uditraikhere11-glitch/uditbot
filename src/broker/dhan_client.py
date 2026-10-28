@@ -1,7 +1,8 @@
 """
 DhanHQ API v2 Client Interface.
 Handles authentication, token validity checks, market quotes (LTP),
-order submission (strictly disabled in TEST mode), and Forever OCO protection legs.
+order submission (strictly disabled in TEST mode), Forever OCO protection legs,
+and order status/trade execution tracking.
 """
 
 import json
@@ -193,3 +194,43 @@ class DhanClient:
             return False, None, f"Forever OCO rejected ({resp.status_code}): {resp.text}"
         except Exception as e:
             return False, None, f"HTTP exception placing Forever OCO: {e}"
+
+    def order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetches current order status, filled quantity, and average traded price from Dhan.
+        """
+        if self.cfg.trading_mode == TradingMode.TEST:
+            return {"orderStatus": "TRADED", "filledQty": 0, "averageTradedPrice": 0.0}
+
+        url = f"{BASE_URL}/orders/{order_id}"
+        try:
+            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning(f"Failed to fetch Dhan order status for {order_id} ({resp.status_code}): {resp.text}")
+            return None
+        except Exception as e:
+            logger.error(f"HTTP exception fetching order status for {order_id}: {e}")
+            return None
+
+    def trades_avg_price(self, order_id: str) -> Optional[float]:
+        """
+        Calculates volume-weighted average executed price from Dhan trade records for an order.
+        """
+        if self.cfg.trading_mode == TradingMode.TEST:
+            return None
+
+        url = f"{BASE_URL}/trades/{order_id}"
+        try:
+            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            if resp.status_code == 200:
+                trades = resp.json()
+                if isinstance(trades, list) and trades:
+                    total_val = sum(float(t.get("tradedPrice", 0.0)) * int(t.get("tradedQuantity", 0)) for t in trades)
+                    total_qty = sum(int(t.get("tradedQuantity", 0)) for t in trades)
+                    if total_qty > 0:
+                        return round(total_val / total_qty, 4)
+            return None
+        except Exception as e:
+            logger.error(f"HTTP exception fetching trades for {order_id}: {e}")
+            return None

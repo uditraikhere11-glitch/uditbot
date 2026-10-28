@@ -1,11 +1,12 @@
 """
-Unit tests for Sizing, Price Ceilings, and Protection Levels.
+Unit tests for Sizing, Price Ceilings, Protection Levels, and Tranche Splitting.
 """
 
 import unittest
 from src.engine.sizer import (
     size_equity,
     size_option,
+    split_tranches,
     calculate_equity_limit_price,
     calculate_option_limit_price,
     calculate_protection_levels,
@@ -21,6 +22,27 @@ class TestSizer(unittest.TestCase):
         self.assertEqual(round_to_tick(104.128, 0.05, mode="up"), 104.15)
         # 104.128 nearest to 0.05 tick -> 104.15
         self.assertEqual(round_to_tick(104.128, 0.05, mode="nearest"), 104.15)
+
+    def test_split_tranches(self):
+        # 3 lots, 2 targets -> 1 lot to target 1 (500), 2 lots to target 2 (1000)
+        t1 = split_tranches(3, [500.0, 1000.0])
+        self.assertEqual(t1, [(1, 500.0), (2, 1000.0)])
+
+        # 1 lot, 2 targets -> 1 lot to target 1 (500)
+        t2 = split_tranches(1, [500.0, 1000.0])
+        self.assertEqual(t2, [(1, 500.0)])
+
+        # 4 lots, 3 targets -> 1 lot to T1, 1 lot to T2, 2 lots to T3
+        t3 = split_tranches(4, [10.0, 20.0, 30.0])
+        self.assertEqual(t3, [(1, 10.0), (1, 20.0), (2, 30.0)])
+
+        # 2 lots, 1 target -> 2 lots to T1
+        t4 = split_tranches(2, [50.0])
+        self.assertEqual(t4, [(2, 50.0)])
+
+        # 0 lots or empty targets
+        self.assertEqual(split_tranches(0, [10.0]), [])
+        self.assertEqual(split_tranches(3, []), [])
 
     def test_equity_limit_price(self):
         # CMP 800 with 0.5% markup -> 804.00
@@ -62,11 +84,14 @@ class TestSizer(unittest.TestCase):
             max_lots=0,
             lot_size=250,
             limit_price=25.0,
+            targets=[40.0, 50.0],
         )
         self.assertTrue(res.is_valid)
         self.assertEqual(res.units, 3)
         self.assertEqual(res.total_quantity, 750)
         self.assertEqual(res.total_cost, 18750.0)
+        # 3 lots split across [40.0, 50.0] -> [(1, 40.0), (2, 50.0)]
+        self.assertEqual(res.tranches, [(1, 40.0), (2, 50.0)])
 
     def test_option_sizing_max_lots_cap(self):
         # Budget affords 3 lots, but max_lots = 2 -> Capped to 2 lots
