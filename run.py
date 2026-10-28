@@ -1,9 +1,9 @@
 """
-Standalone Production Runner for UditBot.
+Standalone Production Runner for UditBot / Audit bot.
 Directly loads .env, connects authenticated Telethon session,
-downloads/loads Dhan scrip master, listens for live signals, evaluates rules,
-and dispatches visual formatted cards directly to Telegram Log Group via Telethon client.
-Logs both processed signals and rejected/filtered chatter with reasons.
+downloads/loads Dhan scrip master, runs background persistent protection watcher,
+listens for live signals, evaluates rules, and dispatches visual formatted cards
+directly to Telegram Log Group via Telethon client.
 """
 
 import os
@@ -36,6 +36,7 @@ for p in env_paths:
 
 from src.config import AppConfig
 from src.main import TradingBotPipeline
+from src.engine.market import is_market_open
 from src.notifier.formatter import format_trade_log, format_exit_log
 
 cfg = AppConfig.from_env()
@@ -52,7 +53,7 @@ os.makedirs(cfg.data_dir, exist_ok=True)
 session_file = os.path.join(cfg.data_dir, "tg_userbot.session")
 
 print("=" * 60)
-print(f"🚀 STARTING UDITBOT IN {cfg.trading_mode.value} MODE")
+print(f"🚀 STARTING AUDIT BOT IN {cfg.trading_mode.value} MODE")
 print(f"📡 Monitored channels: {cfg.monitored_channel_ids}")
 print(f"📊 Logging destination: {cfg.log_group_id}")
 print(f"🔒 Session file: {session_file}")
@@ -74,13 +75,18 @@ async def main():
     me = await client.get_me()
     print(f"✅ Connected to Telegram as: {me.first_name} (@{me.username or 'No username'})")
 
+    # Start persistent Protection Watcher background task
+    asyncio.create_task(pipeline.watcher.run(is_market_open))
+    print("🛡️ Persistent Protection Watcher activated (monitoring resting fills & OCO legs)")
+
     # Verify Log Group connectivity on startup
     if cfg.log_group_id:
         try:
             startup_card = (
-                f"🟢 <b>{getattr(cfg, 'instance_name', 'UditBot')} Online</b>\n"
+                f"🟢 <b>{getattr(cfg, 'instance_name', 'Audit bot')} Online</b>\n"
                 f"Mode: <code>{cfg.trading_mode.value}</code>\n"
                 f"Monitoring: {len(cfg.monitored_channel_ids)} channels\n"
+                f"Protection Watcher: Active\n"
                 f"Status: Actively listening for trade signals"
             )
             await client.send_message(cfg.log_group_id, startup_card, parse_mode="html")
@@ -118,8 +124,9 @@ async def main():
             if not card:
                 seg = result.signal_type.value if result.signal_type else "NONE"
                 sym = result.symbol or "NONE"
+                unit_label = "lots" if seg == "OPTION" else "shares"
                 dhan_details = (
-                    f"[TEST Mode / Qty: {result.quantity_or_lots} shares / Limit: {result.limit_price:.2f}]"
+                    f"[TEST Mode / Qty: {result.quantity_or_lots} {unit_label} / Limit: {result.limit_price:.2f}]"
                     if result.is_valid else "None (Filtered/Blocked)"
                 )
                 heads_up_note = None if result.is_valid else result.reason

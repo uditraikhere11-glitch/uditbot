@@ -1,10 +1,10 @@
 """
-Position Sizing and Tick-Aligned Price Calculation Engine.
-Strictly enforces whole-unit constraints and price ceilings.
+Position Sizing, Tranche Splitting, and Tick-Aligned Price Calculation Engine.
+Strictly enforces whole-unit constraints, price ceilings, and multi-target lot distribution.
 """
 
 import math
-from typing import Tuple
+from typing import List, Optional, Tuple
 from src.models import SizingResult, ProtectionLevels
 
 
@@ -28,6 +28,29 @@ def round_to_tick(price: float, tick_size: float = 0.05, mode: str = "nearest") 
         n = round(steps)
 
     return round(n * tick_size, 4)
+
+
+def split_tranches(lots: int, targets: List[float]) -> List[Tuple[int, float]]:
+    """
+    Splits lots across targets as [(lots, target_price), ...].
+
+    Uses as many targets as there are lots (earliest targets first).
+    Any remainder lots go to the last (furthest) target so runners ride the bigger move.
+    Examples:
+      - 3 lots, [500.0, 1000.0] -> [(1, 500.0), (2, 1000.0)]
+      - 1 lot,  [500.0, 1000.0] -> [(1, 500.0)]
+      - 4 lots, [10.0, 20.0, 30.0] -> [(1, 10.0), (1, 20.0), (2, 30.0)]
+      - 2 lots, [50.0] -> [(2, 50.0)]
+      - 0 lots or empty targets -> []
+    """
+    if lots <= 0 or not targets:
+        return []
+    sorted_targets = sorted(targets)
+    n = min(len(sorted_targets), lots)
+    base, rem = divmod(lots, n)
+    tranches = [(base, t) for t in sorted_targets[:n]]
+    tranches[-1] = (base + rem, tranches[-1][1])
+    return tranches
 
 
 def calculate_equity_limit_price(cmp: float, markup_pct: float, tick_size: float = 0.05) -> float:
@@ -131,9 +154,10 @@ def size_option(
     max_lots: int,
     lot_size: int,
     limit_price: float,
+    targets: Optional[List[float]] = None,
 ) -> SizingResult:
     """
-    Calculates stock option lot sizing.
+    Calculates stock option lot sizing and splits tranches across multiple targets.
     Rejects if affordable lots < 1. Enforces max_lots cap.
     """
     if lot_size <= 0:
@@ -175,6 +199,7 @@ def size_option(
 
     total_qty = lots * lot_size
     total_cost = round(total_qty * limit_price, 2)
+    tranches = split_tranches(lots, targets or [])
 
     return SizingResult(
         is_valid=True,
@@ -182,4 +207,5 @@ def size_option(
         total_quantity=total_qty,
         price_per_unit=limit_price,
         total_cost=total_cost,
+        tranches=tranches,
     )

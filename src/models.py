@@ -4,7 +4,7 @@ Compatible with Python 3.11/3.12+ and Pydantic v1 / v2.
 """
 
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -81,6 +81,7 @@ class ValidationResult(BaseModel):
     limit_price: Optional[float] = None
     quantity_or_lots: Optional[int] = None
     calculated_exposure: Optional[float] = None
+    log_card: Optional[str] = None
 
 
 class SizingResult(BaseModel):
@@ -90,6 +91,7 @@ class SizingResult(BaseModel):
     price_per_unit: float
     total_cost: float
     error_reason: Optional[str] = None
+    tranches: List[Tuple[int, float]] = Field(default_factory=list)  # [(lots, target_price), ...]
 
 
 class OrderRequest(BaseModel):

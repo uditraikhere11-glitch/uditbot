@@ -1,8 +1,8 @@
 """
 Main Application Pipeline Orchestrator.
 Processes raw Telegram messages through deterministic validation, deduplication,
-sizing, risk limits, and broker execution (strictly disabled in TEST mode).
-Integrates visual Telegram Log Group card formatting.
+sizing, risk limits, market hours validation, and broker execution (strictly disabled in TEST mode).
+Integrates persistent partial-fill protection and visual Telegram Log Group card formatting.
 """
 
 import logging
@@ -23,6 +23,8 @@ from src.engine.sizer import (
     size_equity, size_option, calculate_equity_limit_price,
     calculate_option_limit_price, calculate_protection_levels
 )
+from src.engine.market import is_market_open, market_status
+from src.engine.protection_watcher import ProtectionWatcher
 from src.engine.risk_manager import RiskManager
 from src.journal.db import JournalDB
 from src.broker.dhan_client import DhanClient
@@ -43,6 +45,14 @@ class TradingBotPipeline:
         self.risk_manager = RiskManager(config)
         self.broker = DhanClient(config)
         self.notifier = TelegramNotifier(config)
+        self.watcher = ProtectionWatcher(
+            broker=self.broker,
+            sl_pct=config.sl_pct,
+            target_pct=config.target_pct,
+            sl_limit_buffer_pct=config.sl_limit_buffer_pct,
+            path=os.path.join(config.data_dir, "pending_protection.json"),
+            dry_run=(config.trading_mode == TradingMode.TEST),
+        )
 
     def process_raw_message(
         self,
@@ -101,7 +111,7 @@ class TradingBotPipeline:
                 timestamp=now,
             )
             self.notifier.send_log_message(exit_card)
-            return ValidationResult(is_valid=False, action=SignalAction.EXIT_SIGNAL, reason=fno_reason, signal_type=SignalType.OPTION)
+            return ValidationResult(is_valid=False, action=SignalAction.EXIT_SIGNAL, reason=fno_reason, signal_type=SignalType.OPTION, log_card=exit_card)
 
         if fno_action == SignalAction.BLOCKED:
             self.db.record_signal(channel_id, message_id, "OPTION", "", "BLOCKED", text, "REJECTED", fno_reason)
@@ -111,17 +121,17 @@ class TradingBotPipeline:
                 original_message=text,
                 segment="FNO",
                 status=f"Rejected: {fno_reason}",
-                dhan_order_details="None (Blocked)",
+                dhan_order_details="None (Blocked by parser validation)",
                 heads_up=fno_reason,
                 is_live=is_live,
                 is_processed=False,
                 timestamp=now,
             )
             self.notifier.send_log_message(rej_card)
-            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=fno_reason, signal_type=SignalType.OPTION)
+            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=fno_reason, signal_type=SignalType.OPTION, log_card=rej_card)
 
         if fno_sig is not None:
-            return self._handle_fno_signal(fno_sig, now, source_name)
+            return self._handle_fno_signal(fno_sig, source_name=source_name, now=now)
 
         # 3. Else evaluate as Cash Equity signal
         eq_sig, eq_reason = parse_equity_regex(
@@ -131,28 +141,52 @@ class TradingBotPipeline:
         )
 
         if eq_sig is not None:
-            return self._handle_equity_signal(eq_sig, now, source_name)
+            return self._handle_equity_signal(eq_sig, source_name=source_name, now=now)
 
-        # Unrecognized / casual chatter
+        # 4. Unrecognized Chatter / Non-trade message
         self.db.record_signal(channel_id, message_id, "NONE", "", "IGNORED", text, "FILTERED", eq_reason)
-        return ValidationResult(is_valid=False, action=SignalAction.IGNORED, reason=eq_reason)
+        return ValidationResult(
+            is_valid=False,
+            action=SignalAction.IGNORED,
+            reason=eq_reason,
+        )
 
-    def _handle_fno_signal(self, sig, now: float, source_name: str) -> ValidationResult:
-        """Processes a validated stock option signal with exact visual log output."""
+    def _handle_fno_signal(self, sig, source_name: str, now: float) -> ValidationResult:
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
+        heads_up_note = None
 
         if not self.cfg.fno_active:
             reason = "Stock Options processing is currently INACTIVE in configuration"
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
+        # Deduplication check
         is_dup, dup_reason = self.dedup.is_duplicate(sig.symbol, sig.channel_id, sig.message_id, event_time=now)
         if is_dup:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "DUPLICATE", dup_reason)
-            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=dup_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
+            rej_card = format_trade_log(
+                symbol=sig.symbol,
+                source_name=source_name,
+                original_message=sig.raw_text,
+                segment="FNO",
+                status="Rejected - Duplicate Signal",
+                dhan_order_details="None (Duplicate signal blocked)",
+                heads_up=dup_reason,
+                is_live=is_live,
+                is_processed=False,
+                timestamp=now,
+            )
+            self.notifier.send_log_message(rej_card)
+            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=dup_reason, signal_type=SignalType.OPTION, symbol=sig.symbol, log_card=rej_card)
 
-        contract, res_reason = self.resolver.resolve_option(sig.symbol, sig.strike, sig.option_type, sig.expiry_month)
-        heads_up_note = None
+        # Resolve Instrument Contract
+        contract, res_reason = self.resolver.resolve_option(
+            symbol=sig.symbol,
+            strike=sig.strike,
+            option_type=sig.option_type,
+            expiry_month=sig.expiry_month,
+        )
+
         if not contract:
             heads_up_note = "Instrument unverified"
             res_reason = f"Instrument unverified: {res_reason}"
@@ -170,7 +204,7 @@ class TradingBotPipeline:
                 timestamp=now,
             )
             self.notifier.send_log_message(rej_card)
-            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
+            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.OPTION, symbol=sig.symbol, log_card=rej_card)
 
         limit_price = calculate_option_limit_price(sig.entry_max, contract.tick_size)
 
@@ -181,6 +215,7 @@ class TradingBotPipeline:
             max_lots=self.cfg.fno_max_lots,
             lot_size=contract.lot_size,
             limit_price=limit_price,
+            targets=sig.targets,
         )
         if not sizing.is_valid:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
@@ -209,6 +244,11 @@ class TradingBotPipeline:
             trading_mode=self.cfg.trading_mode,
         )
 
+        tranches_info = ""
+        if sizing.tranches and len(sizing.tranches) > 1:
+            tranches_str = ", ".join(f"{l}L @ Tgt {t:g}" for l, t in sizing.tranches)
+            tranches_info = f" [Tranches: {tranches_str}]"
+
         if self.cfg.trading_mode == TradingMode.TEST:
             self.db.record_order(
                 correlation_id=correlation_id,
@@ -222,6 +262,17 @@ class TradingBotPipeline:
                 quantity=sizing.total_quantity,
                 status="TEST_VALIDATED",
             )
+
+            # Register with Protection Watcher
+            self.watcher.track(
+                order_id=correlation_id,
+                symbol=sig.symbol,
+                security_id=contract.security_id,
+                segment=contract.exchange_segment,
+                qty=sizing.total_quantity,
+                product_type=ProductType.MARGIN.value,
+                dry_price=limit_price,
+            )
             
             log_card = format_trade_log(
                 symbol=sig.symbol,
@@ -229,7 +280,7 @@ class TradingBotPipeline:
                 original_message=sig.raw_text,
                 segment="FNO",
                 status="TEST Mode: Validated & Sized (No broker order sent)",
-                dhan_order_details=f"[TEST Mode / Qty: {sizing.total_quantity} ({sizing.units} lots) / Limit: {limit_price:.2f}]",
+                dhan_order_details=f"[TEST Mode / Qty: {sizing.total_quantity} ({sizing.units} lots){tranches_info} / Limit: {limit_price:.2f}]",
                 heads_up=heads_up_note or "TEST Mode active - zero broker orders placed",
                 is_live=False,
                 is_processed=True,
@@ -247,11 +298,32 @@ class TradingBotPipeline:
                 limit_price=limit_price,
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
+                log_card=log_card,
             )
         else:
+            # Enforce Market Hours strictly in LIVE mode
+            m_open, m_msg = market_status()
+            if not m_open:
+                reason = f"LIVE Order Blocked: {m_msg}"
+                self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_MARKET_CLOSED", reason)
+                rej_card = format_trade_log(
+                    symbol=sig.symbol,
+                    source_name=source_name,
+                    original_message=sig.raw_text,
+                    segment="FNO",
+                    status=f"Rejected: {reason}",
+                    dhan_order_details=f"None ({m_msg})",
+                    heads_up=reason,
+                    is_live=True,
+                    is_processed=False,
+                    timestamp=now,
+                )
+                self.notifier.send_log_message(rej_card)
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol, log_card=rej_card)
+
             ok, broker_id, msg = self.broker.place_order(order_req)
             status = "PENDING" if ok else "REJECTED"
-            order_details = f"[Order ID: {broker_id} / Status: {status}]" if broker_id else f"[Rejected: {msg}]"
+            order_details = f"[Order ID: {broker_id} / Status: {status}{tranches_info}]" if broker_id else f"[Rejected: {msg}]"
             self.db.record_order(
                 correlation_id=correlation_id,
                 broker_order_id=broker_id,
@@ -265,6 +337,16 @@ class TradingBotPipeline:
                 quantity=sizing.total_quantity,
                 status=status,
             )
+
+            if ok and broker_id:
+                self.watcher.track(
+                    order_id=broker_id,
+                    symbol=sig.symbol,
+                    security_id=contract.security_id,
+                    segment=contract.exchange_segment,
+                    qty=sizing.total_quantity,
+                    product_type=ProductType.MARGIN.value,
+                )
 
             log_card = format_trade_log(
                 symbol=sig.symbol,
@@ -283,31 +365,46 @@ class TradingBotPipeline:
             return ValidationResult(
                 is_valid=ok,
                 action=SignalAction.BUY_ENTRY,
-                reason=msg,
+                reason=f"LIVE Order placed on Dhan: {broker_id}" if ok else f"Dhan order placement failed: {msg}",
                 signal_type=SignalType.OPTION,
                 symbol=sig.symbol,
                 security_id=contract.security_id,
                 limit_price=limit_price,
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
+                log_card=log_card,
             )
 
-    def _handle_equity_signal(self, sig, now: float, source_name: str) -> ValidationResult:
-        """Processes a validated cash equity signal with exact visual log output."""
+    def _handle_equity_signal(self, sig, source_name: str, now: float) -> ValidationResult:
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
+        heads_up_note = None
 
         if not self.cfg.equity_active:
             reason = "Equity Cash processing is currently INACTIVE in configuration"
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
+        # Deduplication check
         is_dup, dup_reason = self.dedup.is_duplicate(sig.symbol, sig.channel_id, sig.message_id, event_time=now)
         if is_dup:
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "DUPLICATE", dup_reason)
-            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=dup_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
+            rej_card = format_trade_log(
+                symbol=sig.symbol,
+                source_name=source_name,
+                original_message=sig.raw_text,
+                segment="EQUITY",
+                status="Rejected - Duplicate Signal",
+                dhan_order_details="None (Duplicate signal blocked)",
+                heads_up=dup_reason,
+                is_live=is_live,
+                is_processed=False,
+                timestamp=now,
+            )
+            self.notifier.send_log_message(rej_card)
+            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=dup_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol, log_card=rej_card)
 
+        # Resolve Instrument
         inst, res_reason = self.resolver.resolve_equity(sig.symbol)
-        heads_up_note = None
         if not inst:
             heads_up_note = "Instrument unverified"
             res_reason = f"Instrument unverified: {res_reason}"
@@ -325,12 +422,20 @@ class TradingBotPipeline:
                 timestamp=now,
             )
             self.notifier.send_log_message(rej_card)
-            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
+            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol, log_card=rej_card)
 
+        # Fetch Reference Price (LTP or Stated Price)
         ref_price = sig.stated_price
-        if ref_price <= 0:
-            ok, ltp, _ = self.broker.get_ltp(inst.exchange_segment, inst.security_id)
-            ref_price = ltp if ok and ltp > 0 else 1000.0
+        if ref_price <= 0.0:
+            ok, ltp, ltp_msg = self.broker.get_ltp(inst.exchange_segment, inst.security_id)
+            if ok and ltp > 0:
+                ref_price = ltp
+            elif self.cfg.trading_mode == TradingMode.TEST:
+                ref_price = 1000.0  # Fallback reference price in standalone test
+            else:
+                reason = f"Could not fetch LTP from Dhan: {ltp_msg}"
+                self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "LTP_ERROR", reason)
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
         limit_price = calculate_equity_limit_price(ref_price, self.cfg.equity_price_markup_pct, inst.tick_size)
 
@@ -380,6 +485,17 @@ class TradingBotPipeline:
                 quantity=sizing.total_quantity,
                 status="TEST_VALIDATED",
             )
+
+            # Register with Protection Watcher
+            self.watcher.track(
+                order_id=correlation_id,
+                symbol=sig.symbol,
+                security_id=inst.security_id,
+                segment=inst.exchange_segment,
+                qty=sizing.total_quantity,
+                product_type=self.cfg.equity_product_type.value,
+                dry_price=limit_price,
+            )
             
             log_card = format_trade_log(
                 symbol=sig.symbol,
@@ -405,8 +521,29 @@ class TradingBotPipeline:
                 limit_price=limit_price,
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
+                log_card=log_card,
             )
         else:
+            # Enforce Market Hours strictly in LIVE mode
+            m_open, m_msg = market_status()
+            if not m_open:
+                reason = f"LIVE Order Blocked: {m_msg}"
+                self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_MARKET_CLOSED", reason)
+                rej_card = format_trade_log(
+                    symbol=sig.symbol,
+                    source_name=source_name,
+                    original_message=sig.raw_text,
+                    segment="EQUITY",
+                    status=f"Rejected: {reason}",
+                    dhan_order_details=f"None ({m_msg})",
+                    heads_up=reason,
+                    is_live=True,
+                    is_processed=False,
+                    timestamp=now,
+                )
+                self.notifier.send_log_message(rej_card)
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=sig.symbol, log_card=rej_card)
+
             ok, broker_id, msg = self.broker.place_order(order_req)
             status = "PENDING" if ok else "REJECTED"
             order_details = f"[Order ID: {broker_id} / Status: {status}]" if broker_id else f"[Rejected: {msg}]"
@@ -423,6 +560,16 @@ class TradingBotPipeline:
                 quantity=sizing.total_quantity,
                 status=status,
             )
+
+            if ok and broker_id:
+                self.watcher.track(
+                    order_id=broker_id,
+                    symbol=sig.symbol,
+                    security_id=inst.security_id,
+                    segment=inst.exchange_segment,
+                    qty=sizing.total_quantity,
+                    product_type=self.cfg.equity_product_type.value,
+                )
 
             log_card = format_trade_log(
                 symbol=sig.symbol,
@@ -441,29 +588,27 @@ class TradingBotPipeline:
             return ValidationResult(
                 is_valid=ok,
                 action=SignalAction.BUY_ENTRY,
-                reason=msg,
+                reason=f"LIVE Order placed on Dhan: {broker_id}" if ok else f"Dhan order placement failed: {msg}",
                 signal_type=SignalType.EQUITY,
                 symbol=sig.symbol,
                 security_id=inst.security_id,
                 limit_price=limit_price,
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
+                log_card=log_card,
             )
 
 
 async def start_telegram_listener(pipeline: TradingBotPipeline):
-    cfg = pipeline.cfg
-    logger.info("Initializing Telegram Client Listener...")
-
-    if not cfg.tg_api_id or not cfg.tg_api_hash:
-        logger.error("TG_API_ID or TG_API_HASH not configured in .env!")
-        return
-
-    session_file = os.path.join(cfg.data_dir, "tg_userbot.session")
+    """
+    Subscribes Telethon client to monitored channels and processes live trade messages.
+    """
     from telethon import TelegramClient, events
     from telethon.sessions import StringSession
+    import asyncio
 
-    session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else session_file
+    cfg = pipeline.cfg
+    session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else os.path.join(cfg.data_dir, "tg_userbot.session")
     client = TelegramClient(session, cfg.tg_api_id, cfg.tg_api_hash)
 
     await client.start()
@@ -471,6 +616,9 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
     logger.info(f"Connected to Telegram as: {me.first_name} (@{me.username or 'No username'})")
     logger.info(f"Operating Mode: {cfg.trading_mode.value}")
     logger.info(f"Monitored Channels: {cfg.monitored_channel_ids}")
+
+    # Launch background Protection Watcher task
+    asyncio.create_task(pipeline.watcher.run(is_market_open))
 
     @client.on(events.NewMessage(chats=cfg.monitored_channel_ids or None))
     async def on_new_message(event):
