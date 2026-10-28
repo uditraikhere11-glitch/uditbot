@@ -2,7 +2,7 @@
 Standalone Production Runner for UditBot.
 Directly loads .env, connects authenticated Telethon session,
 downloads/loads Dhan scrip master, listens for live signals, evaluates rules,
-and dispatches formatted cards.
+and dispatches visual formatted cards directly to Telegram Log Group via Telethon client.
 """
 
 import os
@@ -58,9 +58,8 @@ print("=" * 60)
 
 pipeline = TradingBotPipeline(cfg)
 
-# Download / Load Dhan Scrip Master
+# Download / Load Dhan Scrip Master Catalog
 scrip_file = os.path.join(cfg.data_dir, "scrip_master.csv")
-print("📥 Checking Dhan scrip master catalog...")
 pipeline.resolver.load_dhan_master(scrip_file)
 print("=" * 60 + "\n")
 
@@ -72,7 +71,23 @@ async def main():
     await client.start()
     me = await client.get_me()
     print(f"✅ Connected to Telegram as: {me.first_name} (@{me.username or 'No username'})")
-    print(f"⚡ Listening for live signals on {len(cfg.monitored_channel_ids)} channels...\n")
+
+    # Verify Log Group connectivity on startup
+    if cfg.log_group_id:
+        try:
+            startup_card = (
+                f"🟢 <b>{getattr(cfg, 'instance_name', 'UditBot')} Online</b>\n"
+                f"Mode: <code>{cfg.trading_mode.value}</code>\n"
+                f"Monitoring: {len(cfg.monitored_channel_ids)} channels\n"
+                f"Status: Actively listening for trade signals"
+            )
+            await client.send_message(cfg.log_group_id, startup_card, parse_mode="html")
+            print(f"✅ Log Group Verified: Sent online confirmation to {cfg.log_group_id}")
+        except Exception as e:
+            print(f"⚠️ Log Group Warning: Could not send message to {cfg.log_group_id}: {e}")
+            print(f"   (Please verify that your Telegram account @{me.username} is an admin or has permission to post in that group)")
+
+    print(f"\n⚡ Listening for live signals on {len(cfg.monitored_channel_ids)} channels...\n")
 
     @client.on(events.NewMessage(chats=cfg.monitored_channel_ids or None))
     async def handler(event):
@@ -93,7 +108,16 @@ async def main():
             msg_timestamp=msg_ts,
             source_name=source_name,
         )
-        print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}\n")
+        print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
+
+        # Dispatch visual card directly to Log Group using active Telegram client
+        card = getattr(result, "log_card", None)
+        if cfg.log_group_id and card:
+            try:
+                await client.send_message(cfg.log_group_id, card)
+                print(f"📨 Dispatched visual card to Telegram Log Group ({cfg.log_group_id})\n")
+            except Exception as e:
+                print(f"⚠️ Failed to send log card to {cfg.log_group_id}: {e}\n")
 
     await client.run_until_disconnected()
 
