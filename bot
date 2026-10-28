@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# =====================================================================
+# PLATINUM / UDITBOT UNIFIED OPERATOR CLI ('bot')
+# =====================================================================
+set -e
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${DIR}/venv/bin/python3"
+if [ ! -f "$PYTHON" ]; then
+    PYTHON="python3"
+fi
+
+export PYTHONPATH="${DIR}:${PYTHONPATH:-}"
+
+case "${1:-}" in
+    status)
+        "$PYTHON" -m src.cli status
+        ;;
+    mode)
+        "$PYTHON" -m src.cli mode
+        ;;
+    setup)
+        "$PYTHON" -m src.setup_wizard
+        ;;
+    web)
+        shift || true
+        "$PYTHON" -m src.cli web "$@"
+        ;;
+    journal|logs)
+        shift || true
+        "$PYTHON" -m src.cli journal "$@"
+        ;;
+    emergency-stop|stop-trading)
+        "$PYTHON" -m src.cli emergency-stop
+        ;;
+    resume|start-trading)
+        "$PYTHON" -m src.cli resume
+        ;;
+    start)
+        sudo systemctl start trading_bot.service
+        echo "trading_bot service started."
+        ;;
+    stop)
+        sudo systemctl stop trading_bot.service
+        echo "trading_bot service stopped."
+        ;;
+    restart)
+        sudo systemctl restart trading_bot.service
+        echo "trading_bot service restarted."
+        ;;
+    service-logs)
+        sudo journalctl -u trading_bot.service -f
+        ;;
+    live)
+        echo "⚠️  SWITCHING TRADING_MODE TO LIVE"
+        read -p "Are you sure you want to enable LIVE broker order placement? (yes/no): " ans
+        if [ "$ans" = "yes" ]; then
+            if [ -f "${DIR}/.env" ]; then
+                sed -i 's/^TRADING_MODE=.*/TRADING_MODE=LIVE/' "${DIR}/.env"
+                echo "TRADING_MODE set to LIVE in .env."
+                if systemctl is-active --quiet trading_bot.service; then
+                    sudo systemctl restart trading_bot.service
+                    echo "Service restarted in LIVE mode."
+                fi
+            else
+                echo "Error: .env not found. Run 'bot setup' first."
+            fi
+        else
+            echo "Cancelled. Still in current mode."
+        fi
+        ;;
+    test)
+        if [ -f "${DIR}/.env" ]; then
+            sed -i 's/^TRADING_MODE=.*/TRADING_MODE=TEST/' "${DIR}/.env"
+            echo "TRADING_MODE set to TEST in .env."
+            if systemctl is-active --quiet trading_bot.service; then
+                sudo systemctl restart trading_bot.service
+                echo "Service restarted in TEST mode."
+            fi
+        fi
+        ;;
+    help|--help|-h|*)
+        echo "======================================================="
+        echo "      PLATINUM / UDITBOT OPERATOR CONTROL CLI         "
+        echo "======================================================="
+        echo "Usage: bot <command>"
+        echo ""
+        echo "Operational Commands:"
+        echo "  bot status          Check running status, mode, and parameters"
+        echo "  bot setup           Run interactive terminal setup wizard"
+        echo "  bot web             Launch Sapphire setup web interface (port 8080)"
+        echo "  bot journal [n]     View last n signal evaluation records"
+        echo "  bot live            Switch master mode to LIVE (requires confirmation)"
+        echo "  bot test            Switch master mode to TEST"
+        echo "  bot emergency-stop  Halt all new trade entries immediately"
+        echo "  bot resume          Resume normal trading operations"
+        echo "  bot start           Start systemd service"
+        echo "  bot stop            Stop systemd service"
+        echo "  bot restart         Restart systemd service"
+        echo "  bot service-logs    Watch systemd service logs live"
+        echo "======================================================="
+        ;;
+esac
