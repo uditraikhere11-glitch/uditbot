@@ -35,6 +35,7 @@ for p in env_paths:
 
 from src.config import AppConfig
 from src.main import TradingBotPipeline
+from src.notifier.formatter import format_trade_log, format_exit_log
 
 cfg = AppConfig.from_env()
 
@@ -84,8 +85,8 @@ async def main():
             await client.send_message(cfg.log_group_id, startup_card, parse_mode="html")
             print(f"✅ Log Group Verified: Sent online confirmation to {cfg.log_group_id}")
         except Exception as e:
-            print(f"⚠️ Log Group Warning: Could not send message to {cfg.log_group_id}: {e}")
-            print(f"   (Please verify that your Telegram account @{me.username} is an admin or has permission to post in that group)")
+            print(f"⚠️ Log Group Warning: Could not send test message to {cfg.log_group_id}: {e}")
+            print(f"   (Please verify that your Telegram account @{me.username} is a member/admin in group {cfg.log_group_id})")
 
     print(f"\n⚡ Listening for live signals on {len(cfg.monitored_channel_ids)} channels...\n")
 
@@ -110,9 +111,30 @@ async def main():
         )
         print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
 
-        # Dispatch visual card directly to Log Group using active Telegram client
-        card = getattr(result, "log_card", None)
-        if cfg.log_group_id and card:
+        # Send card to Telegram Log Group via active Telethon client
+        if cfg.log_group_id and result.action.value != "IGNORED":
+            # Generate visual card directly if not already generated
+            card = getattr(result, "log_card", None)
+            if not card:
+                seg = result.signal_type.value if result.signal_type else "EQUITY"
+                dhan_details = (
+                    f"[TEST Mode / Qty: {result.quantity_or_lots} shares / Limit: {result.limit_price:.2f}]"
+                    if result.is_valid else "None"
+                )
+                heads_up_note = None if result.is_valid else result.reason
+                card = format_trade_log(
+                    symbol=result.symbol or "UNKNOWN",
+                    source_name=source_name,
+                    original_message=text,
+                    segment=seg,
+                    status=result.reason,
+                    dhan_order_details=dhan_details,
+                    heads_up=heads_up_note,
+                    is_live=(cfg.trading_mode.value == "LIVE"),
+                    is_processed=result.is_valid,
+                    timestamp=msg_ts,
+                )
+
             try:
                 await client.send_message(cfg.log_group_id, card)
                 print(f"📨 Dispatched visual card to Telegram Log Group ({cfg.log_group_id})\n")
