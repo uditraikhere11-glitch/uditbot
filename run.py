@@ -3,6 +3,7 @@ Standalone Production Runner for UditBot.
 Directly loads .env, connects authenticated Telethon session,
 downloads/loads Dhan scrip master, listens for live signals, evaluates rules,
 and dispatches visual formatted cards directly to Telegram Log Group via Telethon client.
+Logs both processed signals and rejected/filtered chatter with reasons.
 """
 
 import os
@@ -111,19 +112,19 @@ async def main():
         )
         print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
 
-        # Send card to Telegram Log Group via active Telethon client
-        if cfg.log_group_id and result.action.value != "IGNORED":
-            # Generate visual card directly if not already generated
+        # Send visual card directly to Log Group for all evaluated messages
+        if cfg.log_group_id:
             card = getattr(result, "log_card", None)
             if not card:
-                seg = result.signal_type.value if result.signal_type else "EQUITY"
+                seg = result.signal_type.value if result.signal_type else "NONE"
+                sym = result.symbol or "NONE"
                 dhan_details = (
                     f"[TEST Mode / Qty: {result.quantity_or_lots} shares / Limit: {result.limit_price:.2f}]"
-                    if result.is_valid else "None"
+                    if result.is_valid else "None (Filtered/Blocked)"
                 )
                 heads_up_note = None if result.is_valid else result.reason
                 card = format_trade_log(
-                    symbol=result.symbol or "UNKNOWN",
+                    symbol=sym,
                     source_name=source_name,
                     original_message=text,
                     segment=seg,
