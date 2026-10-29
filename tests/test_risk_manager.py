@@ -2,13 +2,25 @@
 Unit tests for Risk Management limits and Emergency Stop.
 """
 
+import os
+import tempfile
 import unittest
 from src.config import AppConfig
+from src.engine.emergency_stop import EmergencyStopManager
 from src.engine.risk_manager import RiskManager
 
 
 class TestRiskManager(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.stop_file = os.path.join(self.temp_dir.name, "emergency_stop.json")
+        self.stop_manager = EmergencyStopManager(
+            state_file=self.stop_file,
+            fail_closed_if_missing=True,
+        )
+        self.stop_manager.provision_initial_clean_state(
+            operator="TestRunner", account_id="1113731536"
+        )
         self.cfg = AppConfig(
             max_order_amount_inr=50000.0,
             min_trade_funds_inr=10000.0,
@@ -17,7 +29,10 @@ class TestRiskManager(unittest.TestCase):
             max_open_positions=5,
             max_daily_trades=10,
         )
-        self.rm = RiskManager(self.cfg)
+        self.rm = RiskManager(self.cfg, stop_manager=self.stop_manager)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
     def test_normal_order_passes(self):
         passed, reason = self.rm.validate_order_risk(
