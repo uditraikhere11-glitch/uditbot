@@ -543,6 +543,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <p class="help-text">Trading halted if funds drop below</p>
           </div>
           <div class="form-group">
+            <label>Virtual Paper Balance (TEST Mode INR)</label>
+            <div class="input-wrap">
+              <input type="number" step="10000" name="test_mode_paper_funds_inr" value="<!--TEST_MODE_PAPER_FUNDS_INR-->" required>
+            </div>
+            <p class="help-text">Simulated capital used for risk sizing in TEST mode</p>
+          </div>
+          <div class="form-group">
             <label>Max Daily Loss (INR)</label>
             <div class="input-wrap">
               <input type="number" step="1000" name="max_daily_loss_inr" value="<!--MAX_DAILY_LOSS_INR-->" required>
@@ -760,6 +767,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         # Risk
         .replace("<!--MAX_ORDER_AMOUNT_INR-->", str(int(cfg.max_order_amount_inr)))
         .replace("<!--MIN_TRADE_FUNDS_INR-->", str(int(cfg.min_trade_funds_inr)))
+        .replace("<!--TEST_MODE_PAPER_FUNDS_INR-->", str(int(getattr(cfg, "test_mode_paper_funds_inr", 100000.0))))
         .replace("<!--MAX_DAILY_LOSS_INR-->", str(int(cfg.max_daily_loss_inr)))
         .replace("<!--MAX_DAILY_TRADES-->", str(cfg.max_daily_trades))
         .replace("<!--MAX_TOTAL_EXPOSURE_INR-->", str(int(cfg.max_total_exposure_inr)))
@@ -804,6 +812,7 @@ def handle_setup_submission(
     # Risk
     max_order_amount_inr: float = Form(50000.0),
     min_trade_funds_inr: float = Form(10000.0),
+    test_mode_paper_funds_inr: float = Form(100000.0),
     max_daily_loss_inr: float = Form(15000.0),
     max_daily_trades: Optional[int] = Form(None),
     daily_trade_limit: Optional[int] = Form(None),
@@ -820,6 +829,13 @@ def handle_setup_submission(
 ):
     trading_mode = "LIVE" if is_live_mode else "TEST"
     trades_count = max_daily_trades if max_daily_trades is not None else (daily_trade_limit if daily_trade_limit is not None else 20)
+    if hasattr(test_mode_paper_funds_inr, "default"):
+        paper_funds_val = float(test_mode_paper_funds_inr.default)
+    else:
+        try:
+            paper_funds_val = float(test_mode_paper_funds_inr)
+        except (ValueError, TypeError):
+            paper_funds_val = 100000.0
 
     # Clean channel IDs
     clean_monitored = ",".join([c.strip() for c in monitored_channel_ids.split(",") if c.strip()])
@@ -868,6 +884,7 @@ FNO_MAX_LOTS={fno_max_lots}
 # --- RISK MANAGEMENT CONTROLS ---
 MAX_ORDER_AMOUNT_INR={max_order_amount_inr}
 MIN_TRADE_FUNDS_INR={min_trade_funds_inr}
+TEST_MODE_PAPER_FUNDS_INR={paper_funds_val}
 MAX_DAILY_LOSS_INR={max_daily_loss_inr}
 MAX_DAILY_TRADES={trades_count}
 MAX_TOTAL_EXPOSURE_INR={max_total_exposure_inr}

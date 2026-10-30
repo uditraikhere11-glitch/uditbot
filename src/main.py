@@ -418,7 +418,8 @@ class TradingBotPipeline:
                 watcher=self.watcher,
             )
 
-        risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, avail_funds)
+        effective_funds = avail_funds if (is_live or avail_funds >= sizing.total_cost) else getattr(self.cfg, "test_mode_paper_funds_inr", 100000.0)
+        risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, effective_funds)
         if not risk_passed:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", risk_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=risk_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
@@ -749,7 +750,8 @@ class TradingBotPipeline:
                 watcher=self.watcher,
             )
 
-        risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, avail_funds)
+        effective_funds = avail_funds if (is_live or avail_funds >= sizing.total_cost) else getattr(self.cfg, "test_mode_paper_funds_inr", 100000.0)
+        risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, effective_funds)
         if not risk_passed:
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", risk_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=risk_reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
