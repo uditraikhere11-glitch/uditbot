@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # =====================================================================
 # PLATINUM / UDITBOT UNIFIED OPERATOR CLI ('bot')
+# V12-22 Fix: Resolves symlinks (e.g. /usr/local/bin/bot) and changes
+# into the application root directory before executing commands.
 # =====================================================================
 set -e
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$LINK_DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+cd "$DIR"
+
 PYTHON="${DIR}/venv/bin/python3"
 if [ ! -f "$PYTHON" ]; then
     PYTHON="python3"
@@ -15,6 +25,18 @@ export PYTHONPATH="${DIR}:${PYTHONPATH:-}"
 case "${1:-}" in
     status)
         "$PYTHON" -m src.cli status
+        ;;
+    dashboard|dash)
+        "$PYTHON" -m src.cli dashboard
+        ;;
+    check-dhan|test-dhan|dhan)
+        "$PYTHON" -m src.cli check-dhan
+        ;;
+    login|refresh-token|token|totp)
+        "$PYTHON" -m src.cli login
+        ;;
+    daily_health_check|daily-health-check|health-check)
+        "$PYTHON" -m src.cli daily_health_check
         ;;
     mode)
         "$PYTHON" -m src.cli mode
@@ -31,10 +53,12 @@ case "${1:-}" in
         "$PYTHON" -m src.cli journal "$@"
         ;;
     emergency-stop|stop-trading)
-        "$PYTHON" -m src.cli emergency-stop
+        shift || true
+        "$PYTHON" -m src.cli emergency-stop "$@"
         ;;
     resume|start-trading)
-        "$PYTHON" -m src.cli resume
+        shift || true
+        "$PYTHON" -m src.cli resume "$@"
         ;;
     start)
         sudo systemctl start trading_bot.service
@@ -86,18 +110,22 @@ case "${1:-}" in
         echo "Usage: bot <command>"
         echo ""
         echo "Operational Commands:"
-        echo "  bot status          Check running status, mode, and parameters"
-        echo "  bot setup           Run interactive terminal setup wizard"
-        echo "  bot web             Launch Sapphire setup web interface (port 8080)"
-        echo "  bot journal [n]     View last n signal evaluation records"
-        echo "  bot live            Switch master mode to LIVE (requires confirmation)"
-        echo "  bot test            Switch master mode to TEST"
-        echo "  bot emergency-stop  Halt all new trade entries immediately"
-        echo "  bot resume          Resume normal trading operations"
-        echo "  bot start           Start systemd service"
-        echo "  bot stop            Stop systemd service"
-        echo "  bot restart         Restart systemd service"
-        echo "  bot service-logs    Watch systemd service logs live"
+        echo "  bot status              Check running status, mode, and parameters"
+        echo "  bot dashboard           Live read-only SSH terminal dashboard"
+        echo "  bot check-dhan          Diagnose Dhan API connection, funds, LTP, and execution readiness"
+        echo "  bot login               Generate fresh 24h Dhan access token using TOTP"
+        echo "  bot daily_health_check  Run scheduled 08:00 IST token refresh & health probe"
+        echo "  bot setup               Run interactive terminal setup wizard"
+        echo "  bot web                 Launch localhost setup web interface (127.0.0.1:8080)"
+        echo "  bot journal [n]         View last n signal evaluation records"
+        echo "  bot live                Switch master mode to LIVE (requires confirmation)"
+        echo "  bot test                Switch master mode to TEST"
+        echo "  bot emergency-stop      Halt all new trade entries immediately"
+        echo "  bot resume              Resume normal trading operations"
+        echo "  bot start               Start systemd service"
+        echo "  bot stop                Stop systemd service"
+        echo "  bot restart             Restart systemd service"
+        echo "  bot service-logs        Watch systemd service logs live"
         echo "======================================================="
         ;;
 esac
