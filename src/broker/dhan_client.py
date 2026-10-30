@@ -903,9 +903,11 @@ class DhanClient:
         Retrieves available ledger balance from Dhan v2 /fundlimit endpoint.
         Returns: (success, available_balance, message)
         """
+        self.last_funds_is_fallback = False
         if self.cfg.trading_mode == TradingMode.TEST:
             if not self.token:
-                return True, 100000.0, "Test mode default balance"
+                self.last_funds_is_fallback = True
+                return True, 100000.0, "Test mode default balance (token missing)"
             url = f"{BASE_URL}/fundlimit"
             try:
                 resp = self.session.get(url, headers=self._headers(), timeout=5)
@@ -913,10 +915,18 @@ class DhanClient:
                     data = resp.json()
                     if isinstance(data, dict):
                         avail = float(data.get("availabelBalance", data.get("availableBalance", data.get("sodLimit", 0.0))))
-                        return True, avail, "Funds retrieved successfully"
-                return True, 100000.0, f"Test mode default balance (Dhan returned {resp.status_code})"
+                        self.last_funds_is_fallback = False
+                        return True, avail, "Funds retrieved successfully from broker (HTTP 200)"
+                    self.last_funds_is_fallback = True
+                    return True, 100000.0, "Test mode fallback balance (Malformed response from Dhan)"
+                elif self.is_token_error(resp.status_code, resp.text):
+                    self.last_funds_is_fallback = True
+                    return True, 100000.0, f"Test mode fallback balance (Dhan auth error {resp.status_code})"
+                self.last_funds_is_fallback = True
+                return True, 100000.0, f"Test mode fallback balance (Dhan returned {resp.status_code})"
             except Exception as e:
-                return True, 100000.0, f"Test mode default balance (Dhan query exception: {e})"
+                self.last_funds_is_fallback = True
+                return True, 100000.0, f"Test mode fallback balance (Dhan query exception: {e})"
 
         url = f"{BASE_URL}/fundlimit"
         try:

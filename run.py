@@ -97,7 +97,7 @@ async def main():
     outbox_worker = None
     try:
         allowed_chats = list(cfg.monitored_channel_ids)
-        if cfg.test_group_id and cfg.test_group_id not in allowed_chats:
+        if cfg.trading_mode.value != 'LIVE' and cfg.test_group_id and cfg.test_group_id not in allowed_chats:
             allowed_chats.append(cfg.test_group_id)
 
         # STEP 05: Reject empty source allowlist before connecting
@@ -148,10 +148,11 @@ async def main():
 
         # Enqueue startup readiness card via durable outbox
         if cfg.log_group_id:
+            channel_note = " (monitored channels only)" if cfg.trading_mode.value == "LIVE" else " (including test channel)"
             startup_card = (
                 f"🟢 <b>{getattr(cfg, 'instance_name', 'Audit bot')} Online</b>\n"
                 f"Mode: <code>{cfg.trading_mode.value}</code>\n"
-                f"Monitoring: {len(allowed_chats)} channels\n"
+                f"Monitoring: {len(allowed_chats)} channels{channel_note}\n"
                 f"Reconciliation: {'Healthy' if rec_ok else 'Blocked/Warning'}\n"
                 f"Protection Watcher: Active\n"
                 f"Status: Actively listening for trade signals"
