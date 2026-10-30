@@ -101,6 +101,7 @@ def calculate_protection_levels(
         sl_limit=max(sl_limit, tick_size),
         target_price=target,
         quantity=quantity,
+        target_trigger=target,
     )
 
 

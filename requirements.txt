@@ -1,7 +1,11 @@
-pydantic>=1.10.0
-fastapi>=0.92.0
-uvicorn>=0.20.0
-python-multipart>=0.0.6
-requests>=2.28.0
-pytz>=2023.3
-telethon>=1.27.0
+# Reproducible Pinned Runtime Dependencies (Python 3.11 / 3.12+)
+pydantic==2.10.6
+fastapi==0.115.8
+uvicorn==0.34.0
+requests==2.32.3
+pytz==2025.1
+telethon==1.38.1
+python-multipart==0.0.20
+
+# Optional AI Fallback Dependency (install when VERTEX_PROJECT_ID or GEMINI_API_KEY is used):
+# google-genai==1.2.0

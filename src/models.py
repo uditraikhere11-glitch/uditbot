@@ -4,7 +4,7 @@ Compatible with Python 3.11/3.12+ and Pydantic v1 / v2.
 """
 
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -42,6 +42,130 @@ class SignalType(str, Enum):
     OPTION = "OPTION"
 
 
+class ProtectionVerificationStatus(str, Enum):
+    VERIFIED_ACTIVE = "VERIFIED_ACTIVE"
+    UNVERIFIED = "UNVERIFIED"
+    TERMINAL_OR_INVALID = "TERMINAL_OR_INVALID"
+
+
+class ProtectionVerificationResult(BaseModel):
+    """
+    Single authoritative verification outcome for Forever OCO and Super Order protection.
+    Distinguishes verified active resting coverage, unverified/unavailable evidence, and
+    terminal/invalid/mismatched records.
+    """
+    status: ProtectionVerificationStatus
+    is_verified: bool
+    is_terminal_or_invalid: bool = False
+    protected_quantity: int = 0
+    group_id: str = ""
+    parent_order_id: str = ""
+    security_id: str = ""
+    exchange_segment: str = ""
+    product_type: str = ""
+    account_id: str = ""
+    sl_price: float = 0.0
+    target_price: float = 0.0
+    reason: str = ""
+
+
+class BrokerReadStatus(str, Enum):
+    OK_EMPTY = "OK_EMPTY"
+    OK_RECORDS = "OK_RECORDS"
+    FAILED = "FAILED"
+    MALFORMED = "MALFORMED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class BrokerReadList(list):
+    """
+    List subclass returned when a broker collection endpoint succeeds with a valid list of dict records.
+    Preserves standard list semantics for callers while exposing structured `.ok`, `.status`, `.records`,
+    and `.error` attributes to distinguish `OK_EMPTY` from `OK_RECORDS`.
+    """
+    def __init__(
+        self,
+        iterable: Optional[List[Dict[str, Any]]] = None,
+        status: Optional[str] = None,
+        status_code: int = 200,
+    ):
+        items = list(iterable or [])
+        super().__init__(items)
+        self.ok: bool = True
+        self.status: str = status or (
+            BrokerReadStatus.OK_RECORDS.value if len(items) > 0 else BrokerReadStatus.OK_EMPTY.value
+        )
+        self.records: List[Dict[str, Any]] = items
+        self.error: str = ""
+        self.status_code: int = status_code
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self) == 0
+
+
+class BrokerReadFailure:
+    """
+    Non-list sentinel returned when a broker collection endpoint fails (HTTP error),
+    is unavailable (network/timeout exception), or returns a malformed payload (non-list JSON
+    or list containing non-dict items).
+    - Never compares equal to `[]` (`res == []` is False).
+    - `isinstance(res, list)` is False.
+    - `bool(res)` is False so legacy `(res or [])` expressions evaluate safely when appropriate,
+      while strict callers (`StartupReconciliationGate`, `ProtectionWatcher`) inspect `res.ok` / `isinstance(res, list)`.
+    """
+    def __init__(self, status: str, error: str, status_code: int = 0):
+        self.ok: bool = False
+        self.status: str = status
+        self.records: Optional[List[Dict[str, Any]]] = None
+        self.error: str = str(error or "Broker read failed")
+        self.status_code: int = int(status_code or 0)
+
+    @property
+    def is_empty(self) -> bool:
+        return False
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, BrokerReadFailure):
+            return (
+                self.status == other.status
+                and self.error == other.error
+                and self.status_code == other.status_code
+            )
+        return False
+
+    def __repr__(self) -> str:
+        return f"BrokerReadFailure(status={self.status!r}, status_code={self.status_code}, error={self.error!r})"
+
+
+class QuoteResult(BaseModel):
+    """
+    Structured market quote result with strict source timestamp, venue, and delay metadata.
+    Note: Yahoo Finance published terms state its data is informational and not an exchange-grade
+    live trading execution feed.
+    """
+    is_valid: bool
+    price: float = 0.0
+    source: str = "YAHOO_FINANCE"
+    ticker: str = ""
+    venue: str = ""
+    security_id: str = ""
+    currency: str = "INR"
+    market_state: str = ""
+    quote_timestamp: float = 0.0
+    age_sec: float = 0.0
+    is_delayed: bool = False
+    delay_seconds: float = 0.0
+    failure_reason: str = ""
+    licensing_note: str = (
+        "Yahoo Finance published market-data terms state that its information is not intended "
+        "for trading; this tunnel is not an exchange-grade live execution feed."
+    )
+
+
 class EquitySignal(BaseModel):
     symbol: str
     action: SignalAction = SignalAction.BUY_ENTRY
@@ -65,6 +189,7 @@ class FnOSignal(BaseModel):
     targets: List[float] = Field(default_factory=list)
     action: SignalAction = SignalAction.BUY_ENTRY
     caution: bool = False
+    hold_hint: Optional[str] = None
     raw_text: str = ""
     channel_id: int = 0
     message_id: int = 0
@@ -114,3 +239,4 @@ class ProtectionLevels(BaseModel):
     sl_limit: float
     target_price: float
     quantity: int
+    target_trigger: Optional[float] = None

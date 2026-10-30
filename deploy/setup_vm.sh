@@ -73,7 +73,7 @@ Type=simple
 User=$CURRENT_USER
 WorkingDirectory=$REPO_DIR
 EnvironmentFile=$REPO_DIR/.env
-ExecStart=$REPO_DIR/venv/bin/python3 -m src.main
+ExecStart=$REPO_DIR/venv/bin/python3 run.py
 Restart=always
 RestartSec=10
 LimitNOFILE=65536
@@ -109,7 +109,8 @@ ExecStart=$REPO_DIR/venv/bin/python3 -m src.cli daily_health_check
 EOF
 
     sudo systemctl daemon-reload
-    echo "Systemd unit files installed."
+    sudo systemctl enable --now dhan-token-refresh.timer || true
+    echo "Systemd unit files installed and dhan-token-refresh.timer enabled."
 else
     echo "Warning: sudo not available. Skipping automatic systemd installation."
 fi
