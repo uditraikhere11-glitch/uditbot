@@ -55,6 +55,7 @@ def run_setup_wizard(env_path: str = ".env") -> Dict[str, Any]:
     daily_trade_limit = prompt("Daily Trade Limit", "20")
     max_order_amount = prompt("Max Order Amount (INR)", "50000")
     min_trade_funds = prompt("Minimum Required Funds (INR)", "10000")
+    test_mode_paper_funds = prompt("Virtual Paper Balance for TEST Mode (INR)", "100000")
 
     # 5. Sizing Defaults
     print("\n--- [5] Sizing & Product Defaults ---")
@@ -108,6 +109,7 @@ MAX_DRAWDOWN_PCT={max_drawdown_pct}
 MAX_DAILY_TRADES={daily_trade_limit}
 MAX_ORDER_AMOUNT_INR={max_order_amount}
 MIN_TRADE_FUNDS_INR={min_trade_funds}
+TEST_MODE_PAPER_FUNDS_INR={test_mode_paper_funds}
 MAX_TOTAL_EXPOSURE_INR=150000
 MAX_OPEN_POSITIONS=5
 INSUFFICIENT_FUNDS_POLICY=HARD_REJECT

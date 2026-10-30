@@ -122,6 +122,7 @@ class AppConfig:
     trading_mode: TradingMode = TradingMode.TEST
     equity_active: bool = True
     fno_active: bool = True
+    test_mode_paper_funds_inr: float = 100000.0
     instance_name: str = "Audit bot"
     operator_name: str = "Udit"
 
@@ -206,6 +207,7 @@ class AppConfig:
             "order_timeout_sec",
             "max_quote_age_sec",
             "partial_fill_retry_timeout_sec",
+            "test_mode_paper_funds_inr",
         ):
             val = getattr(self, attr)
             if not isinstance(val, (int, float)) or isinstance(val, bool) or not math.isfinite(float(val)):
@@ -235,6 +237,7 @@ class AppConfig:
             trading_mode=trading_mode,
             equity_active=_bool(env.get("EQUITY_ACTIVE", "true"), default=True),
             fno_active=_bool(env.get("FNO_ACTIVE", "true"), default=True),
+            test_mode_paper_funds_inr=_clean_float(env.get("TEST_MODE_PAPER_FUNDS_INR", "100000.0"), 100000.0),
             instance_name=str(env.get("BOT_INSTANCE_NAME", "Audit bot")).strip(),
             operator_name=str(env.get("OPERATOR_NAME", "Udit")).strip(),
 
