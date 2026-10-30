@@ -126,6 +126,7 @@ class InstrumentResolver:
         self._equities: Dict[str, EquityInstrument] = {}
         self._options: Dict[Tuple[str, float, str, date], OptionContract] = {}
         self._options_list: List[OptionContract] = []
+        self._options_key_to_idx: Dict[Tuple[str, float, str, date, str, str], int] = {}
         self._company_rows: List[Tuple[str, str, str]] = []
         self._name_index: Dict[str, List[Tuple[Tuple[str, ...], str]]] = {}
         self.last_loaded_at: float = 0.0
@@ -212,21 +213,13 @@ class InstrumentResolver:
         )
         self._options[(sym, float(strike), opt_type, expiry)] = contract
         # V12-01: Deduplicate identical (symbol, strike, option_type, expiry, segment, security_id) entries
-        # while retaining distinct security_ids on the same date so competing-contract checks (INSTR-01) still work.
-        replaced = False
-        for idx, existing in enumerate(self._options_list):
-            if (
-                existing.symbol == sym
-                and abs(existing.strike - float(strike)) < 1e-4
-                and existing.option_type == opt_type
-                and existing.expiry == expiry
-                and existing.exchange_segment.strip().upper() == seg_upper
-                and existing.security_id == sec_str
-            ):
-                self._options_list[idx] = contract
-                replaced = True
-                break
-        if not replaced:
+        # O(1) indexed lookup prevents N^2 bottleneck when loading entire 100k scrip catalog.
+        dedup_key = (sym, round(float(strike), 4), opt_type, expiry, seg_upper, sec_str)
+        if dedup_key in self._options_key_to_idx:
+            idx = self._options_key_to_idx[dedup_key]
+            self._options_list[idx] = contract
+        else:
+            self._options_key_to_idx[dedup_key] = len(self._options_list)
             self._options_list.append(contract)
 
     # --- Atomic Staged Refresh (13-D) ---
@@ -447,6 +440,7 @@ class InstrumentResolver:
             self._equities = staged_resolver._equities
             self._options = staged_resolver._options
             self._options_list = staged_resolver._options_list
+            self._options_key_to_idx = staged_resolver._options_key_to_idx
             self._company_rows = names
             self._name_index = build_name_index(names) if names else {}
             if names:
