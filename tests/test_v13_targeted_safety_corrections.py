@@ -1183,13 +1183,11 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
             self.assertEqual(row["quantity"], 10)
 
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        candidates = [
+        example_candidates = [
             os.path.join(root_dir, ".env.example"),
             os.path.join(os.getcwd(), ".env.example"),
-            os.path.join(root_dir, ".env"),
-            os.path.join(os.getcwd(), ".env"),
         ]
-        target_env = next((p for p in candidates if os.path.exists(p)), None)
+        target_env = next((p for p in example_candidates if os.path.exists(p)), None)
         if target_env:
             with open(target_env, "r", encoding="utf-8") as f:
                 env_ex = f.read()
@@ -1202,6 +1200,11 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
                 "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK",
             ):
                 self.assertIn(key, env_ex)
+        else:
+            # When .env.example is not present, verify that config model recognizes required safety keys
+            cfg = AppConfig()
+            for attr in ("max_quote_age_sec", "partial_fill_retry_timeout_sec", "scrip_master_max_age_sec", "allow_next_month_expiry_fallback"):
+                self.assertTrue(hasattr(cfg, attr))
 
 
 if __name__ == "__main__":

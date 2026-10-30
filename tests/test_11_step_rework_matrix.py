@@ -469,6 +469,11 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
             test_group_id=-100222,
             data_dir=self.data_dir,
             journal_db_path=self.db_path,
+            dhan_access_token="",
+            dhan_token_file=os.path.join(self.data_dir, ".dhan_token"),
+            dhan_client_id="1113731536",
+            equity_budget_inr=25000.0,
+            equity_price_markup_pct=0.5,
         )
         pipeline = TradingBotPipeline(cfg)
         pipeline.stop_manager.provision_initial_clean_state("Udit", "1113731536")
