@@ -175,11 +175,18 @@ class TradingBotPipeline:
             msg_ts = msg_timestamp or now
 
             allowed_channels = set(self.cfg.monitored_channel_ids or [])
-            if self.cfg.test_group_id:
+            # In TEST mode, test_group_id is permitted for dry-run testing.
+            # In LIVE mode, test_group_id is strictly ignored to prevent test signals from executing live orders.
+            if self.cfg.trading_mode != TradingMode.LIVE and self.cfg.test_group_id:
                 allowed_channels.add(self.cfg.test_group_id)
 
             if getattr(self.cfg, "enforce_source_allowlist", False) and not allowed_channels:
                 reason = "Source allowlist is empty (MONITORED_CHANNEL_IDS not configured)"
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
+
+            if self.cfg.trading_mode == TradingMode.LIVE and self.cfg.test_group_id and channel_id == self.cfg.test_group_id:
+                reason = f"Ignored test group signal in LIVE mode ({channel_id} is TEST_GROUP_ID; LIVE mode restricted strictly to monitored channels)"
+                self.db.record_signal(channel_id, message_id, "UNKNOWN", "", "BLOCKED", text, "IGNORED_TEST_GROUP", reason)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
 
             if allowed_channels and channel_id != 0 and channel_id not in allowed_channels:
@@ -978,7 +985,7 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
 
     cfg = pipeline.cfg
     allowed_chats = list(cfg.monitored_channel_ids or [])
-    if cfg.test_group_id and cfg.test_group_id not in allowed_chats:
+    if cfg.trading_mode != TradingMode.LIVE and cfg.test_group_id and cfg.test_group_id not in allowed_chats:
         allowed_chats.append(cfg.test_group_id)
 
     if not allowed_chats:

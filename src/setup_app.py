@@ -424,6 +424,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <p class="help-text">Prevents stale fills when restarting</p>
           </div>
         </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label>Telegram Bot Token (Optional - Dedicated Bot Dispatch)</label>
+          <div class="input-wrap">
+            <input type="text" name="tg_bot_token" value="<!--TG_BOT_TOKEN-->" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ">
+          </div>
+          <p class="help-text">Send trade log cards via official Telegram Bot API instead of userbot</p>
+        </div>
       </div>
 
       <!-- 3. DhanHQ Exchange Credentials -->
@@ -504,6 +512,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="grid-2" style="margin-top: 10px;">
           <div class="form-group">
+            <label>Equity Sizing Mode</label>
+            <div class="input-wrap">
+              <select name="equity_sizing_mode">
+                <option value="BUDGET" <!--EQ_BUDGET_SEL-->>BUDGET (Rupee Allocation)</option>
+                <option value="FIXED_QTY" <!--EQ_FIXED_SEL-->>FIXED_QTY (Fixed Share Count)</option>
+              </select>
+            </div>
+            <p class="help-text">Determine order sizing method for Cash Equity</p>
+          </div>
+          <div class="form-group">
+            <label>Equity Fixed Quantity (Shares)</label>
+            <div class="input-wrap">
+              <input type="number" name="equity_fixed_qty" value="<!--EQUITY_FIXED_QTY-->" required>
+            </div>
+            <p class="help-text">Fixed share count used when Sizing Mode = FIXED_QTY</p>
+          </div>
+        </div>
+
+        <div class="grid-2" style="margin-top: 10px;">
+          <div class="form-group">
             <label>Stock Options Capital per Trade (INR)</label>
             <div class="input-wrap">
               <input type="number" step="500" name="fno_capital_per_trade" value="<!--FNO_CAPITAL_PER_TRADE-->" required>
@@ -517,6 +545,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <p class="help-text">Maximum whole lots per options signal</p>
           </div>
+        </div>
+
+        <div class="grid-2" style="margin-top: 10px;">
+          <div class="form-group">
+            <label>Options Sizing Mode</label>
+            <div class="input-wrap">
+              <select name="fno_sizing_mode">
+                <option value="BUDGET" <!--FNO_BUDGET_SEL-->>BUDGET (Rupee Allocation)</option>
+                <option value="FIXED_LOTS" <!--FNO_FIXED_SEL-->>FIXED_LOTS (Fixed Lot Count)</option>
+              </select>
+            </div>
+            <p class="help-text">Determine order sizing method for Stock Options</p>
+          </div>
+          <div class="form-group">
+            <label>Options Fixed Lots</label>
+            <div class="input-wrap">
+              <input type="number" name="fno_fixed_lots" value="<!--FNO_FIXED_LOTS-->" required>
+            </div>
+            <p class="help-text">Fixed lot count used when Options Sizing = FIXED_LOTS</p>
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label>Nearest-Month Expiry Fallback</label>
+          <div class="input-wrap">
+            <select name="allow_next_month_expiry_fallback">
+              <option value="true" <!--EXP_FB_TRUE-->>Enabled - Fall back to nearest monthly expiry</option>
+              <option value="false" <!--EXP_FB_FALSE-->>Disabled - Require explicit month in signal</option>
+            </select>
+          </div>
+          <p class="help-text">Resolves options when signal callout omits explicit month</p>
         </div>
       </div>
 
@@ -581,6 +640,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <p class="help-text">Open positions threshold</p>
           </div>
         </div>
+
+        <div class="grid-2" style="margin-top: 10px;">
+          <div class="form-group">
+            <label>Max Account Drawdown Limit (%)</label>
+            <div class="input-wrap">
+              <input type="number" step="0.5" name="max_drawdown_pct" value="<!--MAX_DRAWDOWN_PCT-->" required>
+            </div>
+            <p class="help-text">Account-level circuit breaker threshold</p>
+          </div>
+          <div class="form-group">
+            <label>Insufficient Funds Policy</label>
+            <div class="input-wrap">
+              <select name="insufficient_funds_policy">
+                <option value="HARD_REJECT" <!--HR_SELECTED-->>HARD_REJECT (Block Order)</option>
+                <option value="SCALE_DOWN" <!--SD_SELECTED-->>SCALE_DOWN (Adjust Quantity)</option>
+              </select>
+            </div>
+            <p class="help-text">Behavior when required capital exceeds ledger balance</p>
+          </div>
+        </div>
       </div>
 
       <!-- 6. Protection & Timing Parameters -->
@@ -637,6 +716,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <p class="help-text">Rejects stale market quotes</p>
           </div>
         </div>
+
+        <div class="grid-3" style="margin-top: 10px;">
+          <div class="form-group">
+            <label>Entry Order Fill Timeout (Sec)</label>
+            <div class="input-wrap">
+              <input type="number" step="1" name="order_timeout_sec" value="<!--ORDER_TIMEOUT_SEC-->" required>
+            </div>
+            <p class="help-text">Auto-cancels entry limit order if unfilled</p>
+          </div>
+          <div class="form-group">
+            <label>Partial-Fill Retry Delay (Sec)</label>
+            <div class="input-wrap">
+              <input type="number" step="0.5" name="partial_fill_retry_timeout_sec" value="<!--PARTIAL_FILL_RETRY_TIMEOUT_SEC-->" required>
+            </div>
+            <p class="help-text">Wait buffer before single controlled retry</p>
+          </div>
+          <div class="form-group">
+            <label>Scrip Master Cache Lifetime (Sec)</label>
+            <div class="input-wrap">
+              <input type="number" step="3600" name="scrip_master_max_age_sec" value="<!--SCRIP_MASTER_MAX_AGE_SEC-->" required>
+            </div>
+            <p class="help-text">Dhan catalog cache duration (default 86400s)</p>
+          </div>
+        </div>
       </div>
 
       <button type="submit" class="btn-submit">
@@ -668,7 +771,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
               <span>Audit bot Configuration Saved & Applied!</span>
             </div>
             <p style="font-size: 13px; color: #a7f3d0; margin-bottom: 8px;">
-              Your parameters were successfully written to <code>.env</code> with secure locked permissions (chmod 0600).
+              Your parameters were written to <code>.env</code> (chmod 0600). {f"⚡ <strong>trading_bot.service</strong> restarted automatically in <strong>{mode_val}</strong> mode!" if info.get("service_restarted") else "(Note: If service is running, run <code>./bot restart</code> to apply)."}
             </p>
             <div class="summary-grid">
               <div class="summary-chip">
@@ -779,6 +882,22 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--MAX_MESSAGE_AGE_SEC-->", str(int(cfg.max_message_age_sec)))
         .replace("<!--DEDUP_WINDOW_SEC-->", str(int(cfg.dedup_window_sec)))
         .replace("<!--MAX_QUOTE_AGE_SEC-->", str(cfg.max_quote_age_sec))
+        # Additional Engine Parameters
+        .replace("<!--TG_BOT_TOKEN-->", getattr(cfg, "tg_bot_token", os.environ.get("TG_BOT_TOKEN", "")) or "")
+        .replace("<!--EQ_BUDGET_SEL-->", "selected" if getattr(cfg, "equity_sizing_mode", "BUDGET") == "BUDGET" else "")
+        .replace("<!--EQ_FIXED_SEL-->", "selected" if getattr(cfg, "equity_sizing_mode", "BUDGET") == "FIXED_QTY" else "")
+        .replace("<!--EQUITY_FIXED_QTY-->", str(getattr(cfg, "equity_fixed_qty", 10)))
+        .replace("<!--FNO_BUDGET_SEL-->", "selected" if getattr(cfg, "fno_sizing_mode", "BUDGET") == "BUDGET" else "")
+        .replace("<!--FNO_FIXED_SEL-->", "selected" if getattr(cfg, "fno_sizing_mode", "BUDGET") == "FIXED_LOTS" else "")
+        .replace("<!--FNO_FIXED_LOTS-->", str(getattr(cfg, "fno_fixed_lots", 1)))
+        .replace("<!--EXP_FB_TRUE-->", "selected" if getattr(cfg, "allow_next_month_expiry_fallback", True) else "")
+        .replace("<!--EXP_FB_FALSE-->", "selected" if not getattr(cfg, "allow_next_month_expiry_fallback", True) else "")
+        .replace("<!--MAX_DRAWDOWN_PCT-->", str(getattr(cfg, "max_drawdown_pct", 5.0)))
+        .replace("<!--HR_SELECTED-->", "selected" if getattr(cfg, "insufficient_funds_policy", "HARD_REJECT") == "HARD_REJECT" else "")
+        .replace("<!--SD_SELECTED-->", "selected" if getattr(cfg, "insufficient_funds_policy", "HARD_REJECT") == "SCALE_DOWN" else "")
+        .replace("<!--ORDER_TIMEOUT_SEC-->", str(int(getattr(cfg, "order_timeout_sec", 60.0))))
+        .replace("<!--PARTIAL_FILL_RETRY_TIMEOUT_SEC-->", str(getattr(cfg, "partial_fill_retry_timeout_sec", 2.0)))
+        .replace("<!--SCRIP_MASTER_MAX_AGE_SEC-->", str(int(getattr(cfg, "scrip_master_max_age_sec", 86400.0))))
     )
     return HTMLResponse(content=html)
 
@@ -826,16 +945,58 @@ def handle_setup_submission(
     max_message_age_sec: float = Form(60.0),
     dedup_window_sec: float = Form(20.0),
     max_quote_age_sec: float = Form(2.0),
+    tg_bot_token: str = Form(""),
+    equity_sizing_mode: str = Form("BUDGET"),
+    equity_fixed_qty: int = Form(10),
+    fno_sizing_mode: str = Form("BUDGET"),
+    fno_fixed_lots: int = Form(1),
+    allow_next_month_expiry_fallback: str = Form("true"),
+    insufficient_funds_policy: str = Form("HARD_REJECT"),
+    order_timeout_sec: float = Form(60.0),
+    partial_fill_retry_timeout_sec: float = Form(2.0),
+    scrip_master_max_age_sec: float = Form(86400.0),
 ):
     trading_mode = "LIVE" if is_live_mode else "TEST"
     trades_count = max_daily_trades if max_daily_trades is not None else (daily_trade_limit if daily_trade_limit is not None else 20)
-    if hasattr(test_mode_paper_funds_inr, "default"):
-        paper_funds_val = float(test_mode_paper_funds_inr.default)
-    else:
-        try:
-            paper_funds_val = float(test_mode_paper_funds_inr)
-        except (ValueError, TypeError):
-            paper_funds_val = 100000.0
+    def _extract_val(field_val, fallback):
+        if hasattr(field_val, "default"):
+            return field_val.default
+        return field_val if field_val is not None else fallback
+
+    try:
+        paper_funds_val = float(_extract_val(test_mode_paper_funds_inr, 100000.0))
+    except (ValueError, TypeError):
+        paper_funds_val = 100000.0
+
+    clean_tg_bot = str(_extract_val(tg_bot_token, "")).strip()
+    clean_eq_mode = str(_extract_val(equity_sizing_mode, "BUDGET")).upper().strip()
+    try:
+        clean_eq_qty = int(_extract_val(equity_fixed_qty, 10))
+    except (ValueError, TypeError):
+        clean_eq_qty = 10
+    clean_fno_mode = str(_extract_val(fno_sizing_mode, "BUDGET")).upper().strip()
+    try:
+        clean_fno_lots = int(_extract_val(fno_fixed_lots, 1))
+    except (ValueError, TypeError):
+        clean_fno_lots = 1
+    clean_exp_fb = "true" if str(_extract_val(allow_next_month_expiry_fallback, "true")).lower() in ("true", "1", "yes") else "false"
+    clean_insufficient = str(_extract_val(insufficient_funds_policy, "HARD_REJECT")).upper().strip()
+    try:
+        clean_drawdown = float(_extract_val(max_drawdown_pct, 5.0))
+    except (ValueError, TypeError):
+        clean_drawdown = 5.0
+    try:
+        clean_order_timeout = float(_extract_val(order_timeout_sec, 60.0))
+    except (ValueError, TypeError):
+        clean_order_timeout = 60.0
+    try:
+        clean_retry_timeout = float(_extract_val(partial_fill_retry_timeout_sec, 2.0))
+    except (ValueError, TypeError):
+        clean_retry_timeout = 2.0
+    try:
+        clean_scrip_max_age = float(_extract_val(scrip_master_max_age_sec, 86400.0))
+    except (ValueError, TypeError):
+        clean_scrip_max_age = 86400.0
 
     # Clean channel IDs
     clean_monitored = ",".join([c.strip() for c in monitored_channel_ids.split(",") if c.strip()])
@@ -857,6 +1018,7 @@ FNO_ACTIVE={'true' if fno_active else 'false'}
 # --- TELEGRAM USERBOT & CHANNEL INGESTION ---
 TG_API_ID={tg_api_id.strip()}
 TG_API_HASH={tg_api_hash.strip()}
+TG_BOT_TOKEN={clean_tg_bot}
 MONITORED_CHANNEL_IDS={clean_monitored}
 LOG_GROUP_ID={log_group_id.strip()}
 TEST_GROUP_ID={test_group_id.strip()}
@@ -871,25 +1033,27 @@ DHAN_TOKEN_FILE=~/.dhan_token
 
 # --- CAPITAL & POSITION SIZING ---
 EQUITY_PRODUCT_TYPE={equity_product_type.strip().upper()}
-EQUITY_SIZING_MODE=BUDGET
+EQUITY_SIZING_MODE={clean_eq_mode}
 EQUITY_BUDGET_INR={equity_budget_inr}
-EQUITY_FIXED_QTY=10
+EQUITY_FIXED_QTY={clean_eq_qty}
 EQUITY_PRICE_MARKUP_PCT={equity_price_markup_pct}
 
-FNO_SIZING_MODE=BUDGET
+FNO_SIZING_MODE={clean_fno_mode}
 FNO_CAPITAL_PER_TRADE={fno_capital_per_trade}
-FNO_FIXED_LOTS=1
+FNO_FIXED_LOTS={clean_fno_lots}
 FNO_MAX_LOTS={fno_max_lots}
+ALLOW_NEXT_MONTH_EXPIRY_FALLBACK={clean_exp_fb}
 
 # --- RISK MANAGEMENT CONTROLS ---
 MAX_ORDER_AMOUNT_INR={max_order_amount_inr}
 MIN_TRADE_FUNDS_INR={min_trade_funds_inr}
 TEST_MODE_PAPER_FUNDS_INR={paper_funds_val}
 MAX_DAILY_LOSS_INR={max_daily_loss_inr}
+MAX_DRAWDOWN_PCT={clean_drawdown}
 MAX_DAILY_TRADES={trades_count}
 MAX_TOTAL_EXPOSURE_INR={max_total_exposure_inr}
 MAX_OPEN_POSITIONS={max_open_positions}
-INSUFFICIENT_FUNDS_POLICY=HARD_REJECT
+INSUFFICIENT_FUNDS_POLICY={clean_insufficient}
 MODE_SWITCH_POSITION_POLICY=REMAIN_UNTOUCHED
 
 # --- PROTECTION & TIMING (FOREVER OCO) ---
@@ -899,13 +1063,23 @@ SL_LIMIT_BUFFER_PCT={sl_limit_buffer_pct}
 MAX_MESSAGE_AGE_SEC={max_message_age_sec}
 DEDUP_WINDOW_SEC={dedup_window_sec}
 MAX_QUOTE_AGE_SEC={max_quote_age_sec}
-PARTIAL_FILL_RETRY_TIMEOUT_SEC=2.0
-ORDER_TIMEOUT_SEC=60.0
+ORDER_TIMEOUT_SEC={clean_order_timeout}
+PARTIAL_FILL_RETRY_TIMEOUT_SEC={clean_retry_timeout}
+SCRIP_MASTER_MAX_AGE_SEC={clean_scrip_max_age}
 """
 
     fd = os.open(".env", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(env_content)
+
+    service_restarted = False
+    try:
+        import subprocess
+        res = subprocess.run(["sudo", "systemctl", "restart", "trading_bot.service"], capture_output=True, timeout=5)
+        if res.returncode == 0:
+            service_restarted = True
+    except Exception as e:
+        logger.warning(f"Could not automatically restart trading_bot.service: {e}")
 
     saved_info = {
         "mode": trading_mode,
@@ -913,6 +1087,7 @@ ORDER_TIMEOUT_SEC=60.0
         "instance": instance_name.strip(),
         "dhan_id": dhan_client_id.strip(),
         "log_group": log_group_id.strip(),
+        "service_restarted": service_restarted,
     }
     return get_setup_page(saved=True, saved_info=saved_info)
 

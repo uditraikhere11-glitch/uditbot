@@ -288,13 +288,24 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
 
     print("\n[1] Testing Dhan API Authentication & Funds (/fundlimit)...")
     ok_funds = False
+    is_real_auth = False
     try:
         ok_funds, avail_balance, funds_msg = client.get_fund_limits()
-        if ok_funds:
-            print("    [OK] AUTHENTICATION SUCCESSFUL")
+        is_fallback = getattr(client, "last_funds_is_fallback", False) or ("fallback" in funds_msg.lower() or "test mode default" in funds_msg.lower())
+        if ok_funds and not is_fallback:
+            is_real_auth = True
+            print("    [OK] AUTHENTICATION SUCCESSFUL (BROKER CONFIRMED)")
             print(f"    Available Ledger Balance: INR {avail_balance:,.2f}")
+        elif is_fallback:
+            print("    [WARN] UNVERIFIED BROKER AUTHENTICATION (TEST-Mode Fallback):")
+            print(f"           Fallback Balance : INR {avail_balance:,.2f}")
+            print(f"           Detail           : {funds_msg}")
+        elif "auth" in funds_msg.lower() or "token" in funds_msg.lower():
+            print(f"    [FAIL] AUTHENTICATION FAILED: {funds_msg}")
+        elif "malformed" in funds_msg.lower():
+            print(f"    [FAIL] MALFORMED BROKER RESPONSE: {funds_msg}")
         else:
-            print(f"    [FAIL] AUTHENTICATION / FUNDS ERROR: {funds_msg}")
+            print(f"    [FAIL] HTTP / BROKER FUNDS ERROR: {funds_msg}")
     except Exception as e:
         print(f"    [FAIL] EXCEPTION CALLING FUNDS API: {e}")
 
@@ -315,6 +326,17 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
     except Exception as e:
         print(f"    [FAIL] EXCEPTION CALLING LTP API: {e}")
 
+    # [2.1] Darvas Yahoo Finance Observational Price Diagnostic (Safe, Non-executable diagnostic)
+    print("\n[2.1] Yahoo Finance Observational Diagnostic (Darvas Observer)...")
+    try:
+        from src.broker.yahoo_observer import YahooObserver
+        observer = YahooObserver()
+        obs = observer.observe(test_symbol, exchange_segment=test_seg)
+        for line in obs.format_diagnostic().splitlines():
+            print(f"    {line}")
+    except Exception as e:
+        print(f"    [SKIPPED] Yahoo observer diagnostic unavailable: {e}")
+
     print("\n[3] Order Execution Readiness Matrix:")
     mode_str = cfg.trading_mode.value
     is_live = (mode_str == "LIVE")
@@ -334,14 +356,13 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
     print(f"    [*] Risk Sizing Limits   : Equity Budget=INR {cfg.equity_budget_inr:g} | FnO Budget=INR {cfg.fno_capital_per_trade:g}")
 
     print("=======================================================")
-    if ok_funds and is_live and not is_stopped:
+    if is_real_auth and is_live and not is_stopped:
         print(">>> STATUS: READ-ONLY BROKER CONNECTION SUCCESSFUL <<<")
         print("    (Live order readiness requires verified startup reconciliation and active protection)")
     elif not is_live:
         print(">>> STATUS: TEST MODE ACTIVE (Orders will be simulated/blocked) <<<")
-    elif not ok_funds:
+    elif not is_real_auth:
         print(">>> STATUS: BLOCKED (Dhan token/auth failure - run 'bot login' or update token) <<<")
-    elif is_stopped:
         print(">>> STATUS: BLOCKED (Emergency stop active - run 'bot resume') <<<")
     else:
         print(">>> STATUS: PARTIALLY CONFIGURED (Review warnings above) <<<")
