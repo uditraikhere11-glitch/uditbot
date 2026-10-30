@@ -903,8 +903,20 @@ class DhanClient:
         Retrieves available ledger balance from Dhan v2 /fundlimit endpoint.
         Returns: (success, available_balance, message)
         """
-        if self.cfg.trading_mode == TradingMode.TEST and not self.token:
-            return True, 100000.0, "Test mode default balance"
+        if self.cfg.trading_mode == TradingMode.TEST:
+            if not self.token:
+                return True, 100000.0, "Test mode default balance"
+            url = f"{BASE_URL}/fundlimit"
+            try:
+                resp = self.session.get(url, headers=self._headers(), timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        avail = float(data.get("availabelBalance", data.get("availableBalance", data.get("sodLimit", 0.0))))
+                        return True, avail, "Funds retrieved successfully"
+                return True, 100000.0, f"Test mode default balance (Dhan returned {resp.status_code})"
+            except Exception as e:
+                return True, 100000.0, f"Test mode default balance (Dhan query exception: {e})"
 
         url = f"{BASE_URL}/fundlimit"
         try:
