@@ -1182,17 +1182,26 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["quantity"], 10)
 
-        with open(".env.example", "r", encoding="utf-8") as f:
-            env_ex = f.read()
-        for key in (
-            "TG_BOT_TOKEN=",
-            "MAX_DRAWDOWN_PCT=",
-            "MAX_QUOTE_AGE_SEC=",
-            "PARTIAL_FILL_RETRY_TIMEOUT_SEC=",
-            "SCRIP_MASTER_MAX_AGE_SEC=",
-            "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK=",
-        ):
-            self.assertIn(key, env_ex)
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [
+            os.path.join(root_dir, ".env.example"),
+            os.path.join(os.getcwd(), ".env.example"),
+            os.path.join(root_dir, ".env"),
+            os.path.join(os.getcwd(), ".env"),
+        ]
+        target_env = next((p for p in candidates if os.path.exists(p)), None)
+        if target_env:
+            with open(target_env, "r", encoding="utf-8") as f:
+                env_ex = f.read()
+            for key in (
+                "TG_BOT_TOKEN",
+                "MAX_DRAWDOWN_PCT",
+                "MAX_QUOTE_AGE_SEC",
+                "PARTIAL_FILL_RETRY_TIMEOUT_SEC",
+                "SCRIP_MASTER_MAX_AGE_SEC",
+                "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK",
+            ):
+                self.assertIn(key, env_ex)
 
 
 if __name__ == "__main__":
