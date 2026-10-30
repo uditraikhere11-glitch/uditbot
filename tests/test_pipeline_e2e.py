@@ -194,6 +194,9 @@ class TestPipelineE2E(unittest.TestCase):
                 journal_db_path=os.path.join(prov_dir, "e2e_journal.db"),
                 equity_budget_inr=25000.0,
                 equity_price_markup_pct=0.5,
+                monitored_channel_ids=[-1001],
+                dhan_access_token="",
+                dhan_token_file=os.path.join(data_dir, ".dhan_token"),
             )
             pipeline = TradingBotPipeline(cfg)
             pipeline.resolver.load_equity("SBIN", security_id="3045", exchange_segment="NSE_EQ")
