@@ -46,6 +46,22 @@ for p in env_paths:
             pass
 
 from src.config import AppConfig
+
+# P0 Guard: If invoked with a CLI command (e.g. daily_health_check), route to src.cli without starting listener
+if len(sys.argv) > 1 and sys.argv[1] in (
+    "daily_health_check",
+    "daily-health-check",
+    "health-check",
+    "status",
+    "dashboard",
+    "check-dhan",
+    "login",
+    "refresh-token",
+):
+    from src.cli import main as _cli_main
+    _cli_main()
+    sys.exit(0)
+
 from src.main import TradingBotPipeline
 from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock

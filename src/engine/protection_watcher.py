@@ -31,6 +31,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from src.engine.latency_monitor import GLOBAL_LATENCY_MONITOR
 from src.models import (
     OrderRequest,
     OrderType,
@@ -749,6 +750,13 @@ class ProtectionWatcher:
                     except Exception:
                         pass
 
+                if filled > prev_filled:
+                    try:
+                        GLOBAL_LATENCY_MONITOR.record_fill_confirmed(order_id)
+                        if rec.get("correlation_id"):
+                            GLOBAL_LATENCY_MONITOR.record_fill_confirmed(str(rec["correlation_id"]))
+                    except Exception:
+                        pass
                 if filled > prev_filled and self.journal_db and hasattr(self.journal_db, "record_fill"):
                     try:
                         avg_p = float(st.get("averageTradedPrice") or 0.0)
@@ -1247,6 +1255,12 @@ class ProtectionWatcher:
 
         rec["protection_status"] = leg_status_label
         rec["retry_at"] = 0.0
+        try:
+            GLOBAL_LATENCY_MONITOR.record_protection_verified(rec["order_id"])
+            if rec.get("correlation_id"):
+                GLOBAL_LATENCY_MONITOR.record_protection_verified(str(rec["correlation_id"]))
+        except Exception:
+            pass
 
         if self.journal_db:
             if attempt_id and hasattr(self.journal_db, "update_protection_attempt"):
@@ -2087,12 +2101,13 @@ class ProtectionWatcher:
                         now_utc=eval_clock,
                         max_quote_age_sec=max_quote_age_sec,
                         allow_cached=False,
+                        cmp_policy="STRICT_TIMESTAMP",
                     )
                     if isinstance(q, QuoteResult):
                         if not q.is_valid:
                             return False, None, f"Retry rejected: fresh quote check failed ({q.failure_reason})"
                         current_market_price = q.price
-                        if source_quote_ts is None and q.quote_timestamp > 0:
+                        if source_quote_ts is None and q.quote_timestamp is not None and q.quote_timestamp > 0:
                             source_quote_ts = float(q.quote_timestamp)
                             quote_ts_type = "SOURCE_TIMESTAMP"
                         t_after_q = float(self.clock())
@@ -2245,6 +2260,12 @@ class ProtectionWatcher:
                     return False, None, f"Retry rejected: broker funds exception ({e})"
 
             if self.risk_manager is not None and hasattr(self.risk_manager, "validate_order_risk"):
+                if hasattr(self.risk_manager, "sync_from_journal_and_broker"):
+                    self.risk_manager.sync_from_journal_and_broker(
+                        journal_db=self.journal_db,
+                        broker=self.broker if not self.dry_run else None,
+                        watcher=self,
+                    )
                 r_ok, r_reason = self.risk_manager.validate_order_risk(retry_cost, avail_funds)
                 if not r_ok:
                     return False, None, f"Retry rejected by risk manager: {r_reason}"

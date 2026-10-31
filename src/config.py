@@ -151,6 +151,7 @@ class AppConfig:
     equity_budget_inr: float = 25000.0
     equity_fixed_qty: int = 10
     equity_price_markup_pct: float = 0.5
+    equity_cmp_execution_policy: str = "STRICT_TIMESTAMP"
 
     # Stock Options Sizing
     fno_sizing_mode: str = "BUDGET"
@@ -186,10 +187,15 @@ class AppConfig:
     # Storage Paths
     data_dir: str = field(default_factory=_default_data_dir)
     journal_db_path: str = ""
+    _loaded_from_env: bool = False
 
     def __post_init__(self):
         if not self.journal_db_path:
             self.journal_db_path = os.path.join(self.data_dir, "trade_journal.db")
+        pol = str(self.equity_cmp_execution_policy or "STRICT_TIMESTAMP").upper().strip()
+        if pol not in ("STRICT_TIMESTAMP", "DARVAS_HTTP_SUCCESS"):
+            raise ValueError(f"Invalid EQUITY_CMP_EXECUTION_POLICY '{self.equity_cmp_execution_policy}'; must be STRICT_TIMESTAMP or DARVAS_HTTP_SUCCESS")
+        self.equity_cmp_execution_policy = pol
         for attr in (
             "equity_budget_inr",
             "equity_price_markup_pct",
@@ -263,6 +269,7 @@ class AppConfig:
             equity_budget_inr=_clean_float(env.get("EQUITY_BUDGET_INR", "25000.0"), 25000.0),
             equity_fixed_qty=_clean_int(env.get("EQUITY_FIXED_QTY", "10"), 10),
             equity_price_markup_pct=_clean_float(env.get("EQUITY_PRICE_MARKUP_PCT", "0.5"), 0.5),
+            equity_cmp_execution_policy=str(env.get("EQUITY_CMP_EXECUTION_POLICY", "STRICT_TIMESTAMP")).upper().strip(),
 
             fno_sizing_mode=str(env.get("FNO_SIZING_MODE", "BUDGET")).upper().strip(),
             fno_capital_per_trade=_clean_float(env.get("FNO_CAPITAL_PER_TRADE", "20000.0"), 20000.0),
@@ -293,5 +300,6 @@ class AppConfig:
 
             data_dir=data_dir,
             journal_db_path=journal_db_path,
+            _loaded_from_env=True,
         )
         return cfg

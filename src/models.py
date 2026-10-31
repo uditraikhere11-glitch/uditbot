@@ -112,7 +112,7 @@ class BrokerReadFailure:
     - Never compares equal to `[]` (`res == []` is False).
     - `isinstance(res, list)` is False.
     - `bool(res)` is False so legacy `(res or [])` expressions evaluate safely when appropriate,
-      while strict callers (`StartupReconciliationGate`, `ProtectionWatcher`) inspect `res.ok` / `isinstance(res, list)`.
+      while strict callers (`StartupReconciliationGate`, `ProtectionWatcher`, `RiskManager`) inspect `res.ok` / `isinstance(res, list)`.
     """
     def __init__(self, status: str, error: str, status_code: int = 0):
         self.ok: bool = False
@@ -144,21 +144,33 @@ class BrokerReadFailure:
 class QuoteResult(BaseModel):
     """
     Structured market quote result with strict source timestamp, venue, and delay metadata.
-    Note: Yahoo Finance published terms state its data is informational and not an exchange-grade
-    live trading execution feed.
+    - Never fabricates quote_timestamp from the local clock when Yahoo omits regularMarketTime.
+    - Never fabricates missing exchangeName (`venue`) or `currency` metadata; preserves `"UNKNOWN"` honestly.
+    - Distinguishes accepted pricing (is_valid=True under DARVAS_HTTP_SUCCESS) from verified
+      quote freshness (freshness_verified=True / quote_freshness_status).
     """
     is_valid: bool
     price: float = 0.0
     source: str = "YAHOO_FINANCE"
     ticker: str = ""
-    venue: str = ""
+    venue: str = "UNKNOWN"
     security_id: str = ""
-    currency: str = "INR"
-    market_state: str = ""
-    quote_timestamp: float = 0.0
-    age_sec: float = 0.0
+    currency: str = "UNKNOWN"
+    market_state: str = "UNKNOWN"
+    quote_timestamp: Optional[float] = None
+    age_sec: Optional[float] = None
     is_delayed: bool = False
-    delay_seconds: float = 0.0
+    delay_seconds: Optional[float] = None
+    delay_metadata_present: bool = False
+    http_latency_ms: float = 0.0
+    parse_latency_ms: float = 0.0
+    auth_latency_ms: float = 0.0
+    total_cmp_latency_ms: float = 0.0
+    quote_age_status: str = "QUOTE_AGE_UNKNOWN"
+    freshness_verified: bool = False
+    quote_freshness_status: str = "UNVERIFIED"
+    cmp_policy: str = "STRICT_TIMESTAMP"
+    reference_label: str = "LIVE_REFERENCE"
     failure_reason: str = ""
     licensing_note: str = (
         "Yahoo Finance published market-data terms state that its information is not intended "
@@ -207,6 +219,13 @@ class ValidationResult(BaseModel):
     quantity_or_lots: Optional[int] = None
     calculated_exposure: Optional[float] = None
     log_card: Optional[str] = None
+    latency_breakdown: Optional[Dict[str, Any]] = None
+    cmp_policy: Optional[str] = None
+    reference_label: Optional[str] = None
+    quote_age_status: Optional[str] = None
+    freshness_verified: Optional[bool] = None
+    quote_freshness_status: Optional[str] = None
+    broker_order_status: Optional[str] = None
 
 
 class SizingResult(BaseModel):

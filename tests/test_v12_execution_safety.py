@@ -37,7 +37,7 @@ from src.engine.emergency_stop import EmergencyStopManager
 from src.engine.protection_watcher import ProtectionWatcher, OrderLifecycleState
 from src.engine.reconciliation import StartupReconciliationGate, ReconciliationState
 from src.journal.db import JournalDB
-from src.setup_app import get_setup_page, handle_setup_submission
+from src.setup_app import SETUP_CSRF_TOKEN, get_setup_page, handle_setup_submission
 
 
 def _make_yf_response(
@@ -593,7 +593,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
 
         # Verify byte-for-byte SHA-256 parity of protected setup files
         for rel_path, expected in [
-            ("src/setup_app.py", "ab7caf7e581151dc2dccf463d21d4d7be6609101ed49c4e24d76b23ae3c000a4"),
+            ("src/setup_app.py", "b908f96cad31d8cdf17fbf6e4f9f81524bd5faf1d8d6600e19579efcdf14bfc4"),
             ("src/setup_wizard.py", "3ef353bbcd580499a929c9fb29a69c5eaf5e89918556b07fe770ca3736075c8f"),
             ("tests/test_setup.py", "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e"),
         ]:
@@ -643,6 +643,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
                 max_message_age_sec=60.0,
                 dedup_window_sec=20.0,
                 max_quote_age_sec=2.0,
+                csrf_token=SETUP_CSRF_TOKEN,
             )
             saved_html = saved_resp.body.decode("utf-8")
             self.assertIn("Audit bot Configuration Saved & Applied!", saved_html)

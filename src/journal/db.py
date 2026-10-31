@@ -286,6 +286,63 @@ class JournalDB:
                 payload TEXT,
                 created_at REAL
             );
+
+            CREATE TABLE IF NOT EXISTS signal_latency_telemetry (
+                trace_id TEXT PRIMARY KEY,
+                correlation_id TEXT,
+                broker_order_id TEXT,
+                symbol TEXT,
+                channel_id INTEGER DEFAULT 0,
+                message_id INTEGER DEFAULT 0,
+                ist_received_time REAL,
+                telegram_msg_timestamp REAL,
+                cmp_policy TEXT,
+                price_source TEXT,
+                yahoo_cmp REAL,
+                yahoo_http_ms REAL,
+                yahoo_parse_ms REAL,
+                cmp_auth_ms REAL,
+                quote_timestamp REAL,
+                reported_quote_age_sec REAL,
+                quote_age_status TEXT,
+                freshness_verified INTEGER DEFAULT 0,
+                quote_freshness_status TEXT,
+                l2_parse_ms REAL,
+                l3_resolve_ms REAL,
+                l7_sizing_ms REAL,
+                l8_risk_preflight_ms REAL,
+                telegram_to_cmp_ms REAL,
+                cmp_to_submission_ms REAL,
+                telegram_to_submission_ms REAL,
+                dhan_request_to_ack_ms REAL,
+                telegram_to_ack_ms REAL,
+                ack_wall_time REAL,
+                fill_wall_time REAL,
+                protection_wall_time REAL,
+                ack_to_fill_ms REAL,
+                fill_to_protection_ms REAL,
+                total_processing_ms REAL,
+                updated_at REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lat_corr_id ON signal_latency_telemetry(correlation_id);
+            CREATE INDEX IF NOT EXISTS idx_lat_broker_oid ON signal_latency_telemetry(broker_order_id);
+
+            CREATE TABLE IF NOT EXISTS yahoo_request_telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT DEFAULT '',
+                success INTEGER NOT NULL,
+                http_latency_ms REAL,
+                quote_age_sec REAL,
+                quote_age_unknown INTEGER DEFAULT 0,
+                recorded_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS latency_rejection_counters (
+                reason TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
             """)
             # Idempotent additive schema migrations for existing databases
             for alter_sql in [
@@ -316,6 +373,29 @@ class JournalDB:
                     conn.execute(alter_sql)
                 except sqlite3.OperationalError:
                     pass
+
+            # Migration: heal legacy fills table with broken foreign key referencing non-unique orders column
+            try:
+                fks = conn.execute("PRAGMA foreign_key_list(fills)").fetchall()
+                if any(row[2] == "orders" for row in fks):
+                    conn.execute("PRAGMA foreign_keys = OFF;")
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS fills_v13_clean (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            broker_order_id TEXT,
+                            exchange_trade_id TEXT UNIQUE,
+                            symbol TEXT,
+                            traded_price REAL,
+                            traded_quantity INTEGER,
+                            traded_at REAL
+                        );
+                    """)
+                    conn.execute("INSERT OR IGNORE INTO fills_v13_clean SELECT id, broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity, traded_at FROM fills;")
+                    conn.execute("DROP TABLE fills;")
+                    conn.execute("ALTER TABLE fills_v13_clean RENAME TO fills;")
+                    conn.execute("PRAGMA foreign_keys = ON;")
+            except Exception:
+                pass
 
     # --- Durable Protection-Attempt Lifecycle (Safety Correction A & CV13-01) ---
 
@@ -1077,4 +1157,256 @@ class JournalDB:
                 "unresolved_protection_attempts": c_unres_att,
                 "unknown_intents": c_unknown,
                 "non_terminal_intents": c_non_terminal,
+            }
+
+
+    # --- Durable Latency & Quote-Age Telemetry Persistence (CV13-07 P1) ---
+
+    def record_yahoo_telemetry(
+        self,
+        success: bool,
+        http_latency_ms: Optional[float],
+        quote_age_sec: Optional[float],
+        symbol: str = "",
+    ) -> None:
+        age_unknown = 1 if (success and quote_age_sec is None) else 0
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO yahoo_request_telemetry (symbol, success, http_latency_ms, quote_age_sec, quote_age_unknown, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(symbol or ""),
+                    1 if success else 0,
+                    float(http_latency_ms) if http_latency_ms is not None else None,
+                    float(quote_age_sec) if quote_age_sec is not None else None,
+                    age_unknown,
+                    time.time(),
+                ),
+            )
+
+    def increment_latency_rejection_reason(self, reason: str) -> None:
+        if not reason:
+            return
+        now = time.time()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO latency_rejection_counters (reason, count, updated_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(reason) DO UPDATE SET
+                    count = count + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (str(reason)[:80], now),
+            )
+
+    def upsert_latency_trace(self, bd: Dict[str, Any]) -> None:
+        trace_id = str(bd.get("trace_id") or "")
+        if not trace_id:
+            return
+        now = time.time()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO signal_latency_telemetry (
+                    trace_id, correlation_id, broker_order_id, symbol, channel_id, message_id,
+                    ist_received_time, telegram_msg_timestamp, cmp_policy, price_source, yahoo_cmp,
+                    yahoo_http_ms, yahoo_parse_ms, cmp_auth_ms, quote_timestamp, reported_quote_age_sec,
+                    quote_age_status, freshness_verified, quote_freshness_status,
+                    l2_parse_ms, l3_resolve_ms, l7_sizing_ms, l8_risk_preflight_ms,
+                    telegram_to_cmp_ms, cmp_to_submission_ms, telegram_to_submission_ms,
+                    dhan_request_to_ack_ms, telegram_to_ack_ms,
+                    ack_wall_time, fill_wall_time, protection_wall_time,
+                    ack_to_fill_ms, fill_to_protection_ms, total_processing_ms, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?
+                )
+                ON CONFLICT(trace_id) DO UPDATE SET
+                    correlation_id = COALESCE(excluded.correlation_id, signal_latency_telemetry.correlation_id),
+                    broker_order_id = COALESCE(excluded.broker_order_id, signal_latency_telemetry.broker_order_id),
+                    ack_wall_time = COALESCE(excluded.ack_wall_time, signal_latency_telemetry.ack_wall_time),
+                    fill_wall_time = COALESCE(excluded.fill_wall_time, signal_latency_telemetry.fill_wall_time),
+                    protection_wall_time = COALESCE(excluded.protection_wall_time, signal_latency_telemetry.protection_wall_time),
+                    ack_to_fill_ms = COALESCE(excluded.ack_to_fill_ms, signal_latency_telemetry.ack_to_fill_ms),
+                    fill_to_protection_ms = COALESCE(excluded.fill_to_protection_ms, signal_latency_telemetry.fill_to_protection_ms),
+                    dhan_request_to_ack_ms = COALESCE(excluded.dhan_request_to_ack_ms, signal_latency_telemetry.dhan_request_to_ack_ms),
+                    telegram_to_ack_ms = COALESCE(excluded.telegram_to_ack_ms, signal_latency_telemetry.telegram_to_ack_ms),
+                    total_processing_ms = COALESCE(excluded.total_processing_ms, signal_latency_telemetry.total_processing_ms),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    trace_id,
+                    bd.get("correlation_id"),
+                    bd.get("broker_order_id"),
+                    bd.get("symbol"),
+                    int(bd.get("channel_id") or 0),
+                    int(bd.get("message_id") or 0),
+                    bd.get("ist_received_time"),
+                    bd.get("telegram_msg_timestamp"),
+                    bd.get("cmp_policy"),
+                    bd.get("price_source"),
+                    bd.get("yahoo_cmp"),
+                    bd.get("yahoo_http_latency_ms"),
+                    bd.get("yahoo_parse_ms"),
+                    bd.get("cmp_auth_ms"),
+                    bd.get("quote_timestamp"),
+                    bd.get("reported_quote_age_sec"),
+                    bd.get("quote_age_status"),
+                    1 if bd.get("freshness_verified") else 0,
+                    bd.get("quote_freshness_status"),
+                    bd.get("l2_parse_ms"),
+                    bd.get("l3_resolve_ms"),
+                    bd.get("l7_sizing_ms"),
+                    bd.get("l8_risk_preflight_ms"),
+                    bd.get("telegram_to_cmp_ms"),
+                    bd.get("cmp_to_submission_ms"),
+                    bd.get("telegram_to_submission_ms"),
+                    bd.get("dhan_request_to_ack_ms"),
+                    bd.get("telegram_to_ack_ms"),
+                    bd.get("ack_wall_time"),
+                    bd.get("fill_wall_time"),
+                    bd.get("protection_wall_time"),
+                    bd.get("ack_to_fill_ms"),
+                    bd.get("fill_to_protection_ms"),
+                    bd.get("total_processing_ms"),
+                    now,
+                ),
+            )
+
+    def update_latency_fill_confirmed(
+        self,
+        identifier: str,
+        fill_wall_time: float,
+        monotonic_ack_to_fill_ms: Optional[float] = None,
+    ) -> Optional[float]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT trace_id, ack_wall_time, ack_to_fill_ms
+                FROM signal_latency_telemetry
+                WHERE broker_order_id = ? OR correlation_id = ? OR trace_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (identifier, identifier, identifier),
+            ).fetchone()
+            if not row:
+                return monotonic_ack_to_fill_ms
+            if row["ack_to_fill_ms"] is not None:
+                return float(row["ack_to_fill_ms"])
+            calc_ms = monotonic_ack_to_fill_ms
+            if calc_ms is None and row["ack_wall_time"] is not None:
+                delta = float(fill_wall_time) - float(row["ack_wall_time"])
+                if delta >= 0.0:
+                    calc_ms = round(delta * 1000.0, 3)
+            conn.execute(
+                """
+                UPDATE signal_latency_telemetry
+                SET fill_wall_time = COALESCE(fill_wall_time, ?),
+                    ack_to_fill_ms = COALESCE(ack_to_fill_ms, ?),
+                    updated_at = ?
+                WHERE trace_id = ?
+                """,
+                (float(fill_wall_time), calc_ms, time.time(), row["trace_id"]),
+            )
+            return calc_ms
+
+    def update_latency_protection_verified(
+        self,
+        identifier: str,
+        protection_wall_time: float,
+        monotonic_fill_to_prot_ms: Optional[float] = None,
+    ) -> Optional[float]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT trace_id, fill_wall_time, ack_wall_time, fill_to_protection_ms
+                FROM signal_latency_telemetry
+                WHERE broker_order_id = ? OR correlation_id = ? OR trace_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (identifier, identifier, identifier),
+            ).fetchone()
+            if not row:
+                return monotonic_fill_to_prot_ms
+            if row["fill_to_protection_ms"] is not None:
+                return float(row["fill_to_protection_ms"])
+            calc_ms = monotonic_fill_to_prot_ms
+            base_wt = row["fill_wall_time"] if row["fill_wall_time"] is not None else row["ack_wall_time"]
+            if calc_ms is None and base_wt is not None:
+                delta = float(protection_wall_time) - float(base_wt)
+                if delta >= 0.0:
+                    calc_ms = round(delta * 1000.0, 3)
+            conn.execute(
+                """
+                UPDATE signal_latency_telemetry
+                SET protection_wall_time = COALESCE(protection_wall_time, ?),
+                    fill_to_protection_ms = COALESCE(fill_to_protection_ms, ?),
+                    updated_at = ?
+                WHERE trace_id = ?
+                """,
+                (float(protection_wall_time), calc_ms, time.time(), row["trace_id"]),
+            )
+            return calc_ms
+
+    def get_latency_trace(self, identifier: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM signal_latency_telemetry
+                WHERE broker_order_id = ? OR correlation_id = ? OR trace_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (identifier, identifier, identifier),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def load_latency_telemetry_state(self, max_samples: int = 500) -> Dict[str, Any]:
+        with self._get_conn() as conn:
+            yf_succ = conn.execute("SELECT COUNT(*) FROM yahoo_request_telemetry WHERE success = 1").fetchone()[0]
+            yf_fail = conn.execute("SELECT COUNT(*) FROM yahoo_request_telemetry WHERE success = 0").fetchone()[0]
+            q_unk = conn.execute("SELECT COUNT(*) FROM yahoo_request_telemetry WHERE quote_age_unknown = 1").fetchone()[0]
+
+            yf_rows = conn.execute(
+                "SELECT http_latency_ms, quote_age_sec FROM yahoo_request_telemetry ORDER BY id DESC LIMIT ?",
+                (max_samples,),
+            ).fetchall()
+            yf_lats = [float(r["http_latency_ms"]) for r in reversed(yf_rows) if r["http_latency_ms"] is not None]
+            q_ages = [float(r["quote_age_sec"]) for r in reversed(yf_rows) if r["quote_age_sec"] is not None]
+
+            tr_rows = conn.execute(
+                "SELECT * FROM signal_latency_telemetry ORDER BY ist_received_time DESC LIMIT ?",
+                (max_samples,),
+            ).fetchall()
+            trace_dicts = [dict(r) for r in reversed(tr_rows)]
+
+            tg_cmp = [float(r["telegram_to_cmp_ms"]) for r in trace_dicts if r.get("telegram_to_cmp_ms") is not None]
+            tg_ack = [float(r["telegram_to_ack_ms"]) for r in trace_dicts if r.get("telegram_to_ack_ms") is not None]
+            ack_fill = [float(r["ack_to_fill_ms"]) for r in trace_dicts if r.get("ack_to_fill_ms") is not None]
+            fill_prot = [float(r["fill_to_protection_ms"]) for r in trace_dicts if r.get("fill_to_protection_ms") is not None]
+
+            rej_rows = conn.execute("SELECT reason, count FROM latency_rejection_counters").fetchall()
+            rejs = {str(r["reason"]): int(r["count"]) for r in rej_rows}
+
+            return {
+                "yahoo_success_count": int(yf_succ),
+                "yahoo_failure_count": int(yf_fail),
+                "quote_age_unknown_count": int(q_unk),
+                "yahoo_http_latencies_ms": yf_lats,
+                "quote_ages_sec": q_ages,
+                "telegram_to_cmp_latencies_ms": tg_cmp,
+                "telegram_to_ack_latencies_ms": tg_ack,
+                "ack_to_fill_latencies_ms": ack_fill,
+                "fill_to_protection_latencies_ms": fill_prot,
+                "rejection_reasons": rejs,
+                "trace_rows": trace_dicts,
             }

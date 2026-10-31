@@ -58,6 +58,7 @@ def cmd_status(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager):
     print(f"[*] Log Channel ID         : {cfg.log_group_id or 'Not Configured'}")
     print("-------------------------------------------------------")
     print(f"[*] Equity Sizing Mode     : {cfg.equity_sizing_mode} (Budget={cfg.equity_budget_inr:g} INR)")
+    print(f"[*] Equity CMP Policy      : {getattr(cfg, 'equity_cmp_execution_policy', 'STRICT_TIMESTAMP')}")
     print(f"[*] FnO Sizing Mode        : {cfg.fno_sizing_mode} (Budget={cfg.fno_capital_per_trade:g} INR, Max Lots={cfg.fno_max_lots})")
     print(f"[*] Protection (Post-Fill) : SL={cfg.sl_pct}% | Target={cfg.target_pct}%")
     print(f"[*] Risk Limits            : Max Order={cfg.max_order_amount_inr:g} | Min Funds={cfg.min_trade_funds_inr:g}")
@@ -93,6 +94,7 @@ def cmd_dashboard(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager)
     print(f"[*] Dhan Account ID     : {_mask_account_id(cfg.dhan_client_id)}")
     print(f"[*] Source Allowlist    : {allowlist_status}")
     print(f"[*] Active Segments     : Equity={'YES' if cfg.equity_active else 'NO'} | F&O={'YES' if cfg.fno_active else 'NO'}")
+    print(f"[*] Equity CMP Policy   : {getattr(cfg, 'equity_cmp_execution_policy', 'STRICT_TIMESTAMP')}")
     print("-------------------------------------------------------")
     ist = zoneinfo.ZoneInfo("Asia/Kolkata")
     now_ist = datetime.datetime.now(ist)
@@ -124,6 +126,12 @@ def cmd_dashboard(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager)
         )
     else:
         print("[*] In-Flight / Unknown : 0 unmanaged orders (Clean state)")
+    try:
+        from src.engine.latency_monitor import GLOBAL_LATENCY_MONITOR
+        GLOBAL_LATENCY_MONITOR.bind_db(db, force_reload=True)
+        print(GLOBAL_LATENCY_MONITOR.format_dashboard_section())
+    except Exception:
+        pass
     print("=======================================================")
 
 
@@ -187,41 +195,42 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         print("Please ensure DHAN_CLIENT_ID, DHAN_PIN, and DHAN_TOTP_SECRET are set.")
         return False
 
+    from src.broker.dhan_token import read_token, write_token_atomic
+    token_path = os.path.expanduser(cfg.dhan_token_file)
+    prev_token = read_token(token_path) if os.path.exists(token_path) else ""
+
     client = DhanClient(cfg, stop_manager=stop_mgr)
     ok, token, msg = client.generate_token_with_totp(force=True)
     if ok and token:
+        ok_f, bal, msg_f = client.verify_token_authenticated()
+        if not ok_f:
+            print(f"\n❌ Post-refresh broker verification failed: {msg_f}")
+            if prev_token and prev_token != token:
+                write_token_atomic(prev_token, token_path)
+                client.token = prev_token
+                try:
+                    client._token_mtime = os.path.getmtime(token_path)
+                except Exception:
+                    pass
+                ok_prev, bal_prev, msg_prev = client.verify_token_authenticated()
+                if ok_prev:
+                    print(
+                        f"[*] RECOVERY_VERIFIED: Restored previous token and confirmed broker authentication "
+                        f"(Balance: INR {bal_prev:,.2f})."
+                    )
+                else:
+                    print(
+                        f"[!] RECOVERY_UNVERIFIED: Previous token is no longer valid after new TOTP attempt "
+                        f"({msg_prev}). Broker authentication remains UNVERIFIED!"
+                    )
+            else:
+                print("[!] No distinct previous token available for recovery; broker authentication remains UNVERIFIED.")
+            print("=======================================================")
+            return False
+
         print("\n✅ Successfully generated fresh Dhan access token via TOTP!")
-        print(f"[*] Saved to token file: {cfg.dhan_token_file}")
-
-        env_path = resolve_env_path(".env")
-        if os.path.exists(env_path):
-            try:
-                with open(env_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                has_token = False
-                tmp_env = f"{env_path}.{os.getpid()}.tmp"
-                fd = os.open(tmp_env, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    for line in lines:
-                        if line.startswith("DHAN_ACCESS_TOKEN="):
-                            f.write(f"DHAN_ACCESS_TOKEN={token}\n")
-                            has_token = True
-                        else:
-                            f.write(line)
-                    if not has_token:
-                        f.write(f"DHAN_ACCESS_TOKEN={token}\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.chmod(tmp_env, 0o600)
-                os.replace(tmp_env, env_path)
-                os.chmod(env_path, 0o600)
-                print("✅ Updated DHAN_ACCESS_TOKEN in .env")
-            except Exception as e:
-                print(f"Warning: Could not update .env: {e}")
-
-        ok_f, bal, msg_f = client.get_fund_limits(retry=False)
-        if ok_f:
-            print(f"[*] Available Balance : INR {bal:,.2f}")
+        print(f"[*] Saved to token file: {cfg.dhan_token_file} (Single authoritative token source)")
+        print(f"[*] Available Balance : INR {bal:,.2f}")
         print("=======================================================")
         return True
     else:
@@ -369,6 +378,48 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
     print("=======================================================")
 
 
+def cmd_test_signal(cfg: AppConfig, raw_signal: str) -> int:
+    """
+    Safe SSH diagnostic signal evaluator: forces TRADING_MODE=TEST in memory so zero live
+    broker orders can ever be submitted, and displays CMP, sizing, and L1-L12 latency telemetry.
+    """
+    from src.models import TradingMode
+    from src.main import TradingBotPipeline
+
+    if not raw_signal or not raw_signal.strip():
+        print("Usage: ./bot test-signal \"Buy #IDEA\"")
+        return 2
+
+    test_cfg = cfg.model_copy(update={"trading_mode": TradingMode.TEST}) if hasattr(cfg, "model_copy") else cfg.copy(update={"trading_mode": TradingMode.TEST})
+    pipeline = TradingBotPipeline(test_cfg)
+    ch_id = test_cfg.monitored_channel_ids[0] if test_cfg.monitored_channel_ids else (test_cfg.test_group_id or -1001)
+    now = time.time()
+    print(f"[*] Processing SSH TEST-mode signal: {raw_signal!r} (CMP Policy={test_cfg.equity_cmp_execution_policy})")
+    res = pipeline.process_raw_message(
+        raw_signal,
+        channel_id=ch_id,
+        message_id=int(now * 1000) % 100000000,
+        msg_timestamp=now,
+        current_time=now,
+        source_name="SSH_TEST_SIGNAL",
+    )
+    print(f"[*] Valid            : {res.is_valid}")
+    print(f"[*] Action           : {res.action}")
+    print(f"[*] Reason           : {res.reason}")
+    if res.symbol:
+        print(f"[*] Symbol           : {res.symbol} (SecID={res.security_id})")
+    if res.cmp_policy:
+        print(f"[*] CMP Policy       : {res.cmp_policy} ({res.reference_label})")
+    if res.quote_age_status:
+        print(f"[*] Quote Age        : {res.quote_age_status} | Freshness: {res.quote_freshness_status}")
+    if res.limit_price is not None:
+        print(f"[*] Limit Price      : INR {res.limit_price:.2f} | Qty/Lots: {res.quantity_or_lots}")
+    if res.latency_breakdown:
+        lb = res.latency_breakdown
+        print(f"[*] Latency Breakdown: Yahoo HTTP={lb.get('yahoo_http_latency_ms')}ms | TG->CMP={lb.get('telegram_to_cmp_ms')}ms | Total={lb.get('total_processing_ms')}ms")
+    return 0 if res.is_valid else 1
+
+
 def cmd_setup():
     from src.setup_wizard import run_setup_wizard
     run_setup_wizard(resolve_env_path(".env"))
@@ -409,6 +460,9 @@ def main():
     elif args[0] in ("journal", "logs"):
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
         cmd_journal(db, limit)
+    elif args[0] in ("test-signal", "test_signal"):
+        sig_text = " ".join(args[1:]).strip()
+        sys.exit(cmd_test_signal(cfg, sig_text))
     elif args[0] in ("emergency-stop", "stop"):
         reason = " ".join(args[1:]) if len(args) > 1 else ""
         cmd_emergency_stop(cfg, db, stop_mgr, reason)
