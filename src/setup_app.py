@@ -112,6 +112,116 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .chip-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
     .chip-value { font-size: 13px; font-weight: 600; color: #f8fafc; margin-top: 2px; }
     
+    /* Operational System Status Panel */
+    .system-status-panel {
+      background: rgba(17, 24, 39, 0.75);
+      border: 1px solid #1e293b;
+      border-radius: 14px;
+      padding: 16px 20px;
+      margin-bottom: 22px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+    }
+    .status-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #1f2937;
+    }
+    .status-header-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #f1f5f9;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .status-header-tag {
+      font-size: 11px;
+      font-weight: 600;
+      color: #10b981;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 3px 8px;
+      border-radius: 6px;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+    .status-card {
+      background: #0d1321;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .status-card-label {
+      font-size: 10px;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .status-card-val {
+      font-size: 12px;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .pill-online {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .pill-offline {
+      background: rgba(148, 163, 184, 0.12);
+      color: #cbd5e1;
+      border: 1px solid rgba(148, 163, 184, 0.3);
+    }
+    .pill-test {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+    .pill-live {
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.5);
+    }
+    .pill-darvas {
+      background: rgba(14, 165, 233, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(14, 165, 233, 0.4);
+    }
+    .pill-version {
+      background: rgba(168, 85, 247, 0.15);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.4);
+      font-family: monospace;
+    }
+    .pill-danger {
+      background: rgba(239, 68, 68, 0.2);
+      color: #fca5a5;
+      border: 1px solid #ef4444;
+    }
+    .pill-neutral {
+      background: rgba(30, 41, 59, 0.7);
+      color: #e2e8f0;
+      border: 1px solid #334155;
+    }
+
     /* Next Steps Card */
     .next-steps-card {
       background: rgba(30, 41, 59, 0.5);
@@ -473,9 +583,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="icon-badge">
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
       </div>
-      <h1>Audit bot Setup</h1>
-      <p class="subtitle">Sapphire Bot Setup Engine &mdash; Configure trading parameters, DhanHQ credentials, Telegram channels, and risk controls for Audit bot.</p>
+      <h1>Audit bot Setup &amp; Operations Control</h1>
+      <p class="subtitle">AuditBot Trading &amp; Safety System &mdash; Configure trading parameters, DhanHQ credentials, Telegram channels, and risk controls for Audit bot.</p>
     </div>
+
+    <!--SYSTEM_STATUS_BAR-->
 
     <!--STATUS_BANNER-->
 
@@ -993,16 +1105,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div id="modalServiceStatus" class="modal-card-val">CHECKING...</div>
         </div>
         <div class="modal-card">
-          <div class="modal-card-label">Previous Version</div>
-          <div id="modalPrevVersion" class="modal-card-val" style="font-family: monospace;">Calculating...</div>
+          <div class="modal-card-label">Previous Settings</div>
+          <div id="modalPrevVersion" class="modal-card-val">Calculating...</div>
         </div>
         <div class="modal-card">
-          <div class="modal-card-label">Proposed Version</div>
-          <div id="modalPropVersion" class="modal-card-val" style="font-family: monospace;">Calculating...</div>
+          <div class="modal-card-label">New Submitted Settings</div>
+          <div id="modalPropVersion" class="modal-card-val">Calculating...</div>
         </div>
         <div class="modal-card" style="grid-column: span 2;">
-          <div class="modal-card-label">Running Verified Version</div>
-          <div id="modalActiveVersion" class="modal-card-val" style="font-family: monospace;">Awaiting Running Process Confirmation</div>
+          <div class="modal-card-label">Running Service Settings</div>
+          <div id="modalActiveVersion" class="modal-card-val">Awaiting Running Process Confirmation</div>
         </div>
       </div>
 
@@ -1086,9 +1198,17 @@ document.addEventListener('DOMContentLoaded', function() {
     pill.className = 'state-pill state-' + rec.state;
     
     document.getElementById('modalServiceStatus').textContent = rec.service_status || 'UNKNOWN';
-    document.getElementById('modalPrevVersion').textContent = rec.previous_version_hash ? 'v-' + rec.previous_version_hash.slice(0, 8) : 'None';
-    document.getElementById('modalPropVersion').textContent = rec.proposed_version_hash ? 'v-' + rec.proposed_version_hash.slice(0, 8) : 'Pending';
-    document.getElementById('modalActiveVersion').textContent = rec.effective_version_hash ? 'v-' + rec.effective_version_hash.slice(0, 8) : (rec.state === 'APPLIED_VERIFIED' ? 'v-' + (rec.proposed_version_hash || '').slice(0, 8) : 'Pending Verification');
+    document.getElementById('modalPrevVersion').textContent = rec.previous_version_hash ? 'Saved (Ref: ' + rec.previous_version_hash.slice(0, 8) + ')' : 'None';
+    document.getElementById('modalPropVersion').textContent = rec.proposed_version_hash ? 'Ready to Apply (Ref: ' + rec.proposed_version_hash.slice(0, 8) + ')' : 'Pending';
+    if (rec.state === 'APPLIED_VERIFIED') {
+      document.getElementById('modalActiveVersion').textContent = '🟢 Verified & Active in Running Bot';
+    } else if (rec.state === 'SAVED_FOR_NEXT_START') {
+      document.getElementById('modalActiveVersion').textContent = 'Saved for Next Startup (Bot is currently stopped)';
+    } else if (rec.effective_version_hash) {
+      document.getElementById('modalActiveVersion').textContent = 'Verified (Ref: ' + rec.effective_version_hash.slice(0, 8) + ')';
+    } else {
+      document.getElementById('modalActiveVersion').textContent = 'Pending Verification';
+    }
 
     const reasonBox = document.getElementById('modalReason');
     const msg = rec.error_msg || rec.reason || ('Configuration state: ' + rec.state);
@@ -1137,9 +1257,87 @@ document.addEventListener('DOMContentLoaded', function() {
 """
 
 
+def _mask_account_id(acct: str) -> str:
+    if not acct:
+        return "Not Configured"
+    acct_str = str(acct).strip()
+    if len(acct_str) <= 4:
+        return acct_str
+    return f"***{acct_str[-4:]}"
+
+
 @app.get("/", response_class=HTMLResponse)
 def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     cfg = AppConfig.from_env()
+
+    # Build real-time system status bar
+    from src.engine.config_manager import check_service_is_active, ConfigChangeTracker
+    is_svc_active = check_service_is_active()
+    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+    act_info = tracker.get_active_running_version() or {}
+    act_v = act_info.get("short_version", "v-UNKNOWN")
+    stop_path = os.path.join(getattr(cfg, "data_dir", "data"), "emergency_stop.json")
+    is_stopped = False
+    if os.path.exists(stop_path):
+        try:
+            with open(stop_path, "r", encoding="utf-8") as f:
+                is_stopped = bool(json.load(f).get("is_stopped", False))
+        except Exception:
+            is_stopped = True
+
+    svc_badge = '<span class="status-pill pill-online">🟢 Online (Running)</span>' if is_svc_active else '<span class="status-pill pill-offline">⚪ Offline (Stopped)</span>'
+    mode_badge = f'<span class="status-pill {"pill-live" if cfg.trading_mode.value == "LIVE" else "pill-test"}">{"🔴 Real Trading (Live Money)" if cfg.trading_mode.value == "LIVE" else "🧪 Paper Trading (Safe / Zero Risk)"}</span>'
+    stop_badge = '<span class="status-pill pill-danger">🛑 Halted (Emergency Stop)</span>' if is_stopped else '<span class="status-pill pill-online">🟢 Normal (Trading Allowed)</span>'
+    cmp_pol = getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP")
+    cmp_label = "📈 Darvas Live Market Price" if cmp_pol == "DARVAS_HTTP_SUCCESS" else "⏱️ Strict 2s Market Price"
+    cmp_badge = f'<span class="status-pill pill-darvas">{cmp_label}</span>'
+    
+    clean_v_id = act_v.replace("v-", "")
+    if is_svc_active:
+        ver_badge = f'<span class="status-pill pill-online">🟢 Up to Date &amp; Active</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
+    else:
+        ver_badge = f'<span class="status-pill pill-offline">⚪ Saved (Start Bot to Apply)</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
+
+    dhan_masked = _mask_account_id(cfg.dhan_client_id)
+    dhan_badge = f'<span class="status-pill pill-neutral">Connected ({dhan_masked})</span>' if cfg.dhan_client_id else '<span class="status-pill pill-offline">Not Configured</span>'
+
+    status_bar = f"""
+    <div class="system-status-panel">
+      <div class="status-header">
+        <div class="status-header-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+          AuditBot Real-Time System Status
+        </div>
+        <div class="status-header-tag">Safety Guardrails Active</div>
+      </div>
+      <div class="status-grid">
+        <div class="status-card">
+          <div class="status-card-label">Bot Service</div>
+          <div class="status-card-val">{svc_badge}</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-label">Trading Mode</div>
+          <div class="status-card-val">{mode_badge}</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-label">Settings Status</div>
+          <div class="status-card-val">{ver_badge}</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-label">Price Source</div>
+          <div class="status-card-val">{cmp_badge}</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-label">Safety Circuit Breaker</div>
+          <div class="status-card-val">{stop_badge}</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-label">Dhan Broker Account</div>
+          <div class="status-card-val">{dhan_badge}</div>
+        </div>
+      </div>
+    </div>
+    """
 
     banner = ""
     next_steps = ""
@@ -1188,34 +1386,35 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         </div>
         """
 
-    # Always render the Next Steps card so operator knows what to do
+    # Always render the Next Steps card aligned with AuditBot CLI & systemd
     next_steps = f"""
     <div class="next-steps-card">
       <div class="next-steps-title">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        Next Operational Steps: Running & Verifying Audit bot
+        Next Operational Steps: Running &amp; Verifying AuditBot
       </div>
       <div class="steps-list">
         <div class="step-item">
           <div class="step-num">1</div>
           <div class="step-content">
-            <h5>Start or Restart the Bot Runner</h5>
-            <p>In your VM terminal, start the signal ingestion pipeline:</p>
-            <div class="step-code">cd ~/uditbot && python3 run.py</div>
+            <h5>Service Management &amp; Status Verification</h5>
+            <p>Inspect running status or restart the trading service via operator CLI:</p>
+            <div class="step-code">./bot status</div> &nbsp; <div class="step-code">./bot restart</div>
           </div>
         </div>
         <div class="step-item">
           <div class="step-num">2</div>
           <div class="step-content">
-            <h5>Check the Telegram Handshake</h5>
-            <p>On launch, Audit bot will send an online verification card directly to your Telegram Log Group (<code>{cfg.log_group_id or '-5514889030'}</code>) confirming active channel listening.</p>
+            <h5>Live Telegram Ingestion &amp; Execution Logs</h5>
+            <p>Stream real-time signal parsing, Dhan order placement, and L1&ndash;L12 latency traces:</p>
+            <div class="step-code">./bot service-logs</div>
           </div>
         </div>
         <div class="step-item">
           <div class="step-num">3</div>
           <div class="step-content">
-            <h5>Automated Signal Processing</h5>
-            <p>Any BUY signal in your monitored channels will be sized, validated, and logged in real-time. In <strong>LIVE</strong> mode, orders route to Dhan with Forever OCO protection; in <strong>TEST</strong> mode, visual cards are dispatched without live broker orders.</p>
+            <h5>Darvas CMP Execution &amp; Automated Protection</h5>
+            <p>Signals in monitored channels route via Darvas CMP (<code>{getattr(cfg, 'equity_cmp_execution_policy', 'DARVAS_HTTP_SUCCESS')}</code>). In <strong>TEST</strong> mode, simulated cards are logged safely; in <strong>LIVE</strong> mode, orders execute with verified Forever OCO / Super Order protection.</p>
           </div>
         </div>
       </div>
@@ -1226,6 +1425,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
 
     html = (
         HTML_TEMPLATE.replace("<!--STATUS_BANNER-->", banner)
+        .replace("<!--SYSTEM_STATUS_BAR-->", status_bar)
         .replace("<!--NEXT_STEPS_GUIDE-->", next_steps)
         # Mode & Products
         .replace("<!--LIVE_CHECKED-->", "checked" if cfg.trading_mode.value == "LIVE" else "")

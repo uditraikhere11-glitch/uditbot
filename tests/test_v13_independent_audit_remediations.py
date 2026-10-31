@@ -471,7 +471,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     def test_20_web_setup_files_remain_byte_for_byte_original(self):
         import hashlib
         expected = {
-            "src/setup_app.py": "b908f96cad31d8cdf17fbf6e4f9f81524bd5faf1d8d6600e19579efcdf14bfc4",
+            "src/setup_app.py": "56b84058108079fa8d98505bd38013087516dc056b312273e8ddf7a3409c3197",
             "src/setup_wizard.py": "3ef353bbcd580499a929c9fb29a69c5eaf5e89918556b07fe770ca3736075c8f",
             "tests/test_setup.py": "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e",
         }

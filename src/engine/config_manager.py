@@ -1106,11 +1106,25 @@ def execute_configuration_update(
         tracker.dispatch_telegram_update(record, notifier=notifier)
         return record
 
-    # 10. Verify that the running application acknowledged the proposed version
-    time.sleep(verify_delay_sec)
-    active_info = tracker.get_active_running_version()
-    ack_hash = active_info.get("version_hash") if isinstance(active_info, dict) else None
+    # 10. Verify that the running application acknowledged the proposed version.
+    # In live service operations, systemd process restart and Python initialization
+    # (importing Telethon, SQLite, loading 117k scrip master records) takes ~1-3s.
+    # Poll with a retry loop so we do not prematurely fail and roll back.
+    max_wait = verify_delay_sec if is_isolated_test_environment() else 6.0
+    poll_interval = 0.01 if is_isolated_test_environment() else 0.25
+    start_poll = time.time()
     valid_hashes = {record.proposed_version_hash, merged_proposed_hash}
+    active_info = None
+    ack_hash = None
+
+    while True:
+        time.sleep(poll_interval)
+        active_info = tracker.get_active_running_version()
+        ack_hash = active_info.get("version_hash") if isinstance(active_info, dict) else None
+        if ack_hash in valid_hashes:
+            break
+        if time.time() - start_poll >= max_wait:
+            break
 
     if ack_hash in valid_hashes or (has_secret_change and not has_non_secret_change and ack_hash is None):
         record.state = ConfigApplyState.APPLIED_VERIFIED
