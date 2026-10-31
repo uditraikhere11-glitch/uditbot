@@ -3,7 +3,7 @@ Shared Dhan Access Token Coordinator (adopted from `darvas_script/client_agent/d
 
 Ensures that multiple processes on the same VM (e.g. main trading bot daemon, CLI `bot check-dhan`,
 or scheduled daily refresh) share a single Dhan access token safely via an `fcntl.flock` lockfile
-and PID/thread-unique `0600` atomic file replacement (`V12-20`), preventing `DH-906 Invalid Token`
+and PID/thread-unique `0600` atomic file replacement (`V12-20`, `CV13-06`), preventing
 self-invalidation and concurrent temp-file collisions.
 """
 
@@ -20,17 +20,26 @@ TOKEN_FILE = os.environ.get("DHAN_TOKEN_FILE") or os.path.join(os.path.expanduse
 
 
 def is_token_error(status_code: int, body: object) -> bool:
-    """Dhan signals an expired/replaced token with 401/403, DH-901, DH-906 'Invalid Token', 807, or 809."""
-    text = str(body).lower()
+    """
+    CV13-06: Official Dhan v2 authentication error classifier.
+    Matches HTTP 401/403, DH-901 (Invalid Authentication), Data API auth codes 807/808/809,
+    or explicit 'invalid token' / 'access token is invalid' / 'token is expired' messages.
+    Does NOT misclassify DH-906 Order_Error (e.g. circuit limit or RMS rejection) as a token error.
+    """
+    text = str(body or "").lower()
+    if "order_error" in text and "invalid token" not in text and "access token" not in text:
+        return False
     return (
         status_code in (401, 403)
         or "dh-901" in text
-        or "dh-906" in text
+        or ("dh-906" in text and ("invalid token" in text or "access token" in text or "auth" in text))
         or "invalid token" in text
         or "unauthorized" in text
         or "access token is invalid" in text
-        or "809" in text
-        or "807" in text
+        or "token is expired" in text
+        or '"807"' in text or ": 807" in text or 'errorcode": "807' in text or "807" in text.split()
+        or '"808"' in text or ": 808" in text or 'errorcode": "808' in text
+        or '"809"' in text or ": 809" in text or 'errorcode": "809' in text or "809" in text.split()
     )
 
 

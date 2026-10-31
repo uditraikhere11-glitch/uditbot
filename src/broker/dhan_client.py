@@ -45,6 +45,7 @@ from src.models import (
     TradingMode,
     TransactionType,
 )
+from src.engine.latency_monitor import GLOBAL_LATENCY_MONITOR
 from src.broker.dhan_token import (
     force_login,
     fresh_token,
@@ -783,9 +784,20 @@ class DhanClient:
         self._quote_cache: Dict[Tuple[str, str], QuoteResult] = {}
         self.last_quote_result: Optional[QuoteResult] = None
         self.last_ltp_meta: Optional[Dict[str, Any]] = None
+        self.last_order_http_latency_ms: Optional[float] = None
+        self.last_order_broker_status: str = ""
+        self.last_funds_is_fallback: bool = False
+
+    def _is_isolated_test_default_token_path(self, token_path: str) -> bool:
+        import sys
+        if ("unittest" in sys.modules or "pytest" in sys.modules) and os.environ.get("AUDITBOT_ALLOW_HOME_TOKEN_IN_TESTS") != "1":
+            default_home_tok = os.path.abspath(os.path.expanduser("~/.dhan_token"))
+            if os.path.abspath(token_path) == default_home_tok:
+                return True
+        return False
 
     def _perform_totp_http_login(self) -> Tuple[bool, str, str]:
-        """Executes raw TOTP HTTP call against Dhan auth endpoint."""
+        """Executes raw TOTP HTTP call against Dhan auth endpoint and validates account identity."""
         if not self.cfg.dhan_client_id or not self.cfg.dhan_pin or not self.cfg.dhan_totp_secret:
             return False, "", "Missing DHAN_CLIENT_ID, DHAN_PIN, or DHAN_TOTP_SECRET in config"
         try:
@@ -798,6 +810,11 @@ class DhanClient:
             resp = self.session.post(AUTH_URL, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
+                if not isinstance(data, dict):
+                    return False, "", f"Malformed TOTP response from Dhan: {resp.text}"
+                resp_client_id = str(data.get("dhanClientId", "")).strip()
+                if resp_client_id and self.cfg.dhan_client_id and resp_client_id != str(self.cfg.dhan_client_id).strip():
+                    return False, "", f"Dhan account mismatch in TOTP response: expected '{self.cfg.dhan_client_id}', got '{resp_client_id}'"
                 new_token = str(data.get("accessToken", "")).strip()
                 if new_token:
                     return True, new_token, "Token generated successfully"
@@ -850,9 +867,9 @@ class DhanClient:
             return False, "", f"Exception generating token via TOTP: {e}"
 
     def _sync_shared_token_from_disk(self) -> None:
-        """V12-20: Adopts newer token written by scheduled refresh or another worker."""
+        """V12-20 & CV13-06: Adopts newer token written by scheduled refresh or another worker."""
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
-        if not token_path or not os.path.exists(token_path):
+        if not token_path or self._is_isolated_test_default_token_path(token_path) or not os.path.exists(token_path):
             return
         try:
             mtime = os.path.getmtime(token_path)
@@ -865,11 +882,15 @@ class DhanClient:
             pass
 
     def _load_token(self) -> str:
-        """Loads access token from config, shared token file, or automatically generates via TOTP."""
-        if self.cfg.dhan_access_token:
-            return self.cfg.dhan_access_token.strip()
+        """
+        CV13-06: Single authoritative access-token source (`~/.dhan_token`).
+        Prefers the shared token file when present (unless isolated in a unit test),
+        falling back to explicit in-memory config token or coordinated TOTP generation.
+        """
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
-        if os.path.exists(token_path):
+        is_isolated_default = self._is_isolated_test_default_token_path(token_path)
+
+        if not is_isolated_default and token_path and os.path.exists(token_path):
             tok = read_token(token_path)
             if tok:
                 try:
@@ -878,7 +899,10 @@ class DhanClient:
                     pass
                 return tok
 
-        if self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+        if self.cfg.dhan_access_token:
+            return self.cfg.dhan_access_token.strip()
+
+        if not is_isolated_default and self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
             ok, tok, _ = self.generate_token_with_totp(force=False, rejected_token="")
             if ok and tok:
                 return tok
@@ -897,6 +921,19 @@ class DhanClient:
     def is_token_error(self, status_code: int, response_text: str) -> bool:
         """Detects Dhan expired or invalid token errors."""
         return _shared_is_token_error(status_code, response_text)
+
+    def verify_token_authenticated(self) -> Tuple[bool, float, str]:
+        """
+        P1 TOTP Recovery Guard: Verifies against Dhan /v2/fundlimit that the active token
+        is genuinely authenticated at the broker, never masking errors with TEST-mode fallback.
+        """
+        if not self.token:
+            return False, 0.0, "Missing access token"
+        self.last_funds_is_fallback = False
+        ok_f, avail, msg_f = self.get_fund_limits(retry=False)
+        if not ok_f or getattr(self, "last_funds_is_fallback", False):
+            return False, 0.0, msg_f
+        return True, avail, msg_f
 
     def get_fund_limits(self, retry: bool = True) -> Tuple[bool, float, str]:
         """
@@ -961,19 +998,23 @@ class DhanClient:
         now_utc: Optional[float] = None,
         max_quote_age_sec: Optional[float] = None,
         allow_cached: bool = False,
+        cmp_policy: Optional[str] = None,
     ) -> QuoteResult:
         seg = (exchange_segment or "").strip().upper()
         clean_sym = (stock_symbol or "").replace("-EQ", "").strip().upper()
         max_age = float(max_quote_age_sec) if max_quote_age_sec is not None else float(getattr(self.cfg, "max_quote_age_sec", 2.0))
         current_utc = float(now_utc) if now_utc is not None else time.time()
+        effective_policy = str(cmp_policy or getattr(self.cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") or "STRICT_TIMESTAMP").upper().strip()
+        is_darvas_policy = (effective_policy == "DARVAS_HTTP_SUCCESS" and seg == "NSE_EQ")
 
         if seg in ("NSE_FNO", "BSE_FNO") or seg not in ("NSE_EQ", "BSE_EQ"):
             res = QuoteResult(
                 is_valid=False,
                 source="YAHOO_FINANCE",
                 ticker=clean_sym,
-                venue=seg,
+                venue="UNKNOWN",
                 security_id=str(security_id or ""),
+                cmp_policy=effective_policy,
                 failure_reason=(
                     f"Unsupported segment '{seg}' for Yahoo Finance equity price source: "
                     f"cannot substitute underlying equity quote for F&O option contract premium"
@@ -986,8 +1027,9 @@ class DhanClient:
             res = QuoteResult(
                 is_valid=False,
                 source="YAHOO_FINANCE",
-                venue=seg,
+                venue="UNKNOWN",
                 security_id=str(security_id or ""),
+                cmp_policy=effective_policy,
                 failure_reason="Missing stock symbol for Yahoo Finance quote",
             )
             self.last_quote_result = res
@@ -996,8 +1038,8 @@ class DhanClient:
         cache_key = (seg, clean_sym)
         if allow_cached and cache_key in self._quote_cache:
             cached = self._quote_cache[cache_key]
-            recomputed_age = round(current_utc - cached.quote_timestamp, 6)
-            if cached.is_valid and 0.0 <= recomputed_age <= max_age and (not security_id or cached.security_id == str(security_id)):
+            recomputed_age = round(current_utc - cached.quote_timestamp, 6) if (cached.quote_timestamp is not None and cached.quote_timestamp > 0) else None
+            if cached.is_valid and (recomputed_age is not None and 0.0 <= recomputed_age <= max_age) and (is_darvas_policy or cached.freshness_verified) and (not security_id or cached.security_id == str(security_id)):
                 updated = cached.model_copy(update={"age_sec": recomputed_age}) if hasattr(cached, "model_copy") else cached.copy(update={"age_sec": recomputed_age})
                 self.last_quote_result = updated
                 return updated
@@ -1009,33 +1051,46 @@ class DhanClient:
         url = YAHOO_CHART_URL.format(ticker=expected_ticker)
         headers = {"User-Agent": "Mozilla/5.0"}
 
+        t4_start_ns = time.perf_counter_ns()
         try:
             t_req_start = time.time()
             resp = self.session.get(url, headers=headers, timeout=5)
+            t4_end_ns = time.perf_counter_ns()
+            http_latency_ms = round(max(0.0, (t4_end_ns - t4_start_ns) / 1_000_000.0), 3)
             http_elapsed = max(0.0, time.time() - t_req_start)
             eval_utc = (float(now_utc) + (http_elapsed if http_elapsed >= 0.05 else 0.0)) if now_utc is not None else time.time()
 
             if resp.status_code != 200:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
                     venue=seg,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Yahoo Finance returned HTTP {resp.status_code} for {expected_ticker}",
                 )
                 self.last_quote_result = res
                 return res
 
+            t5_start_ns = time.perf_counter_ns()
             data = resp.json()
             results = (data.get("chart") or {}).get("result") or []
             if not results or not isinstance(results[0], dict):
+                t5_end_ns = time.perf_counter_ns()
+                parse_latency_ms = round(max(0.0, (t5_end_ns - t5_start_ns) / 1_000_000.0), 3)
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
                     venue=seg,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Empty chart result in Yahoo Finance response for {expected_ticker}",
                 )
                 self.last_quote_result = res
@@ -1048,16 +1103,28 @@ class DhanClient:
             meta_exch = str(meta.get("exchangeName") or meta.get("fullExchangeName") or "").strip().upper()
             meta_curr = str(meta.get("currency") or "").strip().upper()
             market_state = str(meta.get("marketState") or "").strip().upper()
+            observed_venue = meta_exch if meta_exch else "UNKNOWN"
+            observed_currency = meta_curr if meta_curr else "UNKNOWN"
+            observed_market_state = market_state if market_state else "UNKNOWN"
             meta_sec_id = str(meta.get("securityId") or "").strip()
             raw_delay = meta.get("exchangeDataDelayedBy")
+            t5_end_ns = time.perf_counter_ns()
+            parse_latency_ms = round(max(0.0, (t5_end_ns - t5_start_ns) / 1_000_000.0), 3)
 
+            t6_start_ns = time.perf_counter_ns()
             if raw_price is None or isinstance(raw_price, bool) or not isinstance(raw_price, (int, float)):
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Missing or non-numeric regularMarketPrice for {expected_ticker}",
                 )
                 self.last_quote_result = res
@@ -1065,110 +1132,244 @@ class DhanClient:
 
             price = float(raw_price)
             if not math.isfinite(price) or price <= 0.0:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=0.0,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Invalid non-positive or non-finite price ({raw_price}) for {expected_ticker}",
                 )
                 self.last_quote_result = res
                 return res
 
             if not meta_sym or meta_sym != expected_ticker:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=meta_sym or expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Instrument identity mismatch: requested '{expected_ticker}', response had '{meta_sym}'",
                 )
                 self.last_quote_result = res
                 return res
 
             if meta_sec_id and security_id and meta_sec_id != str(security_id):
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=meta_sec_id,
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Security ID mismatch: expected '{security_id}', response had '{meta_sec_id}'",
                 )
                 self.last_quote_result = res
                 return res
 
             if seg == "NSE_EQ" and (not meta_exch or meta_exch not in VALID_NSE_EXCHANGES):
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
-                    failure_reason=f"Venue mismatch for NSE_EQ: Yahoo returned exchange '{meta_exch}'",
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
+                    failure_reason=f"Venue mismatch or missing exchangeName for NSE_EQ: Yahoo returned exchange '{observed_venue}'",
                 )
                 self.last_quote_result = res
                 return res
 
             if seg == "BSE_EQ" and (not meta_exch or meta_exch not in VALID_BSE_EXCHANGES):
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
-                    failure_reason=f"Venue mismatch for BSE_EQ: Yahoo returned exchange '{meta_exch}'",
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
+                    failure_reason=f"Venue mismatch or missing exchangeName for BSE_EQ: Yahoo returned exchange '{observed_venue}'",
                 )
                 self.last_quote_result = res
                 return res
 
             if meta_curr != "INR":
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
-                    currency=meta_curr,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
-                    failure_reason=f"Unsupported or missing quote currency '{meta_curr}' (expected INR)",
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
+                    failure_reason=f"Unsupported or missing quote currency '{observed_currency}' (expected INR)",
                 )
                 self.last_quote_result = res
                 return res
 
+            if is_darvas_policy:
+                # CV13-07: DARVAS_HTTP_SUCCESS policy for NSE_EQ
+                from src.engine.market import is_market_open
+                m_open = False
+                try:
+                    eval_dt = datetime.datetime.fromtimestamp(eval_utc, tz=IST) if eval_utc else None
+                    m_open = is_market_open(now=eval_dt)
+                except Exception:
+                    pass
+
+                delay_metadata_present = (raw_delay is not None and not isinstance(raw_delay, bool) and isinstance(raw_delay, (int, float)))
+                delay_seconds = float(raw_delay) if delay_metadata_present else None
+                is_delayed = bool(delay_seconds is not None and delay_seconds > 0.0)
+
+                quote_ts: Optional[float] = None
+                age_sec: Optional[float] = None
+                quote_age_status = "QUOTE_AGE_UNKNOWN"
+                freshness_verified = False
+                quote_freshness_status = "ACCEPTED_UNVERIFIED_TIMESTAMP"
+                if raw_ts is not None and not isinstance(raw_ts, bool) and isinstance(raw_ts, (int, float)):
+                    cand_ts = float(raw_ts)
+                    if math.isfinite(cand_ts) and cand_ts > 0.0:
+                        quote_ts = cand_ts
+                        calc_age = round(eval_utc - quote_ts, 6)
+                        if calc_age >= 0.0:
+                            age_sec = calc_age
+                            quote_age_status = f"{age_sec:.2f}s"
+                            if (
+                                observed_market_state in ("REGULAR", "OPEN")
+                                and delay_metadata_present
+                                and not is_delayed
+                                and age_sec <= max_age
+                            ):
+                                freshness_verified = True
+                                quote_freshness_status = "FRESHNESS_VERIFIED"
+                            elif age_sec > max_age:
+                                freshness_verified = False
+                                quote_freshness_status = f"ACCEPTED_BY_DARVAS_POLICY_EXCEEDS_2S ({age_sec:.2f}s > {max_age:.2f}s)"
+                            else:
+                                freshness_verified = False
+                                quote_freshness_status = f"ACCEPTED_BY_DARVAS_POLICY (state={observed_market_state}, delay_verified={delay_metadata_present and not is_delayed})"
+                        else:
+                            quote_age_status = "FUTURE_TIMESTAMP_INVALID"
+                            quote_freshness_status = "ACCEPTED_UNVERIFIED_TIMESTAMP"
+
+                is_current_session = m_open and observed_market_state not in ("CLOSED", "POST", "PRE", "POSTPOST", "PREPRE")
+                ref_label = "LIVE_REFERENCE" if is_current_session else "HISTORICAL_REFERENCE"
+                auth_latency_ms = round(max(0.0, (time.perf_counter_ns() - t6_start_ns) / 1_000_000.0), 3)
+                total_cmp_ms = round(http_latency_ms + parse_latency_ms + auth_latency_ms, 3)
+
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(
+                    True,
+                    http_latency_ms,
+                    age_sec if quote_age_status not in ("QUOTE_AGE_UNKNOWN", "FUTURE_TIMESTAMP_INVALID") else None,
+                    symbol=clean_sym,
+                )
+                res = QuoteResult(
+                    is_valid=True,
+                    price=price,
+                    source="YAHOO_FINANCE",
+                    ticker=expected_ticker,
+                    venue=observed_venue,
+                    security_id=str(security_id or ""),
+                    currency=observed_currency,
+                    market_state=observed_market_state,
+                    quote_timestamp=quote_ts,
+                    age_sec=age_sec,
+                    is_delayed=is_delayed,
+                    delay_seconds=delay_seconds,
+                    delay_metadata_present=delay_metadata_present,
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    auth_latency_ms=auth_latency_ms,
+                    total_cmp_latency_ms=total_cmp_ms,
+                    quote_age_status=quote_age_status,
+                    freshness_verified=freshness_verified,
+                    quote_freshness_status=quote_freshness_status,
+                    cmp_policy="DARVAS_HTTP_SUCCESS",
+                    reference_label=ref_label,
+                    failure_reason="",
+                )
+                self._quote_cache[cache_key] = res
+                self.last_quote_result = res
+                return res
+
+            # STRICT_TIMESTAMP Policy
             if market_state not in ("REGULAR", "OPEN"):
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
-                    market_state=market_state,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Non-regular or closed market session state: '{market_state}'",
                 )
                 self.last_quote_result = res
                 return res
 
-            delay_seconds = float(raw_delay) if (raw_delay is not None and isinstance(raw_delay, (int, float))) else (900.0 if seg == "BSE_EQ" else 0.0)
+            delay_metadata_present = (raw_delay is not None and not isinstance(raw_delay, bool) and isinstance(raw_delay, (int, float)))
+            delay_seconds = float(raw_delay) if delay_metadata_present else (900.0 if seg == "BSE_EQ" else 0.0)
             is_delayed = (delay_seconds > 0.0) or (seg == "BSE_EQ")
             if is_delayed:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
                     is_delayed=True,
                     delay_seconds=delay_seconds,
+                    delay_metadata_present=delay_metadata_present,
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=(
                         f"Delayed quote rejected for live execution ({expected_ticker}, venue={seg}, "
                         f"delay={delay_seconds:g}s — BSE .BO / delayed feeds are prohibited for automated orders)"
@@ -1178,13 +1379,20 @@ class DhanClient:
                 return res
 
             if raw_ts is None or isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    quote_age_status="QUOTE_AGE_UNKNOWN",
+                    cmp_policy=effective_policy,
                     failure_reason=f"Missing or invalid source quote timestamp (regularMarketTime) for {expected_ticker}",
                 )
                 self.last_quote_result = res
@@ -1192,13 +1400,20 @@ class DhanClient:
 
             quote_ts = float(raw_ts)
             if not math.isfinite(quote_ts) or quote_ts <= 0.0:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    quote_age_status="QUOTE_AGE_UNKNOWN",
+                    cmp_policy=effective_policy,
                     failure_reason=f"Non-positive or non-finite regularMarketTime ({raw_ts}) for {expected_ticker}",
                 )
                 self.last_quote_result = res
@@ -1206,48 +1421,74 @@ class DhanClient:
 
             age_sec = round(eval_utc - quote_ts, 6)
             if age_sec < 0.0:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
                     quote_timestamp=quote_ts,
                     age_sec=age_sec,
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Future source quote timestamp rejected (age={age_sec:.3f}s < 0.0s)",
                 )
                 self.last_quote_result = res
                 return res
 
             if age_sec > max_age:
+                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, age_sec)
                 res = QuoteResult(
                     is_valid=False,
                     price=price,
                     source="YAHOO_FINANCE",
                     ticker=expected_ticker,
-                    venue=meta_exch or seg,
+                    venue=observed_venue,
+                    currency=observed_currency,
+                    market_state=observed_market_state,
                     security_id=str(security_id or ""),
                     quote_timestamp=quote_ts,
                     age_sec=age_sec,
+                    quote_age_status=f"{age_sec:.2f}s",
+                    http_latency_ms=http_latency_ms,
+                    parse_latency_ms=parse_latency_ms,
+                    cmp_policy=effective_policy,
                     failure_reason=f"Stale source quote rejected: age {age_sec:.2f}s exceeds {max_age:.2f}s maximum",
                 )
                 self.last_quote_result = res
                 return res
 
+            auth_latency_ms = round(max(0.0, (time.perf_counter_ns() - t6_start_ns) / 1_000_000.0), 3)
+            total_cmp_ms = round(http_latency_ms + parse_latency_ms + auth_latency_ms, 3)
+            GLOBAL_LATENCY_MONITOR.record_yahoo_request(True, http_latency_ms, age_sec, symbol=clean_sym)
             res = QuoteResult(
                 is_valid=True,
                 price=price,
                 source="YAHOO_FINANCE",
                 ticker=expected_ticker,
-                venue=meta_exch or "NSE",
+                venue=observed_venue,
                 security_id=str(security_id or ""),
-                currency=meta_curr,
-                market_state=market_state,
+                currency=observed_currency,
+                market_state=observed_market_state,
                 quote_timestamp=quote_ts,
                 age_sec=age_sec,
                 is_delayed=False,
-                delay_seconds=0.0,
+                delay_seconds=float(raw_delay) if delay_metadata_present else None,
+                delay_metadata_present=delay_metadata_present,
+                http_latency_ms=http_latency_ms,
+                parse_latency_ms=parse_latency_ms,
+                auth_latency_ms=auth_latency_ms,
+                total_cmp_latency_ms=total_cmp_ms,
+                quote_age_status=f"{age_sec:.2f}s",
+                freshness_verified=True,
+                quote_freshness_status="FRESHNESS_VERIFIED",
+                cmp_policy=effective_policy,
+                reference_label="LIVE_REFERENCE",
                 failure_reason="",
             )
             self._quote_cache[cache_key] = res
@@ -1255,12 +1496,16 @@ class DhanClient:
             return res
 
         except Exception as e:
+            http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t4_start_ns) / 1_000_000.0), 3)
+            GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
             res = QuoteResult(
                 is_valid=False,
                 source="YAHOO_FINANCE",
                 ticker=expected_ticker,
-                venue=seg,
+                venue="UNKNOWN",
                 security_id=str(security_id or ""),
+                http_latency_ms=http_latency_ms,
+                cmp_policy=effective_policy,
                 failure_reason=f"Yahoo Finance exception for {expected_ticker}: {e}",
             )
             self.last_quote_result = res
@@ -1272,12 +1517,14 @@ class DhanClient:
         exchange_segment: str = "NSE_EQ",
         now_utc: Optional[float] = None,
         max_quote_age_sec: Optional[float] = None,
+        cmp_policy: Optional[str] = None,
     ) -> Optional[float]:
         ok, price, _ = self.fetch_yahoo_ltp(
             stock_symbol,
             exchange_segment=exchange_segment,
             now_utc=now_utc,
             max_quote_age_sec=max_quote_age_sec,
+            cmp_policy=cmp_policy,
         )
         return price if ok else None
 
@@ -1288,6 +1535,7 @@ class DhanClient:
         security_id: str = "",
         now_utc: Optional[float] = None,
         max_quote_age_sec: Optional[float] = None,
+        cmp_policy: Optional[str] = None,
     ) -> Tuple[bool, float, str]:
         q = self.get_yahoo_quote_details(
             stock_symbol=stock_symbol,
@@ -1296,9 +1544,11 @@ class DhanClient:
             now_utc=now_utc,
             max_quote_age_sec=max_quote_age_sec,
             allow_cached=False,
+            cmp_policy=cmp_policy,
         )
         if q.is_valid:
-            return True, q.price, f"LTP retrieved via Yahoo Finance ({q.ticker}, age={q.age_sec:.2f}s)"
+            age_label = q.quote_age_status or (f"{q.age_sec:.2f}s" if q.age_sec is not None else "QUOTE_AGE_UNKNOWN")
+            return True, q.price, f"LTP retrieved via Yahoo Finance ({q.ticker}, age={age_label}, policy={q.cmp_policy})"
         return False, 0.0, q.failure_reason
 
     def get_ltp(
@@ -1309,6 +1559,7 @@ class DhanClient:
         symbol: Optional[str] = None,
         now_utc: Optional[float] = None,
         max_quote_age_sec: Optional[float] = None,
+        cmp_policy: Optional[str] = None,
     ) -> Tuple[bool, float, str]:
         seg = (exchange_segment or "").strip().upper()
 
@@ -1319,8 +1570,11 @@ class DhanClient:
                 security_id=security_id,
                 now_utc=now_utc,
                 max_quote_age_sec=max_quote_age_sec,
+                cmp_policy=cmp_policy,
             )
             return False, 0.0, q.failure_reason
+
+        effective_policy = str(cmp_policy or getattr(self.cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") or "STRICT_TIMESTAMP").upper().strip()
 
         if symbol and seg in ("NSE_EQ", "BSE_EQ"):
             yf_ok, yf_ltp, yf_msg = self.fetch_yahoo_ltp(
@@ -1329,14 +1583,19 @@ class DhanClient:
                 security_id=security_id,
                 now_utc=now_utc,
                 max_quote_age_sec=max_quote_age_sec,
+                cmp_policy=effective_policy,
             )
             if yf_ok and yf_ltp > 0:
                 return True, yf_ltp, yf_msg
-            if any(
-                k in yf_msg.lower()
-                for k in ("stale", "delayed", "mismatch", "future", "missing or invalid source quote timestamp", "non-regular", "currency")
-            ):
-                return False, 0.0, yf_msg
+            # Never silently substitute an unverified Dhan marketfeed price after a Yahoo failure
+            return False, 0.0, yf_msg
+
+        if seg in ("NSE_EQ", "BSE_EQ") and effective_policy == "DARVAS_HTTP_SUCCESS":
+            return (
+                False,
+                0.0,
+                "DARVAS_HTTP_SUCCESS specifies Yahoo Finance as the executable CMP source; unverified Dhan marketfeed substitution is prohibited",
+            )
 
         if not self.token:
             return False, 0.0, "No valid fresh quote from Yahoo Finance and no Dhan access token configured"
@@ -1375,6 +1634,8 @@ class DhanClient:
                                 return False, 0.0, f"Future Dhan LTP source timestamp rejected (age={src_age:.2f}s < 0.0s)"
                             if src_age > max_age:
                                 return False, 0.0, f"Stale Dhan LTP source timestamp rejected (age={src_age:.2f}s > {max_age:.2f}s)"
+                    if seg in ("NSE_EQ", "BSE_EQ") and src_ts is None:
+                        return False, 0.0, "Unverified Dhan marketfeed LTP rejected: missing source quote timestamp (last_trade_time)"
                     self.last_ltp_meta = {
                         "price": ltp,
                         "exchange_segment": exchange_segment,
@@ -1715,8 +1976,11 @@ class DhanClient:
         }
 
         uncertain_outcome = False
+        self.last_order_http_latency_ms = None
+        t_order_start_ns = time.perf_counter_ns()
         try:
             resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 data = resp.json() if resp.text else {}
                 order_id = str(data.get("orderId", "")).strip()
@@ -1726,9 +1990,11 @@ class DhanClient:
                     if rec_ok and rec_oid:
                         uncertain_outcome = False
                     return rec_ok, rec_oid, rec_msg
-                if str(data.get("orderStatus", "")).upper() == "REJECTED":
+                raw_ord_st = str(data.get("orderStatus", "")).upper().strip()
+                self.last_order_broker_status = raw_ord_st or "TRANSIT"
+                if raw_ord_st == "REJECTED":
                     return False, None, f"Dhan order rejected by RMS: {data}"
-                return True, order_id, "Order placed successfully on Dhan"
+                return True, order_id, f"Order acknowledged by Dhan (status={self.last_order_broker_status})"
             elif self.is_token_error(resp.status_code, resp.text):
                 uncertain_outcome = True
                 if self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
@@ -1824,8 +2090,11 @@ class DhanClient:
         }
 
         uncertain_outcome = False
+        self.last_order_http_latency_ms = None
+        t_order_start_ns = time.perf_counter_ns()
         try:
             resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 try:
                     data = resp.json() if resp.text else {}
@@ -1838,9 +2107,11 @@ class DhanClient:
                     if rec_ok and rec_oid:
                         uncertain_outcome = False
                     return rec_ok, rec_oid, rec_msg
-                if str(data.get("orderStatus", "")).upper() == "REJECTED":
+                raw_ord_st = str(data.get("orderStatus", "")).upper().strip()
+                self.last_order_broker_status = raw_ord_st or "TRANSIT"
+                if raw_ord_st == "REJECTED":
                     return False, None, f"Dhan super order rejected by RMS: {data}"
-                return True, order_id, "Super order placed successfully on Dhan"
+                return True, order_id, f"Super order acknowledged by Dhan (status={self.last_order_broker_status})"
             elif self.is_token_error(resp.status_code, resp.text):
                 uncertain_outcome = True
                 if self.cfg.dhan_pin and self.cfg.dhan_totp_secret:

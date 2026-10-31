@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Dhan TOTP Token Refresh Timer (08:00 IST Mon-Fri)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:00:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=15
+Unit=dhan-token-refresh.service
+
+[Install]
+WantedBy=timers.target

@@ -52,6 +52,10 @@ case "${1:-}" in
         shift || true
         "$PYTHON" -m src.cli journal "$@"
         ;;
+    test-signal|test_signal)
+        shift || true
+        "$PYTHON" -m src.cli test-signal "$@"
+        ;;
     emergency-stop|stop-trading)
         shift || true
         "$PYTHON" -m src.cli emergency-stop "$@"

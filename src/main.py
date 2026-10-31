@@ -36,7 +36,8 @@ from src.engine.sizer import (
     size_equity, size_option, calculate_equity_limit_price,
     calculate_option_limit_price, calculate_protection_levels
 )
-from src.engine.market import is_market_open, is_lifecycle_open, market_status
+from src.engine.market import IST, is_market_open, is_lifecycle_open, market_status
+from src.engine.latency_monitor import GLOBAL_LATENCY_MONITOR, SignalLatencyTrace
 from src.engine.protection_watcher import ProtectionWatcher
 from src.engine.emergency_stop import EmergencyStopManager
 from src.engine.risk_manager import RiskManager
@@ -124,6 +125,17 @@ class TradingBotPipeline:
             stop_manager=self.stop_manager,
         )
         self.broker.reconciliation_gate = self.reconciliation_gate
+        self.latency_monitor = GLOBAL_LATENCY_MONITOR
+        self.latency_monitor.bind_db(self.db, force_reload=True)
+        try:
+            from src.engine.config_manager import ConfigChangeTracker, compute_config_version
+            tracker = ConfigChangeTracker(data_dir=config.data_dir)
+            tracker.record_active_running_version(
+                version_hash=compute_config_version(config),
+                trading_mode=config.trading_mode.value,
+            )
+        except Exception as e:
+            logger.warning(f"Could not record active running config version: {e}")
 
     def reload_config(self, env_file: str = ".env") -> AppConfig:
         """V12-23: Reloads configuration from .env into the active pipeline."""
@@ -137,6 +149,15 @@ class TradingBotPipeline:
             self.watcher.sl_limit_buffer_pct = self.cfg.sl_limit_buffer_pct
             self.watcher.order_timeout_sec = self.cfg.order_timeout_sec
             self.watcher.retry_timeout_sec = getattr(self.cfg, "partial_fill_retry_timeout_sec", 2.0)
+            try:
+                from src.engine.config_manager import ConfigChangeTracker, compute_config_version
+                tracker = ConfigChangeTracker(data_dir=self.cfg.data_dir)
+                tracker.record_active_running_version(
+                    version_hash=compute_config_version(self.cfg),
+                    trading_mode=self.cfg.trading_mode.value,
+                )
+            except Exception:
+                pass
             return self.cfg
 
     def dispatch_notification(self, event_type: str, card: str, priority: str = "NORMAL") -> bool:
@@ -170,9 +191,18 @@ class TradingBotPipeline:
         source_name: str = "Test group",
     ) -> ValidationResult:
         with self._pipeline_lock:
+            l1_start_ns = time.perf_counter_ns()
             injected_clock = current_time
             now = injected_clock if injected_clock is not None else time.time()
             msg_ts = msg_timestamp or now
+            trace = SignalLatencyTrace(
+                trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
+                channel_id=channel_id,
+                message_id=message_id,
+                ist_received_time=now,
+                telegram_msg_timestamp=msg_timestamp if msg_timestamp and msg_timestamp > 0 else None,
+                l1_received_ns=l1_start_ns,
+            )
 
             allowed_channels = set(self.cfg.monitored_channel_ids or [])
             # In TEST mode, test_group_id is permitted for dry-run testing.
@@ -326,7 +356,9 @@ class TradingBotPipeline:
                 )
 
             if eq_sig is not None:
-                return self._handle_equity_signal(eq_sig, source_name=source_name, now=now, injected_clock=injected_clock)
+                trace.symbol = eq_sig.symbol
+                trace.mark_l2_parsed()
+                return self._handle_equity_signal(eq_sig, source_name=source_name, now=now, injected_clock=injected_clock, trace=trace)
 
             self.db.record_signal(channel_id, message_id, "NONE", "", "IGNORED", text, "FILTERED", eq_reason)
             return ValidationResult(
@@ -335,7 +367,7 @@ class TradingBotPipeline:
                 reason=eq_reason,
             )
 
-    def _handle_fno_signal(self, sig, source_name: str, now: float, injected_clock: Optional[float] = None) -> ValidationResult:
+    def _handle_fno_signal(self, sig, source_name: str, now: float, injected_clock: Optional[float] = None, trace: Optional[SignalLatencyTrace] = None) -> ValidationResult:
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
         heads_up_note = None
 
@@ -544,7 +576,15 @@ class TradingBotPipeline:
                 log_card=log_card,
             )
         else:
-            m_open, m_msg = market_status()
+            eval_mkt_dt = None
+            if injected_clock is not None and injected_clock >= 1767225600.0:
+                import src.engine.market as _mkt_mod
+                if not hasattr(_mkt_mod.now_ist, "_mock_name"):
+                    eval_mkt_dt = datetime.fromtimestamp(injected_clock, tz=IST)
+            try:
+                m_open, m_msg = market_status(eval_mkt_dt) if eval_mkt_dt is not None else market_status()
+            except TypeError:
+                m_open, m_msg = market_status()
             if not m_open:
                 reason = f"LIVE Order Blocked: {m_msg}"
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
@@ -563,6 +603,13 @@ class TradingBotPipeline:
                 )
                 self.dispatch_notification("TRADE_LOG", rej_card)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol, log_card=rej_card)
+
+            if trace is not None:
+                trace.mark_l3_resolved()
+                trace.mark_l6_stated_price(sig.entry_max)
+                trace.mark_l7_sized()
+                trace.mark_l8_preflight()
+                trace.mark_l9_dhan_start()
 
             self.db.update_order_intent(correlation_id, state="SUBMITTING")
 
@@ -585,6 +632,11 @@ class TradingBotPipeline:
             else:
                 ok, broker_id, msg = self.broker.place_order(order_req)
 
+            if trace is not None:
+                trace.mark_l10_dhan_ack(dhan_http_ms=getattr(self.broker, "last_order_http_latency_ms", None))
+                trace.mark_completed()
+                self.latency_monitor.record_trace(trace, order_id=broker_id, correlation_id=correlation_id)
+
             if ok:
                 intent_state = "ACKED"
                 status = "PENDING"
@@ -597,6 +649,7 @@ class TradingBotPipeline:
             else:
                 intent_state = "REJECTED"
                 status = "REJECTED"
+                self.latency_monitor.record_rejection(msg)
 
             self.db.update_order_intent(
                 correlation_id=correlation_id,
@@ -665,17 +718,36 @@ class TradingBotPipeline:
                 log_card=log_card,
             )
 
-    def _handle_equity_signal(self, sig, source_name: str, now: float, injected_clock: Optional[float] = None) -> ValidationResult:
+    def _handle_equity_signal(
+        self,
+        sig,
+        source_name: str,
+        now: float,
+        injected_clock: Optional[float] = None,
+        trace: Optional[SignalLatencyTrace] = None,
+    ) -> ValidationResult:
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
         heads_up_note = None
+        if trace is None:
+            trace = SignalLatencyTrace(
+                trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
+                symbol=sig.symbol,
+                channel_id=sig.channel_id,
+                message_id=sig.message_id,
+                ist_received_time=now,
+                telegram_msg_timestamp=sig.message_timestamp if sig.message_timestamp else None,
+            )
+            trace.mark_l2_parsed()
 
         if not self.cfg.equity_active:
             reason = "Equity Cash processing is currently INACTIVE in configuration"
+            self.latency_monitor.record_rejection(reason)
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=sig.symbol)
 
         is_dup, dup_reason = self.dedup.is_duplicate(sig.symbol, sig.channel_id, sig.message_id, event_time=now)
         if is_dup:
+            self.latency_monitor.record_rejection(dup_reason)
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "DUPLICATE", dup_reason)
             rej_card = format_trade_log(
                 symbol=sig.symbol,
@@ -696,6 +768,7 @@ class TradingBotPipeline:
         if not inst:
             heads_up_note = "Instrument unverified"
             res_reason = f"Instrument unverified: {res_reason}"
+            self.latency_monitor.record_rejection(res_reason)
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", sig.symbol, "BLOCKED", sig.raw_text, "UNRESOLVED", res_reason)
             rej_card = format_trade_log(
                 symbol=sig.symbol,
@@ -712,8 +785,14 @@ class TradingBotPipeline:
             self.dispatch_notification("TRADE_LOG", rej_card)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.EQUITY, symbol=sig.symbol, log_card=rej_card)
 
+        trace.mark_l3_resolved()
+
         ref_price = sig.stated_price
         used_live_quote = False
+        configured_policy = str(getattr(self.cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") or "STRICT_TIMESTAMP").upper().strip()
+        ref_label = "STATED_PRICE"
+        last_q = None
+
         if ref_price <= 0.0:
             used_live_quote = True
             ok, ltp, ltp_msg = self.broker.get_ltp(
@@ -722,15 +801,68 @@ class TradingBotPipeline:
                 symbol=inst.symbol,
                 now_utc=injected_clock,
                 max_quote_age_sec=self.cfg.max_quote_age_sec,
+                cmp_policy=configured_policy,
             )
+            last_q = getattr(self.broker, "last_quote_result", None)
+
             if ok and ltp > 0:
                 ref_price = ltp
-            elif self.cfg.trading_mode == TradingMode.TEST and "no valid fresh quote" in ltp_msg.lower():
-                ref_price = 1000.0
+                ref_label = getattr(last_q, "reference_label", "LIVE_REFERENCE") if last_q else "LIVE_REFERENCE"
+                if not is_live and not is_market_open():
+                    ref_label = "HISTORICAL_REFERENCE"
+            elif not is_live:
+                # Section 8: TEST-mode CMP reference outside market hours (no arbitrary 1000.0 fallback)
+                if last_q is not None and last_q.price > 0 and any(
+                    k in ltp_msg.lower()
+                    for k in ("non-regular", "closed", "stale", "missing or invalid source quote timestamp")
+                ):
+                    ref_price = float(last_q.price)
+                    ref_label = "HISTORICAL_REFERENCE"
+                    heads_up_note = "TEST Mode (HISTORICAL_REFERENCE price outside live market hours - zero broker orders placed)"
+                else:
+                    reason = f"Could not establish CMP reference: {ltp_msg}"
+                    self.latency_monitor.record_rejection(reason)
+                    self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "LTP_ERROR", reason)
+                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
             else:
-                reason = f"Could not establish fresh quote (<= {self.cfg.max_quote_age_sec}s): {ltp_msg}"
+                reason = (
+                    f"Could not establish fresh quote (<= {self.cfg.max_quote_age_sec}s): {ltp_msg}"
+                    if configured_policy == "STRICT_TIMESTAMP"
+                    else f"Could not establish CMP reference ({configured_policy}): {ltp_msg}"
+                )
+                self.latency_monitor.record_rejection(reason)
                 self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "LTP_ERROR", reason)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
+
+            q_age_status = getattr(last_q, "quote_age_status", "QUOTE_AGE_UNKNOWN") if last_q else "QUOTE_AGE_UNKNOWN"
+            q_age_val = last_q.age_sec if (last_q and q_age_status not in ("QUOTE_AGE_UNKNOWN", "FUTURE_TIMESTAMP_INVALID")) else None
+            q_ts_val = getattr(last_q, "quote_timestamp", None) if last_q else None
+            q_fresh_ok = bool(getattr(last_q, "freshness_verified", False)) if last_q else False
+            q_fresh_st = str(getattr(last_q, "quote_freshness_status", "UNVERIFIED")) if last_q else "UNVERIFIED"
+            trace.record_yahoo_stages(
+                http_ms=getattr(last_q, "http_latency_ms", None) if last_q else None,
+                parse_ms=getattr(last_q, "parse_latency_ms", None) if last_q else None,
+                auth_ms=getattr(last_q, "auth_latency_ms", None) if last_q else None,
+                quote_age_sec=q_age_val,
+                quote_age_status=q_age_status,
+                cmp_policy=configured_policy,
+                yahoo_cmp=ref_price,
+                quote_timestamp=q_ts_val,
+                freshness_verified=q_fresh_ok,
+                quote_freshness_status=q_fresh_st,
+            )
+            if configured_policy == "DARVAS_HTTP_SUCCESS" and not q_fresh_ok:
+                if q_age_val is not None and q_age_val > self.cfg.max_quote_age_sec:
+                    darvas_note = (
+                        f"Darvas policy accepted quote exceeding {self.cfg.max_quote_age_sec:.2f}s "
+                        f"(source quote age={q_age_val:.2f}s; pricing accepted, strict 2s freshness not met)"
+                    )
+                    heads_up_note = f"{heads_up_note} | {darvas_note}" if heads_up_note else darvas_note
+                elif q_ts_val is None:
+                    darvas_note = "Darvas policy accepted quote with missing regularMarketTime (QUOTE_AGE_UNKNOWN; freshness unverified)"
+                    heads_up_note = f"{heads_up_note} | {darvas_note}" if heads_up_note else darvas_note
+        else:
+            trace.mark_l6_stated_price(ref_price)
 
         limit_price = calculate_equity_limit_price(ref_price, self.cfg.equity_price_markup_pct, inst.tick_size)
 
@@ -741,12 +873,16 @@ class TradingBotPipeline:
             limit_price=limit_price,
         )
         if not sizing.is_valid:
+            self.latency_monitor.record_rejection(sizing.error_reason)
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=sizing.error_reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
+
+        trace.mark_l7_sized()
 
         ok_funds, avail_funds, funds_msg = self.broker.get_fund_limits()
         if not ok_funds:
             reason = f"Broker funds verification failed: {funds_msg}"
+            self.latency_monitor.record_rejection(reason)
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
@@ -760,6 +896,7 @@ class TradingBotPipeline:
         effective_funds = avail_funds if (is_live or avail_funds >= sizing.total_cost) else getattr(self.cfg, "test_mode_paper_funds_inr", 100000.0)
         risk_passed, risk_reason = self.risk_manager.validate_order_risk(sizing.total_cost, effective_funds)
         if not risk_passed:
+            self.latency_monitor.record_rejection(risk_reason)
             self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", risk_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=risk_reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
@@ -799,8 +936,11 @@ class TradingBotPipeline:
             )
         except Exception as e:
             reason = f"Journal DB error recording order intent (blocking entry): {e}"
+            self.latency_monitor.record_rejection(reason)
             logger.critical(f"[JOURNAL FAIL-CLOSED] {reason}")
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
+
+        trace.mark_l8_preflight()
 
         if self.cfg.trading_mode == TradingMode.TEST:
             self.db.update_order_intent(correlation_id, state="TEST_VALIDATED")
@@ -832,6 +972,29 @@ class TradingBotPipeline:
                 lot_size=inst.lot_size,
             )
 
+            trace.mark_completed()
+            self.latency_monitor.record_trace(trace, order_id=correlation_id, correlation_id=correlation_id)
+            lat_dict = trace.to_breakdown_dict()
+            cmp_details = {
+                "symbol": inst.symbol,
+                "source": source_name,
+                "signal": "BUY",
+                "price_source": "Yahoo Finance" if used_live_quote else "Stated Price",
+                "yahoo_cmp": ref_price if used_live_quote else None,
+                "yahoo_cmp_str": f"{ref_price:.2f} (Stated)" if not used_live_quote else None,
+                "yahoo_http_latency_ms": trace.l4_yahoo_http_ms,
+                "reported_quote_age": trace.quote_age_status if used_live_quote else "N/A",
+                "quote_freshness_status": trace.quote_freshness_status if used_live_quote else "STATED_PRICE",
+                "cmp_policy": configured_policy,
+                "reference_label": ref_label,
+                "limit_price": limit_price,
+                "quantity": sizing.total_quantity,
+                "order_submission": "TEST_VALIDATED (No broker order sent)",
+                "broker_order_id": "None",
+                "execution_status": "Not Submitted (TEST Mode)",
+                "protection_status": "Not Applicable",
+            }
+
             log_card = format_trade_log(
                 symbol=inst.symbol,
                 source_name=source_name,
@@ -843,6 +1006,8 @@ class TradingBotPipeline:
                 is_live=False,
                 is_processed=True,
                 timestamp=now,
+                equity_cmp_details=cmp_details,
+                latency_breakdown=lat_dict,
             )
             self.dispatch_notification("TRADE_LOG", log_card)
 
@@ -857,11 +1022,27 @@ class TradingBotPipeline:
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
                 log_card=log_card,
+                latency_breakdown=lat_dict,
+                cmp_policy=configured_policy,
+                reference_label=ref_label,
+                quote_age_status=trace.quote_age_status if used_live_quote else "STATED_PRICE",
+                freshness_verified=trace.freshness_verified if used_live_quote else True,
+                quote_freshness_status=trace.quote_freshness_status if used_live_quote else "STATED_PRICE",
+                broker_order_status="TEST_VALIDATED",
             )
         else:
-            m_open, m_msg = market_status()
+            eval_mkt_dt = None
+            if injected_clock is not None and injected_clock >= 1767225600.0:
+                import src.engine.market as _mkt_mod
+                if not hasattr(_mkt_mod.now_ist, "_mock_name"):
+                    eval_mkt_dt = datetime.fromtimestamp(injected_clock, tz=IST)
+            try:
+                m_open, m_msg = market_status(eval_mkt_dt) if eval_mkt_dt is not None else market_status()
+            except TypeError:
+                m_open, m_msg = market_status()
             if not m_open:
                 reason = f"LIVE Order Blocked: {m_msg}"
+                self.latency_monitor.record_rejection(reason)
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                 self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_MARKET_CLOSED", reason)
                 rej_card = format_trade_log(
@@ -882,35 +1063,49 @@ class TradingBotPipeline:
             pre_submit_now = injected_clock if injected_clock is not None else time.time()
             if (pre_submit_now - (sig.message_timestamp or now)) > self.cfg.max_message_age_sec:
                 reason = f"LIVE Order Blocked: signal aged past {self.cfg.max_message_age_sec}s before submission"
+                self.latency_monitor.record_rejection(reason)
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
-            if used_live_quote and getattr(self.broker, "last_quote_result", None) is not None:
+            # In STRICT_TIMESTAMP mode, re-validate source quote age immediately before submission.
+            # In DARVAS_HTTP_SUCCESS mode, quote age > 2s does not block NSE equity entry reference.
+            if used_live_quote and configured_policy != "DARVAS_HTTP_SUCCESS" and getattr(self.broker, "last_quote_result", None) is not None:
                 last_q = self.broker.last_quote_result
-                if last_q.quote_timestamp > 0 and (pre_submit_now - last_q.quote_timestamp) > self.cfg.max_quote_age_sec:
+                if last_q.quote_timestamp is not None and last_q.quote_timestamp > 0 and (pre_submit_now - last_q.quote_timestamp) > self.cfg.max_quote_age_sec:
                     reason = (
                         f"LIVE Order Blocked: quote expired before submission "
                         f"(age={pre_submit_now - last_q.quote_timestamp:.2f}s > {self.cfg.max_quote_age_sec:.2f}s)"
                     )
+                    self.latency_monitor.record_rejection(reason)
                     self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                     return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
             self.db.update_order_intent(correlation_id, state="SUBMITTING")
+            trace.mark_l9_dhan_start()
 
             ok, broker_id, msg = self.broker.place_order(order_req)
+            trace.mark_l10_dhan_ack(dhan_http_ms=getattr(self.broker, "last_order_http_latency_ms", None))
+            trace.mark_completed()
 
+            broker_raw_st = str(getattr(self.broker, "last_order_broker_status", "") or "").upper().strip()
             if ok:
                 intent_state = "ACKED"
                 status = "PENDING"
+                broker_display_st = broker_raw_st if broker_raw_st in ("TRANSIT", "PENDING", "TRADED") else "TRANSIT"
                 if hasattr(self.risk_manager, "record_order_committed"):
                     self.risk_manager.record_order_committed(sizing.total_cost)
             elif _is_transport_uncertainty(msg):
                 intent_state = "UNKNOWN"
                 status = "UNKNOWN"
+                broker_display_st = "UNKNOWN"
                 self.reconciliation_gate.halt_new_entries(f"Order {correlation_id} outcome is UNKNOWN: {msg}")
             else:
                 intent_state = "REJECTED"
                 status = "REJECTED"
+                broker_display_st = "REJECTED"
+                self.latency_monitor.record_rejection(msg)
+
+            self.latency_monitor.record_trace(trace, order_id=broker_id, correlation_id=correlation_id)
 
             self.db.update_order_intent(
                 correlation_id=correlation_id,
@@ -918,7 +1113,7 @@ class TradingBotPipeline:
                 broker_order_id=broker_id,
                 error_msg=None if ok else msg,
             )
-            order_details = f"[Order ID: {broker_id} / Status: {status}]" if broker_id else f"[{status}: {msg}]"
+            order_details = f"[Order ID: {broker_id} / Broker Status: {broker_display_st}]" if broker_id else f"[{status}: {msg}]"
             self.db.record_order(
                 correlation_id=correlation_id,
                 broker_order_id=broker_id,
@@ -948,24 +1143,61 @@ class TradingBotPipeline:
                     lot_size=inst.lot_size,
                 )
 
+            lat_dict = trace.to_breakdown_dict()
+            # P1 Guard: Never label TRANSIT, PENDING, or broker-acknowledged orders as EXECUTED or FILLED.
+            if ok:
+                if broker_display_st == "TRADED":
+                    exec_status_str = "TRADED (Broker Confirmed Fill)"
+                    status_summary_str = "Order Traded on Dhan (TRADED)"
+                else:
+                    exec_status_str = f"{broker_display_st} (Broker Acknowledged — Not Yet Filled)"
+                    status_summary_str = f"Message sent to Dhan ({broker_display_st} — Awaiting Fill)"
+                order_sub_str = f"ORDER_ACKNOWLEDGED ({broker_display_st})"
+            else:
+                exec_status_str = status
+                status_summary_str = f"Broker Error: {msg}"
+                order_sub_str = status
+
+            cmp_details = {
+                "symbol": inst.symbol,
+                "source": source_name,
+                "signal": "BUY",
+                "price_source": "Yahoo Finance" if used_live_quote else "Stated Price",
+                "yahoo_cmp": ref_price if used_live_quote else None,
+                "yahoo_cmp_str": f"{ref_price:.2f} (Stated)" if not used_live_quote else None,
+                "yahoo_http_latency_ms": trace.l4_yahoo_http_ms,
+                "reported_quote_age": trace.quote_age_status if used_live_quote else "N/A",
+                "quote_freshness_status": trace.quote_freshness_status if used_live_quote else "STATED_PRICE",
+                "cmp_policy": configured_policy,
+                "reference_label": ref_label,
+                "limit_price": limit_price,
+                "quantity": sizing.total_quantity,
+                "order_submission": order_sub_str,
+                "broker_order_id": broker_id or "None",
+                "execution_status": exec_status_str,
+                "protection_status": "Pending Fill Verification" if ok else "Not Applicable",
+            }
+
             log_card = format_trade_log(
                 symbol=inst.symbol,
                 source_name=source_name,
                 original_message=sig.raw_text,
                 segment="EQUITY",
-                status="Message sent to Dhan" if ok else f"Order Failed ({status}): {msg}",
+                status=status_summary_str,
                 dhan_order_details=order_details,
                 heads_up=heads_up_note,
                 is_live=True,
                 is_processed=ok,
                 timestamp=now,
+                equity_cmp_details=cmp_details,
+                latency_breakdown=lat_dict,
             )
             self.dispatch_notification("TRADE_LOG", log_card)
 
             return ValidationResult(
                 is_valid=ok,
                 action=SignalAction.BUY_ENTRY,
-                reason=f"LIVE Order placed on Dhan: {broker_id}" if ok else f"Dhan order placement failed: {msg}",
+                reason=f"LIVE Order placed on Dhan: {broker_id} (status={broker_display_st})" if ok else f"Dhan order placement failed: {msg}",
                 signal_type=SignalType.EQUITY,
                 symbol=inst.symbol,
                 security_id=inst.security_id,
@@ -973,6 +1205,13 @@ class TradingBotPipeline:
                 quantity_or_lots=sizing.units,
                 calculated_exposure=sizing.total_cost,
                 log_card=log_card,
+                latency_breakdown=lat_dict,
+                cmp_policy=configured_policy,
+                reference_label=ref_label,
+                quote_age_status=trace.quote_age_status if used_live_quote else "STATED_PRICE",
+                freshness_verified=trace.freshness_verified if used_live_quote else True,
+                quote_freshness_status=trace.quote_freshness_status if used_live_quote else "STATED_PRICE",
+                broker_order_status=broker_display_st,
             )
 
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=AuditBot V13 Daily Dhan TOTP Access Token Refresh & Health Probe
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=udit_raikhere11
+Group=udit_raikhere11
+WorkingDirectory=/home/udit_raikhere11/uditbot
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/udit_raikhere11/uditbot/bot daily_health_check
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=auditbot-token-refresh
