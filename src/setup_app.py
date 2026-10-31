@@ -222,59 +222,82 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border: 1px solid #334155;
     }
 
-    /* Next Steps Card */
-    .next-steps-card {
-      background: rgba(30, 41, 59, 0.5);
-      border: 1px solid #334155;
+    /* Operational Next Steps Guide (Scoped .guide-* to prevent layout disorientation) */
+    .guide-card {
+      background: #141c2e;
+      border: 1px solid #24324f;
       border-radius: 14px;
-      padding: 20px;
-      margin-bottom: 24px;
+      padding: 22px 24px;
+      margin-bottom: 26px;
+      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.25);
     }
-    .next-steps-title {
+    .guide-title {
       font-size: 15px;
-      font-weight: 600;
-      color: #f1f5f9;
+      font-weight: 700;
+      color: #38bdf8;
       display: flex;
       align-items: center;
-      gap: 8px;
-      margin-bottom: 14px;
+      gap: 10px;
+      margin-bottom: 18px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #1e293b;
     }
-    .steps-list {
+    .guide-list {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 16px;
     }
-    .step-item {
-      display: flex;
-      gap: 12px;
-      align-items: flex-start;
+    .guide-row {
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: flex-start !important;
+      text-align: left !important;
+      gap: 16px;
     }
-    .step-num {
-      width: 24px;
-      height: 24px;
-      background: #2563eb;
-      color: white;
+    .guide-num {
+      width: 28px;
+      height: 28px;
+      background: linear-gradient(135deg, #1d4ed8, #2563eb);
+      color: #ffffff;
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 700;
       flex-shrink: 0;
-      margin-top: 1px;
+      margin-top: 2px;
+      box-shadow: 0 2px 6px rgba(37, 99, 235, 0.4);
     }
-    .step-content h5 { font-size: 13px; font-weight: 600; color: #f8fafc; margin-bottom: 2px; }
-    .step-content p { font-size: 12px; color: #94a3b8; line-height: 1.4; }
-    .step-code {
+    .guide-body {
+      flex: 1;
+      text-align: left !important;
+    }
+    .guide-body h5 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #f8fafc;
+      margin-bottom: 3px;
+      text-align: left !important;
+    }
+    .guide-body p {
+      font-size: 12px;
+      color: #94a3b8;
+      line-height: 1.5;
+      margin: 0;
+      text-align: left !important;
+    }
+    .guide-code {
       display: inline-block;
-      background: #0d1321;
+      background: #090d16;
       border: 1px solid #1e293b;
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: monospace;
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       color: #38bdf8;
       font-size: 11px;
-      margin-top: 3px;
+      font-weight: 600;
+      margin-top: 4px;
     }
 
     .section-card {
@@ -476,11 +499,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     .stepper {
       display: flex;
+      width: 100%;
       justify-content: space-between;
       margin-bottom: 24px;
       position: relative;
     }
-    .step-item {
+    .stepper .step-item {
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -584,7 +608,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
       </div>
       <h1>Audit bot Setup &amp; Operations Control</h1>
-      <p class="subtitle">AuditBot Trading &amp; Safety System &mdash; Configure trading parameters, DhanHQ credentials, Telegram channels, and risk controls for Audit bot.</p>
+      <p class="subtitle">AuditBot Trading &amp; Safety Control Center &mdash; Configure trading parameters, DhanHQ credentials, Telegram channels, and risk controls for Audit bot.</p>
     </div>
 
     <!--SYSTEM_STATUS_BAR-->
@@ -1388,33 +1412,33 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
 
     # Always render the Next Steps card aligned with AuditBot CLI & systemd
     next_steps = f"""
-    <div class="next-steps-card">
-      <div class="next-steps-title">
+    <div class="guide-card">
+      <div class="guide-title">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
         Next Operational Steps: Running &amp; Verifying AuditBot
       </div>
-      <div class="steps-list">
-        <div class="step-item">
-          <div class="step-num">1</div>
-          <div class="step-content">
+      <div class="guide-list">
+        <div class="guide-row">
+          <div class="guide-num">1</div>
+          <div class="guide-body">
             <h5>Service Management &amp; Status Verification</h5>
-            <p>Inspect running status or restart the trading service via operator CLI:</p>
-            <div class="step-code">./bot status</div> &nbsp; <div class="step-code">./bot restart</div>
+            <p>Inspect running status or restart the trading service from your terminal:</p>
+            <div class="guide-code">./bot status</div> &nbsp; <div class="guide-code">./bot restart</div>
           </div>
         </div>
-        <div class="step-item">
-          <div class="step-num">2</div>
-          <div class="step-content">
+        <div class="guide-row">
+          <div class="guide-num">2</div>
+          <div class="guide-body">
             <h5>Live Telegram Ingestion &amp; Execution Logs</h5>
-            <p>Stream real-time signal parsing, Dhan order placement, and L1&ndash;L12 latency traces:</p>
-            <div class="step-code">./bot service-logs</div>
+            <p>Stream real-time Telegram signal parsing and order execution logs:</p>
+            <div class="guide-code">./bot service-logs</div>
           </div>
         </div>
-        <div class="step-item">
-          <div class="step-num">3</div>
-          <div class="step-content">
+        <div class="guide-row">
+          <div class="guide-num">3</div>
+          <div class="guide-body">
             <h5>Darvas CMP Execution &amp; Automated Protection</h5>
-            <p>Signals in monitored channels route via Darvas CMP (<code>{getattr(cfg, 'equity_cmp_execution_policy', 'DARVAS_HTTP_SUCCESS')}</code>). In <strong>TEST</strong> mode, simulated cards are logged safely; in <strong>LIVE</strong> mode, orders execute with verified Forever OCO / Super Order protection.</p>
+            <p>Signals in monitored channels route via Darvas market pricing (<code>{getattr(cfg, 'equity_cmp_execution_policy', 'DARVAS_HTTP_SUCCESS')}</code>). In <strong>TEST</strong> mode, simulated cards are logged safely; in <strong>LIVE</strong> mode, orders execute with verified Forever OCO / Super Order protection.</p>
           </div>
         </div>
       </div>
