@@ -1,0 +1,16 @@
+
+# AUDITBOT_RUNTIME_PRIVACY
+.env
+.env.*
+!.env.example
+/data/*
+!/data/holidays.json
+*.db
+*.db-wal
+*.db-shm
+*.session
+*.session-journal
+__pycache__/
+*.py[cod]
+venv/
+/FETCH_HEAD
