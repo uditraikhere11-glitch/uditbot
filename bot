@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # =====================================================================
 # PLATINUM / UDITBOT UNIFIED OPERATOR CLI ('bot')
-# V12-22 & V14 VM Rebuild Fix: Resolves symlinks (e.g. /usr/local/bin/bot),
-# changes into the application root directory, and exposes read-only VM audit,
-# encrypted runtime backup/restore, and session export helpers.
+# V12-22 Fix: Resolves symlinks (e.g. /usr/local/bin/bot) and changes
+# into the application root directory before executing commands.
 # =====================================================================
 set -e
 
@@ -65,24 +64,6 @@ case "${1:-}" in
         shift || true
         "$PYTHON" -m src.cli resume "$@"
         ;;
-    audit|audit-vm)
-        bash "${DIR}/deploy/audit_vm_state.sh"
-        ;;
-    backup|backup-runtime)
-        shift || true
-        bash "${DIR}/deploy/backup_runtime.sh" "$@"
-        ;;
-    restore|restore-runtime)
-        shift || true
-        bash "${DIR}/deploy/restore_runtime.sh" "$@"
-        ;;
-    install-services)
-        shift || true
-        bash "${DIR}/deploy/install_vm_services.sh" "${@:---plan}"
-        ;;
-    export-session)
-        "$PYTHON" -m src.tg_login --export-string
-        ;;
     start)
         sudo systemctl start trading_bot.service
         echo "trading_bot service started."
@@ -97,16 +78,6 @@ case "${1:-}" in
         ;;
     service-logs)
         sudo journalctl -u trading_bot.service -f
-        ;;
-    web-status)
-        systemctl status auditbot-web.service --no-pager
-        ;;
-    web-restart)
-        sudo systemctl restart auditbot-web.service
-        echo "auditbot-web service restarted."
-        ;;
-    web-logs)
-        sudo journalctl -u auditbot-web.service -f
         ;;
     live)
         echo "⚠️  SWITCHING TRADING_MODE TO LIVE"
@@ -151,21 +122,14 @@ case "${1:-}" in
         echo "  bot setup               Run interactive terminal setup wizard"
         echo "  bot web                 Launch localhost setup web interface (127.0.0.1:8080)"
         echo "  bot journal [n]         View last n signal evaluation records"
-        echo "  bot audit               Read-only VM & systemd drift audit"
-        echo "  bot backup <out.gpg>    Create encrypted off-VM runtime backup"
-        echo "  bot restore <in.gpg>    Restore encrypted runtime backup (forces TEST)"
-        echo "  bot export-session      Export data/tg_userbot.session to TG_SESSION_STRING in .env"
         echo "  bot live                Switch master mode to LIVE (requires confirmation)"
         echo "  bot test                Switch master mode to TEST"
         echo "  bot emergency-stop      Halt all new trade entries immediately"
         echo "  bot resume              Resume normal trading operations"
-        echo "  bot start               Start trading_bot systemd service"
-        echo "  bot stop                Stop trading_bot systemd service"
-        echo "  bot restart             Restart trading_bot systemd service"
-        echo "  bot service-logs        Watch trading_bot systemd service logs live"
-        echo "  bot web-status          Check auditbot-web systemd service status"
-        echo "  bot web-restart         Restart auditbot-web systemd service"
-        echo "  bot web-logs            Watch auditbot-web systemd service logs live"
+        echo "  bot start               Start systemd service"
+        echo "  bot stop                Stop systemd service"
+        echo "  bot restart             Restart systemd service"
+        echo "  bot service-logs        Watch systemd service logs live"
         echo "======================================================="
         ;;
 esac
