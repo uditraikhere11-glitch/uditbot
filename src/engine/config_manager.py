@@ -1084,8 +1084,16 @@ def execute_configuration_update(
             restart_ok = False
     elif not is_isolated_test_environment():
         try:
-            res = subprocess.run(["sudo", "systemctl", "restart", "trading_bot.service"], capture_output=True, timeout=8)
+            systemctl_bin = "/usr/bin/systemctl" if os.path.exists("/usr/bin/systemctl") else "systemctl"
+            res = subprocess.run(
+                ["sudo", "-n", systemctl_bin, "restart", "trading_bot.service"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
             restart_ok = (res.returncode == 0)
+            if not restart_ok and res.stderr:
+                logger.warning(f"systemctl restart stderr: {res.stderr.strip()[:200]}")
         except Exception as e:
             logger.warning(f"systemctl restart exception: {e}")
             restart_ok = False
