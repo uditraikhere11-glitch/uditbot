@@ -30,6 +30,7 @@ from src.models import (
 from src.parsers.equity_parser import parse_equity_regex, filter_equity_message
 from src.parsers.fno_parser import parse_fno_regex, looks_like_option
 from src.parsers.gemini_fallback import parse_fno_gemini_sync, parse_equity_gemini_sync
+from src.parsers.brain import parse_signal_brain
 from src.parsers.duplicate_filter import DuplicateFilter
 from src.instruments.resolver import InstrumentResolver
 from src.engine.sizer import (
@@ -44,6 +45,9 @@ from src.engine.risk_manager import RiskManager
 from src.journal.db import JournalDB, generate_correlation_id
 from src.broker.dhan_client import DhanClient
 from src.notifier.formatter import format_trade_log, format_exit_log
+from src.notifier.execution_updates import (
+    OrderStatusReporter, format_order_submitted, format_order_failed,
+)
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.engine.reconciliation import StartupReconciliationGate
 
@@ -118,6 +122,7 @@ class TradingBotPipeline:
             retry_timeout_sec=getattr(config, "partial_fill_retry_timeout_sec", 2.0),
             risk_manager=self.risk_manager,
         )
+        self.watcher.execution_reporter = OrderStatusReporter(self.db, self.broker)
         self.reconciliation_gate = StartupReconciliationGate(
             broker=self.broker,
             journal_db=self.db,
@@ -189,6 +194,7 @@ class TradingBotPipeline:
         msg_timestamp: float = 0.0,
         current_time: Optional[float] = None,
         source_name: str = "Test group",
+        signal_received_at: Optional[float] = None,
     ) -> ValidationResult:
         with self._pipeline_lock:
             l1_start_ns = time.perf_counter_ns()
@@ -199,7 +205,7 @@ class TradingBotPipeline:
                 trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
                 channel_id=channel_id,
                 message_id=message_id,
-                ist_received_time=now,
+                ist_received_time=signal_received_at if signal_received_at is not None else now,
                 telegram_msg_timestamp=msg_timestamp if msg_timestamp and msg_timestamp > 0 else None,
                 l1_received_ns=l1_start_ns,
             )
@@ -271,65 +277,84 @@ class TradingBotPipeline:
                 self.dispatch_notification("TRADE_LOG", log_card)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
 
-            if looks_like_option(text):
-                fno_sig, fno_reason, fno_action = parse_fno_regex(
-                    text, channel_id=channel_id, message_id=message_id,
-                    msg_timestamp=msg_ts, max_age_sec=self.cfg.max_message_age_sec,
-                    current_time=now,
-                )
+            decision = parse_signal_brain(
+                text=text,
+                channel_id=channel_id,
+                message_id=message_id,
+                msg_timestamp=msg_ts,
+                max_age_sec=self.cfg.max_message_age_sec,
+                current_time=injected_clock if injected_clock is not None else now,
+                journal_db=self.db,
+            )
+            prov_kwargs = {
+                "parser_version": decision.parser_version,
+                "parse_source": decision.source,
+                "rule_id": decision.rule_id,
+                "model_name": decision.model_name or "",
+                "reason_code": decision.reason_code,
+                "parse_latency_ms": decision.parse_latency_ms,
+                "evidence": decision.evidence,
+            }
 
-                if fno_action == SignalAction.EXIT_SIGNAL:
-                    self.db.record_signal(channel_id, message_id, "OPTION", "", "EXIT_SIGNAL", text, "LOGGED_NO_ACTION", fno_reason)
+            if decision.route == "OPTION":
+                if decision.action == SignalAction.EXIT_SIGNAL:
+                    self.db.record_signal(channel_id, message_id, "OPTION", "", "EXIT_SIGNAL", text, "LOGGED_NO_ACTION", decision.reason, **prov_kwargs)
                     exit_card = format_exit_log(
                         symbol="OPTION",
                         source_name=source_name,
                         original_message=text,
                         segment="FNO",
-                        reason=fno_reason,
+                        reason=decision.reason,
                         is_live=is_live,
                         timestamp=now,
                     )
                     self.dispatch_notification("TRADE_LOG", exit_card)
-                    return ValidationResult(is_valid=False, action=SignalAction.EXIT_SIGNAL, reason=fno_reason, signal_type=SignalType.OPTION, log_card=exit_card)
+                    return ValidationResult(is_valid=False, action=SignalAction.EXIT_SIGNAL, reason=decision.reason, signal_type=SignalType.OPTION, log_card=exit_card)
 
-                if fno_action == SignalAction.BLOCKED:
-                    self.db.record_signal(channel_id, message_id, "OPTION", "", "BLOCKED", text, "REJECTED", fno_reason)
+                if decision.action == SignalAction.BLOCKED:
+                    self.db.record_signal(channel_id, message_id, "OPTION", "", "BLOCKED", text, "REJECTED", decision.reason, **prov_kwargs)
                     rej_card = format_trade_log(
                         symbol="OPTION",
                         source_name=source_name,
                         original_message=text,
                         segment="FNO",
-                        status=f"Rejected: {fno_reason}",
+                        status=f"Rejected: {decision.reason}",
                         dhan_order_details="None (Blocked by parser validation)",
-                        heads_up=fno_reason,
+                        heads_up=decision.reason,
                         is_live=is_live,
                         is_processed=False,
                         timestamp=now,
                     )
                     self.dispatch_notification("TRADE_LOG", rej_card)
-                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=fno_reason, signal_type=SignalType.OPTION, log_card=rej_card)
+                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=decision.reason, signal_type=SignalType.OPTION, log_card=rej_card)
 
-                if fno_sig is None and fno_action == SignalAction.IGNORED:
-                    fno_sig = parse_fno_gemini_sync(
-                        text, channel_id=channel_id, message_id=message_id,
-                        msg_timestamp=msg_ts, max_age_sec=self.cfg.max_message_age_sec,
-                        current_time=injected_clock,
-                    )
+                if decision.fno_signal is not None:
+                    post_now = (injected_clock + (decision.parse_latency_ms / 1000.0)) if injected_clock is not None else time.time()
+                    if (post_now - msg_ts) > self.cfg.max_message_age_sec:
+                        stale_reason = f"Signal aged past max_message_age_sec ({post_now - msg_ts:.1f}s > {self.cfg.max_message_age_sec}s) after BRAIN parsing"
+                        prov_kwargs["reason_code"] = "MESSAGE_TOO_OLD"
+                        self.db.record_signal(channel_id, message_id, "OPTION", decision.fno_signal.symbol, "BLOCKED", text, "REJECTED", stale_reason, **prov_kwargs)
+                        return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=stale_reason, signal_type=SignalType.OPTION)
+                    trace.symbol = decision.fno_signal.symbol
+                    trace.mark_l2_parsed()
+                    return self._handle_fno_signal(decision.fno_signal, source_name=source_name, now=post_now, injected_clock=injected_clock, trace=trace, notification_received_at=signal_received_at)
 
-                if fno_sig is not None:
-                    return self._handle_fno_signal(fno_sig, source_name=source_name, now=now, injected_clock=injected_clock)
+                self.db.record_signal(channel_id, message_id, "OPTION", "", "IGNORED", text, "FILTERED", decision.reason, **prov_kwargs)
+                return ValidationResult(
+                    is_valid=False,
+                    action=SignalAction.IGNORED,
+                    reason=decision.reason,
+                    signal_type=SignalType.OPTION,
+                )
 
-            eq_passed, eq_filter_reason, eq_action = filter_equity_message(
-                text, msg_timestamp=msg_ts, max_age_sec=self.cfg.max_message_age_sec, current_time=now
-            )
-            if not eq_passed and eq_action == SignalAction.EXIT_SIGNAL:
-                self.db.record_signal(channel_id, message_id, "EQUITY", "", "EXIT_SIGNAL", text, "LOGGED_NO_ACTION", eq_filter_reason)
+            if decision.route == "EQUITY" and decision.action == SignalAction.EXIT_SIGNAL:
+                self.db.record_signal(channel_id, message_id, "EQUITY", "", "EXIT_SIGNAL", text, "LOGGED_NO_ACTION", decision.reason, **prov_kwargs)
                 exit_card = format_exit_log(
                     symbol="EQUITY",
                     source_name=source_name,
                     original_message=text,
                     segment="EQUITY",
-                    reason=eq_filter_reason,
+                    reason=decision.reason,
                     is_live=is_live,
                     timestamp=now,
                 )
@@ -337,37 +362,35 @@ class TradingBotPipeline:
                 return ValidationResult(
                     is_valid=False,
                     action=SignalAction.EXIT_SIGNAL,
-                    reason=eq_filter_reason,
+                    reason=decision.reason,
                     signal_type=SignalType.EQUITY,
                     log_card=exit_card,
                 )
 
-            eq_sig, eq_reason = parse_equity_regex(
-                text, channel_id=channel_id, message_id=message_id,
-                msg_timestamp=msg_ts, max_age_sec=self.cfg.max_message_age_sec,
-                current_time=now,
-            )
-
-            if eq_sig is None and eq_passed:
-                eq_sig = parse_equity_gemini_sync(
-                    text, channel_id=channel_id, message_id=message_id,
-                    msg_timestamp=msg_ts, max_age_sec=self.cfg.max_message_age_sec,
-                    current_time=injected_clock,
-                )
-
-            if eq_sig is not None:
-                trace.symbol = eq_sig.symbol
+            if decision.equity_signal is not None:
+                post_now = (injected_clock + (decision.parse_latency_ms / 1000.0)) if injected_clock is not None else time.time()
+                if (post_now - msg_ts) > self.cfg.max_message_age_sec:
+                    stale_reason = f"Signal aged past max_message_age_sec ({post_now - msg_ts:.1f}s > {self.cfg.max_message_age_sec}s) after BRAIN parsing"
+                    prov_kwargs["reason_code"] = "MESSAGE_TOO_OLD"
+                    self.db.record_signal(channel_id, message_id, "EQUITY", decision.equity_signal.symbol, "BLOCKED", text, "REJECTED", stale_reason, **prov_kwargs)
+                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=stale_reason, signal_type=SignalType.EQUITY)
+                trace.symbol = decision.equity_signal.symbol
                 trace.mark_l2_parsed()
-                return self._handle_equity_signal(eq_sig, source_name=source_name, now=now, injected_clock=injected_clock, trace=trace)
+                return self._handle_equity_signal(decision.equity_signal, source_name=source_name, now=post_now, injected_clock=injected_clock, trace=trace)
 
-            self.db.record_signal(channel_id, message_id, "NONE", "", "IGNORED", text, "FILTERED", eq_reason)
+            rec_type = "EQUITY" if decision.route == "EQUITY" else "NONE"
+            rec_act = decision.action.value
+            rec_stat = "REJECTED" if decision.action == SignalAction.BLOCKED else "FILTERED"
+            self.db.record_signal(channel_id, message_id, rec_type, "", rec_act, text, rec_stat, decision.reason, **prov_kwargs)
             return ValidationResult(
                 is_valid=False,
-                action=SignalAction.IGNORED,
-                reason=eq_reason,
+                action=decision.action,
+                reason=decision.reason,
+                signal_type=SignalType.EQUITY if decision.route == "EQUITY" else None,
             )
 
-    def _handle_fno_signal(self, sig, source_name: str, now: float, injected_clock: Optional[float] = None, trace: Optional[SignalLatencyTrace] = None) -> ValidationResult:
+    def _handle_fno_signal(self, sig, source_name: str, now: float, injected_clock: Optional[float] = None, trace: Optional[SignalLatencyTrace] = None, notification_received_at: Optional[float] = None) -> ValidationResult:
+        fno_received_at = notification_received_at if notification_received_at is not None else now
         is_live = (self.cfg.trading_mode == TradingMode.LIVE)
         heads_up_note = None
 
@@ -409,6 +432,9 @@ class TradingBotPipeline:
             expiry_day=getattr(sig, "expiry_day", None),
             reference_date=ref_date,
         )
+        if contract is not None and trace is not None:
+            trace.mark_l3_resolved()
+            trace.mark_l6_stated_price(sig.entry_max)
 
         if not contract:
             heads_up_note = "Instrument unverified"
@@ -443,6 +469,8 @@ class TradingBotPipeline:
         if not sizing.is_valid:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=sizing.error_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
+        if trace is not None:
+            trace.mark_l7_sized()
 
         ok_funds, avail_funds, funds_msg = self.broker.get_fund_limits()
         if not ok_funds:
@@ -462,6 +490,8 @@ class TradingBotPipeline:
         if not risk_passed:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_RISK", risk_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=risk_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
+        if trace is not None:
+            trace.mark_l8_preflight()
 
         if is_live and not hasattr(self.broker, "place_super_order"):
             reason = "Entry blocked: MARGIN options require supported Super Order protection route (Forever OCO unsupported for MARGIN)"
@@ -604,11 +634,22 @@ class TradingBotPipeline:
                 self.dispatch_notification("TRADE_LOG", rej_card)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol, log_card=rej_card)
 
+            pre_submit_now = injected_clock if injected_clock is not None else time.time()
+            if (pre_submit_now - (sig.message_timestamp or now)) > self.cfg.max_message_age_sec:
+                reason = f"LIVE Order Blocked: signal aged past {self.cfg.max_message_age_sec}s before submission"
+                self.latency_monitor.record_rejection(reason)
+                self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
+
             if trace is not None:
-                trace.mark_l3_resolved()
-                trace.mark_l6_stated_price(sig.entry_max)
-                trace.mark_l7_sized()
-                trace.mark_l8_preflight()
+                if trace.l3_resolved_ns is None:
+                    trace.mark_l3_resolved()
+                if trace.l6_cmp_auth_ns is None:
+                    trace.mark_l6_stated_price(sig.entry_max)
+                if trace.l7_sized_ns is None:
+                    trace.mark_l7_sized()
+                if trace.l8_preflight_ns is None:
+                    trace.mark_l8_preflight()
                 trace.mark_l9_dhan_start()
 
             self.db.update_order_intent(correlation_id, state="SUBMITTING")
@@ -689,6 +730,11 @@ class TradingBotPipeline:
                     option_type=contract.option_type,
                     strike=contract.strike,
                     expiry=contract.expiry,
+                    notification_meta={
+                        "symbol": sig.symbol, "source": source_name,
+                        "segment": "FNO", "action": "BUY", "mode": "LIVE",
+                        "limit_price": limit_price, "signal_received_at": fno_received_at,
+                    },
                 )
 
             log_card = format_trade_log(
@@ -703,7 +749,20 @@ class TradingBotPipeline:
                 is_processed=ok,
                 timestamp=now,
             )
-            self.dispatch_notification("TRADE_LOG", log_card)
+            user_card = (
+                format_order_submitted({
+                    "symbol": sig.symbol, "source": source_name,
+                    "segment": "FNO", "action": "BUY", "mode": "LIVE",
+                    "limit_price": limit_price, "signal_received_at": fno_received_at,
+                }, sizing.total_quantity)
+                if ok and broker_id else
+                format_order_failed({
+                    "symbol": sig.symbol, "source": source_name,
+                    "segment": "FNO", "action": "BUY", "mode": "LIVE",
+                    "limit_price": limit_price, "signal_received_at": fno_received_at,
+                }, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
+            )
+            self.dispatch_notification("TRADE_LOG", user_card)
 
             return ValidationResult(
                 is_valid=ok,
@@ -1141,6 +1200,15 @@ class TradingBotPipeline:
                     original_market_price=ref_price,
                     tick_size=inst.tick_size,
                     lot_size=inst.lot_size,
+                    notification_meta={
+                        "symbol": inst.symbol, "source": source_name,
+                        "segment": "EQUITY", "action": "BUY", "mode": "LIVE",
+                        "yahoo_cmp": ref_price if used_live_quote else None,
+                        "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
+                        "quote_threshold_sec": self.cfg.max_quote_age_sec,
+                        "quote_accepted": True,
+                        "limit_price": limit_price, "signal_received_at": trace.ist_received_time,
+                    },
                 )
 
             lat_dict = trace.to_breakdown_dict()
@@ -1192,7 +1260,28 @@ class TradingBotPipeline:
                 equity_cmp_details=cmp_details,
                 latency_breakdown=lat_dict,
             )
-            self.dispatch_notification("TRADE_LOG", log_card)
+            user_card = (
+                format_order_submitted({
+                    "symbol": inst.symbol, "source": source_name,
+                    "segment": "EQUITY", "action": "BUY", "mode": "LIVE",
+                    "yahoo_cmp": ref_price if used_live_quote else None,
+                    "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
+                    "quote_threshold_sec": self.cfg.max_quote_age_sec,
+                    "quote_accepted": True, "limit_price": limit_price,
+                    "signal_received_at": trace.ist_received_time,
+                }, sizing.total_quantity)
+                if ok and broker_id else
+                format_order_failed({
+                    "symbol": inst.symbol, "source": source_name,
+                    "segment": "EQUITY", "action": "BUY", "mode": "LIVE",
+                    "yahoo_cmp": ref_price if used_live_quote else None,
+                    "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
+                    "quote_threshold_sec": self.cfg.max_quote_age_sec,
+                    "quote_accepted": True, "limit_price": limit_price,
+                    "signal_received_at": trace.ist_received_time,
+                }, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
+            )
+            self.dispatch_notification("TRADE_LOG", user_card)
 
             return ValidationResult(
                 is_valid=ok,
