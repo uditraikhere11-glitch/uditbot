@@ -108,7 +108,14 @@ class JournalDB:
                 raw_text TEXT,
                 received_at REAL,
                 status TEXT,
-                reason TEXT
+                reason TEXT,
+                parser_version TEXT DEFAULT '',
+                parse_source TEXT DEFAULT '',
+                rule_id TEXT DEFAULT '',
+                model_name TEXT DEFAULT '',
+                reason_code TEXT DEFAULT '',
+                parse_latency_ms REAL DEFAULT 0.0,
+                evidence_json TEXT DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS signal_claims (
@@ -267,6 +274,14 @@ class JournalDB:
                 updated_at REAL NOT NULL
             );
 
+            -- Atomic one-time logical event claim + outbox delivery.
+            CREATE TABLE IF NOT EXISTS order_notification_events (
+                order_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (order_id, event_key)
+            );
+
             CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
@@ -343,6 +358,68 @@ class JournalDB:
                 count INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS parser_rule_candidates (
+                rule_id TEXT PRIMARY KEY,
+                route TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'PROPOSED',
+                proposed_by TEXT DEFAULT 'operator',
+                approved_by TEXT DEFAULT '',
+                sample_positives_json TEXT DEFAULT '[]',
+                sample_negatives_json TEXT DEFAULT '[]',
+                eval_summary_json TEXT DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS parser_rule_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                route TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'PROPOSED',
+                proposed_by TEXT DEFAULT 'operator',
+                approved_by TEXT DEFAULT '',
+                sample_positives_json TEXT DEFAULT '[]',
+                sample_negatives_json TEXT DEFAULT '[]',
+                eval_summary_json TEXT DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(rule_id, version)
+            );
+
+            CREATE TABLE IF NOT EXISTS parser_rule_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                old_state TEXT DEFAULT '',
+                new_state TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                notes TEXT DEFAULT '',
+                eval_summary_json TEXT DEFAULT '{}',
+                created_at REAL NOT NULL
+            );
+            """)
+            # Once proposed, version definitions and their original corpus are write-once.
+            # State, evaluation, approval and restoration events live in the append-only review log.
+            conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS trg_parser_rule_versions_no_update
+            BEFORE UPDATE ON parser_rule_versions
+            BEGIN SELECT RAISE(ABORT, 'parser_rule_versions snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_parser_rule_versions_no_delete
+            BEFORE DELETE ON parser_rule_versions
+            BEGIN SELECT RAISE(ABORT, 'parser_rule_versions snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_parser_rule_reviews_no_update
+            BEFORE UPDATE ON parser_rule_reviews
+            BEGIN SELECT RAISE(ABORT, 'parser_rule_reviews history is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_parser_rule_reviews_no_delete
+            BEFORE DELETE ON parser_rule_reviews
+            BEGIN SELECT RAISE(ABORT, 'parser_rule_reviews history is append-only'); END;
             """)
             # Idempotent additive schema migrations for existing databases
             for alter_sql in [
@@ -368,6 +445,13 @@ class JournalDB:
                 "ALTER TABLE outbox ADD COLUMN retry_count INTEGER DEFAULT 0",
                 "ALTER TABLE outbox ADD COLUMN next_retry_at REAL DEFAULT 0.0",
                 "ALTER TABLE outbox ADD COLUMN last_error TEXT",
+                "ALTER TABLE signals ADD COLUMN parser_version TEXT DEFAULT ''",
+                "ALTER TABLE signals ADD COLUMN parse_source TEXT DEFAULT ''",
+                "ALTER TABLE signals ADD COLUMN rule_id TEXT DEFAULT ''",
+                "ALTER TABLE signals ADD COLUMN model_name TEXT DEFAULT ''",
+                "ALTER TABLE signals ADD COLUMN reason_code TEXT DEFAULT ''",
+                "ALTER TABLE signals ADD COLUMN parse_latency_ms REAL DEFAULT 0.0",
+                "ALTER TABLE signals ADD COLUMN evidence_json TEXT DEFAULT '{}'",
             ]:
                 try:
                     conn.execute(alter_sql)
@@ -920,6 +1004,29 @@ class JournalDB:
 
     # --- Outbox for Durable Notifications (Step 16) ---
 
+    def enqueue_order_notification_once(self, order_id: str, event_key: str, text: str) -> bool:
+        """Atomically claim event and queue Telegram notice. False means already queued.
+
+        The existing outbox worker is at-least-once; Telegram transport may still
+        produce a duplicate after a crash between send and outbox acknowledgement.
+        """
+        if not order_id or not event_key or not text:
+            raise ValueError("Missing order notification identity or body")
+        now = time.time()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO order_notification_events (order_id,event_key,created_at) VALUES (?,?,?)",
+                (str(order_id), str(event_key), now),
+            )
+            if not cur.rowcount:
+                return False
+            conn.execute(
+                "INSERT INTO outbox (event_type,payload,status,retry_count,next_retry_at,created_at) "
+                "VALUES ('ORDER_STATUS_UPDATE', ?, 'PENDING', 0, 0.0, ?)",
+                (json.dumps({"text": text, "event_type": "ORDER_STATUS_UPDATE", "timestamp": now}), now),
+            )
+            return True
+
     def enqueue_outbox(self, event_type: str, payload: Dict[str, Any]) -> int:
         now = time.time()
         with self._get_conn() as conn:
@@ -983,14 +1090,43 @@ class JournalDB:
         raw_text: str,
         status: str,
         reason: str,
+        parser_version: str = "",
+        parse_source: str = "",
+        rule_id: str = "",
+        model_name: str = "",
+        reason_code: str = "",
+        parse_latency_ms: float = 0.0,
+        evidence: Optional[Dict[str, Any]] = None,
     ) -> int:
+        ev_json = json.dumps(evidence or {})
         with self._get_conn() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO signals (channel_id, message_id, signal_type, symbol, action, raw_text, received_at, status, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO signals (
+                    channel_id, message_id, signal_type, symbol, action, raw_text, received_at,
+                    status, reason, parser_version, parse_source, rule_id, model_name,
+                    reason_code, parse_latency_ms, evidence_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (channel_id, message_id, signal_type, symbol, action, raw_text, time.time(), status, reason)
+                (
+                    channel_id,
+                    message_id,
+                    signal_type,
+                    symbol,
+                    action,
+                    raw_text,
+                    time.time(),
+                    status,
+                    reason,
+                    str(parser_version or ""),
+                    str(parse_source or ""),
+                    str(rule_id or ""),
+                    str(model_name or ""),
+                    str(reason_code or ""),
+                    float(parse_latency_ms or 0.0),
+                    ev_json,
+                ),
             )
             return cur.lastrowid
 
@@ -1410,3 +1546,329 @@ class JournalDB:
                 "rejection_reasons": rejs,
                 "trace_rows": trace_dicts,
             }
+
+
+    # --- Audited Adaptive Parser Rule Lifecycle with Immutable Version Retention (Module 2 BRAIN v2) ---
+
+    def create_or_update_parser_rule(
+        self,
+        rule_id: str,
+        route: str,
+        pattern: str,
+        description: str = "",
+        proposed_by: str = "operator",
+        sample_positives: Optional[List[Any]] = None,
+        sample_negatives: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        clean_id = rule_id.strip().upper()
+        clean_route = route.strip().upper()
+        pos_json = json.dumps(list(sample_positives or []))
+        neg_json = json.dumps(list(sample_negatives or []))
+
+        with self._get_conn() as conn:
+            max_ver_row = conn.execute(
+                "SELECT MAX(version) AS mv FROM parser_rule_versions WHERE rule_id = ?",
+                (clean_id,),
+            ).fetchone()
+            existing = conn.execute(
+                "SELECT * FROM parser_rule_candidates WHERE rule_id = ?",
+                (clean_id,),
+            ).fetchone()
+
+            if existing or (max_ver_row and max_ver_row["mv"] is not None):
+                base_ver = max(
+                    int(existing["version"]) if existing else 0,
+                    int(max_ver_row["mv"] or 0) if max_ver_row else 0,
+                )
+                new_ver = base_ver + 1
+                old_state = str(existing["state"]) if existing else ""
+                conn.execute(
+                    """
+                    UPDATE parser_rule_candidates
+                    SET route = ?, pattern = ?, description = ?, version = ?,
+                        state = 'PROPOSED', proposed_by = ?, approved_by = '',
+                        sample_positives_json = ?, sample_negatives_json = ?,
+                        eval_summary_json = '{}', updated_at = ?
+                    WHERE rule_id = ?
+                    """,
+                    (clean_route, pattern, description, new_ver, proposed_by, pos_json, neg_json, now, clean_id),
+                )
+            else:
+                new_ver = 1
+                old_state = ""
+                conn.execute(
+                    """
+                    INSERT INTO parser_rule_candidates
+                    (rule_id, route, pattern, description, version, state, proposed_by, approved_by,
+                     sample_positives_json, sample_negatives_json, eval_summary_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, 'PROPOSED', ?, '', ?, ?, '{}', ?, ?)
+                    """,
+                    (clean_id, clean_route, pattern, description, proposed_by, pos_json, neg_json, now, now),
+                )
+
+            # Retain immutable snapshot in parser_rule_versions
+            conn.execute(
+                """
+                INSERT INTO parser_rule_versions
+                (rule_id, version, route, pattern, description, state, proposed_by, approved_by,
+                 sample_positives_json, sample_negatives_json, eval_summary_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'PROPOSED', ?, '', ?, ?, '{}', ?, ?)
+                """,
+                (clean_id, new_ver, clean_route, pattern, description, proposed_by, pos_json, neg_json, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO parser_rule_reviews
+                (rule_id, version, old_state, new_state, actor, notes, eval_summary_json, created_at)
+                VALUES (?, ?, ?, 'PROPOSED', ?, ?, '{}', ?)
+                """,
+                (clean_id, new_ver, old_state, proposed_by, f"Proposed immutable version v{new_ver}", now),
+            )
+        return self.get_parser_rule(clean_id) or {}
+
+    _VALID_RULE_STATES = frozenset({
+        "DRAFT", "PROPOSED", "EVALUATED", "APPROVED", "ACTIVE", "ROLLED_BACK", "REJECTED",
+    })
+
+    @classmethod
+    def _project_rule_version(cls, conn: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, Any]:
+        """Project effective lifecycle state from append-only events; do not mutate snapshots."""
+        d = cls._row_to_parser_rule(row)
+        events = conn.execute(
+            "SELECT new_state, actor, eval_summary_json FROM parser_rule_reviews "
+            "WHERE rule_id = ? AND version = ? ORDER BY id ASC",
+            (d['rule_id'], d['version']),
+        ).fetchall()
+        for e in events:
+            if e['new_state'] == 'EVALUATED':
+                try:
+                    d['eval_summary'] = json.loads(e['eval_summary_json'] or '{}')
+                except (ValueError, TypeError):
+                    d['eval_summary'] = {}
+            if e['new_state'] == 'APPROVED':
+                d['approved_by'] = e['actor']
+            projected = 'APPROVED' if e['new_state'] == 'RESTORED_APPROVED' else str(e['new_state'] or '')
+            d['state'] = projected if projected in cls._VALID_RULE_STATES else 'REJECTED'
+        if d.get('state') not in cls._VALID_RULE_STATES:
+            d['state'] = 'REJECTED'
+        return d
+
+    def get_parser_rule(self, rule_id: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        clean_id = (rule_id or "").strip().upper()
+        with self._get_conn() as conn:
+            if version is not None:
+                row = conn.execute(
+                    "SELECT * FROM parser_rule_versions WHERE rule_id = ? AND version = ?",
+                    (clean_id, int(version)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM parser_rule_candidates WHERE rule_id = ?",
+                    (clean_id,),
+                ).fetchone()
+            if not row:
+                return None
+            return self._project_rule_version(conn, row) if version is not None else self._row_to_parser_rule(row)
+
+    def get_parser_rule_versions(self, rule_id: str) -> List[Dict[str, Any]]:
+        clean_id = (rule_id or "").strip().upper()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM parser_rule_versions WHERE rule_id = ? ORDER BY version ASC",
+                (clean_id,),
+            ).fetchall()
+            return [self._project_rule_version(conn, r) for r in rows]
+
+    def list_parser_rules(
+        self,
+        route: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM parser_rule_candidates WHERE 1=1"
+        params: List[Any] = []
+        if route:
+            query += " AND route = ?"
+            params.append(route.strip().upper())
+        if state:
+            query += " AND state = ?"
+            params.append(state.strip().upper())
+        query += " ORDER BY rule_id ASC"
+        with self._get_conn() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [self._row_to_parser_rule(r) for r in rows]
+
+    def update_parser_rule_state(
+        self,
+        rule_id: str,
+        new_state: str,
+        actor: str,
+        notes: str = "",
+        eval_summary: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        clean_id = (rule_id or "").strip().upper()
+        now = time.time()
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM parser_rule_candidates WHERE rule_id = ?",
+                (clean_id,),
+            ).fetchone()
+            if not row:
+                return False
+            clean_new_state = str(new_state or "").strip().upper()
+            if clean_new_state not in self._VALID_RULE_STATES:
+                return False
+            old_state = str(row["state"])
+            if old_state not in self._VALID_RULE_STATES:
+                return False
+            ver = int(row["version"])
+            eval_json = json.dumps(eval_summary) if eval_summary is not None else str(row["eval_summary_json"] or "{}")
+            try:
+                eff_eval = json.loads(eval_json or "{}")
+            except Exception:
+                eff_eval = {}
+            if clean_new_state == "APPROVED":
+                if old_state not in ("EVALUATED", "APPROVED") or not eff_eval.get("passed"):
+                    return False
+            if clean_new_state == "ACTIVE":
+                if old_state != "APPROVED" or not str(row["approved_by"] or "").strip() or not eff_eval.get("passed"):
+                    return False
+            new_state = clean_new_state
+            approved_by = actor if new_state == "APPROVED" else str(row["approved_by"] or "")
+            conn.execute(
+                """
+                UPDATE parser_rule_candidates
+                SET state = ?, approved_by = ?, eval_summary_json = ?, updated_at = ?
+                WHERE rule_id = ?
+                """,
+                (new_state, approved_by, eval_json, now, clean_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO parser_rule_reviews
+                (rule_id, version, old_state, new_state, actor, notes, eval_summary_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (clean_id, ver, old_state, new_state, actor, notes, eval_json, now),
+            )
+            return True
+
+    def restore_parser_rule_version(
+        self,
+        rule_id: str,
+        target_version: int,
+        actor: str,
+        activate: bool = False,
+        notes: str = "",
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """
+        Restores a previously approved/active immutable version from `parser_rule_versions`
+        into `parser_rule_candidates` without losing version history.
+        """
+        if activate:
+            return False, 'Restore cannot activate a rule; explicit activation is required', None
+        clean_id = (rule_id or "").strip().upper()
+        now = time.time()
+        with self._get_conn() as conn:
+            target_row = conn.execute(
+                "SELECT * FROM parser_rule_versions WHERE rule_id = ? AND version = ?",
+                (clean_id, int(target_version)),
+            ).fetchone()
+            if not target_row:
+                return False, f"Version {target_version} of rule {clean_id} not found", None
+
+            t_dict = self._project_rule_version(conn, target_row)
+            eval_sum = t_dict.get("eval_summary") or {}
+            if not eval_sum.get("passed") or not t_dict.get("approved_by"):
+                return (
+                    False,
+                    f"Version {target_version} of rule {clean_id} was never evaluated and approved; cannot restore",
+                    None,
+                )
+
+            curr_row = conn.execute(
+                "SELECT * FROM parser_rule_candidates WHERE rule_id = ?",
+                (clean_id,),
+            ).fetchone()
+            if curr_row is None:
+                return False, f"Rule {clean_id} has no current candidate to restore", None
+            old_state = str(curr_row["state"])
+            restored_state = "APPROVED"
+            event_state = "RESTORED_APPROVED"  # Audit restoration, not a fresh approval.
+
+            conn.execute(
+                """
+                UPDATE parser_rule_candidates
+                SET route = ?, pattern = ?, description = ?, version = ?,
+                    state = ?, proposed_by = ?, approved_by = ?,
+                    sample_positives_json = ?, sample_negatives_json = ?,
+                    eval_summary_json = ?, updated_at = ?
+                WHERE rule_id = ?
+                """,
+                (
+                    target_row["route"],
+                    target_row["pattern"],
+                    target_row["description"],
+                    int(target_version),
+                    restored_state,
+                    target_row["proposed_by"],
+                    t_dict["approved_by"],
+                    target_row["sample_positives_json"],
+                    target_row["sample_negatives_json"],
+                    json.dumps(eval_sum),
+                    now,
+                    clean_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO parser_rule_reviews
+                (rule_id, version, old_state, new_state, actor, notes, eval_summary_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_id,
+                    int(target_version),
+                    old_state,
+                    event_state,
+                    actor,
+                    notes or f"Restored immutable version v{target_version} to {restored_state}",
+                    json.dumps(eval_sum),
+                    now,
+                ),
+            )
+        return True, f"Restored {clean_id} to v{target_version} ({restored_state})", self.get_parser_rule(clean_id)
+
+    def get_parser_rule_reviews(self, rule_id: str) -> List[Dict[str, Any]]:
+        clean_id = (rule_id or "").strip().upper()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM parser_rule_reviews WHERE rule_id = ? ORDER BY id ASC",
+                (clean_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    @staticmethod
+    def _row_to_parser_rule(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        try:
+            d["sample_positives"] = json.loads(d.get("sample_positives_json") or "[]")
+        except Exception:
+            d["sample_positives"] = []
+        try:
+            d["sample_negatives"] = json.loads(d.get("sample_negatives_json") or "[]")
+        except Exception:
+            d["sample_negatives"] = []
+        try:
+            d["eval_summary"] = json.loads(d.get("eval_summary_json") or "{}")
+        except Exception:
+            d["eval_summary"] = {}
+        raw_st = str(d.get("state") or "").strip().upper()
+        if raw_st not in JournalDB._VALID_RULE_STATES:
+            d["invalid_raw_state"] = raw_st
+            d["state"] = "REJECTED"
+        elif raw_st == "ACTIVE":
+            # Unknown or unapproved rules fail closed on load/restart
+            if not str(d.get("approved_by") or "").strip() or not d["eval_summary"].get("passed"):
+                d["state"] = "REJECTED"
+        return d

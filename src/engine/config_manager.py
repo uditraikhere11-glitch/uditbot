@@ -31,6 +31,7 @@ Guarantees:
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -440,112 +441,11 @@ def compute_config_version(config_dict_or_obj: Union[Any, Dict[str, Any]]) -> st
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-
-
-def repair_and_export_sqlite_session(
-    data_dir: str = "data",
-    env_path: str = ".env",
-    auto_write_env: bool = True,
-) -> Optional[str]:
-    """
-    Permanently resolves Telethon 6-column SQLite session incompatibility (`ValueError: too many values to unpack (expected 5, got 6)`)
-    and exports `TG_SESSION_STRING` without requiring manual SSH commands:
-    1. If `data/tg_userbot.session` has != 5 columns in `sessions`, migrates `sessions` in-place to Telethon's
-       canonical 5-column schema (`dc_id, server_address, port, auth_key, takeout_id`) while preserving the 256-byte `auth_key`.
-    2. Encodes `(dc_id, server_address, port, auth_key)` into Telethon's `1...` StringSession format and, when
-       `auto_write_env=True` and not in an isolated unit test, persists `TG_SESSION_STRING` to `.env` (0600) and `os.environ`.
-    """
-    session_file = os.path.join(data_dir, "tg_userbot.session")
-    if not os.path.isfile(session_file):
-        return None
-    try:
-        import base64 as _b64
-        import ipaddress as _ip
-        import sqlite3 as _sq
-        import struct as _st
-
-        conn = _sq.connect(session_file, timeout=5.0)
-        try:
-            cols_info = conn.execute("PRAGMA table_info(sessions)").fetchall()
-            if not cols_info:
-                return None
-            col_names = [ str(c[1]).lower() for c in cols_info ]
-            if not {"dc_id", "server_address", "port", "auth_key"}.issubset(set(col_names)):
-                return None
-
-            row = conn.execute(
-                "SELECT dc_id, server_address, port, auth_key FROM sessions LIMIT 1"
-            ).fetchone()
-            if not row or not row[3] or len(bytes(row[3])) != 256:
-                return None
-            dc_id, server_address, port, auth_key = int(row[0]), str(row[1]), int(row[2]), bytes(row[3])
-            takeout_id = None
-            if "takeout_id" in col_names:
-                t_row = conn.execute("SELECT takeout_id FROM sessions LIMIT 1").fetchone()
-                takeout_id = t_row[0] if t_row else None
-
-            # If table has != 5 columns (e.g. 6 columns causing Telethon SQLiteSession ValueError), normalize in-place to 5 columns
-            if len(col_names) != 5:
-                conn.execute("DROP TABLE sessions")
-                conn.execute(
-                    "CREATE TABLE sessions (dc_id integer primary key, server_address text, port integer, auth_key blob, takeout_id integer)"
-                )
-                conn.execute(
-                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
-                    (dc_id, server_address, port, auth_key, takeout_id),
-                )
-                conn.commit()
-        finally:
-            conn.close()
-
-        try:
-            os.chmod(session_file, 0o600)
-        except OSError:
-            pass
-
-        ip_packed = _ip.ip_address(server_address).packed
-        fmt = ">B4sH256s" if len(ip_packed) == 4 else ">B16sH256s"
-        packed = _st.pack(fmt, dc_id, ip_packed, port, auth_key)
-        session_str = "1" + _b64.urlsafe_b64encode(packed).decode("ascii")
-
-        if auto_write_env and not is_isolated_test_environment():
-            if not os.environ.get("TG_SESSION_STRING"):
-                os.environ["TG_SESSION_STRING"] = session_str
-            if os.path.isfile(env_path):
-                with open(env_path, "r", encoding="utf-8") as ef:
-                    raw_env = ef.read()
-                if "TG_SESSION_STRING=" not in raw_env:
-                    lines = [ln for ln in raw_env.splitlines() if not ln.strip().startswith("TG_SESSION_STRING=")]
-                    lines.append(f'TG_SESSION_STRING="{session_str}"')
-                    write_env_atomic(env_path, "\n".join(lines) + "\n")
-        return session_str
-    except Exception:
-        return None
-
-
-def _sync_webui_secret_inputs_in_memory() -> None:
-    """
-    Removes the accidental HTML5 `required` attribute from `name="tg_api_hash"` in `src.setup_app.HTML_TEMPLATE`
-    in memory (preserving `src/setup_app.py`'s locked on-disk SHA-256 hash) so the browser never forces the
-    operator to re-type `Telegram API Hash` on subsequent WebUI Saves.
-    """
-    import sys as _sys
-    setup_mod = _sys.modules.get("src.setup_app")
-    if setup_mod is not None and hasattr(setup_mod, "HTML_TEMPLATE"):
-        tpl = getattr(setup_mod, "HTML_TEMPLATE", "")
-        old_tag = '<input type="password" name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="e.g. 0123456789abcdef..." required>'
-        new_tag = '<input type="password" name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="Saved in .env (leave blank to keep unchanged)">'
-        if old_tag in tpl:
-            setattr(setup_mod, "HTML_TEMPLATE", tpl.replace(old_tag, new_tag))
-
-
 def check_service_is_active(
     service_name: str = "trading_bot.service",
     check_fn: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Checks whether the systemd service is active (strictly isolated during tests)."""
-    _sync_webui_secret_inputs_in_memory()
-    repair_and_export_sqlite_session()
     if check_fn is not None:
         return bool(check_fn())
     if os.environ.get("AUDITBOT_TEST_SERVICE_ACTIVE") == "1":
@@ -574,8 +474,6 @@ class ConfigChangeTracker:
         self.deferred_env_file = os.path.join(data_dir, "deferred_config.env")
         self._lock = threading.Lock()
         os.makedirs(self.data_dir, exist_ok=True)
-        _sync_webui_secret_inputs_in_memory()
-        repair_and_export_sqlite_session(data_dir=self.data_dir)
 
     def generate_change_id(self) -> str:
         """Generates structured, human-readable change ID: CFG-YYYYMMDD-HHMMSS-<hex>."""
@@ -727,20 +625,25 @@ class ConfigChangeTracker:
     def validate_inputs(self, params: Dict[str, Any]) -> Tuple[bool, str]:
         """Section H: Validates input types, limits, and values."""
         try:
-            eq_budget = float(params.get("equity_budget_inr", params.get("EQUITY_BUDGET_INR", 25000.0)))
-            if eq_budget <= 0:
+            for k in ("equity_budget_inr", "EQUITY_BUDGET_INR", "fno_capital_per_trade", "FNO_CAPITAL_PER_TRADE", "sl_pct", "SL_PCT", "target_pct", "TARGET_PCT", "fno_max_lots", "FNO_MAX_LOTS", "min_trade_funds_inr", "MIN_TRADE_FUNDS_INR"):
+                if k in params and isinstance(params[k], bool):
+                    return False, f"Invalid numeric input parameter: boolean value ({params[k]}) not allowed for {k}"
+
+            raw_eq_budget = params.get("equity_budget_inr", params.get("EQUITY_BUDGET_INR", 25000.0))
+            eq_budget = float(raw_eq_budget)
+            if not (math.isfinite(eq_budget) and eq_budget > 0.0):
                 return False, "Equity budget must be greater than 0"
 
             fno_budget = float(params.get("fno_capital_per_trade", params.get("FNO_CAPITAL_PER_TRADE", 20000.0)))
-            if fno_budget <= 0:
+            if not (math.isfinite(fno_budget) and fno_budget > 0.0):
                 return False, "F&O capital per trade must be greater than 0"
 
             sl_pct = float(params.get("sl_pct", params.get("SL_PCT", 3.0)))
-            if sl_pct <= 0 or sl_pct > 50.0:
+            if not (math.isfinite(sl_pct) and 0.1 <= sl_pct <= 50.0):
                 return False, "Stop-Loss percentage must be between 0.1% and 50%"
 
             target_pct = float(params.get("target_pct", params.get("TARGET_PCT", 3.0)))
-            if target_pct <= 0 or target_pct > 100.0:
+            if not (math.isfinite(target_pct) and 0.1 <= target_pct <= 100.0):
                 return False, "Target percentage must be between 0.1% and 100%"
 
             fno_lots = int(params.get("fno_max_lots", params.get("FNO_MAX_LOTS", 3)))
@@ -750,6 +653,12 @@ class ConfigChangeTracker:
             cmp_pol = str(params.get("equity_cmp_execution_policy", params.get("EQUITY_CMP_EXECUTION_POLICY", "STRICT_TIMESTAMP"))).upper().strip()
             if cmp_pol not in ("STRICT_TIMESTAMP", "DARVAS_HTTP_SUCCESS"):
                 return False, f"Invalid EQUITY_CMP_EXECUTION_POLICY '{cmp_pol}'"
+
+            min_funds_raw = params.get("min_trade_funds_inr", params.get("MIN_TRADE_FUNDS_INR", None))
+            if min_funds_raw is not None and str(min_funds_raw).strip() != "":
+                min_funds = float(min_funds_raw)
+                if not (math.isfinite(min_funds) and min_funds >= 0.0):
+                    return False, "Minimum ledger funds must be greater than or equal to 0"
 
             return True, "Valid"
         except (ValueError, TypeError) as e:
@@ -1187,16 +1096,8 @@ def execute_configuration_update(
             restart_ok = False
     elif not is_isolated_test_environment():
         try:
-            systemctl_bin = "/usr/bin/systemctl" if os.path.exists("/usr/bin/systemctl") else "systemctl"
-            res = subprocess.run(
-                ["sudo", "-n", systemctl_bin, "restart", "trading_bot.service"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-            )
+            res = subprocess.run(["sudo", "systemctl", "restart", "trading_bot.service"], capture_output=True, timeout=8)
             restart_ok = (res.returncode == 0)
-            if not restart_ok and res.stderr:
-                logger.warning(f"systemctl restart stderr: {res.stderr.strip()[:200]}")
         except Exception as e:
             logger.warning(f"systemctl restart exception: {e}")
             restart_ok = False

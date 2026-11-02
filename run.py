@@ -106,10 +106,12 @@ if not pipeline.resolver._equities and not pipeline.resolver._options_list:
 print("=" * 60 + "\n")
 
 session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else session_file
+client = TelegramClient(session, tg_api_id, tg_api_hash)
+
+
 async def main():
     outbox_worker = None
     try:
-        client = TelegramClient(session, tg_api_id, tg_api_hash)
         allowed_chats = list(cfg.monitored_channel_ids)
         if cfg.trading_mode.value != 'LIVE' and cfg.test_group_id and cfg.test_group_id not in allowed_chats:
             allowed_chats.append(cfg.test_group_id)
@@ -177,6 +179,7 @@ async def main():
 
         @client.on(events.NewMessage(chats=allowed_chats))
         async def handler(event):
+            received_at = time.time()  # event callback arrival, before chat lookup / to_thread
             if event.chat_id not in allowed_chats:
                 return
             if getattr(event.message, "edit_date", None):
@@ -197,6 +200,7 @@ async def main():
                 message_id=event.id,
                 msg_timestamp=msg_ts,
                 source_name=source_name,
+                signal_received_at=received_at,
             )
             print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
 
