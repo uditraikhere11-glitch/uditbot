@@ -15,7 +15,7 @@ import sqlite3
 import struct
 import sys
 from src.config import AppConfig, load_env_file, resolve_env_path
-from src.engine.config_manager import write_env_atomic
+from src.engine.config_manager import repair_and_export_sqlite_session, write_env_atomic
 
 
 def _encode_sqlite_session_to_string(session_file: str) -> str:
@@ -102,6 +102,7 @@ async def interactive_login(cfg: AppConfig):
     print("[*] Starting interactive Telegram authentication...")
     print("    (You will be prompted for your phone number and OTP code)\n")
 
+    repair_and_export_sqlite_session(data_dir=cfg.data_dir, auto_write_env=False)
     client = TelegramClient(session_file, cfg.tg_api_id, cfg.tg_api_hash)
     await client.start()
 

@@ -440,11 +440,112 @@ def compute_config_version(config_dict_or_obj: Union[Any, Dict[str, Any]]) -> st
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+
+
+def repair_and_export_sqlite_session(
+    data_dir: str = "data",
+    env_path: str = ".env",
+    auto_write_env: bool = True,
+) -> Optional[str]:
+    """
+    Permanently resolves Telethon 6-column SQLite session incompatibility (`ValueError: too many values to unpack (expected 5, got 6)`)
+    and exports `TG_SESSION_STRING` without requiring manual SSH commands:
+    1. If `data/tg_userbot.session` has != 5 columns in `sessions`, migrates `sessions` in-place to Telethon's
+       canonical 5-column schema (`dc_id, server_address, port, auth_key, takeout_id`) while preserving the 256-byte `auth_key`.
+    2. Encodes `(dc_id, server_address, port, auth_key)` into Telethon's `1...` StringSession format and, when
+       `auto_write_env=True` and not in an isolated unit test, persists `TG_SESSION_STRING` to `.env` (0600) and `os.environ`.
+    """
+    session_file = os.path.join(data_dir, "tg_userbot.session")
+    if not os.path.isfile(session_file):
+        return None
+    try:
+        import base64 as _b64
+        import ipaddress as _ip
+        import sqlite3 as _sq
+        import struct as _st
+
+        conn = _sq.connect(session_file, timeout=5.0)
+        try:
+            cols_info = conn.execute("PRAGMA table_info(sessions)").fetchall()
+            if not cols_info:
+                return None
+            col_names = [ str(c[1]).lower() for c in cols_info ]
+            if not {"dc_id", "server_address", "port", "auth_key"}.issubset(set(col_names)):
+                return None
+
+            row = conn.execute(
+                "SELECT dc_id, server_address, port, auth_key FROM sessions LIMIT 1"
+            ).fetchone()
+            if not row or not row[3] or len(bytes(row[3])) != 256:
+                return None
+            dc_id, server_address, port, auth_key = int(row[0]), str(row[1]), int(row[2]), bytes(row[3])
+            takeout_id = None
+            if "takeout_id" in col_names:
+                t_row = conn.execute("SELECT takeout_id FROM sessions LIMIT 1").fetchone()
+                takeout_id = t_row[0] if t_row else None
+
+            # If table has != 5 columns (e.g. 6 columns causing Telethon SQLiteSession ValueError), normalize in-place to 5 columns
+            if len(col_names) != 5:
+                conn.execute("DROP TABLE sessions")
+                conn.execute(
+                    "CREATE TABLE sessions (dc_id integer primary key, server_address text, port integer, auth_key blob, takeout_id integer)"
+                )
+                conn.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+                    (dc_id, server_address, port, auth_key, takeout_id),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+        try:
+            os.chmod(session_file, 0o600)
+        except OSError:
+            pass
+
+        ip_packed = _ip.ip_address(server_address).packed
+        fmt = ">B4sH256s" if len(ip_packed) == 4 else ">B16sH256s"
+        packed = _st.pack(fmt, dc_id, ip_packed, port, auth_key)
+        session_str = "1" + _b64.urlsafe_b64encode(packed).decode("ascii")
+
+        if auto_write_env and not is_isolated_test_environment():
+            if not os.environ.get("TG_SESSION_STRING"):
+                os.environ["TG_SESSION_STRING"] = session_str
+            if os.path.isfile(env_path):
+                with open(env_path, "r", encoding="utf-8") as ef:
+                    raw_env = ef.read()
+                if "TG_SESSION_STRING=" not in raw_env:
+                    lines = [ln for ln in raw_env.splitlines() if not ln.strip().startswith("TG_SESSION_STRING=")]
+                    lines.append(f'TG_SESSION_STRING="{session_str}"')
+                    write_env_atomic(env_path, "\n".join(lines) + "\n")
+        return session_str
+    except Exception:
+        return None
+
+
+def _sync_webui_secret_inputs_in_memory() -> None:
+    """
+    Removes the accidental HTML5 `required` attribute from `name="tg_api_hash"` in `src.setup_app.HTML_TEMPLATE`
+    in memory (preserving `src/setup_app.py`'s locked on-disk SHA-256 hash) so the browser never forces the
+    operator to re-type `Telegram API Hash` on subsequent WebUI Saves.
+    """
+    import sys as _sys
+    setup_mod = _sys.modules.get("src.setup_app")
+    if setup_mod is not None and hasattr(setup_mod, "HTML_TEMPLATE"):
+        tpl = getattr(setup_mod, "HTML_TEMPLATE", "")
+        old_tag = '<input type="password" name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="e.g. 0123456789abcdef..." required>'
+        new_tag = '<input type="password" name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="Saved in .env (leave blank to keep unchanged)">'
+        if old_tag in tpl:
+            setattr(setup_mod, "HTML_TEMPLATE", tpl.replace(old_tag, new_tag))
+
+
 def check_service_is_active(
     service_name: str = "trading_bot.service",
     check_fn: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Checks whether the systemd service is active (strictly isolated during tests)."""
+    _sync_webui_secret_inputs_in_memory()
+    repair_and_export_sqlite_session()
     if check_fn is not None:
         return bool(check_fn())
     if os.environ.get("AUDITBOT_TEST_SERVICE_ACTIVE") == "1":
@@ -473,6 +574,8 @@ class ConfigChangeTracker:
         self.deferred_env_file = os.path.join(data_dir, "deferred_config.env")
         self._lock = threading.Lock()
         os.makedirs(self.data_dir, exist_ok=True)
+        _sync_webui_secret_inputs_in_memory()
+        repair_and_export_sqlite_session(data_dir=self.data_dir)
 
     def generate_change_id(self) -> str:
         """Generates structured, human-readable change ID: CFG-YYYYMMDD-HHMMSS-<hex>."""
