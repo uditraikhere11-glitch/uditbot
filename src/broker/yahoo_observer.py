@@ -14,13 +14,65 @@ Explicit architectural separation:
 """
 
 from dataclasses import dataclass
+import json
 import logging
+import socket
 import time
 from typing import Optional
+import requests
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
+
+# YF-SCOPE-ONLY: All HTTP tuning is scoped to these Yahoo origins. No
+# modifications to the generic HTTPS adapter, Dhan requests, proxy handling,
+# or authentication. Requests' timeout is per socket operation, not a hard
+# end-to-end deadline.
+YAHOO_HTTP_TIMEOUT = (2.0, 3.0)
+YAHOO_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+YAHOO_ORIGINS = (
+    "https://query1.finance.yahoo.com/",
+    "https://query2.finance.yahoo.com/",
+)
+
+
+class YahooHTTPAdapter(HTTPAdapter):
+    """Yahoo-only persistent adapter; no retries that can delay signal handling."""
+
+    def __init__(self):
+        super().__init__(pool_connections=2, pool_maxsize=4, max_retries=0)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **kwargs):
+        options = list(kwargs.get("socket_options") or [])
+        if hasattr(socket, "IPPROTO_TCP") and hasattr(socket, "TCP_NODELAY"):
+            options.append((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1))
+        if hasattr(socket, "SOL_SOCKET") and hasattr(socket, "SO_KEEPALIVE"):
+            options.append((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1))
+        kwargs["socket_options"] = options
+        return super().init_poolmanager(connections, maxsize, block=block, **kwargs)
+
+
+def configure_yahoo_http(session):
+    """Mount ONLY Yahoo-origin adapters; injected mock sessions stay unchanged."""
+    if isinstance(session, requests.Session):
+        adapter = YahooHTTPAdapter()
+        for origin in YAHOO_ORIGINS:
+            session.mount(origin, adapter)
+    return session
+
+
+def parse_yahoo_response(response):
+    """Decode JSON bytes directly when available, preserving .json() mocks."""
+    raw = getattr(response, "_content", None)
+    if isinstance(raw, (bytes, bytearray)) and raw:
+        payload = json.loads(raw)
+    else:
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Yahoo chart response is not a JSON object")
+    return payload
 
 
 @dataclass
@@ -66,11 +118,7 @@ class YahooObserver:
     """Darvas-compatible observational quote fetcher for diagnostics."""
 
     def __init__(self, session=None):
-        if session is None:
-            import requests
-            self.session = requests.Session()
-        else:
-            self.session = session
+        self.session = configure_yahoo_http(requests.Session()) if session is None else session
 
     def observe(
         self,
@@ -96,19 +144,19 @@ class YahooObserver:
             return obs
 
         url = YAHOO_CHART_URL.format(ticker=ticker)
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = YAHOO_HTTP_HEADERS
 
         try:
-            t0 = time.time()
+            t0 = time.perf_counter()
             resp = self.session.get(url, headers=headers, timeout=timeout)
-            elapsed = time.time() - t0
+            elapsed = time.perf_counter() - t0
             obs.status_code = resp.status_code
 
             if resp.status_code != 200:
                 obs.error = f"HTTP {resp.status_code} returned by Yahoo Finance"
                 return obs
 
-            data = resp.json()
+            data = parse_yahoo_response(resp)
             results = (data.get("chart") or {}).get("result") or []
             if not results or not isinstance(results[0], dict):
                 obs.error = "Empty chart result in Yahoo Finance response"
