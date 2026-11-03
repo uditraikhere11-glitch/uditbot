@@ -28,16 +28,9 @@ import math
 import os
 import re
 import struct
-import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
-from src.broker.yahoo_observer import (
-    YAHOO_HTTP_TIMEOUT,
-    YAHOO_HTTP_HEADERS,
-    configure_yahoo_http,
-    parse_yahoo_response,
-)
 from src.config import AppConfig
 from src.engine.emergency_stop import EmergencyStopManager
 from src.models import (
@@ -781,7 +774,7 @@ class DhanClient:
         reconciliation_gate: Optional[Any] = None,
     ):
         self.cfg = config
-        self.session = configure_yahoo_http(requests.Session())
+        self.session = requests.Session()
         self.stop_manager = stop_manager or EmergencyStopManager(
             state_file=os.path.join(config.data_dir, "emergency_stop.json")
         )
@@ -789,7 +782,7 @@ class DhanClient:
         self._token_mtime: float = 0.0
         self.token = self._load_token()
         self._quote_cache: Dict[Tuple[str, str], QuoteResult] = {}
-        self._yahoo_quote_local = threading.local()
+        self.last_quote_result: Optional[QuoteResult] = None
         self.last_ltp_meta: Optional[Dict[str, Any]] = None
         self.last_order_http_latency_ms: Optional[float] = None
         self.last_order_broker_status: str = ""
@@ -997,15 +990,6 @@ class DhanClient:
     # SECTION A & V12-15: Yahoo Finance Primary Price Source with Strict 2.0s Freshness Gate
     # =========================================================================
 
-    @property
-    def last_quote_result(self) -> Optional[QuoteResult]:
-        """Yahoo result from this thread only, never another signal/watcher's."""
-        return getattr(self._yahoo_quote_local, "result", None)
-
-    @last_quote_result.setter
-    def last_quote_result(self, value: Optional[QuoteResult]) -> None:
-        self._yahoo_quote_local.result = value
-
     def get_yahoo_quote_details(
         self,
         stock_symbol: str,
@@ -1065,12 +1049,12 @@ class DhanClient:
         suffix = ".BO" if seg == "BSE_EQ" else ".NS"
         expected_ticker = f"{clean_sym}{suffix}"
         url = YAHOO_CHART_URL.format(ticker=expected_ticker)
-        headers = YAHOO_HTTP_HEADERS
+        headers = {"User-Agent": "Mozilla/5.0"}
 
         t4_start_ns = time.perf_counter_ns()
         try:
             t_req_start = time.time()
-            resp = self.session.get(url, headers=headers, timeout=YAHOO_HTTP_TIMEOUT)
+            resp = self.session.get(url, headers=headers, timeout=5)
             t4_end_ns = time.perf_counter_ns()
             http_latency_ms = round(max(0.0, (t4_end_ns - t4_start_ns) / 1_000_000.0), 3)
             http_elapsed = max(0.0, time.time() - t_req_start)
@@ -1092,7 +1076,7 @@ class DhanClient:
                 return res
 
             t5_start_ns = time.perf_counter_ns()
-            data = parse_yahoo_response(resp)
+            data = resp.json()
             results = (data.get("chart") or {}).get("result") or []
             if not results or not isinstance(results[0], dict):
                 t5_end_ns = time.perf_counter_ns()
@@ -1974,6 +1958,22 @@ class DhanClient:
             self.stop_manager.deregister_in_flight(corr_id)
             return False, None, "ORDER BLOCKED: System is in TEST mode (Zero live orders allowed)"
 
+        # B05: Enforce durable transition gate on all risk-increasing BUY entries (including RTRY- retry orders)
+        intent_type = str(getattr(order_req, "intent_type", "NEW_ENTRY") or "NEW_ENTRY").upper()
+        is_protective_exit = (order_req.transaction_type == TransactionType.SELL and intent_type == "PROTECTIVE_EXIT")
+        if not is_protective_exit:
+            try:
+                from src.engine.config_manager import ConfigChangeTracker
+                t_blocked, t_reason = ConfigChangeTracker(data_dir=self.cfg.data_dir).is_live_entry_blocked_by_transition()
+                if t_blocked:
+                    self.stop_manager.deregister_in_flight(corr_id)
+                    reason_msg = f"MUTATION BLOCKED: {t_reason}"
+                    logger.warning(f"[TRANSITION_GATE] {reason_msg}")
+                    return False, None, reason_msg
+            except Exception as e:
+                self.stop_manager.deregister_in_flight(corr_id)
+                return False, None, f"MUTATION BLOCKED: Could not verify mode transition gate (failing closed): {e}"
+
         url = f"{BASE_URL}/orders"
         payload = {
             "dhanClientId": self.cfg.dhan_client_id,
@@ -2084,6 +2084,22 @@ class DhanClient:
         if self.cfg.trading_mode == TradingMode.TEST:
             self.stop_manager.deregister_in_flight(corr_id)
             return False, None, "SUPER ORDER BLOCKED: System is in TEST mode (Zero live orders allowed)"
+
+        # B05: Enforce durable transition gate on all risk-increasing BUY entries (including RTRY- retry orders)
+        intent_type = str(getattr(order_req, "intent_type", "NEW_ENTRY") or "NEW_ENTRY").upper()
+        is_protective_exit = (order_req.transaction_type == TransactionType.SELL and intent_type == "PROTECTIVE_EXIT")
+        if not is_protective_exit:
+            try:
+                from src.engine.config_manager import ConfigChangeTracker
+                t_blocked, t_reason = ConfigChangeTracker(data_dir=self.cfg.data_dir).is_live_entry_blocked_by_transition()
+                if t_blocked:
+                    self.stop_manager.deregister_in_flight(corr_id)
+                    reason_msg = f"MUTATION BLOCKED: {t_reason}"
+                    logger.warning(f"[TRANSITION_GATE] {reason_msg}")
+                    return False, None, reason_msg
+            except Exception as e:
+                self.stop_manager.deregister_in_flight(corr_id)
+                return False, None, f"MUTATION BLOCKED: Could not verify mode transition gate (failing closed): {e}"
 
         if stop_loss_price <= 0 or target_price <= 0 or target_price <= stop_loss_price:
             self.stop_manager.deregister_in_flight(corr_id)
