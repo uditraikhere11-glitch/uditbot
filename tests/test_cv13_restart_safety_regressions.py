@@ -253,6 +253,8 @@ class TestCV13RestartSafetyRegressions(unittest.TestCase):
             env_path=self.env_path,
         )
 
+        init_cfg = AppConfig.from_env(env=parse_env_dict(self.env_path), env_file="")
+        self.tracker.record_active_running_version(compute_config_version(init_cfg), trading_mode="LIVE")
         restart_mock_same = MagicMock(return_value=True)
         rec_same = execute_configuration_update(
             form_params=form_params_same,

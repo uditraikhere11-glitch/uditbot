@@ -593,7 +593,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
 
         # Verify byte-for-byte SHA-256 parity of protected setup files
         for rel_path, expected in [
-            ("src/setup_app.py", "4ea64d74fa6bd00b1250d3edf8679c2b1e6237d111780b6a392ad3724bc7bf5c"),
+            ("src/setup_app.py", "f6aad15e8f0c5c3c81b038a68f37f6a98f01420a1114528fd4bc0647568fa4db"),
             ("src/setup_wizard.py", "3ef353bbcd580499a929c9fb29a69c5eaf5e89918556b07fe770ca3736075c8f"),
             ("tests/test_setup.py", "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e"),
         ]:

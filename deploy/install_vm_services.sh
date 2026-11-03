@@ -131,6 +131,8 @@ WantedBy=timers.target
 EOF
 cat >"$TMP/auditbot-web-restart" <<EOF
 $BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart trading_bot.service
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block start trading_bot.service
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop trading_bot.service
 EOF
 sudo /usr/sbin/visudo -cf "$TMP/auditbot-web-restart" >/dev/null || fail "Sudoers syntax invalid."
 # Existing sudoers policies elsewhere must be independently audited.
@@ -139,10 +141,13 @@ for name in trading_bot.service auditbot-web.service dhan-token-refresh.service 
     sudo install -o root -g root -m 0644 "$TMP/$name" "/etc/systemd/system/$name"
     echo "INSTALLED $name"
 done
-# Do not install or replace sudoers for an existing WebUI automatically.
+# Do not install or replace sudoers for an existing WebUI automatically unless AUDITBOT_UPGRADE_SUDOERS=1 is explicitly passed.
 if [[ "$WEB_EXISTED" == 0 ]]; then
     sudo install -o root -g root -m 0440 "$TMP/auditbot-web-restart" "$SUDOERS"
     echo "INSTALLED exact-command WebUI sudoers"
+elif [[ "${AUDITBOT_UPGRADE_SUDOERS:-0}" == "1" ]]; then
+    sudo install -o root -g root -m 0440 "$TMP/auditbot-web-restart" "$SUDOERS"
+    echo "UPGRADED exact-command WebUI sudoers"
 fi
 # Enforce private runtime permissions without reading or printing any secret.
 chmod 0700 "$REPO_DIR/data"
