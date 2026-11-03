@@ -425,98 +425,6 @@ def cmd_setup():
     run_setup_wizard(resolve_env_path(".env"))
 
 
-def cmd_rules(db: JournalDB, sub_args: list) -> int:
-    from src.parsers.adaptive_rules import AdaptiveRuleManager
-    mgr = AdaptiveRuleManager(db)
-    sub = (sub_args[0].lower() if sub_args else "list")
-    if sub in ("list", "ls"):
-        rules = db.list_parser_rules()
-        print("=======================================================")
-        print("          AUDIT BOT ADAPTIVE PARSER RULES              ")
-        print("=======================================================")
-        if not rules:
-            print("  No adaptive parser rules registered.")
-        for r in rules:
-            print(f"  [{r['state']}] {r['rule_id']} (v{r['version']}, route={r['route']}) — {r['pattern']}")
-        print("=======================================================")
-        return 0
-    elif sub == "versions" and len(sub_args) >= 2:
-        rule_id = sub_args[1]
-        vers = db.get_parser_rule_versions(rule_id)
-        for v in vers:
-            print(f"  {v['rule_id']} v{v['version']} [{v['state']}] approved_by={v['approved_by']!r} pattern={v['pattern']}")
-        return 0
-    elif sub == "approve" and len(sub_args) >= 2:
-        rule_id = sub_args[1]
-        reviewer = sub_args[2] if len(sub_args) >= 3 else "Udit"
-        notes = " ".join(sub_args[3:]) if len(sub_args) >= 4 else ""
-        ok, msg = mgr.approve_rule(rule_id, reviewer=reviewer, notes=notes)
-        print(f"{'✅' if ok else '❌'} {msg}")
-        return 0 if ok else 1
-    elif sub == "activate" and len(sub_args) >= 2:
-        rule_id = sub_args[1]
-        actor = sub_args[2] if len(sub_args) >= 3 else "Udit"
-        ok, msg = mgr.activate_rule(rule_id, actor=actor)
-        print(f"{'✅' if ok else '❌'} {msg}")
-        return 0 if ok else 1
-    elif sub in ("deactivate", "rollback") and len(sub_args) >= 2:
-        rule_id = sub_args[1]
-        actor = sub_args[2] if len(sub_args) >= 3 else "Udit"
-        reason = " ".join(sub_args[3:]) if len(sub_args) >= 4 else "Operator CLI deactivation"
-        ok, msg = mgr.deactivate_rule(rule_id, actor=actor, reason=reason)
-        print(f"{'✅' if ok else '❌'} {msg}")
-        return 0 if ok else 1
-    elif sub == "restore" and len(sub_args) >= 3 and sub_args[2].isdigit():
-        rule_id = sub_args[1]
-        ver_num = int(sub_args[2])
-        actor = sub_args[3] if len(sub_args) >= 4 else "Udit"
-        ok, msg, _ = mgr.restore_rule_version(rule_id, target_version=ver_num, actor=actor, activate=False)
-        print(f"{'✅' if ok else '❌'} {msg}")
-        if ok:
-            print("Rule restored in APPROVED state only; run `bot rules activate <ID> <actor>` separately to enable it.")
-        return 0 if ok else 1
-    else:
-        print("Usage: bot rules [list | versions <ID> | approve <ID> [reviewer] | activate <ID> [actor] | deactivate <ID> [actor] [reason] | restore <ID> <version> [actor]]")
-        return 2
-
-
-def cmd_service_control(cfg: AppConfig, action: str, args: list) -> int:
-    """B10 & B12: Owner-authorized service start/stop/restart/status command with safety and control-state tracking."""
-    from src.engine.config_manager import ConfigChangeTracker
-    tracker = ConfigChangeTracker(data_dir=cfg.data_dir)
-    confirm_live = ("--yes" in args or "-y" in args)
-    clean_args = [a for a in args if a not in ("--yes", "-y")]
-    reason = " ".join(clean_args).strip() or f"Operator CLI {action}"
-
-    if action in ("start", "restart") and cfg.trading_mode.value == "LIVE" and not confirm_live:
-        ans = input(f"You are about to {action} AuditBot in LIVE mode. Real Dhan orders may be placed. Continue? (yes/no): ").strip().lower()
-        if ans not in ("yes", "y"):
-            print(f"Aborted LIVE service {action}.")
-            return 1
-        confirm_live = True
-
-    env_p = resolve_env_path(".env")
-    ro_broker = tracker.get_readonly_broker(env_path=env_p) if action != "status" else None
-    res = tracker.control_service(
-        action=action,
-        reason=reason,
-        confirm_live=confirm_live,
-        env_path=env_p,
-        stop_state_path=os.path.join(cfg.data_dir, "emergency_stop.json"),
-        db_path=cfg.journal_db_path,
-        broker=ro_broker,
-    )
-    msg = res.get("message") or res.get("error") or f"Service {action} completed"
-    if res.get("ok"):
-        print(f"✅ {msg} ({res.get('service_state_label', res.get('service_state'))})")
-        return 0
-    if res.get("deferred"):
-        print(f"⏳ {msg}")
-        return 0
-    print(f"❌ {msg}")
-    return 1
-
-
 def cmd_web(port: int = 8080, host: str = "127.0.0.1"):
     """STEP 06: Binds setup web UI strictly to localhost (127.0.0.1) by default."""
     print(f"Starting Audit Bot Setup Web Interface on http://{host}:{port}...")
@@ -555,14 +463,6 @@ def main():
     elif args[0] in ("test-signal", "test_signal"):
         sig_text = " ".join(args[1:]).strip()
         sys.exit(cmd_test_signal(cfg, sig_text))
-    elif args[0] in ("service-stop", "bot-stop"):
-        sys.exit(cmd_service_control(cfg, "stop", args[1:]))
-    elif args[0] in ("service-start", "bot-start"):
-        sys.exit(cmd_service_control(cfg, "start", args[1:]))
-    elif args[0] in ("service-restart", "bot-restart"):
-        sys.exit(cmd_service_control(cfg, "restart", args[1:]))
-    elif args[0] in ("service-status", "bot-status"):
-        sys.exit(cmd_service_control(cfg, "status", args[1:]))
     elif args[0] in ("emergency-stop", "stop"):
         reason = " ".join(args[1:]) if len(args) > 1 else ""
         cmd_emergency_stop(cfg, db, stop_mgr, reason)
@@ -571,8 +471,6 @@ def main():
         cmd_resume(cfg, db, stop_mgr, reason)
     elif args[0] in ("setup", "config", "wizard"):
         cmd_setup()
-    elif args[0] in ("rules", "rule"):
-        sys.exit(cmd_rules(db, args[1:]))
     elif args[0] in ("web", "ui"):
         port = int(args[1]) if len(args) > 1 and args[1].isdigit() else 8080
         cmd_web(port)

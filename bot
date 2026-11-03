@@ -88,16 +88,16 @@ case "${1:-}" in
         "$PYTHON" -m src.tg_login --export-string
         ;;
     start)
-        shift || true
-        "$PYTHON" -m src.cli service-start "$@"
+        sudo systemctl start trading_bot.service
+        echo "trading_bot service started."
         ;;
     stop)
-        shift || true
-        "$PYTHON" -m src.cli service-stop "$@"
+        sudo systemctl stop trading_bot.service
+        echo "trading_bot service stopped."
         ;;
     restart)
-        shift || true
-        "$PYTHON" -m src.cli service-restart "$@"
+        sudo systemctl restart trading_bot.service
+        echo "trading_bot service restarted."
         ;;
     service-logs)
         sudo journalctl -u trading_bot.service -f
