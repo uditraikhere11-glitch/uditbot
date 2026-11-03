@@ -208,6 +208,7 @@ class JournalDB:
                 order_type TEXT,
                 price REAL,
                 quantity INTEGER,
+                filled_quantity INTEGER DEFAULT 0,
                 status TEXT,
                 created_at REAL,
                 updated_at REAL
@@ -272,14 +273,6 @@ class JournalDB:
                 is_terminal INTEGER DEFAULT 0,
                 record_json TEXT NOT NULL,
                 updated_at REAL NOT NULL
-            );
-
-            -- Atomic one-time logical event claim + outbox delivery.
-            CREATE TABLE IF NOT EXISTS order_notification_events (
-                order_id TEXT NOT NULL,
-                event_key TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                PRIMARY KEY (order_id, event_key)
             );
 
             CREATE TABLE IF NOT EXISTS outbox (
@@ -1004,29 +997,6 @@ class JournalDB:
 
     # --- Outbox for Durable Notifications (Step 16) ---
 
-    def enqueue_order_notification_once(self, order_id: str, event_key: str, text: str) -> bool:
-        """Atomically claim event and queue Telegram notice. False means already queued.
-
-        The existing outbox worker is at-least-once; Telegram transport may still
-        produce a duplicate after a crash between send and outbox acknowledgement.
-        """
-        if not order_id or not event_key or not text:
-            raise ValueError("Missing order notification identity or body")
-        now = time.time()
-        with self._get_conn() as conn:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO order_notification_events (order_id,event_key,created_at) VALUES (?,?,?)",
-                (str(order_id), str(event_key), now),
-            )
-            if not cur.rowcount:
-                return False
-            conn.execute(
-                "INSERT INTO outbox (event_type,payload,status,retry_count,next_retry_at,created_at) "
-                "VALUES ('ORDER_STATUS_UPDATE', ?, 'PENDING', 0, 0.0, ?)",
-                (json.dumps({"text": text, "event_type": "ORDER_STATUS_UPDATE", "timestamp": now}), now),
-            )
-            return True
-
     def enqueue_outbox(self, event_type: str, payload: Dict[str, Any]) -> int:
         now = time.time()
         with self._get_conn() as conn:
@@ -1210,31 +1180,78 @@ class JournalDB:
             now_ist = datetime.datetime.now(IST)
             start_of_day = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         with self._get_conn() as conn:
-            cur = conn.execute(
-                "SELECT COUNT(*) FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE' AND status NOT IN ('REJECTED', 'CANCELLED', 'EXPIRED', 'NOT_SUBMITTED')",
-                (start_of_day,)
-            )
+            o_cols = {c[1] for c in conn.execute("PRAGMA table_info(orders)").fetchall()}
+            has_filled_col = "filled_quantity" in o_cols
+            if has_filled_col:
+                cur = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM orders
+                    WHERE created_at >= ?
+                      AND trading_mode = 'LIVE'
+                      AND (
+                          status NOT IN ('REJECTED', 'CANCELLED', 'EXPIRED', 'NOT_SUBMITTED')
+                          OR COALESCE(filled_quantity, 0) > 0
+                          OR (broker_order_id IS NOT NULL AND broker_order_id != '' AND broker_order_id IN (
+                              SELECT broker_order_id FROM fills WHERE traded_quantity > 0
+                          ))
+                      )
+                    """,
+                    (start_of_day,),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE' AND status NOT IN ('REJECTED', 'CANCELLED', 'EXPIRED', 'NOT_SUBMITTED')",
+                    (start_of_day,),
+                )
             return cur.fetchone()[0]
 
     def get_live_portfolio_risk_state(self, start_of_day: Optional[float] = None) -> Dict[str, Any]:
-        """V12-08: Aggregates today's live order count, active open positions, and committed exposure."""
+        """V12-08 & F03-01: Aggregates today's live order count, active open positions, and committed exposure."""
         if start_of_day is None:
             now_ist = datetime.datetime.now(IST)
             start_of_day = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         with self._get_conn() as conn:
-            daily_trades = conn.execute(
-                "SELECT COUNT(*) FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE' AND status NOT IN ('REJECTED', 'CANCELLED', 'EXPIRED', 'NOT_SUBMITTED')",
-                (start_of_day,),
-            ).fetchone()[0]
-            rows = conn.execute(
-                "SELECT security_id, price, quantity FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE' AND status IN ('PENDING', 'ACKED', 'PART_FILLED', 'PART_TRADED', 'TRADED')",
-                (start_of_day,),
-            ).fetchall()
+            o_cols = {c[1] for c in conn.execute("PRAGMA table_info(orders)").fetchall()}
+            has_filled_col = "filled_quantity" in o_cols
+            daily_trades = self.get_today_orders_count(start_of_day=start_of_day)
+
+            fill_sums: Dict[str, int] = {}
+            try:
+                for fr in conn.execute("SELECT broker_order_id, SUM(traded_quantity) AS sq FROM fills GROUP BY broker_order_id").fetchall():
+                    if fr["broker_order_id"]:
+                        fill_sums[str(fr["broker_order_id"])] = int(fr["sq"] or 0)
+            except sqlite3.OperationalError:
+                pass
+
+            if has_filled_col:
+                rows = conn.execute(
+                    "SELECT broker_order_id, security_id, price, quantity, COALESCE(filled_quantity, 0) AS filled_qty, status FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE'",
+                    (start_of_day,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT broker_order_id, security_id, price, quantity, 0 AS filled_qty, status FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE'",
+                    (start_of_day,),
+                ).fetchall()
+
             open_sec_ids = set()
             exposure = 0.0
             for r in rows:
-                open_sec_ids.add(str(r["security_id"]))
-                exposure += float(r["price"] or 0.0) * int(r["quantity"] or 0)
+                st = str(r["status"] or "").upper()
+                boid = str(r["broker_order_id"] or "")
+                req_qty = int(r["quantity"] or 0)
+                f_qty = int(r["filled_qty"] or 0) or fill_sums.get(boid, 0)
+                if st in ("PENDING", "ACKED", "TRANSIT", "TRIGGERED", "PART_FILLED", "PART_TRADED"):
+                    eff_qty = req_qty
+                elif st == "TRADED":
+                    eff_qty = f_qty if f_qty > 0 else req_qty
+                elif st in ("CANCELLED", "EXPIRED") and f_qty > 0:
+                    eff_qty = f_qty
+                else:
+                    eff_qty = 0
+                if eff_qty > 0:
+                    open_sec_ids.add(str(r["security_id"]))
+                    exposure += float(r["price"] or 0.0) * eff_qty
             return {
                 "daily_trades": int(daily_trades),
                 "open_positions": len(open_sec_ids),
