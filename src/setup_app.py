@@ -38,6 +38,33 @@ from src.notifier.telegram_notifier import TelegramNotifier
 
 app = FastAPI(title="Audit bot - Setup Dashboard")
 
+
+def ensure_webui_coordinator_started(
+    data_dir: Optional[str] = None,
+    env_path: str = ".env",
+    stop_when_idle: bool = False,
+):
+    """F02-03: Starts or wakes the persistent background control coordinator for the WebUI process."""
+    cfg = AppConfig.from_env()
+    resolved_data_dir = os.path.abspath(data_dir or getattr(cfg, "data_dir", "data"))
+    resolved_env_path = os.path.abspath(env_path)
+    tracker = ConfigChangeTracker(data_dir=resolved_data_dir)
+    ro_broker = tracker.get_readonly_broker(env_path=resolved_env_path)
+    notifier = TelegramNotifier(cfg) if cfg.log_group_id else None
+    return tracker.start_coordinator_daemon(
+        env_path=resolved_env_path,
+        broker=ro_broker,
+        notifier=notifier,
+        stop_when_idle=stop_when_idle,
+    )
+
+
+@app.on_event("startup")
+def _on_webui_startup() -> None:
+    if not is_isolated_test_environment():
+        ensure_webui_coordinator_started(stop_when_idle=False)
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -697,7 +724,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Telegram API Hash</label>
             <div class="input-wrap">
-              <input type="password" name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="e.g. 0123456789abcdef (leave blank to keep current)">
+              <input type="password" name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="Saved in .env (leave blank to keep unchanged)">
             </div>
             <p class="help-text">From my.telegram.org</p>
           </div>
@@ -802,7 +829,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Equity Budget per Trade (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="any" min="0.01" name="equity_budget_inr" value="<!--EQUITY_BUDGET_INR-->" required>
+              <input type="number" step="500" name="equity_budget_inr" value="<!--EQUITY_BUDGET_INR-->" required>
             </div>
             <p class="help-text">Allocated budget per cash equity buy</p>
           </div>
@@ -925,7 +952,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Min Required Ledger Funds (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="any" min="0" name="min_trade_funds_inr" value="<!--MIN_TRADE_FUNDS_INR-->" required>
+              <input type="number" step="1000" name="min_trade_funds_inr" value="<!--MIN_TRADE_FUNDS_INR-->" required>
             </div>
             <p class="help-text">Trading halted if funds drop below</p>
           </div>
@@ -1076,7 +1103,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </form>
   </div>
 
-  <!-- CV13-06G: Configuration Save & Application Tracking Modal -->
+  <!-- CV13-06G & AB-V14-WEBUI-BACKEND-FIX-01: Configuration Save, 0-100% Progress & Service Control Modal -->
   <div id="configModal" class="modal-backdrop">
     <div class="modal-box">
       <div class="modal-header">
@@ -1084,7 +1111,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span>⚙️</span> Configuration Change Tracker
         </div>
         <div style="display: flex; align-items: center; gap: 8px;">
-          <span id="modalStatePill" class="state-pill state-REQUEST_RECEIVED">REQUEST_RECEIVED</span>
+          <span id="modalProgressBadge" style="font-size: 12px; font-weight: 700; color: #38bdf8; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); padding: 3px 10px; border-radius: 999px;">0%</span>
+          <span id="modalStatePill" class="state-pill state-REQUEST_RECEIVED">Request Received</span>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 18px;">
+        <div style="display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; font-weight: 600; margin-bottom: 6px;">
+          <span id="modalProgressStepText">0% — Preparing Request</span>
+          <span id="modalProgressPctRight">0%</span>
+        </div>
+        <div style="width: 100%; height: 8px; background: #1f2937; border-radius: 999px; overflow: hidden; border: 1px solid #374151;">
+          <div id="modalProgressBar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #3b82f6, #10b981); transition: width 0.25s ease;"></div>
         </div>
       </div>
 
@@ -1126,18 +1164,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="modal-card">
           <div class="modal-card-label">Service Operating State</div>
-          <div id="modalServiceStatus" class="modal-card-val">CHECKING...</div>
+          <div id="modalServiceStatus" class="modal-card-val">Checking...</div>
         </div>
         <div class="modal-card">
           <div class="modal-card-label">Previous Settings</div>
           <div id="modalPrevVersion" class="modal-card-val">Calculating...</div>
         </div>
         <div class="modal-card">
-          <div class="modal-card-label">New Submitted Settings</div>
+          <div class="modal-card-label">Requested Settings</div>
           <div id="modalPropVersion" class="modal-card-val">Calculating...</div>
         </div>
         <div class="modal-card" style="grid-column: span 2;">
-          <div class="modal-card-label">Running Service Settings</div>
+          <div class="modal-card-label">Running Settings</div>
           <div id="modalActiveVersion" class="modal-card-val">Awaiting Running Process Confirmation</div>
         </div>
       </div>
@@ -1147,7 +1185,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="modalChangesList" style="font-size: 12px; color: #cbd5e1; font-family: monospace; line-height: 1.6;">None</div>
       </div>
 
-      <div class="modal-footer">
+      <div class="modal-footer" style="justify-content: space-between; align-items: center;">
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <button id="modalStartBotBtn" type="button" style="background: #10b981; color: #ffffff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; display: none;">▶ Start Bot</button>
+          <button id="modalStopBotBtn" type="button" style="background: #ef4444; color: #ffffff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; display: none;">⏹ Stop Bot</button>
+          <span id="modalWaitingBadge" style="font-size: 12px; color: #fbbf24; font-weight: 600; display: none;">⏳ Waiting for LIVE Order</span>
+        </div>
         <button id="modalCloseBtn" type="button" style="background: #374151; color: #f9fafb; border: none; border-radius: 8px; padding: 8px 18px; font-size: 13px; font-weight: 600; cursor: pointer; display: none;">Close</button>
       </div>
     </div>
@@ -1158,7 +1201,15 @@ document.addEventListener('DOMContentLoaded', function() {
   const form = document.querySelector('form');
   const modal = document.getElementById('configModal');
   const closeBtn = document.getElementById('modalCloseBtn');
+  const startBotBtn = document.getElementById('modalStartBotBtn');
+  const stopBotBtn = document.getElementById('modalStopBotBtn');
   let pollTimer = null;
+  let lastRecord = null;
+
+  function getCsrfToken() {
+    const inp = document.querySelector('input[name="csrf_token"]');
+    return inp ? inp.value : '';
+  }
 
   if (closeBtn) {
     closeBtn.addEventListener('click', function() {
@@ -1167,11 +1218,116 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
 
+  async function invokeServiceControl(action, confirmLive = false) {
+    const reasonBox = document.getElementById('modalReason');
+    reasonBox.textContent = (action === 'start' ? 'Starting AuditBot service...' : 'Stopping AuditBot service safely...');
+    reasonBox.className = 'modal-reason';
+    try {
+      const resp = await fetch('/setup/service-control', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          action: action,
+          confirm_live: confirmLive,
+          csrf_token: getCsrfToken()
+        })
+      });
+      const res = await resp.json();
+      if (res.requires_live_confirmation) {
+        if (window.confirm(res.message || 'You are about to start AuditBot in LIVE mode. Real Dhan orders may be placed. Continue?')) {
+          return await invokeServiceControl('start', true);
+        } else {
+          reasonBox.textContent = 'LIVE startup cancelled by operator.';
+          return;
+        }
+      }
+      if (res.service_state_label || res.service_state) {
+        document.getElementById('modalServiceStatus').textContent = res.service_state_label || res.service_state;
+      }
+      reasonBox.textContent = res.message || res.error || 'Service control operation completed.';
+      reasonBox.className = res.ok ? 'modal-reason success' : (res.deferred ? 'modal-reason warning' : 'modal-reason error');
+      if (res.service_state === 'RUNNING') {
+        startBotBtn.style.display = 'none';
+        stopBotBtn.style.display = res.deferred ? 'none' : 'inline-block';
+        document.getElementById('modalActiveVersion').textContent = (res.running_mode || res.saved_mode || 'TEST') + ' — Verified';
+      } else if (res.service_state && res.service_state.startsWith('STOPPED')) {
+        startBotBtn.style.display = 'inline-block';
+        stopBotBtn.style.display = 'none';
+        document.getElementById('modalActiveVersion').textContent = 'Bot Stopped (Saved: ' + (res.saved_mode || 'TEST') + ')';
+      }
+    } catch (err) {
+      reasonBox.textContent = 'Service control request error: ' + err;
+      reasonBox.className = 'modal-reason error';
+    }
+  }
+
+  if (startBotBtn) {
+    startBotBtn.addEventListener('click', function() {
+      const savedMode = (lastRecord && (lastRecord.saved_mode || lastRecord.requested_mode)) || 'TEST';
+      if (savedMode === 'LIVE') {
+        if (!window.confirm('You are about to start AuditBot in LIVE mode. Real Dhan orders may be placed. Continue?')) {
+          return;
+        }
+        invokeServiceControl('start', true);
+      } else {
+        invokeServiceControl('start', false);
+      }
+    });
+  }
+
+  if (stopBotBtn) {
+    stopBotBtn.addEventListener('click', function() {
+      invokeServiceControl('stop', false);
+    });
+  }
+
+  function startPolling(changeId) {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      try {
+        const sResp = await fetch('/setup/change-status/' + changeId);
+        if (sResp.ok) {
+          const sRec = await sResp.json();
+          updateModal(sRec);
+          if (['APPLIED_VERIFIED', 'SAVED_FOR_NEXT_START', 'APPLY_FAILED', 'REJECTED'].includes(sRec.state)) {
+            clearInterval(pollTimer);
+            document.getElementById('modalCloseBtn').style.display = 'inline-block';
+          } else if (sRec.state === 'WAITING_FOR_SAFE_APPLY') {
+            document.getElementById('modalCloseBtn').style.display = 'inline-block';
+          }
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
+      }
+    }, 450);
+  }
+
+  // Resume active or waiting configuration tracker popup across page refresh if a transition is in progress
+  (async function checkExistingOperationOnLoad() {
+    try {
+      const resp = await fetch('/setup/active-version');
+      if (resp.ok) {
+        const info = await resp.json();
+        if (info.latest_change && ['REQUEST_RECEIVED', 'VALIDATING', 'SAVED', 'SAFETY_CHECK_PENDING', 'WAITING_FOR_SAFE_APPLY', 'APPLYING'].includes(info.latest_change.state)) {
+          modal.classList.add('active');
+          updateModal(info.latest_change);
+          startPolling(info.latest_change.change_id);
+        }
+      }
+    } catch (e) {}
+  })();
+
   if (form) {
     form.addEventListener('submit', async function(e) {
       e.preventDefault();
+      const liveCheckbox = form.querySelector('input[name="is_live_mode"]');
+      if (liveCheckbox && liveCheckbox.checked) {
+        if (!window.confirm('You are about to enable LIVE Trading Mode. Real Dhan orders may be placed when active. Continue?')) {
+          return;
+        }
+      }
       modal.classList.add('active');
-      document.getElementById('modalStatePill').textContent = 'REQUEST_RECEIVED';
+      document.getElementById('modalStatePill').textContent = 'Request Received';
       document.getElementById('modalStatePill').className = 'state-pill state-REQUEST_RECEIVED';
       document.getElementById('modalReason').textContent = 'Submitting configuration request to server...';
       document.getElementById('modalReason').className = 'modal-reason';
@@ -1188,24 +1344,10 @@ document.addEventListener('DOMContentLoaded', function() {
         updateModal(rec);
 
         if (rec.change_id) {
-          pollTimer = setInterval(async () => {
-            try {
-              const sResp = await fetch('/setup/change-status/' + rec.change_id);
-              if (sResp.ok) {
-                const sRec = await sResp.json();
-                updateModal(sRec);
-                if (['APPLIED_VERIFIED', 'WAITING_FOR_SAFE_APPLY', 'SAVED_FOR_NEXT_START', 'APPLY_FAILED', 'REJECTED'].includes(sRec.state)) {
-                  clearInterval(pollTimer);
-                  document.getElementById('modalCloseBtn').style.display = 'inline-block';
-                }
-              }
-            } catch (err) {
-              console.error('Polling error:', err);
-            }
-          }, 400);
+          startPolling(rec.change_id);
         }
       } catch (err) {
-        document.getElementById('modalStatePill').textContent = 'ERROR';
+        document.getElementById('modalStatePill').textContent = 'Could Not Apply Settings';
         document.getElementById('modalStatePill').className = 'state-pill state-APPLY_FAILED';
         document.getElementById('modalReason').textContent = 'Network error communicating with setup engine: ' + err;
         document.getElementById('modalReason').className = 'modal-reason error';
@@ -1216,26 +1358,51 @@ document.addEventListener('DOMContentLoaded', function() {
 
   function updateModal(rec) {
     if (!rec) return;
+    lastRecord = rec;
     document.getElementById('modalChangeId').textContent = rec.change_id || 'CFG-PENDING';
     const pill = document.getElementById('modalStatePill');
-    pill.textContent = rec.state;
+    pill.textContent = rec.state_label || rec.state;
     pill.className = 'state-pill state-' + rec.state;
-    
-    document.getElementById('modalServiceStatus').textContent = rec.service_status || 'UNKNOWN';
-    document.getElementById('modalPrevVersion').textContent = rec.previous_version_hash ? 'Saved (Ref: ' + rec.previous_version_hash.slice(0, 8) + ')' : 'None';
-    document.getElementById('modalPropVersion').textContent = rec.proposed_version_hash ? 'Ready to Apply (Ref: ' + rec.proposed_version_hash.slice(0, 8) + ')' : 'Pending';
-    if (rec.state === 'APPLIED_VERIFIED') {
-      document.getElementById('modalActiveVersion').textContent = '🟢 Verified & Active in Running Bot';
+
+    const pct = (typeof rec.progress_percent === 'number') ? rec.progress_percent : 0;
+    document.getElementById('modalProgressBadge').textContent = pct + '%';
+    document.getElementById('modalProgressPctRight').textContent = pct + '%';
+    document.getElementById('modalProgressBar').style.width = pct + '%';
+
+    let stepCaption = pct + '% — ' + (rec.state_label || rec.current_step || rec.state);
+    if (rec.state === 'WAITING_FOR_SAFE_APPLY' || rec.operation_state === 'WAITING_FOR_ORDER') {
+      stepCaption = pct + '% — Waiting for Existing LIVE Order';
     } else if (rec.state === 'SAVED_FOR_NEXT_START') {
-      document.getElementById('modalActiveVersion').textContent = 'Saved for Next Startup (Bot is currently stopped)';
+      stepCaption = pct + '% — Settings Saved (Bot Not Started — Runtime Verification Skipped)';
+    }
+    document.getElementById('modalProgressStepText').textContent = stepCaption;
+
+    document.getElementById('modalServiceStatus').textContent = rec.service_state_label || rec.service_status || 'UNKNOWN';
+
+    const prevMode = rec.previous_mode || 'TEST';
+    const reqMode = rec.requested_mode || 'TEST';
+    const prevRef = rec.previous_version_hash ? ' (Ref: ' + rec.previous_version_hash.slice(0, 8) + ')' : '';
+    const propRef = rec.proposed_version_hash ? ' (Ref: ' + rec.proposed_version_hash.slice(0, 8) + ')' : '';
+    document.getElementById('modalPrevVersion').textContent = prevMode + prevRef;
+    document.getElementById('modalPropVersion').textContent = reqMode + propRef;
+
+    if (rec.state === 'APPLIED_VERIFIED') {
+      document.getElementById('modalActiveVersion').textContent = (rec.running_mode || reqMode) + ' — Verified';
+    } else if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
+      document.getElementById('modalActiveVersion').textContent = (rec.running_mode || prevMode) + ' — Waiting for Order';
+    } else if (rec.state === 'SAVED_FOR_NEXT_START') {
+      document.getElementById('modalActiveVersion').textContent = 'Bot Not Running (Saved: ' + (rec.saved_mode || reqMode) + ' — Runtime Verification Not Performed)';
     } else if (rec.effective_version_hash) {
-      document.getElementById('modalActiveVersion').textContent = 'Verified (Ref: ' + rec.effective_version_hash.slice(0, 8) + ')';
+      document.getElementById('modalActiveVersion').textContent = (rec.running_mode || reqMode) + ' — Verified (Ref: ' + rec.effective_version_hash.slice(0, 8) + ')';
     } else {
       document.getElementById('modalActiveVersion').textContent = 'Pending Verification';
     }
 
     const reasonBox = document.getElementById('modalReason');
-    const msg = rec.error_msg || rec.reason || ('Configuration state: ' + rec.state);
+    let msg = rec.error_msg || rec.reason || ('Configuration state: ' + (rec.state_label || rec.state));
+    if (rec.state === 'WAITING_FOR_SAFE_APPLY' && (rec.blocked_reason === 'LIVE_ORDER_IN_PROGRESS' || msg.toLowerCase().includes('order'))) {
+      msg = '⏳ Configuration Paused — LIVE Order in Progress: ' + msg;
+    }
     reasonBox.textContent = msg;
 
     if (rec.state === 'APPLIED_VERIFIED' || rec.state === 'SAVED_FOR_NEXT_START') {
@@ -1250,28 +1417,46 @@ document.addEventListener('DOMContentLoaded', function() {
 
     if (rec.changes_summary && rec.changes_summary.length > 0) {
       document.getElementById('modalChangesList').innerHTML = rec.changes_summary.map(c => '<div>• ' + c + '</div>').join('');
+    } else if (rec.previous_version_hash && rec.previous_version_hash === rec.proposed_version_hash) {
+      document.getElementById('modalChangesList').innerHTML = '<div>No settings changed; the requested configuration already matches the saved configuration.</div>';
+    } else {
+      document.getElementById('modalChangesList').innerHTML = '<div>None</div>';
     }
 
-    const stepOrder = ['REQUEST_RECEIVED', 'VALIDATING', 'SAVED', 'SAFETY_CHECK_PENDING', 'APPLYING', 'APPLIED_VERIFIED'];
-    const curIdx = stepOrder.indexOf(rec.state);
-    for (let i = 0; i < stepOrder.length; i++) {
+    // Context-sensitive Start / Stop / Waiting controls (Part 5)
+    const waitBadge = document.getElementById('modalWaitingBadge');
+    if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
+      startBotBtn.style.display = 'none';
+      stopBotBtn.style.display = 'none';
+      waitBadge.style.display = 'inline-block';
+    } else if (rec.service_state === 'RUNNING' || rec.service_status === 'LIVE' || rec.service_status === 'TEST') {
+      startBotBtn.style.display = 'none';
+      stopBotBtn.style.display = 'inline-block';
+      waitBadge.style.display = 'none';
+    } else if (rec.service_state && (rec.service_state.startsWith('STOPPED') || rec.service_state === 'FAILED')) {
+      startBotBtn.style.display = 'inline-block';
+      stopBotBtn.style.display = 'none';
+      waitBadge.style.display = 'none';
+    } else {
+      startBotBtn.style.display = 'none';
+      stopBotBtn.style.display = 'none';
+      waitBadge.style.display = 'none';
+    }
+
+    if (['APPLIED_VERIFIED', 'WAITING_FOR_SAFE_APPLY', 'SAVED_FOR_NEXT_START', 'APPLY_FAILED', 'REJECTED'].includes(rec.state)) {
+      document.getElementById('modalCloseBtn').style.display = 'inline-block';
+    }
+
+    const stepKeys = ['RECEIVED', 'VALIDATING', 'PERSISTED', 'SAFETY_GATE', 'APPLYING', 'VERIFIED'];
+    const stepMap = (rec.step_status && typeof rec.step_status === 'object') ? rec.step_status : {};
+    for (let i = 0; i < stepKeys.length; i++) {
       const el = document.getElementById('step_' + (i + 1));
       if (!el) continue;
-      el.className = 'step-item';
-      if (rec.state === 'APPLY_FAILED' || rec.state === 'REJECTED') {
-        if (i === Math.max(0, curIdx)) el.className = 'step-item failed';
-        else if (i < curIdx) el.className = 'step-item completed';
-      } else if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
-        if (i < 3) el.className = 'step-item completed';
-        else if (i === 3) el.className = 'step-item active';
-      } else if (rec.state === 'SAVED_FOR_NEXT_START') {
-        if (i < 3) el.className = 'step-item completed';
-        else if (i === 3) el.className = 'step-item completed';
-      } else if (i < curIdx) {
-        el.className = 'step-item completed';
-      } else if (i === curIdx) {
-        el.className = 'step-item active';
-      }
+      const st = stepMap[stepKeys[i]] || 'PENDING';
+      if (st === 'COMPLETED') el.className = 'step-item completed';
+      else if (st === 'FAILED' || st === 'CANCELLED') el.className = 'step-item failed';
+      else if (st === 'IN_PROGRESS' || st === 'WAITING' || st === 'READY') el.className = 'step-item active';
+      else el.className = 'step-item';
     }
   }
 });
@@ -1295,9 +1480,10 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     cfg = AppConfig.from_env()
 
     # Build real-time system status bar
-    from src.engine.config_manager import check_service_is_active, ConfigChangeTracker
-    is_svc_active = check_service_is_active()
+    from src.engine.config_manager import check_service_is_active, ConfigChangeTracker, ServiceOperatingState
     tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+    svc_op_state, _ = tracker.resolve_service_operating_state()
+    is_svc_active = (svc_op_state == ServiceOperatingState.RUNNING)
     act_info = tracker.get_active_running_version() or {}
     act_v = act_info.get("short_version", "v-UNKNOWN")
     stop_path = os.path.join(getattr(cfg, "data_dir", "data"), "emergency_stop.json")
@@ -1309,7 +1495,16 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         except Exception:
             is_stopped = True
 
-    svc_badge = '<span class="status-pill pill-online">🟢 Online (Running)</span>' if is_svc_active else '<span class="status-pill pill-offline">⚪ Offline (Stopped)</span>'
+    if svc_op_state == ServiceOperatingState.RUNNING:
+        svc_badge = '<span class="status-pill pill-online">🟢 Online (Running)</span>'
+    elif svc_op_state == ServiceOperatingState.STOPPED_BY_OWNER:
+        svc_badge = '<span class="status-pill pill-offline">⚪ Stopped by Owner</span>'
+    elif svc_op_state == ServiceOperatingState.FAILED:
+        svc_badge = '<span class="status-pill pill-danger">❌ Stopped Unexpectedly</span>'
+    elif svc_op_state == ServiceOperatingState.UNKNOWN:
+        svc_badge = '<span class="status-pill pill-offline">⚠️ Status Unavailable (UNKNOWN)</span>'
+    else:
+        svc_badge = '<span class="status-pill pill-offline">⚪ Offline (Stopped)</span>'
     mode_badge = f'<span class="status-pill {"pill-live" if cfg.trading_mode.value == "LIVE" else "pill-test"}">{"🔴 Real Trading (Live Money)" if cfg.trading_mode.value == "LIVE" else "🧪 Paper Trading (Safe / Zero Risk)"}</span>'
     stop_badge = '<span class="status-pill pill-danger">🛑 Halted (Emergency Stop)</span>' if is_stopped else '<span class="status-pill pill-online">🟢 Normal (Trading Allowed)</span>'
     cmp_pol = getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP")
@@ -1473,7 +1668,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--CMP_DARVAS_SEL-->", "selected" if getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") == "DARVAS_HTTP_SUCCESS" else "")
         .replace("<!--CMP_STRICT_SEL-->", "selected" if getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") != "DARVAS_HTTP_SUCCESS" else "")
         # Sizing
-        .replace("<!--EQUITY_BUDGET_INR-->", f"{cfg.equity_budget_inr:g}")
+        .replace("<!--EQUITY_BUDGET_INR-->", str(int(cfg.equity_budget_inr)))
         .replace("<!--CNC_SELECTED-->", "selected" if cfg.equity_product_type.value == "CNC" else "")
         .replace("<!--MTF_SELECTED-->", "selected" if cfg.equity_product_type.value == "MTF" else "")
         .replace("<!--EQUITY_PRICE_MARKUP_PCT-->", str(cfg.equity_price_markup_pct))
@@ -1481,7 +1676,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--FNO_MAX_LOTS-->", str(cfg.fno_max_lots))
         # Risk
         .replace("<!--MAX_ORDER_AMOUNT_INR-->", str(int(cfg.max_order_amount_inr)))
-        .replace("<!--MIN_TRADE_FUNDS_INR-->", f"{cfg.min_trade_funds_inr:g}")
+        .replace("<!--MIN_TRADE_FUNDS_INR-->", str(int(cfg.min_trade_funds_inr)))
         .replace("<!--TEST_MODE_PAPER_FUNDS_INR-->", str(int(getattr(cfg, "test_mode_paper_funds_inr", 100000.0))))
         .replace("<!--MAX_DAILY_LOSS_INR-->", str(int(cfg.max_daily_loss_inr)))
         .replace("<!--MAX_DAILY_TRADES-->", str(cfg.max_daily_trades))
@@ -1780,7 +1975,7 @@ SCRIP_MASTER_MAX_AGE_SEC={clean_scrip_max_age}
 
 @app.post("/setup/submit-async")
 async def handle_setup_submission_async(request: Request):
-    """CV13-06G: Asynchronous WebUI submission returning immediate change tracking metadata."""
+    """B11: Durable, serialized asynchronous WebUI submission returning change_id immediately."""
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         raw_data = await request.json()
@@ -1803,21 +1998,40 @@ async def handle_setup_submission_async(request: Request):
 
     env_content, form_params = build_env_and_params_dict(**raw_data)
     cfg = AppConfig.from_env()
+    data_dir = os.path.abspath(getattr(cfg, "data_dir", "data"))
+    env_path = os.path.abspath(".env")
     notifier = TelegramNotifier(cfg) if cfg.log_group_id else None
+    tracker = ConfigChangeTracker(data_dir=data_dir)
+    ro_broker = tracker.get_readonly_broker(env_path=env_path)
 
-    record = execute_configuration_update(
+    # Support explicit sync_mode="1" only when caller explicitly requests blocking execution;
+    # standard Save & Apply is always durably queued and executed by the serialized coordinator (B11).
+    if str(raw_data.get("sync_mode", "")).lower() in ("1", "true"):
+        record = execute_configuration_update(
+            form_params=form_params,
+            env_content=env_content,
+            data_dir=data_dir,
+            env_path=env_path,
+            notifier=notifier,
+            broker=ro_broker,
+        )
+        return JSONResponse(content=record.to_dict())
+
+    spawn_bg = str(raw_data.get("spawn_worker", "true")).lower() not in ("0", "false")
+    init_rec = tracker.enqueue_durable_configuration_update(
         form_params=form_params,
         env_content=env_content,
-        data_dir=getattr(cfg, "data_dir", "data"),
-        env_path=".env",
+        env_path=env_path,
         notifier=notifier,
+        broker=ro_broker,
+        spawn_worker=spawn_bg,
     )
-    return JSONResponse(content=record.to_dict())
+    return JSONResponse(content=init_rec.to_dict())
 
 
 @app.get("/setup/change-status/{change_id}")
 def get_change_status(change_id: str):
-    """CV13-06G: Polling endpoint for real-time modal progress."""
+    """Section F: Strictly read-only polling endpoint for real-time modal progress."""
     tracker = ConfigChangeTracker(data_dir="data")
     rec = tracker.get_change_record(change_id)
     if not rec:
@@ -1827,18 +2041,112 @@ def get_change_status(change_id: str):
     return JSONResponse(content=rec.to_dict())
 
 
+@app.post("/setup/coordinator-tick")
+async def handle_coordinator_tick(request: Request):
+    """B07 & B11: Authorized POST endpoint for triggering the control coordinator to process queued/ready operations."""
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        raw_data = await request.json()
+    else:
+        form = await request.form()
+        raw_data = dict(form)
+    csrf_val = raw_data.get("csrf_token")
+    if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Missing or invalid CSRF token"})
+    cfg = AppConfig.from_env()
+    data_dir = os.path.abspath(getattr(cfg, "data_dir", "data"))
+    env_path = os.path.abspath(".env")
+    tracker = ConfigChangeTracker(data_dir=data_dir)
+    ro_broker = tracker.get_readonly_broker(env_path=env_path)
+    outcomes = tracker.run_control_coordinator_tick(env_path=env_path, broker=ro_broker)
+    latest = tracker.get_change_record()
+    return JSONResponse(content={
+        "ok": True,
+        "latest_change": latest.to_dict() if latest else None,
+        "service_control": tracker.get_service_control_record(),
+        "transition_gate": tracker.inspect_transition_gate_status(read_only=True),
+        "outcomes_summary": {k: (v.to_dict() if hasattr(v, "to_dict") else v) for k, v in outcomes.items()},
+    })
+
+
+@app.post("/setup/cancel-deferred")
+async def handle_cancel_deferred(request: Request):
+    """Section F: Authorized POST endpoint to cancel a deferred configuration change before it enters APPLYING."""
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        raw_data = await request.json()
+    else:
+        form = await request.form()
+        raw_data = dict(form)
+    csrf_val = raw_data.get("csrf_token")
+    if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Missing or invalid CSRF token"})
+    change_id = raw_data.get("change_id")
+    reason = str(raw_data.get("reason") or "Cancelled by owner from WebUI").strip()
+    cfg = AppConfig.from_env()
+    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+    res = tracker.cancel_deferred_change(change_id=change_id, reason=reason)
+    return JSONResponse(status_code=200 if res.get("ok") else 400, content=res)
+
+
+@app.post("/setup/service-control")
+async def handle_service_control(request: Request):
+    """B10 & B12: Authenticated, CSRF-protected Start / Stop / Restart / Status endpoint for the WebUI."""
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        raw_data = await request.json()
+    else:
+        form = await request.form()
+        raw_data = dict(form)
+
+    csrf_val = raw_data.get("csrf_token")
+    if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error": "Missing or invalid CSRF token", "service_state": "UNKNOWN"},
+        )
+
+    action = str(raw_data.get("action") or "").strip().lower()
+    if action not in ("start", "stop", "restart", "status"):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": f"Invalid service action '{action}' (only start/stop/restart/status allowed)"},
+        )
+
+    confirm_live = str(raw_data.get("confirm_live", "")).strip().lower() in ("1", "true", "yes", "on") or (raw_data.get("confirm_live") is True)
+    reason = str(raw_data.get("reason") or f"Operator requested {action} from WebUI").strip()
+
+    cfg = AppConfig.from_env()
+    env_path = os.path.abspath(".env")
+    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+    ro_broker = tracker.get_readonly_broker(env_path=env_path) if action != "status" else None
+    res = tracker.control_service(
+        action=action,
+        reason=reason,
+        confirm_live=confirm_live,
+        env_path=env_path,
+        broker=ro_broker,
+    )
+    status_code = 200 if (res.get("ok") or res.get("deferred") or res.get("requires_live_confirmation")) else 400
+    return JSONResponse(status_code=status_code, content=res)
+
+
 @app.get("/setup/active-version")
 def get_active_version():
-    """CV13-06G: Returns currently running configuration version."""
+    """CV13-06G: Returns currently running configuration version and latest change record."""
     tracker = ConfigChangeTracker(data_dir="data")
     info = tracker.get_active_running_version() or {}
-    is_active = check_service_is_active()
+    svc_state, _ = tracker.resolve_service_operating_state()
+    is_active = (svc_state.value == "RUNNING")
+    latest_rec = tracker.get_change_record()
     return JSONResponse(content={
         "version_hash": info.get("version_hash", "UNKNOWN"),
         "short_version": info.get("short_version", "v-UNKNOWN"),
         "trading_mode": info.get("trading_mode", "UNKNOWN"),
         "service_running": is_active,
+        "service_state": svc_state.value,
         "acknowledged_at": info.get("acknowledged_at"),
+        "latest_change": latest_rec.to_dict() if latest_rec else None,
     })
 
 
