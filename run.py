@@ -66,6 +66,7 @@ from src.main import TradingBotPipeline
 from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock
 from src.notifier.outbox_worker import OutboxWorker
+from src.notifier.dhan_response import configure_dhan_response_group
 from src.notifier.formatter import format_trade_log
 
 cfg = AppConfig.from_env()
@@ -132,11 +133,20 @@ async def main():
         else:
             print(f"⚠️ Startup Reconciliation: {rec_msg}")
 
+        # Configure the actual production listener, not src.main's alternate listener.
+        # Resolve a joined group before enabling mirrored broker notifications.
+        loop = asyncio.get_running_loop()
+        dhan_response_dispatch_fn = await configure_dhan_response_group(
+            client=client,
+            group_name=cfg.dhan_response_group_name,
+            signal_source_ids=allowed_chats,
+            reporter=getattr(pipeline.watcher, "execution_reporter", None),
+            loop=loop,
+        )
+
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         print("🛡️ Persistent Protection Watcher activated (monitoring resting fills & OCO/Super legs through market close)")
-
-        loop = asyncio.get_running_loop()
 
         def _dispatch_notification_sync(formatted_text: str) -> bool:
             if pipeline.notifier.enabled:
@@ -158,6 +168,7 @@ async def main():
         outbox_worker = OutboxWorker(
             journal_db=pipeline.db,
             dispatch_fn=_dispatch_notification_sync,
+            dhan_response_dispatch_fn=dhan_response_dispatch_fn,
         )
         asyncio.create_task(outbox_worker.run())
         print("📬 Durable Outbox Worker activated (non-blocking notification pipeline)")

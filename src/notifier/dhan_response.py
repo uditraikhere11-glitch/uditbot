@@ -7,10 +7,11 @@ are rejected.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -59,3 +60,51 @@ async def resolve_dhan_response_group(client: Any, name: str, forbidden_chat_ids
     if int(dialog.id) in forbidden:
         raise ValueError("Dhan Response group cannot also be a monitored trade-signal source.")
     return dialog.entity
+
+
+async def configure_dhan_response_group(
+    client: Any,
+    group_name: str,
+    signal_source_ids: Iterable[int],
+    reporter: Any,
+    loop: Any,
+) -> Optional[Callable[[str], bool]]:
+    """Bind the existing watcher and outbox to a verified Telegram destination.
+
+    This is notification-only. A group lookup failure must not affect the
+    trading listener, source allowlist, STOP, orders or protection watcher.
+    """
+    if reporter is not None:
+        reporter.dhan_response_enabled = False
+    if not group_name:
+        logger.info("Dhan Response group not configured; response mirroring disabled.")
+        return None
+    if reporter is None:
+        logger.warning("Dhan Response group unavailable; execution reporter is not initialized.")
+        return None
+    try:
+        entity = await asyncio.wait_for(
+            resolve_dhan_response_group(
+                client, group_name, forbidden_chat_ids=signal_source_ids
+            ), timeout=15.0,
+        )
+    except Exception as exc:
+        logger.warning("Dhan Response group unavailable; mirroring disabled: %s", exc)
+        return None
+
+    def dispatch_dhan_response(message: str) -> bool:
+        """Invoked only from the existing outbox worker's background thread."""
+        future = asyncio.run_coroutine_threadsafe(
+            client.send_message(entity, message, parse_mode="html"), loop
+        )
+        try:
+            future.result(timeout=12.0)
+            return True
+        except Exception as exc:
+            future.cancel()
+            logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
+            return False
+
+    reporter.dhan_response_enabled = True
+    logger.info("Dhan final response group resolved uniquely: %s", group_name)
+    return dispatch_dhan_response
