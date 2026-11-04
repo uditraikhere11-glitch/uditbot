@@ -1052,6 +1052,7 @@ class TradingBotPipeline:
                 price=order_req.price,
                 quantity=order_req.quantity,
                 is_super_order=False,
+                is_amo=pre_price_amo,
                 original_market_price=ref_price,
                 tick_size=inst.tick_size,
                 lot_size=inst.lot_size,
