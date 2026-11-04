@@ -47,9 +47,11 @@ class OutboxWorker:
         dispatch_fn: Callable[[str], bool],
         poll_interval_sec: float = 1.0,
         max_retries: int = 5,
+        dhan_response_dispatch_fn: Optional[Callable[[str], bool]] = None,
     ):
         self.db = journal_db
         self.dispatch_fn = dispatch_fn
+        self.dhan_response_dispatch_fn = dhan_response_dispatch_fn
         self.poll_interval_sec = poll_interval_sec
         self.max_retries = max_retries
         self.running: bool = False
@@ -80,7 +82,13 @@ class OutboxWorker:
                     msg_text = payload.get("text") or payload.get("message") or str(payload)
                     safe_text = redact_secrets(msg_text)
 
-                    ok = self.dispatch_fn(safe_text)
+                    if item.get("event_type") == "DHAN_FINAL_RESPONSE":
+                        ok = (
+                            self.dhan_response_dispatch_fn(safe_text)
+                            if self.dhan_response_dispatch_fn is not None else False
+                        )
+                    else:
+                        ok = self.dispatch_fn(safe_text)
                     if ok:
                         self.db.mark_outbox_processed(out_id)
                         dispatched_count += 1

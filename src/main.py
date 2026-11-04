@@ -1464,10 +1464,46 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
         logger.info(f"Operating Mode: {cfg.trading_mode.value}")
         logger.info(f"Monitored Channels: {allowed_chats}")
 
+        # Dhan final acknowledgements go to one explicitly named Telegram group.
+        # This is notification-only: not a signal source, order route or trading gate.
+        dhan_response_dispatch_fn = None
+        response_reporter = getattr(pipeline.watcher, "execution_reporter", None)
+        if response_reporter is not None:
+            response_reporter.dhan_response_enabled = False
+        if cfg.dhan_response_group_name:
+            from src.notifier.dhan_response import resolve_dhan_response_group
+            try:
+                response_entity = await resolve_dhan_response_group(
+                    client, cfg.dhan_response_group_name,
+                    forbidden_chat_ids=allowed_chats,
+                )
+                loop = asyncio.get_running_loop()
+
+                def _send_dhan_response(message: str) -> bool:
+                    """Runs exclusively from the outbox worker thread, never the trading event loop."""
+                    future = asyncio.run_coroutine_threadsafe(
+                        client.send_message(response_entity, message, parse_mode="html"), loop
+                    )
+                    try:
+                        future.result(timeout=12)
+                        return True
+                    except Exception as exc:
+                        future.cancel()
+                        logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
+                        return False
+
+                dhan_response_dispatch_fn = _send_dhan_response
+                if response_reporter is not None:
+                    response_reporter.dhan_response_enabled = True
+                logger.info("Dhan final response group resolved uniquely: %s", cfg.dhan_response_group_name)
+            except (ValueError, OSError, RuntimeError) as exc:
+                logger.warning("Dhan Response group unavailable; final mirroring disabled: %s", exc)
+
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         outbox_worker = OutboxWorker(
             journal_db=pipeline.db,
             dispatch_fn=pipeline.notifier.send_log_message,
+            dhan_response_dispatch_fn=dhan_response_dispatch_fn,
         )
         asyncio.create_task(outbox_worker.run())
 
@@ -1513,7 +1549,8 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
 
         print(f"\n🚀 Bot is actively listening for trade signals in {cfg.trading_mode.value} mode...")
         print(f"📡 Monitored channels: {allowed_chats}")
-        print(f"📊 Logging destination: {cfg.log_group_id}\n")
+        print(f"📊 Logging destination: {cfg.log_group_id}")
+        print(f"📨 Dhan Response group: {cfg.dhan_response_group_name if dhan_response_dispatch_fn else 'Disabled / unresolved'}\n")
 
         await client.run_until_disconnected()
     finally:
