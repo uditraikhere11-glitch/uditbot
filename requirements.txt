@@ -1,11 +1,19 @@
-# Reproducible Pinned Runtime Dependencies (Python 3.11 / 3.12+)
-pydantic==2.10.6
-fastapi==0.115.8
-uvicorn==0.34.0
+# Reproducible Runtime Dependencies (AB-08)
+# Primary production target: Python 3.12 (Ubuntu 24.04 LTS / Debian 12 venv)
+# - Python 3.11 and 3.12 use exact verified pins with prebuilt manylinux wheels.
+# - Python >=3.13 (including Python 3.14) uses compatible major-version bounds so
+#   prebuilt pydantic-core wheels resolve without requiring a local Rust toolchain.
+pydantic==2.10.6; python_version < "3.13"
+pydantic>=2.11.0,<3.0.0; python_version >= "3.13"
+fastapi==0.115.8; python_version < "3.13"
+fastapi>=0.115.8,<1.0.0; python_version >= "3.13"
+uvicorn==0.34.0; python_version < "3.13"
+uvicorn>=0.34.0,<1.0.0; python_version >= "3.13"
 requests==2.32.3
 pytz==2025.1
 telethon==1.38.1
 python-multipart==0.0.20
+python-dotenv>=1.0.1,<2.0.0
 
 # Optional AI Fallback Dependency (install when VERTEX_PROJECT_ID or GEMINI_API_KEY is used):
 # google-genai==1.2.0

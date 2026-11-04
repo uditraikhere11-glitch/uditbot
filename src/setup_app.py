@@ -829,7 +829,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Equity Budget per Trade (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="500" name="equity_budget_inr" value="<!--EQUITY_BUDGET_INR-->" required>
+              <input type="number" step="any" min="0.01" name="equity_budget_inr" value="<!--EQUITY_BUDGET_INR-->" required>
             </div>
             <p class="help-text">Allocated budget per cash equity buy</p>
           </div>
@@ -952,7 +952,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Min Required Ledger Funds (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="1000" name="min_trade_funds_inr" value="<!--MIN_TRADE_FUNDS_INR-->" required>
+              <input type="number" step="any" min="0" name="min_trade_funds_inr" value="<!--MIN_TRADE_FUNDS_INR-->" required>
             </div>
             <p class="help-text">Trading halted if funds drop below</p>
           </div>
@@ -1668,7 +1668,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--CMP_DARVAS_SEL-->", "selected" if getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") == "DARVAS_HTTP_SUCCESS" else "")
         .replace("<!--CMP_STRICT_SEL-->", "selected" if getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") != "DARVAS_HTTP_SUCCESS" else "")
         # Sizing
-        .replace("<!--EQUITY_BUDGET_INR-->", str(int(cfg.equity_budget_inr)))
+        .replace("<!--EQUITY_BUDGET_INR-->", f"{cfg.equity_budget_inr:g}")
         .replace("<!--CNC_SELECTED-->", "selected" if cfg.equity_product_type.value == "CNC" else "")
         .replace("<!--MTF_SELECTED-->", "selected" if cfg.equity_product_type.value == "MTF" else "")
         .replace("<!--EQUITY_PRICE_MARKUP_PCT-->", str(cfg.equity_price_markup_pct))
@@ -1676,7 +1676,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--FNO_MAX_LOTS-->", str(cfg.fno_max_lots))
         # Risk
         .replace("<!--MAX_ORDER_AMOUNT_INR-->", str(int(cfg.max_order_amount_inr)))
-        .replace("<!--MIN_TRADE_FUNDS_INR-->", str(int(cfg.min_trade_funds_inr)))
+        .replace("<!--MIN_TRADE_FUNDS_INR-->", f"{cfg.min_trade_funds_inr:g}")
         .replace("<!--TEST_MODE_PAPER_FUNDS_INR-->", str(int(getattr(cfg, "test_mode_paper_funds_inr", 100000.0))))
         .replace("<!--MAX_DAILY_LOSS_INR-->", str(int(cfg.max_daily_loss_inr)))
         .replace("<!--MAX_DAILY_TRADES-->", str(cfg.max_daily_trades))
