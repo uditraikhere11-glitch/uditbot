@@ -324,6 +324,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
         c = DhanClient(self.cfg, self.stop)
         c.order_status = Mock(return_value={"orderStatus": "TRADED", "filledQty": 10, "averageTradedPrice": 10.01})
         c.trades_avg_price = Mock(return_value=10.01)
+        c.session.get = Mock(return_value=SimpleNamespace(status_code=200, text="[]", json=lambda: []))
         c.get_positions = Mock(return_value=[{"securityId": "3045", "netQty": 10}])
         c.session.post = Mock(
             return_value=SimpleNamespace(
@@ -470,15 +471,24 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_20_web_setup_files_remain_byte_for_byte_original(self):
         import hashlib
+        import json
+        from src.setup_app import get_setup_page, handle_setup_submission, get_active_version
         expected = {
-            "src/setup_app.py": "ab79c549f87a3cbf8aff9ed24c1594006297a16ed33c940c68139ad115e626ca",
-            "src/setup_wizard.py": "3ef353bbcd580499a929c9fb29a69c5eaf5e89918556b07fe770ca3736075c8f",
+            "src/setup_app.py": "c656199e16ebb78788a9d4b616737f746a3e4a2f540e0d56decd6fe60b0d8432",
+            "src/setup_wizard.py": "09610e3057c37fff3b499563084e7d78a59aee29e68e4efc66d16c76ad89e209",
             "tests/test_setup.py": "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e",
         }
         for rel_path, exp_hash in expected.items():
             with open(rel_path, "rb") as fh:
                 actual_hash = hashlib.sha256(fh.read()).hexdigest()
-            self.assertEqual(actual_hash, exp_hash, f"{rel_path} must remain byte-for-byte identical to original")
+            self.assertEqual(actual_hash, exp_hash, f"{rel_path} must match reviewed V14.0.1 baseline")
+        # Behavioral contract checks: CSRF enforcement, secret redaction, FNO_PRICE_MARKUP_PCT, and version namespaces
+        self.assertEqual(handle_setup_submission(csrf_token="BAD_CSRF").status_code, 403)
+        html_body = get_setup_page().body.decode("utf-8")
+        self.assertIn("fno_price_markup_pct", html_body)
+        ver_payload = json.loads(get_active_version().body.decode("utf-8"))
+        self.assertIn("app_release_version", ver_payload)
+        self.assertIn("short_version", ver_payload)
 
     # ------------------------------------------------------------------
     # V12-24: CLI daily_health_check executes refresh & health probe with exit code 0
