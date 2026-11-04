@@ -54,6 +54,15 @@ from src.engine.reconciliation import StartupReconciliationGate
 logger = logging.getLogger("trading_bot")
 
 
+def _is_eligible_amo_closed_session(reason: str) -> bool:
+    """Permit AMO only for verified closed-market reasons, not calendar errors."""
+    return str(reason or "").startswith((
+        "Market Pre-Open / Closed", "Market Closed Post-Hours",
+        "Market Closed (Saturday)", "Market Closed (Sunday)",
+        "Market Closed (Exchange Holiday",
+    ))
+
+
 def _is_transport_uncertainty(msg: str) -> bool:
     """
     V12-13: Detects HTTP 5xx (500/502/503/504), 408, timeouts, auth ambiguity, or network
@@ -858,6 +867,24 @@ class TradingBotPipeline:
 
         trace.mark_l3_resolved()
 
+        # Select the correct CMP policy before pricing an after-hours entry.
+        pre_price_amo = False
+        if (
+            is_live and bool(getattr(self.cfg, "equity_amo_enabled", False))
+            and inst.exchange_segment == "NSE_EQ"
+            and self.cfg.equity_product_type == ProductType.CNC
+        ):
+            price_eval_dt = None
+            if injected_clock is not None and injected_clock >= 1767225600.0:
+                import src.engine.market as _mkt_mod
+                if not hasattr(_mkt_mod.now_ist, "_mock_name"):
+                    price_eval_dt = datetime.fromtimestamp(injected_clock, tz=IST)
+            try:
+                price_m_open, price_m_msg = market_status(price_eval_dt) if price_eval_dt is not None else market_status()
+            except TypeError:
+                price_m_open, price_m_msg = market_status()
+            pre_price_amo = not price_m_open and _is_eligible_amo_closed_session(price_m_msg)
+
         ref_price = sig.stated_price
         used_live_quote = False
         configured_policy = str(getattr(self.cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") or "STRICT_TIMESTAMP").upper().strip()
@@ -872,9 +899,33 @@ class TradingBotPipeline:
                 symbol=inst.symbol,
                 now_utc=injected_clock,
                 max_quote_age_sec=self.cfg.max_quote_age_sec,
-                cmp_policy=configured_policy,
+                cmp_policy="DARVAS_HTTP_SUCCESS" if pre_price_amo else configured_policy,
             )
             last_q = getattr(self.broker, "last_quote_result", None)
+
+            if pre_price_amo:
+                amo_ref_age = getattr(last_q, "age_sec", None)
+                max_amo_age = float(getattr(self.cfg, "equity_amo_max_reference_age_sec", 259200.0))
+                valid_amo_ref = (
+                    ok and ltp > 0 and last_q is not None
+                    and bool(getattr(last_q, "is_valid", False))
+                    and getattr(last_q, "quote_timestamp", None) is not None
+                    and isinstance(amo_ref_age, (int, float)) and 0.0 <= amo_ref_age <= max_amo_age
+                    and str(getattr(last_q, "currency", "")).upper() == "INR"
+                    and str(getattr(last_q, "reference_label", "")) == "HISTORICAL_REFERENCE"
+                )
+                if not valid_amo_ref:
+                    reason = (
+                        "AMO blocked: no verified historical Yahoo reference within "
+                        f"{max_amo_age / 3600.0:g} hours ({ltp_msg})"
+                    )
+                    self.latency_monitor.record_rejection(reason)
+                    self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "AMO_REFERENCE_UNVERIFIED", reason)
+                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
+                heads_up_note = (
+                    f"AMO LIMIT priced from last published quote ({amo_ref_age / 3600.0:.1f}h old); "
+                    "Dhan queues the order for market OPEN; execution and stop/target are not yet confirmed"
+                )
 
             if ok and ltp > 0:
                 ref_price = ltp
@@ -1001,6 +1052,7 @@ class TradingBotPipeline:
                 price=order_req.price,
                 quantity=order_req.quantity,
                 is_super_order=False,
+                is_amo=pre_price_amo,
                 original_market_price=ref_price,
                 tick_size=inst.tick_size,
                 lot_size=inst.lot_size,
@@ -1111,8 +1163,13 @@ class TradingBotPipeline:
                 m_open, m_msg = market_status(eval_mkt_dt) if eval_mkt_dt is not None else market_status()
             except TypeError:
                 m_open, m_msg = market_status()
-            if not m_open:
-                reason = f"LIVE Order Blocked: {m_msg}"
+            is_amo_order = (
+                pre_price_amo and not m_open
+                and _is_eligible_amo_closed_session(m_msg)
+                and bool(getattr(self.cfg, "equity_amo_enabled", False))
+            )
+            if (not m_open and not is_amo_order) or (pre_price_amo and not is_amo_order):
+                reason = f"LIVE Order Blocked: {m_msg}" if not pre_price_amo else "LIVE Order Blocked: AMO session changed during processing"
                 self.latency_monitor.record_rejection(reason)
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                 self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_MARKET_CLOSED", reason)
@@ -1150,9 +1207,9 @@ class TradingBotPipeline:
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
-            # In STRICT_TIMESTAMP mode, re-validate source quote age immediately before submission.
-            # In DARVAS_HTTP_SUCCESS mode, quote age > 2s does not block NSE equity entry reference.
-            if used_live_quote and configured_policy != "DARVAS_HTTP_SUCCESS" and getattr(self.broker, "last_quote_result", None) is not None:
+            # Normal-hours quotes use the strict live freshness check.
+            # AMO references use a separate bounded historical-age check above.
+            if not is_amo_order and used_live_quote and configured_policy != "DARVAS_HTTP_SUCCESS" and getattr(self.broker, "last_quote_result", None) is not None:
                 last_q = self.broker.last_quote_result
                 if last_q.quote_timestamp is not None and last_q.quote_timestamp > 0 and (pre_submit_now - last_q.quote_timestamp) > self.cfg.max_quote_age_sec:
                     reason = (
@@ -1163,6 +1220,8 @@ class TradingBotPipeline:
                     self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                     return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
+            order_req.after_market_order = is_amo_order
+            order_req.amo_time = "OPEN"
             self.db.update_order_intent(correlation_id, state="SUBMITTING")
             trace.mark_l9_dhan_start()
 
@@ -1215,6 +1274,7 @@ class TradingBotPipeline:
                 self.watcher.track(
                     order_id=broker_id,
                     correlation_id=correlation_id,
+                    is_amo=is_amo_order,
                     symbol=inst.symbol,
                     trading_symbol=eq_trading_sym,
                     security_id=inst.security_id,
@@ -1227,6 +1287,7 @@ class TradingBotPipeline:
                     notification_meta={
                         "symbol": inst.symbol, "source": source_name,
                         "segment": "EQUITY", "action": "BUY", "mode": "LIVE",
+                        "is_amo": is_amo_order,
                         "yahoo_cmp": ref_price if used_live_quote else None,
                         "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
                         "quote_threshold_sec": self.cfg.max_quote_age_sec,
@@ -1241,10 +1302,13 @@ class TradingBotPipeline:
                 if broker_display_st == "TRADED":
                     exec_status_str = "TRADED (Broker Confirmed Fill)"
                     status_summary_str = "Order Traded on Dhan (TRADED)"
+                elif is_amo_order:
+                    exec_status_str = f"AMO {broker_display_st} (Broker Acknowledged — Queued for OPEN)"
+                    status_summary_str = f"AMO submitted to Dhan ({broker_display_st} — Queued for market OPEN, Not Filled)"
                 else:
                     exec_status_str = f"{broker_display_st} (Broker Acknowledged — Not Yet Filled)"
                     status_summary_str = f"Message sent to Dhan ({broker_display_st} — Awaiting Fill)"
-                order_sub_str = f"ORDER_ACKNOWLEDGED ({broker_display_st})"
+                order_sub_str = f"{'AMO_' if is_amo_order else ''}ORDER_ACKNOWLEDGED ({broker_display_st})"
             else:
                 exec_status_str = status
                 status_summary_str = f"Broker Error: {msg}"
@@ -1266,6 +1330,7 @@ class TradingBotPipeline:
                 "quantity": sizing.total_quantity,
                 "order_submission": order_sub_str,
                 "broker_order_id": broker_id or "None",
+                "is_amo": is_amo_order,
                 "execution_status": exec_status_str,
                 "protection_status": "Pending Fill Verification" if ok else "Not Applicable",
             }
@@ -1288,6 +1353,7 @@ class TradingBotPipeline:
                 format_order_submitted({
                     "symbol": inst.symbol, "source": source_name,
                     "segment": "EQUITY", "action": "BUY", "mode": "LIVE",
+                    "is_amo": is_amo_order,
                     "yahoo_cmp": ref_price if used_live_quote else None,
                     "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
                     "quote_threshold_sec": self.cfg.max_quote_age_sec,
@@ -1298,6 +1364,7 @@ class TradingBotPipeline:
                 format_order_failed({
                     "symbol": inst.symbol, "source": source_name,
                     "segment": "EQUITY", "action": "BUY", "mode": "LIVE",
+                    "is_amo": is_amo_order,
                     "yahoo_cmp": ref_price if used_live_quote else None,
                     "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
                     "quote_threshold_sec": self.cfg.max_quote_age_sec,

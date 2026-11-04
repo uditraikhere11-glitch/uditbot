@@ -45,6 +45,8 @@ from src.models import (
     BrokerReadList,
     BrokerReadStatus,
     OrderRequest,
+    OrderType,
+    ProductType,
     ProtectionLevels,
     ProtectionVerificationResult,
     ProtectionVerificationStatus,
@@ -1964,6 +1966,25 @@ class DhanClient:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} orders are forbidden on BUY-ONLY entry path"
 
+        # AMO must be an explicit broker request, never a bypass of the normal market-hours gate.
+        is_amo = bool(getattr(order_req, "after_market_order", False))
+        if is_amo:
+            if not bool(getattr(self.cfg, "equity_amo_enabled", False)):
+                return False, None, "AMO BLOCKED: EQUITY_AMO_ENABLED is false"
+            if (str(order_req.exchange_segment).upper() != "NSE_EQ"
+                    or order_req.product_type != ProductType.CNC
+                    or order_req.order_type != OrderType.LIMIT
+                    or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"):
+                return False, None, "AMO BLOCKED: Only NSE_EQ CNC LIMIT with amoTime=OPEN is supported"
+            from src.engine.market import market_status
+            m_open, m_reason = market_status()
+            if m_open or not m_reason.startswith((
+                "Market Pre-Open / Closed", "Market Closed Post-Hours",
+                "Market Closed (Saturday)", "Market Closed (Sunday)",
+                "Market Closed (Exchange Holiday",
+            )):
+                return False, None, f"AMO BLOCKED: Not an eligible closed-market session ({m_reason})"
+
         corr_id = order_req.correlation_id[:30]
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
@@ -2025,8 +2046,10 @@ class DhanClient:
             "price": float(order_req.price),
             "triggerPrice": 0.0,
             "disclosedQuantity": 0,
-            "afterMarketOrder": False,
+            "afterMarketOrder": is_amo,
         }
+        if is_amo:
+            payload["amoTime"] = "OPEN"
 
         uncertain_outcome = False
         self.last_order_http_latency_ms = None

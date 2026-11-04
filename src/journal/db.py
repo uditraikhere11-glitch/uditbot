@@ -155,6 +155,7 @@ class JournalDB:
                 price REAL NOT NULL,
                 quantity INTEGER NOT NULL,
                 is_super_order INTEGER DEFAULT 0,
+                is_amo INTEGER DEFAULT 0,
                 original_market_price REAL DEFAULT 0.0,
                 tick_size REAL DEFAULT 0.05,
                 lot_size INTEGER DEFAULT 1,
@@ -430,6 +431,7 @@ class JournalDB:
                 "ALTER TABLE order_intents ADD COLUMN account_id TEXT DEFAULT ''",
                 "ALTER TABLE order_intents ADD COLUMN trading_symbol TEXT DEFAULT ''",
                 "ALTER TABLE order_intents ADD COLUMN is_super_order INTEGER DEFAULT 0",
+                "ALTER TABLE order_intents ADD COLUMN is_amo INTEGER DEFAULT 0",
                 "ALTER TABLE order_intents ADD COLUMN original_market_price REAL DEFAULT 0.0",
                 "ALTER TABLE order_intents ADD COLUMN tick_size REAL DEFAULT 0.05",
                 "ALTER TABLE order_intents ADD COLUMN lot_size INTEGER DEFAULT 1",
@@ -727,6 +729,7 @@ class JournalDB:
         strike: float = 0.0,
         expiry: Any = "",
         trading_symbol: str = "",
+        is_amo: bool = False,
     ) -> int:
         """Persists order intent + full contract/route metadata before network POST (<=30-char correlation ID)."""
         now = time.time()
@@ -743,9 +746,9 @@ class JournalDB:
                 INSERT INTO order_intents (
                     correlation_id, parent_correlation_id, account_id, symbol, trading_symbol,
                     security_id, exchange_segment, product_type, order_type, price, quantity,
-                    is_super_order, original_market_price, tick_size, lot_size, option_type, strike, expiry,
+                    is_super_order, is_amo, original_market_price, tick_size, lot_size, option_type, strike, expiry,
                     state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENT_CREATED', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENT_CREATED', ?, ?)
                 """,
                 (
                     correlation_id[:30],
@@ -760,6 +763,7 @@ class JournalDB:
                     float(price),
                     int(quantity),
                     is_super,
+                    1 if is_amo else 0,
                     float(original_market_price or price),
                     float(tick_size or 0.05),
                     int(lot_size or 1),

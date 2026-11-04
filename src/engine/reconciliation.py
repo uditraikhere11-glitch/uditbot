@@ -251,6 +251,7 @@ class StartupReconciliationGate:
                 product_type=prod,
                 original_market_price=float(intent.get("original_market_price") or intent.get("price") or 0.0),
                 is_super_order=is_super,
+                is_amo=bool(int(intent.get("is_amo") or 0)),
                 tick_size=float(intent.get("tick_size") or 0.05),
                 lot_size=int(intent.get("lot_size") or 1),
                 option_type=str(intent.get("option_type") or ""),

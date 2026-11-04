@@ -152,6 +152,8 @@ class AppConfig:
     equity_fixed_qty: int = 10
     equity_price_markup_pct: float = 0.5
     equity_cmp_execution_policy: str = "STRICT_TIMESTAMP"
+    equity_amo_enabled: bool = False  # Explicit opt-in, NSE CNC only
+    equity_amo_max_reference_age_sec: float = 259200.0  # 72 hours
 
     # Stock Options Sizing
     fno_sizing_mode: str = "BUDGET"
@@ -212,6 +214,7 @@ class AppConfig:
             "dedup_window_sec",
             "order_timeout_sec",
             "max_quote_age_sec",
+            "equity_amo_max_reference_age_sec",
             "partial_fill_retry_timeout_sec",
             "test_mode_paper_funds_inr",
         ):
@@ -270,6 +273,8 @@ class AppConfig:
             equity_fixed_qty=_clean_int(env.get("EQUITY_FIXED_QTY", "10"), 10),
             equity_price_markup_pct=_clean_float(env.get("EQUITY_PRICE_MARKUP_PCT", "0.5"), 0.5),
             equity_cmp_execution_policy=str(env.get("EQUITY_CMP_EXECUTION_POLICY", "STRICT_TIMESTAMP")).upper().strip(),
+            equity_amo_enabled=_bool(env.get("EQUITY_AMO_ENABLED", "false"), default=False),
+            equity_amo_max_reference_age_sec=_clean_float(env.get("EQUITY_AMO_MAX_REFERENCE_AGE_SEC", "259200.0"), 259200.0),
 
             fno_sizing_mode=str(env.get("FNO_SIZING_MODE", "BUDGET")).upper().strip(),
             fno_capital_per_trade=_clean_float(env.get("FNO_CAPITAL_PER_TRADE", "20000.0"), 20000.0),
