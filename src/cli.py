@@ -20,7 +20,6 @@ import zoneinfo
 from src.config import AppConfig, resolve_env_path
 from src.journal.db import JournalDB
 from src.engine.emergency_stop import EmergencyStopManager
-from src.version import get_app_version, get_git_commit_sha, get_release_summary, PARSER_RULE_VERSION
 
 
 def _mask_account_id(acct: str) -> str:
@@ -47,7 +46,6 @@ def cmd_status(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager):
         if is_stopped else "🟢 NORMAL (Trading Allowed)"
     )
 
-    print(f"[*] App Release Version    : {get_app_version()} (commit={get_git_commit_sha(short=True)}, parser={PARSER_RULE_VERSION})")
     print(f"[*] Emergency STOP Status  : {stop_str}")
     print(f"[*] Operating Master Switch : {cfg.trading_mode.value}")
     print(f"[*] Equity Trading Active  : {'YES' if cfg.equity_active else 'NO'}")
@@ -61,8 +59,7 @@ def cmd_status(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager):
     print("-------------------------------------------------------")
     print(f"[*] Equity Sizing Mode     : {cfg.equity_sizing_mode} (Budget={cfg.equity_budget_inr:g} INR)")
     print(f"[*] Equity CMP Policy      : {getattr(cfg, 'equity_cmp_execution_policy', 'STRICT_TIMESTAMP')}")
-    print(f"[*] FnO Sizing Mode        : {cfg.fno_sizing_mode} (Budget={cfg.fno_capital_per_trade:g} INR, Max Lots={cfg.fno_max_lots}, Markup={getattr(cfg, 'fno_price_markup_pct', 4.0):g}%)")
-    print(f"[*] Equity Protection Route: {getattr(cfg, 'equity_protection_route', 'SUPER_ORDER')}")
+    print(f"[*] FnO Sizing Mode        : {cfg.fno_sizing_mode} (Budget={cfg.fno_capital_per_trade:g} INR, Max Lots={cfg.fno_max_lots})")
     print(f"[*] Protection (Post-Fill) : SL={cfg.sl_pct}% | Target={cfg.target_pct}%")
     print(f"[*] Risk Limits            : Max Order={cfg.max_order_amount_inr:g} | Min Funds={cfg.min_trade_funds_inr:g}")
     print(f"[*] Timing Thresholds      : Quote Staleness={cfg.max_quote_age_sec}s | Retry Timeout={cfg.partial_fill_retry_timeout_sec}s")
@@ -92,7 +89,6 @@ def cmd_dashboard(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager)
     allowlist_count = len(cfg.monitored_channel_ids)
     allowlist_status = f"{allowlist_count} channel(s)" if allowlist_count > 0 else "⚠️ EMPTY (Blocked in LIVE)"
 
-    print(f"[*] App Release Version : {get_app_version()} (commit={get_git_commit_sha(short=True)})")
     print(f"[*] Operating Mode      : {cfg.trading_mode.value}")
     print(f"[*] Emergency STOP      : {stop_str}")
     print(f"[*] Dhan Account ID     : {_mask_account_id(cfg.dhan_client_id)}")
@@ -382,100 +378,6 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
     print("=======================================================")
 
 
-def _redact_id(raw_id: object) -> str:
-    s = str(raw_id or "").strip()
-    if not s:
-        return "None"
-    return f"…{s[-4:]}" if len(s) > 4 else s
-
-
-def cmd_order_details(cfg: AppConfig, stop_mgr: EmergencyStopManager, args: list) -> int:
-    """
-    P0-06: Strictly read-only single-order diagnostic (`./bot order-details <order-id> --read-only`).
-    Queries live Dhan GET endpoints even when TRADING_MODE=TEST or Emergency STOP is active,
-    redacts full order IDs (`…1234`), and never mutates broker or local state.
-    """
-    from src.broker.dhan_client import DhanClient
-
-    clean_args = [a for a in args if a not in ("--read-only", "--readonly", "-r")]
-    if not clean_args:
-        print("Usage: ./bot order-details <order-id> [--read-only]")
-        return 2
-    order_id = clean_args[0].strip()
-    client = DhanClient(cfg, stop_manager=stop_mgr)
-    res = client.fetch_order_details_readonly(order_id)
-
-    print("=======================================================")
-    print("       DHAN READ-ONLY ORDER & TRADEBOOK DIAGNOSTIC     ")
-    print("=======================================================")
-    print(f"[*] Order ID (Redacted) : {res.get('order_id_redacted')}")
-    print(f"[*] Read-Only Mode      : YES (Zero mutations permitted)")
-    ord_d = res.get("order_detail")
-    if isinstance(ord_d, dict) and ord_d:
-        print(f"[*] Symbol              : {ord_d.get('tradingSymbol') or ord_d.get('symbol') or 'UNKNOWN'}")
-        print(f"[*] Order Status        : {ord_d.get('orderStatus')}")
-        print(f"[*] Segment / Product   : {ord_d.get('exchangeSegment')} / {ord_d.get('productType')}")
-        print(f"[*] Quantity / Filled   : {ord_d.get('quantity')} / {ord_d.get('filledQty')}")
-        print(f"[*] Limit / Avg Price   : {ord_d.get('price')} / {ord_d.get('averageTradedPrice')}")
-    else:
-        print("[!] Order Detail        : Not found or unavailable via /v2/orders/{order-id}")
-
-    trades = res.get("trades") or []
-    print(f"[*] Tradebook Fills     : {len(trades)} record(s) (status={res.get('trades_status')}, VWAP={res.get('trade_vwap')})")
-    for idx, t in enumerate(trades, 1):
-        etid_red = _redact_id(t.get("exchangeTradeId"))
-        print(
-            f"    [{idx}] side={t.get('transactionType')} qty={t.get('tradedQuantity')} "
-            f"price={t.get('tradedPrice')} tradeId={etid_red}"
-        )
-
-    so = res.get("super_order")
-    if isinstance(so, dict) and so:
-        legs = so.get("legDetails") if isinstance(so.get("legDetails"), list) else []
-        print(f"[*] Super Order Status  : {so.get('orderStatus')} ({len(legs)} leg(s))")
-        for lg in legs:
-            if isinstance(lg, dict):
-                print(
-                    f"    - {lg.get('legName')}: status={lg.get('orderStatus')} "
-                    f"price={lg.get('price') or lg.get('targetPrice') or lg.get('stopLossPrice')} "
-                    f"remQty={lg.get('remainingQuantity')}"
-                )
-    fo_list = res.get("forever_orders") or []
-    if fo_list:
-        print(f"[*] Forever OCO Records : {len(fo_list)} linked record(s)")
-    print("=======================================================")
-    return 0 if res.get("ok") else 1
-
-
-def cmd_check_dhan_orders(cfg: AppConfig, stop_mgr: EmergencyStopManager, args: list) -> int:
-    """
-    P0-06: Strictly read-only diagnostic summary of Dhan orders, trades, Super Orders,
-    Forever OCO orders, positions, and holdings (`./bot check-dhan-orders --read-only`).
-    """
-    from src.broker.dhan_client import DhanClient
-
-    client = DhanClient(cfg, stop_manager=stop_mgr)
-    res = client.check_dhan_orders_readonly(limit=10)
-    print("=======================================================")
-    print("     DHAN READ-ONLY ORDERS, TRADES & PROTECTION AUDIT  ")
-    print("=======================================================")
-    print(f"[*] Client ID (Redacted): {_mask_account_id(cfg.dhan_client_id)}")
-    print(f"[*] Order Book          : {len(res.get('orders') or [])} recent order(s) (status={res.get('order_book_status')})")
-    for o in (res.get("orders") or []):
-        print(
-            f"    - {_redact_id(o.get('orderId'))} | {o.get('tradingSymbol') or o.get('symbol')} | "
-            f"{o.get('transactionType')} {o.get('productType')} | status={o.get('orderStatus')} | "
-            f"filled={o.get('filledQty')}/{o.get('quantity')}"
-        )
-    print(f"[*] Trade Book          : {len(res.get('trades') or [])} recent trade(s) (status={res.get('trade_book_status')})")
-    print(f"[*] Super Orders        : {len(res.get('super_orders') or [])} record(s) (status={res.get('super_orders_status')})")
-    print(f"[*] Forever OCO Orders  : {len(res.get('forever_orders') or [])} record(s) (status={res.get('forever_orders_status')})")
-    print(f"[*] Open Positions      : {len(res.get('positions') or [])} record(s) (status={res.get('positions_status')})")
-    print(f"[*] Demat Holdings      : {len(res.get('holdings') or [])} record(s) (status={res.get('holdings_status')})")
-    print("=======================================================")
-    return 0 if res.get("ok") else 1
-
-
 def cmd_test_signal(cfg: AppConfig, raw_signal: str) -> int:
     """
     Safe SSH diagnostic signal evaluator: forces TRADING_MODE=TEST in memory so zero live
@@ -632,13 +534,6 @@ def main():
     )
 
     args = sys.argv[1:]
-    if args and args[0] in ("version", "--version", "-V"):
-        rel = get_release_summary()
-        print(f"AuditBot Release Version : {rel['app_release_version']} (previous: {rel['previous_version']})")
-        print(f"Patch Identifier         : {rel['patch_identifier']}")
-        print(f"Git Commit               : {rel['git_commit']}")
-        print(f"Parser Rule Version      : {rel['parser_rule_version']}")
-        return
     if not args or args[0] in ("status", "--status"):
         cmd_status(cfg, db, stop_mgr)
     elif args[0] in ("dashboard", "--dashboard", "dash"):
@@ -647,10 +542,6 @@ def main():
         print(f"Current Master Switch: {cfg.trading_mode.value}")
     elif args[0] in ("check-dhan", "test-dhan", "dhan"):
         cmd_check_dhan(cfg, stop_mgr)
-    elif args[0] in ("order-details", "order_details"):
-        sys.exit(cmd_order_details(cfg, stop_mgr, args[1:]))
-    elif args[0] in ("check-dhan-orders", "check_dhan_orders", "dhan-orders"):
-        sys.exit(cmd_check_dhan_orders(cfg, stop_mgr, args[1:]))
     elif args[0] in ("login", "refresh-token", "token", "totp"):
         ok = cmd_refresh_token(cfg, stop_mgr)
         if not ok:

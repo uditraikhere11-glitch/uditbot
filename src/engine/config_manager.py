@@ -539,21 +539,6 @@ class ReadOnlyDhanBrokerAdapter:
             raise RuntimeError("Broker positions read is unavailable; cannot verify missing LIVE journal")
         return self._get_cached("positions", self._broker.get_positions)
 
-    def get_holdings(self) -> Any:
-        if hasattr(self._broker, "get_holdings"):
-            return self._get_cached("holdings", self._broker.get_holdings)
-        return []
-
-    def get_trade_book(self) -> Any:
-        if hasattr(self._broker, "get_trade_book"):
-            return self._get_cached("trade_book", self._broker.get_trade_book)
-        return []
-
-    def get_trades_for_order(self, order_id: str) -> Any:
-        if hasattr(self._broker, "get_trades_for_order"):
-            return self._broker.get_trades_for_order(order_id)
-        return []
-
     def evaluate_forever_oco_protection(self, *args, **kwargs) -> Any:
         if hasattr(self._broker, "evaluate_forever_oco_protection"):
             return self._broker.evaluate_forever_oco_protection(*args, **kwargs)
@@ -824,7 +809,6 @@ _KEY_ALIASES: Dict[str, str] = {
     "fno_capital_per_trade": "fno_capital_per_trade",
     "fno_fixed_lots": "fno_fixed_lots",
     "fno_max_lots": "fno_max_lots",
-    "fno_price_markup_pct": "fno_price_markup_pct",
     "allow_next_month_expiry_fallback": "allow_next_month_expiry_fallback",
     "sl_pct": "sl_pct",
     "target_pct": "target_pct",
@@ -852,8 +836,6 @@ _EXCLUDED_NON_HASH_FIELDS: Set[str] = {
     "journal_db_path",
     "dhan_token_file",
     "_loaded_from_env",
-    "_explicit_equity_protection_route",
-    "equity_protection_route",
     "is_live_mode",
     "csrf_token",
     "confirm_live",
@@ -882,7 +864,6 @@ _FLOAT_CANONICAL_FIELDS: Set[str] = {
     "equity_budget_inr",
     "equity_price_markup_pct",
     "fno_capital_per_trade",
-    "fno_price_markup_pct",
     "sl_pct",
     "target_pct",
     "sl_limit_buffer_pct",
@@ -2101,8 +2082,6 @@ class ConfigChangeTracker:
                 "sl_pct", "SL_PCT",
                 "target_pct", "TARGET_PCT",
                 "fno_max_lots", "FNO_MAX_LOTS",
-                "fno_price_markup_pct", "FNO_PRICE_MARKUP_PCT",
-                "equity_price_markup_pct", "EQUITY_PRICE_MARKUP_PCT",
                 "min_trade_funds_inr", "MIN_TRADE_FUNDS_INR",
             ):
                 if k in params and isinstance(params[k], bool):
@@ -2127,13 +2106,6 @@ class ConfigChangeTracker:
             fno_lots = int(params.get("fno_max_lots", params.get("FNO_MAX_LOTS", 3)))
             if fno_lots <= 0:
                 return False, "F&O Max Lots must be at least 1"
-
-            raw_fno_markup = params.get("fno_price_markup_pct", params.get("FNO_PRICE_MARKUP_PCT", 4.0))
-            if isinstance(raw_fno_markup, bool) or str(raw_fno_markup).strip().lower() in ("true", "false"):
-                return False, "Invalid numeric input parameter: boolean not allowed for FNO_PRICE_MARKUP_PCT"
-            fno_markup = float(raw_fno_markup)
-            if not (math.isfinite(fno_markup) and 0.0 <= fno_markup <= 20.0):
-                return False, "F&O Price Markup (%) must be between 0.0% and 20.0%"
 
             cmp_pol = str(params.get("equity_cmp_execution_policy", params.get("EQUITY_CMP_EXECUTION_POLICY", "STRICT_TIMESTAMP"))).upper().strip()
             if cmp_pol not in ("STRICT_TIMESTAMP", "DARVAS_HTTP_SUCCESS"):
@@ -2437,7 +2409,7 @@ class ConfigChangeTracker:
 
             if filled > 0:
                 prot_verified = 0
-                if oid in so_by_id:
+                if prod == "MARGIN" and oid in so_by_id:
                     if not so_loaded:
                         return False, "BROKER_RECONCILIATION_FAILED: Super Order book unavailable to verify filled MARGIN order."
                     ver_so = verify_super_order_record(so_by_id[oid], oid, expected_security_id=sec_id or None, expected_segment=seg or None, expected_product_type=prod or None)
@@ -2942,10 +2914,9 @@ class ConfigChangeTracker:
                             linked_so_ids.append(s_oid)
 
                 prod_up = str(prod_type or "CNC").strip().upper()
-                is_super_hint = bool(linked_so_ids) or bool((w_rec or {}).get("is_super_order")) or (str((w_rec or {}).get("protection_route") or "").upper() == "SUPER_ORDER")
-                if (prod_up == "MARGIN" or is_super_hint) and not so_book_loaded and not fo_book_loaded:
+                if prod_up == "MARGIN" and not so_book_loaded and not fo_book_loaded:
                     return 0, "BROKER_RECONCILIATION_FAILED: Broker Super Order book unavailable to confirm protective legs."
-                if prod_up != "MARGIN" and not is_super_hint and not fo_book_loaded and not so_book_loaded:
+                if prod_up != "MARGIN" and not fo_book_loaded:
                     return 0, "BROKER_RECONCILIATION_FAILED: Broker Forever OCO book unavailable to confirm protective legs."
 
                 total_verified = 0

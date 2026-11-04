@@ -62,22 +62,12 @@ def calculate_equity_limit_price(cmp: float, markup_pct: float, tick_size: float
     return round_to_tick(raw_price, tick_size, mode="nearest")
 
 
-def calculate_option_limit_price(
-    entry_max: float,
-    tick_size: float = 0.05,
-    markup_pct: float = 4.0,
-) -> float:
+def calculate_option_limit_price(entry_max: float, tick_size: float = 0.05) -> float:
     """
-    P1-11: Calculates stock option BUY LIMIT upper entry ceiling = entry_max * (1 + markup_pct / 100),
+    Calculates stock option BUY LIMIT upper entry ceiling = entry_max * 1.04,
     rounded DOWN to the contract tick size so it never exceeds the calculated ceiling.
-    Defaults to 4.0% when markup_pct is not specified.
     """
-    if isinstance(markup_pct, bool) or not isinstance(markup_pct, (int, float)) or not math.isfinite(float(markup_pct)):
-        raise ValueError(f"Invalid option markup_pct: {markup_pct!r}")
-    eff_markup = float(markup_pct)
-    if eff_markup < 0.0 or eff_markup > 20.0:
-        raise ValueError(f"Option markup_pct must be between 0.0% and 20.0%, got {eff_markup}")
-    raw_ceiling = float(entry_max) * (1.0 + (eff_markup / 100.0))
+    raw_ceiling = entry_max * 1.04
     return round_to_tick(raw_ceiling, tick_size, mode="down")
 
 

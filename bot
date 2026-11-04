@@ -24,10 +24,6 @@ fi
 export PYTHONPATH="${DIR}:${PYTHONPATH:-}"
 
 case "${1:-}" in
-    version|--version|-V)
-        shift || true
-        "$PYTHON" -m src.version "$@"
-        ;;
     status)
         "$PYTHON" -m src.cli status
         ;;
@@ -36,14 +32,6 @@ case "${1:-}" in
         ;;
     check-dhan|test-dhan|dhan)
         "$PYTHON" -m src.cli check-dhan
-        ;;
-    order-details|order_details)
-        shift || true
-        "$PYTHON" -m src.cli order-details "$@"
-        ;;
-    check-dhan-orders|check_dhan_orders|dhan-orders)
-        shift || true
-        "$PYTHON" -m src.cli check-dhan-orders "$@"
         ;;
     login|refresh-token|token|totp)
         "$PYTHON" -m src.cli login

@@ -2,17 +2,16 @@
 System Configuration & Environment Management.
 Reads from environment variables and protected .env files with automatic file parsing.
 Robust against formatting artifacts (braces, quotes, multi-value inputs).
-Implements V13 & V14 Audit Hardening:
+Implements V13 Audit Hardening:
 - Resolves application root (`APP_ROOT`) so CLI/systemd invocations from outside the repo find `.env` and `data/` (`V12-22`).
-- Supports `TG_BOT_TOKEN` (`V12-18`), `MAX_DRAWDOWN_PCT` (`V12-23`), `FNO_PRICE_MARKUP_PCT` (`P1-11`),
-  `EQUITY_PROTECTION_ROUTE` (`P0-01`), and finite/range validation on all numeric settings.
+- Supports `TG_BOT_TOKEN` (`V12-18`), `MAX_DRAWDOWN_PCT` (`V12-23`), and finite/range validation on all numeric settings.
 """
 
 import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from src.models import TradingMode, ProductType, ProtectionRoute
+from src.models import TradingMode, ProductType
 
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -69,8 +68,6 @@ def _clean_int(val: Any, default: int = 0) -> int:
     """Safely parses integers from strings, stripping brackets, braces, and trailing items."""
     if val is None or val == "":
         return default
-    if isinstance(val, bool):
-        raise ValueError(f"Boolean value '{val}' is not a valid integer")
     cleaned = str(val).strip().strip("{}[]()\"' ")
     if "," in cleaned:
         cleaned = cleaned.split(",")[0].strip().strip("{}[]()\"' ")
@@ -81,14 +78,10 @@ def _clean_int(val: Any, default: int = 0) -> int:
 
 
 def _clean_float(val: Any, default: float = 0.0) -> float:
-    """Safely parses finite floats from strings, rejecting booleans and non-finite values."""
-    if isinstance(val, bool):
-        raise ValueError(f"Boolean value '{val}' is not a valid float")
+    """Safely parses finite floats from strings."""
     if val is None or val == "" or str(val).startswith("extra="):
         return default
     cleaned = str(val).strip().strip("{}[]()\"' ")
-    if cleaned.lower() in ("true", "false"):
-        raise ValueError(f"Boolean string '{val}' is not a valid float")
     try:
         res = float(cleaned)
         if not math.isfinite(res):
@@ -159,14 +152,12 @@ class AppConfig:
     equity_fixed_qty: int = 10
     equity_price_markup_pct: float = 0.5
     equity_cmp_execution_policy: str = "STRICT_TIMESTAMP"
-    equity_protection_route: str = ProtectionRoute.SUPER_ORDER.value
 
     # Stock Options Sizing
     fno_sizing_mode: str = "BUDGET"
     fno_capital_per_trade: float = 20000.0
     fno_fixed_lots: int = 1
     fno_max_lots: int = 3
-    fno_price_markup_pct: float = 4.0
     allow_next_month_expiry_fallback: bool = True
 
     # Protection (Post-Fill)
@@ -197,7 +188,6 @@ class AppConfig:
     data_dir: str = field(default_factory=_default_data_dir)
     journal_db_path: str = ""
     _loaded_from_env: bool = False
-    _explicit_equity_protection_route: bool = False
 
     def __post_init__(self):
         if not self.journal_db_path:
@@ -206,17 +196,10 @@ class AppConfig:
         if pol not in ("STRICT_TIMESTAMP", "DARVAS_HTTP_SUCCESS"):
             raise ValueError(f"Invalid EQUITY_CMP_EXECUTION_POLICY '{self.equity_cmp_execution_policy}'; must be STRICT_TIMESTAMP or DARVAS_HTTP_SUCCESS")
         self.equity_cmp_execution_policy = pol
-
-        eq_route = str(self.equity_protection_route or ProtectionRoute.SUPER_ORDER.value).upper().strip()
-        if eq_route not in (ProtectionRoute.SUPER_ORDER.value, ProtectionRoute.FOREVER_OCO.value):
-            raise ValueError(f"Invalid EQUITY_PROTECTION_ROUTE '{self.equity_protection_route}'; must be SUPER_ORDER or FOREVER_OCO")
-        self.equity_protection_route = eq_route
-
         for attr in (
             "equity_budget_inr",
             "equity_price_markup_pct",
             "fno_capital_per_trade",
-            "fno_price_markup_pct",
             "sl_pct",
             "target_pct",
             "sl_limit_buffer_pct",
@@ -237,28 +220,6 @@ class AppConfig:
                 raise ValueError(f"Configuration field '{attr}' must be a finite number, got {val!r}")
             if float(val) < 0.0:
                 raise ValueError(f"Configuration field '{attr}' cannot be negative, got {val!r}")
-            setattr(self, attr, float(val))
-
-        if float(self.fno_price_markup_pct) > 20.0:
-            raise ValueError(f"Configuration field 'fno_price_markup_pct' must be between 0.0 and 20.0, got {self.fno_price_markup_pct!r}")
-
-        # Source allowlist fail-closed overlap validation:
-        # LOG_GROUP_ID must never appear in MONITORED_CHANNEL_IDS or equal TEST_GROUP_ID,
-        # and TEST_GROUP_ID must not overlap with MONITORED_CHANNEL_IDS.
-        mon_set = {int(ch) for ch in (self.monitored_channel_ids or []) if int(ch) != 0}
-        if int(self.log_group_id or 0) != 0:
-            if int(self.log_group_id) in mon_set:
-                raise ValueError(
-                    "Invalid channel configuration: LOG_GROUP_ID must not appear in MONITORED_CHANNEL_IDS (self-echo hazard)"
-                )
-            if int(self.test_group_id or 0) != 0 and int(self.log_group_id) == int(self.test_group_id):
-                raise ValueError(
-                    "Invalid channel configuration: LOG_GROUP_ID must not equal TEST_GROUP_ID"
-                )
-        if int(self.test_group_id or 0) != 0 and int(self.test_group_id) in mon_set:
-            raise ValueError(
-                "Invalid channel configuration: TEST_GROUP_ID must not appear in MONITORED_CHANNEL_IDS (LIVE/TEST channel overlap)"
-            )
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None, env_file: str = ".env") -> "AppConfig":
@@ -277,9 +238,6 @@ class AppConfig:
         default_dd = _default_data_dir()
         data_dir = str(env.get("DATA_DIR") or default_dd).strip()
         journal_db_path = str(env.get("JOURNAL_DB_PATH") or os.path.join(data_dir, "trade_journal.db")).strip()
-
-        has_explicit_eq_route = "EQUITY_PROTECTION_ROUTE" in env and str(env.get("EQUITY_PROTECTION_ROUTE") or "").strip() != ""
-        eq_prot_route = str(env.get("EQUITY_PROTECTION_ROUTE") or ProtectionRoute.SUPER_ORDER.value).upper().strip()
 
         cfg = cls(
             trading_mode=trading_mode,
@@ -312,13 +270,11 @@ class AppConfig:
             equity_fixed_qty=_clean_int(env.get("EQUITY_FIXED_QTY", "10"), 10),
             equity_price_markup_pct=_clean_float(env.get("EQUITY_PRICE_MARKUP_PCT", "0.5"), 0.5),
             equity_cmp_execution_policy=str(env.get("EQUITY_CMP_EXECUTION_POLICY", "STRICT_TIMESTAMP")).upper().strip(),
-            equity_protection_route=eq_prot_route,
 
             fno_sizing_mode=str(env.get("FNO_SIZING_MODE", "BUDGET")).upper().strip(),
             fno_capital_per_trade=_clean_float(env.get("FNO_CAPITAL_PER_TRADE", "20000.0"), 20000.0),
             fno_fixed_lots=_clean_int(env.get("FNO_FIXED_LOTS", "1"), 1),
             fno_max_lots=_clean_int(env.get("FNO_MAX_LOTS", "3"), 3),
-            fno_price_markup_pct=_clean_float(env.get("FNO_PRICE_MARKUP_PCT", "4.0"), 4.0),
             allow_next_month_expiry_fallback=_bool(env.get("ALLOW_NEXT_MONTH_EXPIRY_FALLBACK", "true"), default=True),
 
             sl_pct=_clean_float(env.get("SL_PCT", "3.0"), 3.0),
@@ -345,6 +301,5 @@ class AppConfig:
             data_dir=data_dir,
             journal_db_path=journal_db_path,
             _loaded_from_env=True,
-            _explicit_equity_protection_route=has_explicit_eq_route,
         )
         return cfg

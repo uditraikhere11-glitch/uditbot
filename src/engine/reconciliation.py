@@ -27,7 +27,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.models import BrokerReadFailure, ProtectionRoute, infer_record_protection_route
+from src.models import BrokerReadFailure
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
 
 logger = logging.getLogger(__name__)
@@ -233,8 +233,11 @@ class StartupReconciliationGate:
 
         seg = str(intent.get("exchange_segment") or "NSE_EQ")
         prod = str(intent.get("product_type") or "CNC")
-        resolved_route = infer_record_protection_route(intent)
-        is_super = (resolved_route == ProtectionRoute.SUPER_ORDER.value)
+        raw_super = intent.get("is_super_order")
+        if raw_super is None:
+            is_super = (seg.upper() in ("NSE_FNO", "BSE_FNO") and prod.upper() == "MARGIN")
+        else:
+            is_super = bool(int(raw_super)) or (seg.upper() in ("NSE_FNO", "BSE_FNO") and prod.upper() == "MARGIN")
 
         try:
             self.watcher.track(
@@ -248,7 +251,6 @@ class StartupReconciliationGate:
                 product_type=prod,
                 original_market_price=float(intent.get("original_market_price") or intent.get("price") or 0.0),
                 is_super_order=is_super,
-                protection_route=resolved_route,
                 tick_size=float(intent.get("tick_size") or 0.05),
                 lot_size=int(intent.get("lot_size") or 1),
                 option_type=str(intent.get("option_type") or ""),
@@ -525,11 +527,6 @@ class StartupReconciliationGate:
                             symbol=str(trade.get("tradingSymbol") or trade.get("customSymbol") or ""),
                             traded_price=float(trade.get("tradedPrice") or 0.0),
                             traded_quantity=int(trade.get("tradedQuantity") or 0),
-                            transaction_type=str(trade.get("transactionType") or "BUY").upper(),
-                            security_id=str(trade.get("securityId") or ""),
-                            exchange_segment=str(trade.get("exchangeSegment") or ""),
-                            product_type=str(trade.get("productType") or ""),
-                            is_verified_trade=True,
                         )
                     except Exception:
                         pass
