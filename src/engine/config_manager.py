@@ -805,6 +805,8 @@ _KEY_ALIASES: Dict[str, str] = {
     "equity_fixed_qty": "equity_fixed_qty",
     "equity_price_markup_pct": "equity_price_markup_pct",
     "equity_cmp_execution_policy": "equity_cmp_execution_policy",
+    "equity_amo_enabled": "equity_amo_enabled",
+    "equity_amo_max_reference_age_sec": "equity_amo_max_reference_age_sec",
     "fno_sizing_mode": "fno_sizing_mode",
     "fno_capital_per_trade": "fno_capital_per_trade",
     "fno_fixed_lots": "fno_fixed_lots",
@@ -846,6 +848,7 @@ _BOOL_CANONICAL_FIELDS: Set[str] = {
     "fno_active",
     "ignore_backlog_on_restart",
     "allow_next_month_expiry_fallback",
+    "equity_amo_enabled",
 }
 
 _INT_CANONICAL_FIELDS: Set[str] = {
@@ -863,6 +866,7 @@ _FLOAT_CANONICAL_FIELDS: Set[str] = {
     "test_mode_paper_funds_inr",
     "equity_budget_inr",
     "equity_price_markup_pct",
+    "equity_amo_max_reference_age_sec",
     "fno_capital_per_trade",
     "sl_pct",
     "target_pct",
