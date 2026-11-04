@@ -1101,11 +1101,13 @@ class TestV14WebUIBackendModeSwitch(unittest.TestCase):
         with open(self.env_path, "w", encoding="utf-8") as f:
             f.write(f"TRADING_MODE=TEST\nDATA_DIR={self.data_dir}\nJOURNAL_DB_PATH={self.db_path}\n")
         cfg = AppConfig(trading_mode=TradingMode.TEST, data_dir=self.data_dir, journal_db_path=self.db_path)
-        rc_stop = cmd_service_control(cfg, "stop", ["CLI test stop"])
-        self.assertEqual(rc_stop, 0)
-        with patch.dict(os.environ, {"AUDITBOT_TEST_SERVICE_ACTIVE": "1"}):
-            rc_start = cmd_service_control(cfg, "start", ["CLI test start"])
-        self.assertEqual(rc_start, 0)
+        # Use this test's temporary TEST-mode .env, never the live repo .env.
+        with patch("src.cli.resolve_env_path", return_value=self.env_path):
+            rc_stop = cmd_service_control(cfg, "stop", ["CLI test stop"])
+            self.assertEqual(rc_stop, 0)
+            with patch.dict(os.environ, {"AUDITBOT_TEST_SERVICE_ACTIVE": "1"}):
+                rc_start = cmd_service_control(cfg, "start", ["CLI test start"])
+            self.assertEqual(rc_start, 0)
 
     # 33. Read-only service status inspection does not perform side-effect writes
     def test_33_service_status_inspection_is_strictly_read_only(self):

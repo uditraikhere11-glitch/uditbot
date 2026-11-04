@@ -56,26 +56,21 @@ class TestWebUIFlexibleBudget(unittest.TestCase):
         self.assertNotIn('name="tg_api_hash" value="<!--TG_API_HASH-->" placeholder="e.g. 0123456789abcdef..." required', HTML_TEMPLATE)
 
     def test_webui_renders_decimal_budget_without_truncation(self):
+        from unittest.mock import patch
+        from src.config import AppConfig
         from src.setup_app import get_setup_page
-        old_eq = os.environ.get("EQUITY_BUDGET_INR")
-        old_funds = os.environ.get("MIN_TRADE_FUNDS_INR")
-        try:
-            os.environ["EQUITY_BUDGET_INR"] = "100.5"
-            os.environ["MIN_TRADE_FUNDS_INR"] = "0"
-            resp = get_setup_page()
-            html = resp.body.decode("utf-8") if hasattr(resp, "body") else str(resp)
-            self.assertIn('name="equity_budget_inr" value="100.5"', html)
-            self.assertIn('name="min_trade_funds_inr" value="0"', html)
-        finally:
-            if old_eq is not None:
-                os.environ["EQUITY_BUDGET_INR"] = old_eq
-            else:
-                os.environ.pop("EQUITY_BUDGET_INR", None)
-            if old_funds is not None:
-                os.environ["MIN_TRADE_FUNDS_INR"] = old_funds
-            else:
-                os.environ.pop("MIN_TRADE_FUNDS_INR", None)
 
+        cfg = AppConfig(
+            equity_budget_inr=100.5,
+            min_trade_funds_inr=0.0,
+        )
+
+        with patch("src.setup_app.AppConfig.from_env", return_value=cfg):
+            resp = get_setup_page()
+
+        html = resp.body.decode("utf-8") if hasattr(resp, "body") else str(resp)
+        self.assertIn('name="equity_budget_inr" value="100.5"', html)
+        self.assertIn('name="min_trade_funds_inr" value="0"', html)
 
 if __name__ == "__main__":
     unittest.main()

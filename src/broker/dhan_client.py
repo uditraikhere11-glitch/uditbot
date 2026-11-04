@@ -1769,14 +1769,8 @@ class DhanClient:
         return self._read_collection("/holdings", "holdings", bypass_test_mode=bypass_test_mode)
 
     def get_forever_orders(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
-        """
-        P0-06: Retrieves all Forever OCO orders.
-        Supports both `/v2/forever/all` and documented Dhan v2 `/v2/forever/orders` fallback on 404/405.
-        """
-        res = self._read_collection("/forever/all", "forever_orders", bypass_test_mode=bypass_test_mode)
-        if isinstance(res, BrokerReadFailure) and res.status_code in (404, 405):
-            return self._read_collection("/forever/orders", "forever_orders", bypass_test_mode=bypass_test_mode)
-        return res
+        """P0-06: Retrieve Forever OCO orders from the documented Dhan v2 endpoint."""
+        return self._read_collection("/forever/orders", "forever_orders", bypass_test_mode=bypass_test_mode)
 
     # =========================================================================
     # SAFETY CORRECTION B & C: Authoritative Broker Protection Verification

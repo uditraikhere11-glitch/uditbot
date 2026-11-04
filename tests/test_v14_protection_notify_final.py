@@ -596,7 +596,7 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         def router(url, **kwargs):
             if url.endswith("/holdings"):
                 return SimpleNamespace(status_code=200, text="[...]", json=lambda: [{"securityId": "11915", "tradingSymbol": "YESBANK", "totalQty": 100}])
-            if url.endswith("/forever/all"):
+            if url.endswith("/forever/orders"):
                 return SimpleNamespace(status_code=404, text="Not Found", json=lambda: {})
             if url.endswith("/forever/orders"):
                 return SimpleNamespace(status_code=200, text="[...]", json=lambda: [{"orderId": "FO-V2-1", "orderStatus": "PENDING"}])

@@ -1,0 +1,4 @@
+# Dependencies for the offline AuditBot regression suite.
+-r requirements.txt
+# FastAPI/Starlette TestClient requires httpx.
+httpx>=0.27,<1.0
