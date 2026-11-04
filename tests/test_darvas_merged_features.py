@@ -130,7 +130,7 @@ class TestDarvasMergedFeatures(unittest.TestCase):
             ("Buy State Bank of India @ 810", ("SBIN", 810.0)),
             ("Bought Bajaj Finance at 7000", ("BAJFINANCE", 7000.0)),
             ("Bought HEG at 500", ("HEGAM", 500.0)),
-            ("Buy #SBIN @ 805-810", ("SBIN", 810.0)),  # A01: upper-entry reference for price range
+            ("Buy #SBIN @ 805-810", ("SBIN", 810.0)),
             ("Bought in POLYCAB @ 7000", ("POLYCAB", 7000.0)),
             ("Added more #SBIN", ("SBIN", 0.0)),
             ("Bought Polycab India", ("POLYCAB", 0.0)),
@@ -319,9 +319,6 @@ class TestDarvasMergedFeatures(unittest.TestCase):
             client.get_super_orders = MagicMock(return_value=[super_rec])
             client.order_status = MagicMock(return_value=super_rec)
             client.trades_avg_price = MagicMock(return_value=100.0)
-            client.session.get = MagicMock(
-                return_value=MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
-            )
 
             watcher.check_once()
             self.assertEqual(mock_put.call_count, 2)
