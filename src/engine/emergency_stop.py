@@ -239,14 +239,12 @@ class EmergencyStopManager:
                     return False, "Emergency STOP state unavailable or invalid; manual recovery required"
                 if not old_id:
                     return False, "Emergency STOP account binding missing; manual recovery required"
-                if old_id == expected:
-                    return True, "Emergency STOP account already matches configured Dhan account"
-                if original.get("in_flight_orders") or self._in_flight:
+                if old_id != expected and (original.get("in_flight_orders") or self._in_flight):
                     return False, "Cannot change account binding with in-flight broker mutations"
             finally:
                 self._release_flock(fd)
 
-        if pending_watcher_count:
+        if old_id != expected and pending_watcher_count:
             return False, "Cannot change account binding with unresolved watcher or journal obligations"
 
         # Never use .env alone as authority: compare it against the token's
@@ -258,6 +256,8 @@ class EmergencyStopManager:
             return False, "Could not verify Dhan token account identity"
         if not profile_id or str(profile_id).strip() != expected:
             return False, "Authenticated Dhan profile does not match configured account"
+        if old_id == expected:
+            return True, "Emergency STOP account matches verified Dhan profile"
 
         # Recheck under the durable flock before committing the account change.
         with self._thread_lock:
