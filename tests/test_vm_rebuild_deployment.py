@@ -23,7 +23,12 @@ class VMRebuildDeploymentTests(unittest.TestCase):
         pybin.mkdir(parents=True, exist_ok=True)
         py3 = pybin / "python3"
         if not py3.exists():
-            py3.symlink_to(sys.executable)
+            import shlex
+            py3.write_text(
+                '#!/bin/sh\nexec ' + shlex.quote(sys.executable)
+                + ' "$@"\n'
+            )
+            py3.chmod(0o755)
         env_vars["PATH"] = f"{pybin}:{Path(sys.executable).resolve().parent}:{env_vars.get('PATH', '')}"
 
     @classmethod
