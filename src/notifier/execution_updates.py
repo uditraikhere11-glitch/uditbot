@@ -84,7 +84,11 @@ def _tail(meta: Mapping[str, Any], timestamp: Any, label: str) -> list[str]:
 
 def format_order_submitted(meta: Mapping[str, Any], quantity: int) -> str:
     lines = _top(meta, quantity)
-    lines.extend(("", "⏳ <b>Status: Order Submitted</b>", "Awaiting Dhan execution confirmation."))
+    if meta.get("is_amo"):
+        lines.extend(("", "🌙 <b>Status: AMO Submitted</b>",
+                      "Dhan acknowledged the after-market order; queued for market OPEN, not executed."))
+    else:
+        lines.extend(("", "⏳ <b>Status: Order Submitted</b>", "Awaiting Dhan execution confirmation."))
     lines.extend(_tail(meta, meta.get("signal_received_at"), "Signal Received"))
     return "\n".join(lines)
 
