@@ -116,7 +116,7 @@ class TestVerifiedEmergencyStopAccountSync(unittest.TestCase):
         ok, msg = self.manager.sync_account_from_authenticated_broker(broker)
         self.assertTrue(ok, msg)
         self.assertEqual(self.path.read_bytes(), before)
-        broker.get_authenticated_profile_id.assert_not_called()
+        broker.get_authenticated_profile_id.assert_called_once_with()
 
     def test_08_missing_file_remains_fail_closed(self):
         ok, _ = self.manager.sync_account_from_authenticated_broker(self.broker())
