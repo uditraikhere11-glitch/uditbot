@@ -1041,6 +1041,25 @@ class JournalDB:
                 )
             return True
 
+    def enqueue_dhan_response_ack_once(self, order_id: str, text: str) -> bool:
+        """Queue a positively acknowledged AMO response once, without claiming a fill."""
+        if not order_id or not text:
+            raise ValueError("Dhan AMO acknowledgement requires order ID and text")
+        now = time.time()
+        with self._get_conn() as conn:
+            claimed = conn.execute(
+                "INSERT OR IGNORE INTO order_notification_events (order_id,event_key,created_at) VALUES (?,?,?)",
+                (str(order_id), "DHAN_AMO_ACK", now),
+            )
+            if not claimed.rowcount:
+                return False
+            conn.execute(
+                "INSERT INTO outbox (event_type,payload,status,retry_count,next_retry_at,created_at) "
+                "VALUES ('DHAN_RESPONSE_ACK', ?, 'PENDING', 0, 0.0, ?)",
+                (json.dumps({"text": text, "event_type": "DHAN_RESPONSE_ACK", "timestamp": now}), now),
+            )
+        return True
+
     def enqueue_outbox(self, event_type: str, payload: Dict[str, Any]) -> int:
         now = time.time()
         with self._get_conn() as conn:

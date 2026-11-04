@@ -146,6 +146,23 @@ def format_order_outcome(meta: Mapping[str, Any], requested_qty: int, filled_qty
     return "\n".join(lines)
 
 
+def format_amo_acknowledged(meta: Mapping[str, Any], quantity: int, broker_status: str) -> str:
+    """Format a confirmed Dhan acceptance, explicitly not an executed trade."""
+    status = str(broker_status).upper().strip()
+    if status not in {"TRANSIT", "PENDING"}:
+        raise ValueError("AMO queued acknowledgement requires TRANSIT or PENDING")
+    return "\n".join((
+        "🌙 <b>Dhan AMO Acknowledgement</b>",
+        f"• Symbol: {_safe(meta.get('symbol', 'UNKNOWN'))}",
+        f"• Quantity: {int(quantity)}",
+        f"• Limit Price: {_money(meta.get('limit_price'))}",
+        f"• Dhan Status: {_safe(status)}",
+        "✅ <b>AMO Accepted by Dhan</b>",
+        "⏳ Queued for market OPEN — NOT EXECUTED",
+        "A separate confirmation will follow only after a broker-verified fill or final rejection/cancellation.",
+    ))
+
+
 class OrderStatusReporter:
     """Convert existing watcher observations to durable, deduplicated outbox events.
 

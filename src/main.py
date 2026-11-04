@@ -46,7 +46,7 @@ from src.journal.db import JournalDB, generate_correlation_id
 from src.broker.dhan_client import DhanClient
 from src.notifier.formatter import format_trade_log, format_exit_log
 from src.notifier.execution_updates import (
-    OrderStatusReporter, format_order_submitted, format_order_failed,
+    OrderStatusReporter, format_order_submitted, format_order_failed, format_amo_acknowledged,
 )
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.engine.reconciliation import StartupReconciliationGate
@@ -1373,6 +1373,23 @@ class TradingBotPipeline:
                 }, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
             )
             self.dispatch_notification("TRADE_LOG", user_card)
+
+            
+            # Distinguish an accepted AMO from an executed trade.
+            if ok and broker_id and is_amo_order and broker_display_st in ("TRANSIT", "PENDING"):
+                reporter = getattr(self.watcher, "execution_reporter", None)
+                if bool(getattr(reporter, "dhan_response_enabled", False)):
+                    try:
+                        ack_text = format_amo_acknowledged(
+                            {"symbol": inst.symbol, "limit_price": limit_price},
+                            sizing.total_quantity, broker_display_st,
+                        )
+                        self.db.enqueue_dhan_response_ack_once(broker_id, ack_text)
+                    except Exception as notify_err:
+                        logger.warning(
+                            "[DhanResponse] Could not queue AMO acknowledgement for %s: %s",
+                            broker_id, type(notify_err).__name__,
+                        )
 
             return ValidationResult(
                 is_valid=ok,

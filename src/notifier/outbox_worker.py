@@ -82,7 +82,7 @@ class OutboxWorker:
                     msg_text = payload.get("text") or payload.get("message") or str(payload)
                     safe_text = redact_secrets(msg_text)
 
-                    if item.get("event_type") == "DHAN_FINAL_RESPONSE":
+                    if item.get("event_type") in {"DHAN_FINAL_RESPONSE", "DHAN_RESPONSE_ACK"}:
                         ok = (
                             self.dhan_response_dispatch_fn(safe_text)
                             if self.dhan_response_dispatch_fn is not None else False
