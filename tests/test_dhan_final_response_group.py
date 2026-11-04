@@ -48,6 +48,19 @@ class TestResponseGroupConfiguration(unittest.TestCase):
                             env_path=os.path.join(tmp, "no.env"),
                         )
 
+    def test_numeric_group_id_survives_env_and_webui(self):
+        cfg = AppConfig.from_env(
+            env={"DHAN_RESPONSE_GROUP_NAME": "-5254821642"}, env_file=""
+        )
+        self.assertEqual(cfg.dhan_response_group_name, "-5254821642")
+        with tempfile.TemporaryDirectory() as tmp:
+            env_text, params = build_env_and_params_dict(
+                dhan_response_group_name="-5254821642",
+                env_path=os.path.join(tmp, "nonexistent.env"),
+            )
+            self.assertIn("DHAN_RESPONSE_GROUP_NAME=-5254821642", env_text)
+            self.assertEqual(params["DHAN_RESPONSE_GROUP_NAME"], "-5254821642")
+
     def test_empty_name_disables_feature_without_changing_log_group(self):
         cfg = AppConfig.from_env(env={"LOG_GROUP_ID": "-1001234567890"}, env_file="")
         self.assertFalse(cfg.dhan_response_group_name)
@@ -92,6 +105,39 @@ class TestExactGroupLookup(unittest.IsolatedAsyncioTestCase):
     async def test_unjoined_group_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "found 0"):
             await resolve_dhan_response_group(_FakeTelegram([]), "Dhan Response")
+
+    async def test_signed_group_id_resolves_exact_peer(self):
+        group = await resolve_dhan_response_group(
+            _FakeTelegram([
+                _dialog("Other group", -1001111111111),
+                _dialog("Dhan Response", -5254821642),
+                _dialog("-5254821642", -1002222222222),
+            ]),
+            "-5254821642",
+        )
+        self.assertEqual(group.id, -5254821642)
+
+    async def test_unjoined_numeric_group_id_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            await resolve_dhan_response_group(
+                _FakeTelegram([_dialog("Other group", -123456789)]),
+                "-5254821642",
+            )
+
+    async def test_numeric_id_does_not_match_non_group_dialog(self):
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            await resolve_dhan_response_group(
+                _FakeTelegram([_dialog("User", -5254821642, is_group=False)]),
+                "-5254821642",
+            )
+
+    async def test_numeric_id_cannot_be_monitored_source(self):
+        with self.assertRaisesRegex(ValueError, "monitored trade-signal source"):
+            await resolve_dhan_response_group(
+                _FakeTelegram([_dialog("Dhan Response", -5254821642)]),
+                "-5254821642",
+                forbidden_chat_ids=[-5254821642],
+            )
 
     async def test_signal_source_cannot_be_response_destination(self):
         with self.assertRaisesRegex(ValueError, "monitored trade-signal source"):

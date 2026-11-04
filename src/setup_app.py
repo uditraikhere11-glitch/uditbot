@@ -750,11 +750,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
 
         <div class="form-group" style="margin-top: 10px;">
-          <label>Dhan Response Telegram Group (optional)</label>
+          <label>Dhan Response Telegram Group Name or ID (optional)</label>
           <div class="input-wrap">
-            <input type="text" name="dhan_response_group_name" value="<!--DHAN_RESPONSE_GROUP_NAME-->" maxlength="100" placeholder="e.g. Dhan Response">
+            <input type="text" name="dhan_response_group_name" value="<!--DHAN_RESPONSE_GROUP_NAME-->" maxlength="100" placeholder="Dhan Response or -5254821642">
           </div>
-          <p class="help-text">Enter the exact Telegram group name. Final Dhan-confirmed order results are posted there; leave blank to disable. The logged-in Telegram account must belong to the group.</p>
+          <p class="help-text">Enter the exact Telegram group name or signed group chat ID. Dhan acknowledgements and final broker-confirmed outcomes are posted there. Leave blank to disable; the logged-in Telegram account must be a member.</p>
         </div>
 
         <div class="grid-2" style="margin-top: 10px;">
