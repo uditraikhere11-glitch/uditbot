@@ -45,6 +45,8 @@ from src.models import (
     BrokerReadList,
     BrokerReadStatus,
     OrderRequest,
+    OrderType,
+    ProductType,
     ProtectionLevels,
     ProtectionVerificationResult,
     ProtectionVerificationStatus,
