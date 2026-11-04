@@ -2426,20 +2426,52 @@ class DhanClient:
             return False, None, f"HTTP exception placing Forever OCO: {e}"
 
     def order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        # V14_MANUAL_CANCEL_READ_FALLBACK
         if self.cfg.trading_mode == TradingMode.TEST:
             return {"orderStatus": "TRADED", "filledQty": 0, "averageTradedPrice": 0.0}
 
-        url = f"{BASE_URL}/orders/{order_id}"
+        requested_id = str(order_id).strip()
+        url = f"{BASE_URL}/orders/{requested_id}"
+
         try:
             resp = self.session.get(url, headers=self._headers(), timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                return data if isinstance(data, dict) else None
-            logger.warning(f"Failed to fetch Dhan order status for {order_id} ({resp.status_code}): {resp.text}")
-            return None
-        except Exception as e:
-            logger.error(f"HTTP exception fetching order status for {order_id}: {e}")
-            return None
+                candidates = [data] if isinstance(data, dict) else (
+                    data if isinstance(data, list) else []
+                )
+                matches = [
+                    x for x in candidates
+                    if isinstance(x, dict)
+                    and str(x.get("orderId") or "").strip() == requested_id
+                    and x.get("orderStatus")
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+            else:
+                logger.warning(
+                    "Dhan single-order read failed: %s HTTP %s",
+                    requested_id, resp.status_code
+                )
+        except Exception as exc:
+            logger.warning(
+                "Dhan single-order read exception for %s: %s",
+                requested_id, exc
+            )
+
+        # Read-only fallback for manually cancelled orders.
+        book = self.get_order_book()
+        if isinstance(book, list) and getattr(book, "ok", True):
+            matches = [
+                x for x in book
+                if isinstance(x, dict)
+                and str(x.get("orderId") or "").strip() == requested_id
+                and x.get("orderStatus")
+            ]
+            if len(matches) == 1:
+                return matches[0]
+
+        return None
 
     def trades_avg_price(self, order_id: str) -> Optional[float]:
         if self.cfg.trading_mode == TradingMode.TEST:
