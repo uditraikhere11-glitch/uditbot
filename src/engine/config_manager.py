@@ -805,6 +805,8 @@ _KEY_ALIASES: Dict[str, str] = {
     "equity_fixed_qty": "equity_fixed_qty",
     "equity_price_markup_pct": "equity_price_markup_pct",
     "equity_cmp_execution_policy": "equity_cmp_execution_policy",
+    "equity_amo_enabled": "equity_amo_enabled",
+    "equity_amo_max_reference_age_sec": "equity_amo_max_reference_age_sec",
     "fno_sizing_mode": "fno_sizing_mode",
     "fno_capital_per_trade": "fno_capital_per_trade",
     "fno_fixed_lots": "fno_fixed_lots",
@@ -846,6 +848,7 @@ _BOOL_CANONICAL_FIELDS: Set[str] = {
     "fno_active",
     "ignore_backlog_on_restart",
     "allow_next_month_expiry_fallback",
+    "equity_amo_enabled",
 }
 
 _INT_CANONICAL_FIELDS: Set[str] = {
@@ -863,6 +866,7 @@ _FLOAT_CANONICAL_FIELDS: Set[str] = {
     "test_mode_paper_funds_inr",
     "equity_budget_inr",
     "equity_price_markup_pct",
+    "equity_amo_max_reference_age_sec",
     "fno_capital_per_trade",
     "sl_pct",
     "target_pct",
@@ -3433,13 +3437,99 @@ class ConfigChangeTracker:
                     cur.execute("SELECT order_id, record_json FROM watcher_orders WHERE is_terminal = 0;")
                     w_pending = cur.fetchall()
                     if w_pending:
-                        con.close()
-                        return (
-                            False,
-                            f"Active broker order in progress ({len(w_pending)} order(s) monitored by protection watcher).",
-                            "LIVE_ORDER_IN_PROGRESS",
-                            len(w_pending),
+                        # V14_MANUAL_CANCEL_GATE
+                        # Local watcher rows alone do not prove a broker order is active.
+                        # Do not delete or mutate watcher records here.
+                        readonly = self.get_readonly_broker(
+                            explicit_broker=broker, env_path=env_path
                         )
+                        if readonly is None:
+                            return (
+                                False, "Dhan unavailable for watcher verification",
+                                "BROKER_RECONCILIATION_FAILED", len(w_pending)
+                            )
+
+                        try:
+                            book = readonly.get_order_book()
+                        except Exception as exc:
+                            return (
+                                False, f"Dhan order book read failed: {exc}",
+                                "BROKER_RECONCILIATION_FAILED", len(w_pending)
+                            )
+
+                        if not isinstance(book, list) or not getattr(book, "ok", True):
+                            return (
+                                False, "Dhan order book unavailable",
+                                "BROKER_RECONCILIATION_FAILED", len(w_pending)
+                            )
+
+                        unresolved = 0
+
+                        for row in w_pending:
+                            oid = str(row["order_id"] or "").strip()
+                            try:
+                                rec = json.loads(row["record_json"] or "")
+                                if not oid or not isinstance(rec, dict):
+                                    raise ValueError("Invalid watcher record")
+                            except (ValueError, TypeError):
+                                unresolved += 1
+                                continue
+
+                            matches = [
+                                x for x in book
+                                if isinstance(x, dict)
+                                and str(x.get("orderId") or "").strip() == oid
+                            ]
+
+                            broker_row = matches[0] if len(matches) == 1 else None
+
+                            if broker_row is None and not matches and hasattr(readonly, "order_status"):
+                                try:
+                                    broker_row = readonly.order_status(oid)
+                                except Exception:
+                                    broker_row = None
+
+                            if (
+                                not isinstance(broker_row, dict)
+                                or str(broker_row.get("orderId") or "").strip() != oid
+                            ):
+                                unresolved += 1
+                                continue
+
+                            status = str(
+                                broker_row.get("orderStatus") or ""
+                            ).strip().upper()
+
+                            try:
+                                if broker_row.get("filledQty") is None:
+                                    raise ValueError("Missing broker filled quantity")
+                                broker_filled = int(broker_row["filledQty"])
+                                local_filled = int(rec.get("filled_qty") or 0)
+                                protected = int(rec.get("protected_qty") or 0)
+                            except (TypeError, ValueError):
+                                unresolved += 1
+                                continue
+
+                            safe_terminal = (
+                                status in {"CANCELLED", "REJECTED", "EXPIRED"}
+                                and broker_filled == local_filled == protected == 0
+                                and not rec.get("pending_oco")
+                                and not rec.get("retry_reserved")
+                                and not rec.get("retry_eligible")
+                                and str(rec.get("cancel_origin") or "").upper() != "BOT_TIMEOUT"
+                                and str(rec.get("state") or "").upper() != "TRADED"
+                            )
+
+                            if not safe_terminal:
+                                unresolved += 1
+
+                        if unresolved:
+                            return (
+                                False,
+                                f"{unresolved} watcher order(s) active or not safely verified by Dhan",
+                                "LIVE_ORDER_IN_PROGRESS",
+                                unresolved
+                            )
                 except sqlite3.OperationalError:
                     pass
 

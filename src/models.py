@@ -250,6 +250,8 @@ class OrderRequest(BaseModel):
     quantity: int
     trigger_price: float = 0.0
     trading_mode: TradingMode = TradingMode.TEST
+    after_market_order: bool = False
+    amo_time: str = "OPEN"
 
 
 class ProtectionLevels(BaseModel):

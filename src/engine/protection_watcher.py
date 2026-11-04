@@ -20,7 +20,7 @@ Implements:
 """
 
 import asyncio
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 import inspect
 import json
@@ -43,7 +43,7 @@ from src.models import (
     TransactionType,
 )
 from src.engine.sizer import calculate_protection_levels, round_to_tick
-from src.engine.market import is_lifecycle_open
+from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
@@ -215,6 +215,8 @@ class ProtectionWatcher:
 
         rec.setdefault("cancel_reason", "")
         rec.setdefault("entry_timeout_elapsed", bool(rec.get("timed_out_cancel", False)))
+        rec.setdefault("is_amo", False)
+        rec.setdefault("amo_activated_at", 0.0)
         rec.setdefault(
             "cancel_requested",
             bool(rec.get("cancel_requested_at"))
@@ -418,6 +420,7 @@ class ProtectionWatcher:
         retry_reserved: bool = False,
         root_order_id: str = "",
         notification_meta: Optional[dict] = None,
+        is_amo: bool = False,
     ) -> str:
         exp_str = ""
         if isinstance(expiry, date):
@@ -448,6 +451,8 @@ class ProtectionWatcher:
                     existing["original_market_price"] = float(original_market_price)
                 if notification_meta and not existing.get("notification_meta"):
                     existing["notification_meta"] = dict(notification_meta)
+                if is_amo:
+                    existing["is_amo"] = True
                 if order_id not in self.pending and order_id in self.terminal_orders:
                     pass
                 else:
@@ -465,6 +470,8 @@ class ProtectionWatcher:
                     "segment": segment,
                     "product_type": product_type,
                     "is_super_order": bool(is_super_order),
+                    "is_amo": bool(is_amo),
+                    "amo_activated_at": 0.0,
                     "tick_size": tick_size if tick_size and tick_size > 0 else TICK,
                     "lot_size": int(lot_size) if lot_size and int(lot_size > 0) else 1,
                     "option_type": (option_type or "").strip().upper(),
@@ -819,7 +826,22 @@ class ProtectionWatcher:
                     else:
                         timeout_limit = self.fno_timeout_sec if seg in ("NSE_FNO", "BSE_FNO") else self.order_timeout_sec
 
-                    if timeout_limit > 0 and (current_time - float(rec.get("created_at") or current_time)) >= timeout_limit:
+                    # AMO may remain queued overnight; start its entry timeout only
+                    # after the first verified regular-hours status check.
+                    timeout_anchor = float(rec.get("created_at") or current_time)
+                    if rec.get("is_amo"):
+                        activated = float(rec.get("amo_activated_at") or 0.0)
+                        if activated <= 0.0:
+                            if is_market_open(now=datetime.fromtimestamp(current_time, tz=IST)):
+                                activated = current_time
+                                rec["amo_activated_at"] = activated
+                                changed = True
+                            else:
+                                timeout_limit = 0.0
+                        if activated > 0.0:
+                            timeout_anchor = activated
+
+                    if timeout_limit > 0 and (current_time - timeout_anchor) >= timeout_limit:
                         if not rec.get("entry_timeout_elapsed", False):
                             rec["entry_timeout_elapsed"] = True
                             if not rec.get("cancel_origin") or rec.get("cancel_origin") == "LEGACY_UNKNOWN":

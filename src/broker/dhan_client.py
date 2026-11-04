@@ -45,6 +45,8 @@ from src.models import (
     BrokerReadList,
     BrokerReadStatus,
     OrderRequest,
+    OrderType,
+    ProductType,
     ProtectionLevels,
     ProtectionVerificationResult,
     ProtectionVerificationStatus,
@@ -1760,7 +1762,7 @@ class DhanClient:
 
     def get_forever_orders(self) -> Union[BrokerReadList, BrokerReadFailure]:
         """Retrieves all Forever OCO orders: GET /v2/forever/all."""
-        return self._read_collection("/forever/all", "forever_orders")
+        return self._read_collection("/forever/orders", "forever_orders")
 
     # =========================================================================
     # SAFETY CORRECTION B & C: Authoritative Broker Protection Verification
@@ -1943,6 +1945,25 @@ class DhanClient:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} orders are forbidden on BUY-ONLY entry path"
 
+        # AMO must be an explicit broker request, never a bypass of the normal market-hours gate.
+        is_amo = bool(getattr(order_req, "after_market_order", False))
+        if is_amo:
+            if not bool(getattr(self.cfg, "equity_amo_enabled", False)):
+                return False, None, "AMO BLOCKED: EQUITY_AMO_ENABLED is false"
+            if (str(order_req.exchange_segment).upper() != "NSE_EQ"
+                    or order_req.product_type != ProductType.CNC
+                    or order_req.order_type != OrderType.LIMIT
+                    or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"):
+                return False, None, "AMO BLOCKED: Only NSE_EQ CNC LIMIT with amoTime=OPEN is supported"
+            from src.engine.market import market_status
+            m_open, m_reason = market_status()
+            if m_open or not m_reason.startswith((
+                "Market Pre-Open / Closed", "Market Closed Post-Hours",
+                "Market Closed (Saturday)", "Market Closed (Sunday)",
+                "Market Closed (Exchange Holiday",
+            )):
+                return False, None, f"AMO BLOCKED: Not an eligible closed-market session ({m_reason})"
+
         corr_id = order_req.correlation_id[:30]
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
@@ -2004,8 +2025,10 @@ class DhanClient:
             "price": float(order_req.price),
             "triggerPrice": 0.0,
             "disclosedQuantity": 0,
-            "afterMarketOrder": False,
+            "afterMarketOrder": is_amo,
         }
+        if is_amo:
+            payload["amoTime"] = "OPEN"
 
         uncertain_outcome = False
         self.last_order_http_latency_ms = None
@@ -2382,20 +2405,52 @@ class DhanClient:
             return False, None, f"HTTP exception placing Forever OCO: {e}"
 
     def order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        # V14_MANUAL_CANCEL_READ_FALLBACK
         if self.cfg.trading_mode == TradingMode.TEST:
             return {"orderStatus": "TRADED", "filledQty": 0, "averageTradedPrice": 0.0}
 
-        url = f"{BASE_URL}/orders/{order_id}"
+        requested_id = str(order_id).strip()
+        url = f"{BASE_URL}/orders/{requested_id}"
+
         try:
             resp = self.session.get(url, headers=self._headers(), timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                return data if isinstance(data, dict) else None
-            logger.warning(f"Failed to fetch Dhan order status for {order_id} ({resp.status_code}): {resp.text}")
-            return None
-        except Exception as e:
-            logger.error(f"HTTP exception fetching order status for {order_id}: {e}")
-            return None
+                candidates = [data] if isinstance(data, dict) else (
+                    data if isinstance(data, list) else []
+                )
+                matches = [
+                    x for x in candidates
+                    if isinstance(x, dict)
+                    and str(x.get("orderId") or "").strip() == requested_id
+                    and x.get("orderStatus")
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+            else:
+                logger.warning(
+                    "Dhan single-order read failed: %s HTTP %s",
+                    requested_id, resp.status_code
+                )
+        except Exception as exc:
+            logger.warning(
+                "Dhan single-order read exception for %s: %s",
+                requested_id, exc
+            )
+
+        # Read-only fallback for manually cancelled orders.
+        book = self.get_order_book()
+        if isinstance(book, list) and getattr(book, "ok", True):
+            matches = [
+                x for x in book
+                if isinstance(x, dict)
+                and str(x.get("orderId") or "").strip() == requested_id
+                and x.get("orderStatus")
+            ]
+            if len(matches) == 1:
+                return matches[0]
+
+        return None
 
     def trades_avg_price(self, order_id: str) -> Optional[float]:
         if self.cfg.trading_mode == TradingMode.TEST:

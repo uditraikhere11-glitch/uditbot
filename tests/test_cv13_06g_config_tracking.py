@@ -363,26 +363,28 @@ class TestCV1306GConfigTracking(unittest.TestCase):
 
     # 12. Repeated Save requests cannot cause duplicate restarts
     def test_12_token_only_update_skips_restart(self):
-        from dataclasses import asdict
-        restart_mock = MagicMock()
-        old_cfg = AppConfig.from_env(env_file=self.env_path)
-        form_params = asdict(old_cfg)
-        form_params["dhan_access_token"] = "NEW_TOKEN_999"
-        rec = execute_configuration_update(
-            form_params=form_params,
-            env_content="DHAN_ACCESS_TOKEN=NEW_TOKEN_999\n",
-            data_dir=self.data_dir,
-            env_path=self.env_path,
-            stop_state_path=self.stop_path,
-            db_path=self.db_path,
-            systemctl_restart_fn=restart_mock,
-            check_service_fn=lambda: True,
-        )
+        # Prevent other tests' environment variables from leaking in.
+        with patch.dict(os.environ, {}, clear=True):
+            from dataclasses import asdict
+            restart_mock = MagicMock()
+            old_cfg = AppConfig.from_env(env_file=self.env_path)
+            form_params = asdict(old_cfg)
+            form_params["dhan_access_token"] = "NEW_TOKEN_999"
+            rec = execute_configuration_update(
+                form_params=form_params,
+                env_content="DHAN_ACCESS_TOKEN=NEW_TOKEN_999\n",
+                data_dir=self.data_dir,
+                env_path=self.env_path,
+                stop_state_path=self.stop_path,
+                db_path=self.db_path,
+                systemctl_restart_fn=restart_mock,
+                check_service_fn=lambda: True,
+            )
 
-        # Token-only refresh is verified without service restart
-        self.assertEqual(rec.state, ConfigApplyState.APPLIED_VERIFIED)
-        self.assertTrue(rec.is_token_only_refresh)
-        restart_mock.assert_not_called()
+            # Token-only refresh is verified without service restart
+            self.assertEqual(rec.state, ConfigApplyState.APPLIED_VERIFIED)
+            self.assertTrue(rec.is_token_only_refresh)
+            restart_mock.assert_not_called()
 
     # 13. Secret values are excluded from HTML, logs, and Telegram messages
     def test_13_secrets_excluded_from_version_hash_and_notifications(self):
