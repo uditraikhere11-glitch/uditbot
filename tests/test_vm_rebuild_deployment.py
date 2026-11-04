@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -16,6 +17,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class VMRebuildDeploymentTests(unittest.TestCase):
+    @staticmethod
+    def _bind_sys_executable_path(tmp_path: Path, env_vars: dict) -> None:
+        pybin = tmp_path / "_pybin"
+        pybin.mkdir(parents=True, exist_ok=True)
+        py3 = pybin / "python3"
+        if not py3.exists():
+            py3.symlink_to(sys.executable)
+        env_vars["PATH"] = f"{pybin}:{Path(sys.executable).resolve().parent}:{env_vars.get('PATH', '')}"
+
     @classmethod
     def setUpClass(cls):
         cls.install = (ROOT / 'deploy/install_vm_services.sh').read_text()
@@ -186,6 +196,7 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             env_vars["HOME"] = str(new_home)
             env_vars["AUDITBOT_RESTORE_HOME"] = str(new_home)
             env_vars["AUDITBOT_BACKUP_PASSPHRASE_FILE"] = str(pass_file)
+            self._bind_sys_executable_path(tmp_path, env_vars)
             env_vars["AUDITBOT_TEST_ISOLATION"] = "1"
             env_vars["AUDITBOT_SKIP_SYSTEMCTL_CHECK"] = "1"
 
@@ -348,6 +359,7 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             env_vars = os.environ.copy()
             env_vars["HOME"] = str(fake_home)
             env_vars["AUDITBOT_BACKUP_PASSPHRASE_FILE"] = str(pass_file)
+            self._bind_sys_executable_path(tmp_path, env_vars)
             env_vars["AUDITBOT_TEST_ISOLATION"] = "1"
             env_vars["AUDITBOT_SKIP_SYSTEMCTL_CHECK"] = "1"
 
@@ -509,6 +521,7 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             env_vars = os.environ.copy()
             env_vars["HOME"] = str(b_home)
             env_vars["AUDITBOT_BACKUP_PASSPHRASE_FILE"] = str(pass_file)
+            self._bind_sys_executable_path(tmp_path, env_vars)
             env_vars["AUDITBOT_TEST_ISOLATION"] = "1"
             env_vars["AUDITBOT_SKIP_SYSTEMCTL_CHECK"] = "1"
 
@@ -619,6 +632,7 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             env_vars = os.environ.copy()
             env_vars["HOME"] = str(src_home)
             env_vars["AUDITBOT_BACKUP_PASSPHRASE_FILE"] = str(pass_file)
+            self._bind_sys_executable_path(tmp_path, env_vars)
             env_vars["AUDITBOT_TEST_ISOLATION"] = "1"
             env_vars["AUDITBOT_SKIP_SYSTEMCTL_CHECK"] = "1"
 

@@ -188,6 +188,7 @@ class ProtectionWatcher:
         self._pass_lock = threading.RLock()
         self._running_lock = threading.Lock()
         self._is_running = False
+        self.execution_reporter = None  # read-only observer; set by TradingBotPipeline
         self._load()
 
     def _hydrate_loaded_record_defaults(self, rec: dict, is_term: bool = False) -> None:
@@ -416,6 +417,7 @@ class ProtectionWatcher:
         max_retries: int = 1,
         retry_reserved: bool = False,
         root_order_id: str = "",
+        notification_meta: Optional[dict] = None,
     ) -> str:
         exp_str = ""
         if isinstance(expiry, date):
@@ -444,6 +446,8 @@ class ProtectionWatcher:
                     existing["expiry"] = exp_str
                 if original_market_price and float(original_market_price) > 0 and not existing.get("original_market_price"):
                     existing["original_market_price"] = float(original_market_price)
+                if notification_meta and not existing.get("notification_meta"):
+                    existing["notification_meta"] = dict(notification_meta)
                 if order_id not in self.pending and order_id in self.terminal_orders:
                     pass
                 else:
@@ -497,6 +501,7 @@ class ProtectionWatcher:
                     "max_retries": int(max_retries),
                     "retry_reserved": bool(retry_reserved),
                     "pending_oco": None,
+                    "notification_meta": dict(notification_meta) if notification_meta else None,
                 }
                 self.pending[order_id] = rec
         self._save()
@@ -793,6 +798,19 @@ class ProtectionWatcher:
                 has_unresolved_after = unresolved_att_after is not None
                 is_terminal = rec["state"] in {s.value for s in TERMINAL_STATES}
 
+                # Observe broker lifecycle AFTER the existing protection verification.
+                # Notification failures must never create another trade or bypass stops.
+                notify_ready = True
+                if self.execution_reporter is not None and rec.get("notification_meta"):
+                    prev_notification_pending = rec.get("notification_protection_pending")
+                    try:
+                        notify_ready = bool(self.execution_reporter.process(rec, st, observed_at=current_time))
+                    except Exception as notify_err:
+                        notify_ready = False
+                        logger.warning("[OrderNotification] Could not enqueue status: %s", notify_err)
+                    if prev_notification_pending != rec.get("notification_protection_pending"):
+                        changed = True
+
                 # 2. CV13-03: Remainder timeout & bounded-backoff cancellation recovery
                 if not str(order_id).startswith("DRY-") and not is_terminal and filled < int(rec.get("qty") or 0):
                     seg = str(rec.get("segment") or "NSE_EQ").upper()
@@ -907,7 +925,7 @@ class ProtectionWatcher:
                         changed = True
 
                 # 4. Check terminal finalization
-                if is_terminal and all_fills_protected:
+                if is_terminal and all_fills_protected and notify_ready:
                     if filled == 0:
                         logger.info(f"[Protection] {rec['symbol']} order {order_id} terminal ({rec['state']}) with 0 fills; closed.")
                     else:
@@ -2531,6 +2549,7 @@ class ProtectionWatcher:
             retry_count=1,
             max_retries=1,
             retry_reserved=True,
+            notification_meta=dict(rec.get("notification_meta") or {}) or None,
         )
 
         with self._lock:

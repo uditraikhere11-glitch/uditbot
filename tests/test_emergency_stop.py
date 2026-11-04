@@ -65,12 +65,23 @@ class TestEmergencyStop(unittest.TestCase):
         self.assertTrue(st["is_stopped"])
         self.assertEqual(st["stopped_by"], "SYSTEM_FAIL_CLOSED")
 
+    def _make_isolated_config(self, mode: TradingMode = TradingMode.TEST) -> AppConfig:
+        return AppConfig(
+            trading_mode=mode,
+            dhan_client_id="1113731536",
+            dhan_access_token="ISOLATED-TEST-TOKEN",
+            dhan_token_file=os.path.join(self.temp_dir.name, ".dhan_token"),
+            data_dir=self.temp_dir.name,
+            journal_db_path=os.path.join(self.temp_dir.name, "trade_journal.db"),
+        )
+
     def test_04_b_dhan_client_blocks_mutation_when_stopped(self):
         """DhanClient adapter boundary rejects place_order when STOP is active."""
         self.manager.provision_initial_clean_state(operator="Udit", account_id="1113731536")
-        cfg = AppConfig.from_env()
-        cfg.trading_mode = TradingMode.LIVE  # Test live path gate
+        cfg = self._make_isolated_config(mode=TradingMode.LIVE)
         client = DhanClient(cfg, stop_manager=self.manager)
+        self.addCleanup(client.session.close)
+        client.session.post = MagicMock(side_effect=AssertionError("Live HTTP POST forbidden during Emergency STOP test"))
 
         self.manager.trigger_stop(operator="Udit", reason="Manual circuit breaker")
 
@@ -123,8 +134,11 @@ class TestEmergencyStop(unittest.TestCase):
         remain permitted during STOP so positions are not left unhedged.
         """
         self.manager.provision_initial_clean_state(operator="Udit", account_id="1113731536")
-        cfg = AppConfig.from_env()
+        cfg = self._make_isolated_config(mode=TradingMode.TEST)
         client = DhanClient(cfg, stop_manager=self.manager)
+        self.addCleanup(client.session.close)
+        client.session.delete = MagicMock(side_effect=AssertionError("Live HTTP DELETE forbidden in TEST mode"))
+        client.session.post = MagicMock(side_effect=AssertionError("Live HTTP POST forbidden in TEST mode"))
         self.manager.trigger_stop(operator="Udit", reason="Halt")
 
         # 1. Cancel resting order: permitted

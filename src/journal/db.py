@@ -275,6 +275,14 @@ class JournalDB:
                 updated_at REAL NOT NULL
             );
 
+            -- Atomic one-time logical event claim + outbox delivery.
+            CREATE TABLE IF NOT EXISTS order_notification_events (
+                order_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (order_id, event_key)
+            );
+
             CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
@@ -996,6 +1004,29 @@ class JournalDB:
         return pending, terminal
 
     # --- Outbox for Durable Notifications (Step 16) ---
+
+    def enqueue_order_notification_once(self, order_id: str, event_key: str, text: str) -> bool:
+        """Atomically claim event and queue Telegram notice. False means already queued.
+
+        The existing outbox worker is at-least-once; Telegram transport may still
+        produce a duplicate after a crash between send and outbox acknowledgement.
+        """
+        if not order_id or not event_key or not text:
+            raise ValueError("Missing order notification identity or body")
+        now = time.time()
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO order_notification_events (order_id,event_key,created_at) VALUES (?,?,?)",
+                (str(order_id), str(event_key), now),
+            )
+            if not cur.rowcount:
+                return False
+            conn.execute(
+                "INSERT INTO outbox (event_type,payload,status,retry_count,next_retry_at,created_at) "
+                "VALUES ('ORDER_STATUS_UPDATE', ?, 'PENDING', 0, 0.0, ?)",
+                (json.dumps({"text": text, "event_type": "ORDER_STATUS_UPDATE", "timestamp": now}), now),
+            )
+            return True
 
     def enqueue_outbox(self, event_type: str, payload: Dict[str, Any]) -> int:
         now = time.time()

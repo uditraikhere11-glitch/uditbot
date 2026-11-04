@@ -520,10 +520,13 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
         self.assertTrue(ok_rec)
         self.assertEqual(code_rec, "")
         self.assertTrue(os.path.exists(self.db_path), "Verified broker records must be restored into trade_journal.db")
-        with sqlite3.connect(self.db_path) as conn:
+        conn = sqlite3.connect(self.db_path)
+        try:
             restored_ord = conn.execute("SELECT status, filled_quantity FROM orders WHERE broker_order_id = 'ORD-RESTORE-1'").fetchone()
             self.assertEqual(restored_ord[0], "TRADED")
             self.assertEqual(int(restored_ord[1]), 5)
+        finally:
+            conn.close()
 
     # =========================================================================
     # F03-03 — Local Watcher Protection Never Accepted Without Broker Confirmation

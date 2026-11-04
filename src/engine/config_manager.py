@@ -2580,6 +2580,8 @@ class ConfigChangeTracker:
                 j_detail=j_detail,
             )
 
+        con = None
+        cur = None
         try:
             con = sqlite3.connect(db_path, timeout=5.0)
             con.row_factory = sqlite3.Row
@@ -3243,12 +3245,22 @@ class ConfigChangeTracker:
                                     f"but only {ver_q} verified linked protected shares (protected={ver_q}/{b_filled}).",
                                 )
 
-            con.close()
             return True, None
         except sqlite3.Error as sq_e:
             return False, f"JOURNAL_ERROR: Journal safety check error (failing closed): {sq_e}"
         except Exception as e:
             return False, f"BROKER_RECONCILIATION_FAILED: Broker/journal reconciliation error: {e}"
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
 
     def evaluate_trading_safety_gate_detailed(
         self,
@@ -3333,6 +3345,8 @@ class ConfigChangeTracker:
             return False, err_s, "BROKER_RECONCILIATION_FAILED", 1
 
         if os.path.exists(db_path):
+            con = None
+            cur = None
             try:
                 con = sqlite3.connect(db_path, timeout=5.0)
                 con.row_factory = sqlite3.Row
@@ -3429,9 +3443,19 @@ class ConfigChangeTracker:
                 except sqlite3.OperationalError:
                     pass
 
-                con.close()
             except Exception as e:
                 return False, f"Journal safety check error (failing closed): {e}", "JOURNAL_ERROR", 0
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
 
         return True, "All broker safeguards passed; safe to apply configuration.", "", 0
 
