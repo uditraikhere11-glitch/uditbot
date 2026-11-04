@@ -880,7 +880,7 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
                     text="[...]",
                     json=lambda: [{"securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 5}],
                 )
-            if "/forever/all" in url:
+            if "/forever/orders" in url:
                 return SimpleNamespace(
                     status_code=200,
                     text="[...]",

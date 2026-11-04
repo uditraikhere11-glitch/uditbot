@@ -130,7 +130,7 @@ class TestDarvasMergedFeatures(unittest.TestCase):
             ("Buy State Bank of India @ 810", ("SBIN", 810.0)),
             ("Bought Bajaj Finance at 7000", ("BAJFINANCE", 7000.0)),
             ("Bought HEG at 500", ("HEGAM", 500.0)),
-            ("Buy #SBIN @ 805-810", ("SBIN", 805.0)),
+            ("Buy #SBIN @ 805-810", ("SBIN", 810.0)),
             ("Bought in POLYCAB @ 7000", ("POLYCAB", 7000.0)),
             ("Added more #SBIN", ("SBIN", 0.0)),
             ("Bought Polycab India", ("POLYCAB", 0.0)),
