@@ -135,7 +135,7 @@ class AppConfig:
     monitored_channel_ids: List[int] = field(default_factory=list)
     test_group_id: int = 0
     log_group_id: int = 0
-    dhan_response_group_name: str = ""  # Optional exact Telegram group title, outgoing only
+    dhan_response_group_name: str = ""  # Optional exact Telegram group name or signed ID, outgoing only
     authorized_operator_id: int = 0
     ignore_backlog_on_restart: bool = True
 
