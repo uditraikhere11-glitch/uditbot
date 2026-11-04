@@ -204,6 +204,105 @@ class EmergencyStopManager:
             finally:
                 self._release_flock(flock_fd)
 
+
+    def sync_account_from_authenticated_broker(
+        self,
+        broker: Any,
+        pending_watcher_count: int = 0,
+    ) -> Tuple[bool, str]:
+        """
+        Rebind an outdated account-scoped STOP file only after a read-only Dhan
+        profile proves the active token belongs to the configured account.
+
+        Account switches ALWAYS leave Emergency STOP active; no trading is
+        automatically resumed. Missing/corrupt state, unknown identities,
+        in-flight mutations, and pending watcher obligations fail closed.
+        """
+        expected = self.expected_account_id
+        if not expected or not expected.isdigit():
+            return False, "Configured Dhan account ID missing or invalid"
+
+        # First inspect the durable state without contacting the broker or
+        # changing an already-correct binding.
+        with self._thread_lock:
+            fd = self._acquire_flock()
+            if fd is None:
+                return False, "Cannot acquire Emergency STOP lock"
+            try:
+                try:
+                    with open(self.state_file, "r", encoding="utf-8") as f:
+                        original = json.load(f)
+                    if not isinstance(original, dict) or not isinstance(original.get("is_stopped"), bool):
+                        raise ValueError("Invalid Emergency STOP schema")
+                    old_id = str(original.get("account_id") or "").strip()
+                except (OSError, ValueError, TypeError):
+                    return False, "Emergency STOP state unavailable or invalid; manual recovery required"
+                if not old_id:
+                    return False, "Emergency STOP account binding missing; manual recovery required"
+                if old_id == expected:
+                    return True, "Emergency STOP account already matches configured Dhan account"
+                if original.get("in_flight_orders") or self._in_flight:
+                    return False, "Cannot change account binding with in-flight broker mutations"
+            finally:
+                self._release_flock(fd)
+
+        if pending_watcher_count:
+            return False, "Cannot change account binding with unresolved watcher or journal obligations"
+
+        # Never use .env alone as authority: compare it against the token's
+        # authenticated profile. No broker writes occur.
+        try:
+            profile_id = broker.get_authenticated_profile_id()
+        except Exception as exc:
+            logger.warning("Read-only Dhan profile verification failed: %s", type(exc).__name__)
+            return False, "Could not verify Dhan token account identity"
+        if not profile_id or str(profile_id).strip() != expected:
+            return False, "Authenticated Dhan profile does not match configured account"
+
+        # Recheck under the durable flock before committing the account change.
+        with self._thread_lock:
+            fd = self._acquire_flock()
+            if fd is None:
+                return False, "Cannot acquire Emergency STOP lock for account sync"
+            try:
+                try:
+                    with open(self.state_file, "r", encoding="utf-8") as f:
+                        current = json.load(f)
+                    if not isinstance(current, dict) or not isinstance(current.get("is_stopped"), bool):
+                        raise ValueError("Invalid Emergency STOP schema")
+                except (OSError, ValueError, TypeError):
+                    return False, "Emergency STOP state changed or became unreadable"
+                if str(current.get("account_id") or "").strip() != old_id:
+                    return False, "Emergency STOP account changed concurrently; refusing stale migration"
+                if current.get("in_flight_orders") or self._in_flight:
+                    return False, "In-flight broker mutations appeared during account sync"
+
+                now = time.time()
+                updated = dict(current)
+                updated["previous_account_id"] = old_id
+                updated["account_id"] = expected
+                updated["is_stopped"] = True
+                updated["prior_stop_reason"] = str(current.get("reason") or "")
+                updated["stopped_by"] = "SYSTEM_ACCOUNT_SWITCH"
+                updated["reason"] = (
+                    f"Broker-verified account binding changed {old_id} -> {expected}. "
+                    "New LIVE trading remains blocked until owner-authorized resume and reconciliation."
+                )
+                updated["stopped_at"] = now
+                updated["account_rebound_at"] = now
+                updated["state_version"] = max(2, int(current.get("state_version") or 2))
+                updated["epoch"] = int(now)
+                if not self._save_raw(updated):
+                    return False, "Failed to persist verified Emergency STOP account binding"
+                logger.warning(
+                    "[ACCOUNT SYNC] Rebound Emergency STOP to authenticated account %s; "
+                    "STOP remains active pending explicit owner authorization.",
+                    expected,
+                )
+                return True, "Verified account binding updated; Emergency STOP remains active"
+            finally:
+                self._release_flock(fd)
+
     def is_stopped(self) -> bool:
         """Returns True if emergency stop is currently active or file is corrupt/missing/disk-failed (fail-closed)."""
         with self._thread_lock:
