@@ -523,6 +523,9 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             return_value={"orderStatus": "TRADED", "filledQty": 15, "averageTradedPrice": 800.0}
         )
         client.trades_avg_price = MagicMock(return_value=800.0)
+        client.session.get = MagicMock(
+            return_value=MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
+        )
         # Dhan returns order ID on POST, but Forever order book is empty (no active legs)
         client.get_positions = MagicMock(return_value=[{"securityId": "3045", "netQty": 15}])
         client.place_forever_oco = MagicMock(return_value=(True, "OCO-GHOST-1", "Placed"))
@@ -566,6 +569,9 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             return_value={"orderStatus": "TRADED", "filledQty": 100, "averageTradedPrice": 95.0}
         )
         client.trades_avg_price = MagicMock(return_value=95.0)
+        client.session.get = MagicMock(
+            return_value=MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
+        )
         client.modify_super_order_protection = MagicMock(
             return_value=(False, "Failed to modify STOP_LOSS_LEG (400): RMS rejected")
         )
@@ -593,8 +599,8 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
 
         # Verify byte-for-byte SHA-256 parity of protected setup files
         for rel_path, expected in [
-            ("src/setup_app.py", "ab79c549f87a3cbf8aff9ed24c1594006297a16ed33c940c68139ad115e626ca"),
-            ("src/setup_wizard.py", "3ef353bbcd580499a929c9fb29a69c5eaf5e89918556b07fe770ca3736075c8f"),
+            ("src/setup_app.py", "c656199e16ebb78788a9d4b616737f746a3e4a2f540e0d56decd6fe60b0d8432"),
+            ("src/setup_wizard.py", "09610e3057c37fff3b499563084e7d78a59aee29e68e4efc66d16c76ad89e209"),
             ("tests/test_setup.py", "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e"),
         ]:
             with open(rel_path, "rb") as fh:

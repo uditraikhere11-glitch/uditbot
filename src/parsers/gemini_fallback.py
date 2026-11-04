@@ -254,47 +254,58 @@ class _StrictCandidateBase(BaseModel):
     Base model that intercepts raw input dictionaries/JSON before Pydantic v1/v2 float coercion
     so booleans passed for numeric fields (`entry_min=True`, `entry_price=True`, etc.) are
     never silently coerced to `1.0` or `0.0`.
+    Uses true `ClassVar` metadata and class-level access so Python 3.13 / Pydantic 2.13+
+    never accesses uninitialized `__pydantic_private__` before `super().__init__`.
     """
 
+    FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ()
+    INT_FIELDS: ClassVar[Tuple[str, ...]] = ()
+    BOOL_FIELDS: ClassVar[Tuple[str, ...]] = ()
+    LIST_FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ()
     _FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ()
     _INT_FIELDS: ClassVar[Tuple[str, ...]] = ()
     _BOOL_FIELDS: ClassVar[Tuple[str, ...]] = ()
     _LIST_FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ()
 
     def __init__(self, **data: Any) -> None:
+        cls = type(self)
         sanitized, raw_overrides, errors = _inspect_raw_candidate_dict(
             data,
-            float_fields=self._FLOAT_FIELDS,
-            int_fields=self._INT_FIELDS,
-            bool_fields=self._BOOL_FIELDS,
-            list_float_fields=self._LIST_FLOAT_FIELDS,
+            float_fields=cls.FLOAT_FIELDS or cls._FLOAT_FIELDS,
+            int_fields=cls.INT_FIELDS or cls._INT_FIELDS,
+            bool_fields=cls.BOOL_FIELDS or cls._BOOL_FIELDS,
+            list_float_fields=cls.LIST_FLOAT_FIELDS or cls._LIST_FLOAT_FIELDS,
         )
         super().__init__(**sanitized)
-        object.__setattr__(self, "_raw_type_errors", errors)
+        self.__dict__["_raw_type_errors"] = list(errors)
         for k, raw_v in raw_overrides.items():
-            object.__setattr__(self, k, raw_v)
+            try:
+                object.__setattr__(self, k, raw_v)
+            except Exception:
+                self.__dict__[k] = raw_v
 
     @property
     def raw_type_errors(self) -> List[str]:
-        return list(getattr(self, "_raw_type_errors", ()))
+        return list(self.__dict__.get("_raw_type_errors", ()))
 
     def is_strictly_valid(self) -> Tuple[bool, str]:
+        cls = type(self)
         errs = self.raw_type_errors
         if errs:
             return False, "; ".join(errs)
-        for bf in self._BOOL_FIELDS:
+        for bf in (cls.BOOL_FIELDS or cls._BOOL_FIELDS):
             v = getattr(self, bf, None)
             if not isinstance(v, bool):
                 return False, f"Invalid {bf}: expected bool, got {v!r}"
-        for ff in self._FLOAT_FIELDS:
+        for ff in (cls.FLOAT_FIELDS or cls._FLOAT_FIELDS):
             v = getattr(self, ff, None)
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v))):
                 return False, f"Invalid {ff}: boolean or non-finite numeric value ({v!r})"
-        for inf_f in self._INT_FIELDS:
+        for inf_f in (cls.INT_FIELDS or cls._INT_FIELDS):
             v = getattr(self, inf_f, None)
             if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
                 return False, f"Invalid {inf_f}: boolean or non-int value ({v!r})"
-        for lf in self._LIST_FLOAT_FIELDS:
+        for lf in (cls.LIST_FLOAT_FIELDS or cls._LIST_FLOAT_FIELDS):
             v = getattr(self, lf, None)
             if v is not None:
                 if not isinstance(v, (list, tuple)):
@@ -338,10 +349,14 @@ class _StrictCandidateBase(BaseModel):
 
 
 class GeminiFnOCandidate(_StrictCandidateBase):
-    _FLOAT_FIELDS = ("strike", "entry_min", "entry_max", "stop_loss")
-    _INT_FIELDS = ("expiry_day",)
-    _BOOL_FIELDS = ("is_option_buy_entry",)
-    _LIST_FLOAT_FIELDS = ("targets",)
+    FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ("strike", "entry_min", "entry_max", "stop_loss")
+    INT_FIELDS: ClassVar[Tuple[str, ...]] = ("expiry_day",)
+    BOOL_FIELDS: ClassVar[Tuple[str, ...]] = ("is_option_buy_entry",)
+    LIST_FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ("targets",)
+    _FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = FLOAT_FIELDS
+    _INT_FIELDS: ClassVar[Tuple[str, ...]] = INT_FIELDS
+    _BOOL_FIELDS: ClassVar[Tuple[str, ...]] = BOOL_FIELDS
+    _LIST_FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = LIST_FLOAT_FIELDS
 
     is_option_buy_entry: bool = Field(description="True only if this message is a fresh BUY call on a single stock option")
     symbol: str = Field(description="Underlying stock symbol, e.g. POLYCAB, TATACHEM")
@@ -356,10 +371,14 @@ class GeminiFnOCandidate(_StrictCandidateBase):
 
 
 class GeminiEquityCandidate(_StrictCandidateBase):
-    _FLOAT_FIELDS = ("entry_price",)
-    _INT_FIELDS = ()
-    _BOOL_FIELDS = ("is_buy_entry",)
-    _LIST_FLOAT_FIELDS = ()
+    FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ("entry_price",)
+    INT_FIELDS: ClassVar[Tuple[str, ...]] = ()
+    BOOL_FIELDS: ClassVar[Tuple[str, ...]] = ("is_buy_entry",)
+    LIST_FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = ()
+    _FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = FLOAT_FIELDS
+    _INT_FIELDS: ClassVar[Tuple[str, ...]] = INT_FIELDS
+    _BOOL_FIELDS: ClassVar[Tuple[str, ...]] = BOOL_FIELDS
+    _LIST_FLOAT_FIELDS: ClassVar[Tuple[str, ...]] = LIST_FLOAT_FIELDS
 
     is_buy_entry: bool = Field(description="True only if this message is a fresh BUY recommendation for a single stock")
     stock_symbol: str = Field(description="Clean NSE/BSE stock ticker in uppercase without exchange prefix")

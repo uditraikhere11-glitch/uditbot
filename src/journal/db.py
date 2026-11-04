@@ -275,6 +275,32 @@ class JournalDB:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS positions_lifecycle (
+                parent_order_id TEXT PRIMARY KEY,
+                account_id TEXT DEFAULT '',
+                symbol TEXT NOT NULL,
+                trading_symbol TEXT DEFAULT '',
+                security_id TEXT NOT NULL,
+                exchange_segment TEXT NOT NULL,
+                product_type TEXT NOT NULL,
+                protection_route TEXT NOT NULL DEFAULT 'UNKNOWN',
+                position_state TEXT NOT NULL DEFAULT 'ENTRY',
+                entry_qty INTEGER DEFAULT 0,
+                buy_filled_qty INTEGER DEFAULT 0,
+                buy_vwap REAL DEFAULT 0.0,
+                protected_qty INTEGER DEFAULT 0,
+                sl_price REAL DEFAULT 0.0,
+                target_price REAL DEFAULT 0.0,
+                sell_filled_qty INTEGER DEFAULT 0,
+                sell_vwap REAL DEFAULT 0.0,
+                confirmed_open_qty INTEGER DEFAULT 0,
+                realized_pnl REAL DEFAULT 0.0,
+                triggered_leg TEXT DEFAULT '',
+                manual_exit_detected INTEGER DEFAULT 0,
+                orphaned_legs_detected INTEGER DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
+
             -- Atomic one-time logical event claim + outbox delivery.
             CREATE TABLE IF NOT EXISTS order_notification_events (
                 order_id TEXT NOT NULL,
@@ -453,6 +479,20 @@ class JournalDB:
                 "ALTER TABLE signals ADD COLUMN reason_code TEXT DEFAULT ''",
                 "ALTER TABLE signals ADD COLUMN parse_latency_ms REAL DEFAULT 0.0",
                 "ALTER TABLE signals ADD COLUMN evidence_json TEXT DEFAULT '{}'",
+                "ALTER TABLE order_intents ADD COLUMN protection_route TEXT DEFAULT ''",
+                "ALTER TABLE order_intents ADD COLUMN markup_pct REAL DEFAULT 0.0",
+                "ALTER TABLE order_intents ADD COLUMN config_version TEXT DEFAULT ''",
+                "ALTER TABLE orders ADD COLUMN protection_route TEXT DEFAULT ''",
+                "ALTER TABLE protection_orders ADD COLUMN protection_route TEXT DEFAULT ''",
+                "ALTER TABLE protection_attempts ADD COLUMN target_leg_state TEXT DEFAULT 'PENDING'",
+                "ALTER TABLE protection_attempts ADD COLUMN sl_leg_state TEXT DEFAULT 'PENDING'",
+                "ALTER TABLE fills ADD COLUMN transaction_type TEXT DEFAULT 'BUY'",
+                "ALTER TABLE fills ADD COLUMN security_id TEXT DEFAULT ''",
+                "ALTER TABLE fills ADD COLUMN exchange_segment TEXT DEFAULT ''",
+                "ALTER TABLE fills ADD COLUMN product_type TEXT DEFAULT ''",
+                "ALTER TABLE fills ADD COLUMN parent_order_id TEXT DEFAULT ''",
+                "ALTER TABLE fills ADD COLUMN is_verified_trade INTEGER DEFAULT 1",
+                "ALTER TABLE outbox ADD COLUMN claimed_at REAL DEFAULT 0.0",
             ]:
                 try:
                     conn.execute(alter_sql)
@@ -583,6 +623,8 @@ class JournalDB:
         broker_order_id: Optional[str] = None,
         response_payload: Optional[Any] = None,
         error_msg: Optional[str] = None,
+        target_leg_state: Optional[str] = None,
+        sl_leg_state: Optional[str] = None,
         now: Optional[float] = None,
     ) -> None:
         ts = float(now if now is not None else time.time())
@@ -601,10 +643,12 @@ class JournalDB:
                     broker_order_id = COALESCE(?, broker_order_id),
                     response_json = COALESCE(?, response_json),
                     error_msg = COALESCE(?, error_msg),
+                    target_leg_state = COALESCE(?, target_leg_state),
+                    sl_leg_state = COALESCE(?, sl_leg_state),
                     updated_at = ?
                 WHERE attempt_id = ? OR correlation_id = ?
                 """,
-                (str(state), broker_order_id, resp_str, error_msg, ts, key, key[:30]),
+                (str(state), broker_order_id, resp_str, error_msg, target_leg_state, sl_leg_state, ts, key, key[:30]),
             )
 
     def supersede_protection_attempts(self, parent_order_id: str, now: Optional[float] = None) -> int:
@@ -727,15 +771,27 @@ class JournalDB:
         strike: float = 0.0,
         expiry: Any = "",
         trading_symbol: str = "",
+        protection_route: str = "",
+        markup_pct: float = 0.0,
+        config_version: str = "",
     ) -> int:
         """Persists order intent + full contract/route metadata before network POST (<=30-char correlation ID)."""
         now = time.time()
         acct = str(account_id or self.account_id).strip()
         exp_str = expiry.isoformat() if isinstance(expiry, date) else str(expiry or "").strip()
+        clean_route = str(protection_route or "").strip().upper()
         if is_super_order is None:
-            is_super = 1 if (exchange_segment.upper() in ("NSE_FNO", "BSE_FNO") and product_type.upper() == "MARGIN") else 0
+            if clean_route == "SUPER_ORDER":
+                is_super = 1
+            elif clean_route == "FOREVER_OCO":
+                is_super = 0
+            else:
+                is_super = 1 if (exchange_segment.upper() in ("NSE_FNO", "BSE_FNO") and product_type.upper() == "MARGIN") else 0
         else:
             is_super = 1 if is_super_order else 0
+
+        if not clean_route:
+            clean_route = "SUPER_ORDER" if is_super else ("FOREVER_OCO" if product_type.upper() in ("CNC", "MTF") else "UNKNOWN")
 
         with self._get_conn() as conn:
             cur = conn.execute(
@@ -743,9 +799,10 @@ class JournalDB:
                 INSERT INTO order_intents (
                     correlation_id, parent_correlation_id, account_id, symbol, trading_symbol,
                     security_id, exchange_segment, product_type, order_type, price, quantity,
-                    is_super_order, original_market_price, tick_size, lot_size, option_type, strike, expiry,
+                    is_super_order, protection_route, markup_pct, config_version,
+                    original_market_price, tick_size, lot_size, option_type, strike, expiry,
                     state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENT_CREATED', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENT_CREATED', ?, ?)
                 """,
                 (
                     correlation_id[:30],
@@ -760,6 +817,9 @@ class JournalDB:
                     float(price),
                     int(quantity),
                     is_super,
+                    clean_route,
+                    float(markup_pct or 0.0),
+                    str(config_version or ""),
                     float(original_market_price or price),
                     float(tick_size or 0.05),
                     int(lot_size or 1),
@@ -1037,6 +1097,47 @@ class JournalDB:
             )
             return cur.lastrowid
 
+    def claim_pending_outbox(
+        self,
+        limit: int = 10,
+        now: Optional[float] = None,
+        claim_timeout_sec: float = 60.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        P0-08: Atomically claims pending outbox rows (`status = 'CLAIMING'`) inside an immediate
+        SQLite transaction so concurrent workers/processes never dispatch duplicate Telegram messages.
+        Also recovers stale `CLAIMING` rows older than `claim_timeout_sec`.
+        """
+        current_ts = float(now if now is not None else time.time())
+        stale_cutoff = current_ts - max(1.0, float(claim_timeout_sec))
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM outbox
+                WHERE (
+                    status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ) OR (
+                    status = 'CLAIMING' AND COALESCE(claimed_at, 0.0) <= ?
+                )
+                ORDER BY id ASC LIMIT ?
+                """,
+                (current_ts, stale_cutoff, int(limit)),
+            ).fetchall()
+            claimed: List[Dict[str, Any]] = []
+            for row in rows:
+                oid = int(row["id"])
+                upd = conn.execute(
+                    "UPDATE outbox SET status = 'CLAIMING', claimed_at = ? WHERE id = ? AND status IN ('PENDING', 'CLAIMING')",
+                    (current_ts, oid),
+                )
+                if upd.rowcount == 1:
+                    d = dict(row)
+                    d["status"] = "CLAIMING"
+                    d["claimed_at"] = current_ts
+                    claimed.append(d)
+            return claimed
+
     def fetch_pending_outbox(self, limit: int = 10, now: Optional[float] = None) -> List[Dict[str, Any]]:
         current_ts = now if now is not None else time.time()
         with self._get_conn() as conn:
@@ -1058,23 +1159,33 @@ class JournalDB:
             )
 
     def mark_outbox_retry(self, outbox_id: int, error_msg: str = "", max_retries: int = 5, now: Optional[float] = None) -> str:
-        """16-C: Increments retry count with exponential backoff or marks DEAD_LETTER if max_retries exceeded."""
+        """16-C & P0-08: Increments retry count with exponential backoff or marks DEAD_LETTER with system event alert."""
         current_ts = now if now is not None else time.time()
         with self._get_conn() as conn:
-            cur = conn.execute("SELECT retry_count FROM outbox WHERE id = ?", (outbox_id,))
+            cur = conn.execute("SELECT retry_count, event_type FROM outbox WHERE id = ?", (outbox_id,))
             row = cur.fetchone()
             if not row:
                 return "MISSING"
             retries = int(row["retry_count"] or 0) + 1
+            ev_type = str(row["event_type"] or "OUTBOX")
             if retries >= max_retries:
                 conn.execute(
                     "UPDATE outbox SET status = 'DEAD_LETTER', retry_count = ?, last_error = ? WHERE id = ?",
                     (retries, error_msg[:500], outbox_id),
                 )
+                conn.execute(
+                    "INSERT INTO system_events (event_type, description, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        "OUTBOX_DEAD_LETTER",
+                        f"Outbox notification {outbox_id} ({ev_type}) exhausted {retries} retries: {error_msg[:200]}",
+                        json.dumps({"outbox_id": outbox_id, "event_type": ev_type, "retries": retries}),
+                        current_ts,
+                    ),
+                )
                 return "DEAD_LETTER"
             backoff = min(300.0, float(2 ** retries))
             conn.execute(
-                "UPDATE outbox SET retry_count = ?, next_retry_at = ?, last_error = ? WHERE id = ?",
+                "UPDATE outbox SET status = 'PENDING', retry_count = ?, next_retry_at = ?, last_error = ? WHERE id = ?",
                 (retries, current_ts + backoff, error_msg[:500], outbox_id),
             )
             return "RETRY_SCHEDULED"
@@ -1165,15 +1276,22 @@ class JournalDB:
         quantity: int,
         status: str = "TEST_VALIDATED",
         broker_order_id: Optional[str] = None,
+        protection_route: str = "",
     ) -> int:
         now = time.time()
         with self._get_conn() as conn:
             cur = conn.execute(
                 """
-                INSERT OR REPLACE INTO orders (correlation_id, broker_order_id, trading_mode, product_type, exchange_segment, symbol, security_id, order_type, price, quantity, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO orders (
+                    correlation_id, broker_order_id, trading_mode, product_type, exchange_segment,
+                    symbol, security_id, order_type, price, quantity, status, protection_route, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (correlation_id[:30], broker_order_id, trading_mode, product_type, exchange_segment, symbol, security_id, order_type, price, quantity, status, now, now)
+                (
+                    correlation_id[:30], broker_order_id, trading_mode, product_type, exchange_segment,
+                    symbol, security_id, order_type, price, quantity, status, str(protection_route or ""), now, now,
+                ),
             )
             return cur.lastrowid
 
@@ -1185,18 +1303,248 @@ class JournalDB:
         traded_price: float,
         traded_quantity: int,
         traded_at: Optional[float] = None,
+        transaction_type: str = "BUY",
+        security_id: str = "",
+        exchange_segment: str = "",
+        product_type: str = "",
+        parent_order_id: str = "",
+        is_verified_trade: Optional[bool] = None,
     ) -> bool:
-        """14-B / V12-19: Records unique exchange trade fill idempotently."""
+        """
+        14-B / V12-19 / P0-09: Records unique exchange trade fill idempotently by `exchange_trade_id`.
+        Distinguishes real exchange tradebook fills (`is_verified_trade=1`) from order-summary fallback
+        snapshots (`-FILL-` / `-RECON-FILL-`, `is_verified_trade=0`), and removes superseded synthetic
+        snapshots when real exchange tradebook rows are recorded for the same `broker_order_id`.
+        """
         ts = traded_at if traded_at is not None else time.time()
+        etid = str(exchange_trade_id or "").strip()
+        boid = str(broker_order_id or "").strip()
+        side = str(transaction_type or "BUY").strip().upper()
+        if side not in ("BUY", "SELL"):
+            side = "BUY"
+        is_synthetic = ("-FILL-" in etid or "-RECON-FILL-" in etid)
+        verified_flag = (0 if is_synthetic else 1) if is_verified_trade is None else (1 if is_verified_trade else 0)
+
         with self._get_conn() as conn:
+            if verified_flag == 1 and boid:
+                # Remove synthetic order-summary placeholders for this order so real tradebook fills never double-count
+                conn.execute(
+                    "DELETE FROM fills WHERE broker_order_id = ? AND is_verified_trade = 0",
+                    (boid,),
+                )
+            elif verified_flag == 0 and boid:
+                # Do not insert a synthetic snapshot if real tradebook fills already exist for this order
+                has_real = conn.execute(
+                    "SELECT 1 FROM fills WHERE broker_order_id = ? AND is_verified_trade = 1 AND exchange_trade_id NOT LIKE '%-FILL-%' LIMIT 1",
+                    (boid,),
+                ).fetchone()
+                if has_real:
+                    return False
+
             cur = conn.execute(
                 """
-                INSERT OR IGNORE INTO fills (broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity, traded_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO fills (
+                    broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity,
+                    traded_at, transaction_type, security_id, exchange_segment, product_type,
+                    parent_order_id, is_verified_trade
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(broker_order_id), str(exchange_trade_id), symbol, float(traded_price), int(traded_quantity), ts),
+                (
+                    boid,
+                    etid,
+                    str(symbol or ""),
+                    float(traded_price),
+                    int(traded_quantity),
+                    ts,
+                    side,
+                    str(security_id or ""),
+                    str(exchange_segment or ""),
+                    str(product_type or ""),
+                    str(parent_order_id or boid),
+                    verified_flag,
+                ),
             )
             return cur.rowcount == 1
+
+    def upsert_position_lifecycle(
+        self,
+        parent_order_id: str,
+        symbol: str,
+        security_id: str,
+        exchange_segment: str,
+        product_type: str,
+        protection_route: str,
+        position_state: str,
+        entry_qty: int = 0,
+        buy_filled_qty: int = 0,
+        buy_vwap: float = 0.0,
+        protected_qty: int = 0,
+        sl_price: float = 0.0,
+        target_price: float = 0.0,
+        sell_filled_qty: int = 0,
+        sell_vwap: float = 0.0,
+        confirmed_open_qty: Optional[int] = None,
+        realized_pnl: float = 0.0,
+        triggered_leg: str = "",
+        manual_exit_detected: bool = False,
+        orphaned_legs_detected: bool = False,
+        trading_symbol: str = "",
+        account_id: str = "",
+        now: Optional[float] = None,
+    ) -> None:
+        """P0-03 & P0-09: Persists durable position lifecycle state and BUY/SELL accounting."""
+        ts = float(now if now is not None else time.time())
+        acct = str(account_id or self.account_id).strip()
+        open_q = int(confirmed_open_qty) if confirmed_open_qty is not None else max(0, int(buy_filled_qty) - int(sell_filled_qty))
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO positions_lifecycle (
+                    parent_order_id, account_id, symbol, trading_symbol, security_id,
+                    exchange_segment, product_type, protection_route, position_state,
+                    entry_qty, buy_filled_qty, buy_vwap, protected_qty, sl_price, target_price,
+                    sell_filled_qty, sell_vwap, confirmed_open_qty, realized_pnl, triggered_leg,
+                    manual_exit_detected, orphaned_legs_detected, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(parent_order_id) DO UPDATE SET
+                    protection_route = excluded.protection_route,
+                    position_state = excluded.position_state,
+                    entry_qty = excluded.entry_qty,
+                    buy_filled_qty = excluded.buy_filled_qty,
+                    buy_vwap = CASE WHEN excluded.buy_vwap > 0 THEN excluded.buy_vwap ELSE positions_lifecycle.buy_vwap END,
+                    protected_qty = excluded.protected_qty,
+                    sl_price = CASE WHEN excluded.sl_price > 0 THEN excluded.sl_price ELSE positions_lifecycle.sl_price END,
+                    target_price = CASE WHEN excluded.target_price > 0 THEN excluded.target_price ELSE positions_lifecycle.target_price END,
+                    sell_filled_qty = excluded.sell_filled_qty,
+                    sell_vwap = CASE WHEN excluded.sell_vwap > 0 THEN excluded.sell_vwap ELSE positions_lifecycle.sell_vwap END,
+                    confirmed_open_qty = excluded.confirmed_open_qty,
+                    realized_pnl = excluded.realized_pnl,
+                    triggered_leg = CASE WHEN excluded.triggered_leg != '' THEN excluded.triggered_leg ELSE positions_lifecycle.triggered_leg END,
+                    manual_exit_detected = excluded.manual_exit_detected,
+                    orphaned_legs_detected = excluded.orphaned_legs_detected,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(parent_order_id),
+                    acct,
+                    str(symbol),
+                    str(trading_symbol or symbol),
+                    str(security_id),
+                    str(exchange_segment),
+                    str(product_type),
+                    str(protection_route or "UNKNOWN"),
+                    str(position_state),
+                    int(entry_qty),
+                    int(buy_filled_qty),
+                    float(buy_vwap),
+                    int(protected_qty),
+                    float(sl_price),
+                    float(target_price),
+                    int(sell_filled_qty),
+                    float(sell_vwap),
+                    open_q,
+                    float(realized_pnl),
+                    str(triggered_leg or ""),
+                    1 if manual_exit_detected else 0,
+                    1 if orphaned_legs_detected else 0,
+                    ts,
+                ),
+            )
+
+    def get_position_lifecycle(self, parent_order_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM positions_lifecycle WHERE parent_order_id = ?",
+                (str(parent_order_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_open_positions_lifecycle(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM positions_lifecycle WHERE position_state NOT IN ('POSITION_CLOSED') AND confirmed_open_qty > 0 ORDER BY updated_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_fill_by_exchange_trade_id(self, exchange_trade_id: str) -> Optional[Dict[str, Any]]:
+        """P0-A: Returns existing persisted fill row for `exchange_trade_id` to prevent cross-order attribution."""
+        etid = str(exchange_trade_id or "").strip()
+        if not etid:
+            return None
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM fills WHERE exchange_trade_id = ? LIMIT 1",
+                (etid,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_sell_fills_for_parent(self, parent_order_id: str) -> List[Dict[str, Any]]:
+        """P0-A: Returns verified parent-linked SELL fills persisted for `parent_order_id`."""
+        p_oid = str(parent_order_id or "").strip()
+        if not p_oid:
+            return []
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM fills WHERE parent_order_id = ? AND UPPER(transaction_type) = 'SELL' AND is_verified_trade = 1 ORDER BY traded_at ASC, id ASC",
+                (p_oid,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_position_accounting(self, parent_order_id: str) -> Dict[str, Any]:
+        """
+        P0-09 & P0-A: Computes verified BUY and SELL fill totals, VWAPs, open quantity, and realized gross P&L
+        from the `fills` table strictly for `parent_order_id`. Only verified parent-linked SELL fills
+        (`parent_order_id = p_oid` and `is_verified_trade = 1`) are counted toward exit quantity and realized P&L.
+        """
+        p_oid = str(parent_order_id or "").strip()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM fills WHERE broker_order_id = ? OR parent_order_id = ? ORDER BY traded_at ASC, id ASC",
+                (p_oid, p_oid),
+            ).fetchall()
+        buy_qty = 0
+        buy_val = 0.0
+        sell_qty = 0
+        sell_val = 0.0
+        verified_trades = 0
+        seen_etids = set()
+        for r in rows:
+            etid = str(r["exchange_trade_id"] or "").strip()
+            if etid:
+                if etid in seen_etids:
+                    continue
+                seen_etids.add(etid)
+            q = int(r["traded_quantity"] or 0)
+            p = float(r["traded_price"] or 0.0)
+            if q <= 0 or p <= 0.0:
+                continue
+            is_ver = int(r["is_verified_trade"] if "is_verified_trade" in r.keys() else 1) == 1
+            side = str(r["transaction_type"] or "BUY").upper()
+            if side == "SELL":
+                if not is_ver or str(r["parent_order_id"] or "").strip() != p_oid:
+                    continue
+                sell_qty += q
+                sell_val += q * p
+            else:
+                buy_qty += q
+                buy_val += q * p
+            if is_ver:
+                verified_trades += 1
+        buy_vwap = round(buy_val / buy_qty, 4) if buy_qty > 0 else 0.0
+        sell_vwap = round(sell_val / sell_qty, 4) if sell_qty > 0 else 0.0
+        matched_exit_qty = min(buy_qty, sell_qty)
+        realized_pnl = round((sell_vwap - buy_vwap) * matched_exit_qty, 2) if matched_exit_qty > 0 and buy_vwap > 0 and sell_vwap > 0 else 0.0
+        return {
+            "parent_order_id": p_oid,
+            "buy_filled_qty": buy_qty,
+            "buy_vwap": buy_vwap,
+            "sell_filled_qty": sell_qty,
+            "sell_vwap": sell_vwap,
+            "confirmed_open_qty": max(0, buy_qty - sell_qty),
+            "realized_pnl": realized_pnl,
+            "verified_trades_count": verified_trades,
+        }
 
     def record_system_event(self, event_type: str, description: str, payload: str = "") -> int:
         with self._get_conn() as conn:
