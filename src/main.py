@@ -1425,7 +1425,42 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
 
     outbox_worker = None
     try:
-        rec_ok, rec_msg = await asyncio.to_thread(pipeline.reconciliation_gate.run_startup_reconciliation)
+        # V14: Automatically rebind an outdated Emergency STOP account only
+        # when Dhan's authenticated profile matches the configured account.
+        # Never auto-resume trading after an account switch.
+        if cfg.trading_mode == TradingMode.LIVE:
+            try:
+                obligations = len(pipeline.watcher.pending)
+                for reader_name in (
+                    "get_non_terminal_intents",
+                    "get_unprotected_orders",
+                    "get_unresolved_protection_attempts",
+                ):
+                    reader = getattr(pipeline.db, reader_name, None)
+                    if not callable(reader):
+                        raise RuntimeError(f"Missing journal safety reader: {reader_name}")
+                    obligations += len(reader())
+                sync_ok, sync_reason = await asyncio.to_thread(
+                    pipeline.stop_manager.sync_account_from_authenticated_broker,
+                    pipeline.broker,
+                    pending_watcher_count=obligations,
+                )
+            except Exception as exc:
+                sync_ok = False
+                sync_reason = f"Account sync safety check unavailable: {type(exc).__name__}"
+            if not sync_ok:
+                pipeline.reconciliation_gate.halt_new_entries(
+                    f"Dhan account identity/binding verification failed: {sync_reason}"
+                )
+                rec_ok, rec_msg = False, sync_reason
+            else:
+                rec_ok, rec_msg = await asyncio.to_thread(
+                    pipeline.reconciliation_gate.run_startup_reconciliation
+                )
+        else:
+            rec_ok, rec_msg = await asyncio.to_thread(
+                pipeline.reconciliation_gate.run_startup_reconciliation
+            )
         logger.info(f"Startup Reconciliation: ok={rec_ok}, msg={rec_msg}")
 
         session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else os.path.join(cfg.data_dir, "tg_userbot.session")
