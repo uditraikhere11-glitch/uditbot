@@ -1759,8 +1759,8 @@ class DhanClient:
         return self._read_collection("/positions", "positions")
 
     def get_forever_orders(self) -> Union[BrokerReadList, BrokerReadFailure]:
-        """Retrieves all Forever OCO orders: GET /v2/forever/all."""
-        return self._read_collection("/forever/all", "forever_orders")
+        """Retrieves all Forever OCO orders: GET /v2/forever/orders."""
+        return self._read_collection("/forever/orders", "forever_orders")
 
     # =========================================================================
     # SAFETY CORRECTION B & C: Authoritative Broker Protection Verification
