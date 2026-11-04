@@ -7,6 +7,7 @@ on:
       - ".github/workflows/amo-offline-tests.yml"
   push:
     branches:
+      - main
       - "feature/equity-amo-order-routing"
 
 permissions:
@@ -24,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt 'httpx==0.28.1'
       - name: AMO regressions
         run: python -m unittest -v tests.test_equity_amo
       - name: Existing offline suite

@@ -931,6 +931,27 @@ class DhanClient:
         """Detects Dhan expired or invalid token errors."""
         return _shared_is_token_error(status_code, response_text)
 
+
+    def get_authenticated_profile_id(self) -> Optional[str]:
+        """Read-only Dhan /v2/profile identity check; never infers identity from .env."""
+        if self.cfg.trading_mode == TradingMode.TEST:
+            return None
+        try:
+            resp = self.session.get(
+                f"{BASE_URL}/profile", headers=self._headers(), timeout=5
+            )
+            if resp.status_code != 200:
+                logger.warning("Dhan profile identity check returned HTTP %s", resp.status_code)
+                return None
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                return None
+            account_id = str(payload.get("dhanClientId") or "").strip()
+            return account_id if account_id.isdigit() else None
+        except Exception as exc:
+            logger.warning("Dhan profile identity check unavailable: %s", type(exc).__name__)
+            return None
+
     def verify_token_authenticated(self) -> Tuple[bool, float, str]:
         """
         P1 TOTP Recovery Guard: Verifies against Dhan /v2/fundlimit that the active token
@@ -1761,7 +1782,7 @@ class DhanClient:
         return self._read_collection("/positions", "positions")
 
     def get_forever_orders(self) -> Union[BrokerReadList, BrokerReadFailure]:
-        """Retrieves all Forever OCO orders: GET /v2/forever/all."""
+        """Retrieves all Forever OCO orders: GET /v2/forever/orders."""
         return self._read_collection("/forever/orders", "forever_orders")
 
     # =========================================================================

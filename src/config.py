@@ -257,7 +257,7 @@ class AppConfig:
             tg_bot_token=str(env.get("TG_BOT_TOKEN") or env.get("TELEGRAM_BOT_TOKEN") or "").strip(),
             monitored_channel_ids=_int_list(env.get("MONITORED_CHANNEL_IDS", "")),
             test_group_id=_clean_int(env.get("TEST_GROUP_ID", "0")),
-            log_group_id=env.get("LOG_GROUP_ID", "").strip() if str(env.get("LOG_GROUP_ID", "")).strip().startswith("@") else _clean_int(env.get("LOG_GROUP_ID", "0")),
+            log_group_id=_clean_int(env.get("LOG_GROUP_ID", "0")),
             authorized_operator_id=_clean_int(env.get("AUTHORIZED_OPERATOR_TG_ID", "0")),
             ignore_backlog_on_restart=_bool(env.get("IGNORE_TELEGRAM_BACKLOG_ON_RESTART", "true"), default=True),
 
