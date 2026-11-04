@@ -793,6 +793,7 @@ _KEY_ALIASES: Dict[str, str] = {
     "monitored_channel_ids": "monitored_channel_ids",
     "test_group_id": "test_group_id",
     "log_group_id": "log_group_id",
+    "dhan_response_group_name": "dhan_response_group_name",
     "authorized_operator_tg_id": "authorized_operator_id",
     "authorized_operator_id": "authorized_operator_id",
     "ignore_telegram_backlog_on_restart": "ignore_backlog_on_restart",
@@ -2121,6 +2122,9 @@ class ConfigChangeTracker:
                 if not (math.isfinite(min_funds) and min_funds >= 0.0):
                     return False, "Minimum ledger funds must be greater than or equal to 0"
 
+            from src.notifier.dhan_response import normalize_group_name
+            if "DHAN_RESPONSE_GROUP_NAME" in params or "dhan_response_group_name" in params:
+                normalize_group_name(params.get("DHAN_RESPONSE_GROUP_NAME", params.get("dhan_response_group_name")))
             return True, "Valid"
         except (ValueError, TypeError) as e:
             return False, f"Invalid numeric input parameter: {e}"

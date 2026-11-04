@@ -1009,7 +1009,7 @@ class JournalDB:
 
     # --- Outbox for Durable Notifications (Step 16) ---
 
-    def enqueue_order_notification_once(self, order_id: str, event_key: str, text: str) -> bool:
+    def enqueue_order_notification_once(self, order_id: str, event_key: str, text: str, *, mirror_final: bool = False) -> bool:
         """Atomically claim event and queue Telegram notice. False means already queued.
 
         The existing outbox worker is at-least-once; Telegram transport may still
@@ -1030,6 +1030,15 @@ class JournalDB:
                 "VALUES ('ORDER_STATUS_UPDATE', ?, 'PENDING', 0, 0.0, ?)",
                 (json.dumps({"text": text, "event_type": "ORDER_STATUS_UPDATE", "timestamp": now}), now),
             )
+            if mirror_final:
+                conn.execute(
+                    "INSERT INTO outbox (event_type,payload,status,retry_count,next_retry_at,created_at) "
+                    "VALUES ('DHAN_FINAL_RESPONSE', ?, 'PENDING', 0, 0.0, ?)",
+                    (json.dumps({
+                        "text": "📨 <b>Final Dhan Response</b>\n\n" + text,
+                        "event_type": "DHAN_FINAL_RESPONSE", "timestamp": now,
+                    }), now),
+                )
             return True
 
     def enqueue_outbox(self, event_type: str, payload: Dict[str, Any]) -> int:

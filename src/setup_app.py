@@ -15,6 +15,8 @@ Safely reads from and writes to .env with chmod 0600 file permissions.
 
 import os
 import sys
+from html import escape as escape_html
+from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -745,6 +747,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <p class="help-text">Where formatted trade verification cards are sent</p>
           </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label>Dhan Response Telegram Group (optional)</label>
+          <div class="input-wrap">
+            <input type="text" name="dhan_response_group_name" value="<!--DHAN_RESPONSE_GROUP_NAME-->" maxlength="100" placeholder="e.g. Dhan Response">
+          </div>
+          <p class="help-text">Enter the exact Telegram group name. Final Dhan-confirmed order results are posted there; leave blank to disable. The logged-in Telegram account must belong to the group.</p>
         </div>
 
         <div class="grid-2" style="margin-top: 10px;">
@@ -1659,6 +1669,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--TG_API_HASH-->", "")
         .replace("<!--MONITORED_CHANNEL_IDS-->", channels_str)
         .replace("<!--LOG_GROUP_ID-->", str(cfg.log_group_id or ""))
+        .replace("<!--DHAN_RESPONSE_GROUP_NAME-->", escape_html(cfg.dhan_response_group_name, quote=True))
         .replace("<!--TEST_GROUP_ID-->", str(cfg.test_group_id or ""))
         # Dhan (Secret values strictly excluded from HTML responses)
         .replace("<!--DHAN_CLIENT_ID-->", cfg.dhan_client_id or "")
@@ -1725,6 +1736,7 @@ def build_env_and_params_dict(
     tg_api_hash="",
     monitored_channel_ids="",
     log_group_id="",
+    dhan_response_group_name="",
     test_group_id="",
     ignore_backlog="true",
     dhan_client_id="",
@@ -1831,10 +1843,11 @@ def build_env_and_params_dict(
         clean_scrip_max_age = 86400.0
 
     clean_monitored = ",".join([c.strip() for c in str(_extract_val(monitored_channel_ids, "")).split(",") if c.strip()])
+    clean_dhan_response_group_name = normalize_group_name(_extract_val(dhan_response_group_name, ""))
 
     managed_keys = {
         "OPERATOR_NAME", "BOT_INSTANCE_NAME", "TRADING_MODE", "EQUITY_ACTIVE", "FNO_ACTIVE",
-        "TG_API_ID", "TG_API_HASH", "TG_BOT_TOKEN", "MONITORED_CHANNEL_IDS", "LOG_GROUP_ID",
+        "TG_API_ID", "TG_API_HASH", "TG_BOT_TOKEN", "MONITORED_CHANNEL_IDS", "LOG_GROUP_ID", "DHAN_RESPONSE_GROUP_NAME",
         "TEST_GROUP_ID", "IGNORE_TELEGRAM_BACKLOG_ON_RESTART", "DHAN_CLIENT_ID", "DHAN_PIN",
         "DHAN_TOTP_SECRET", "DHAN_ACCESS_TOKEN", "DHAN_TOKEN_FILE", "EQUITY_PRODUCT_TYPE",
         "EQUITY_SIZING_MODE", "EQUITY_BUDGET_INR", "EQUITY_FIXED_QTY", "EQUITY_PRICE_MARKUP_PCT",
@@ -1876,6 +1889,7 @@ TG_API_HASH={clean_tg_hash}
 TG_BOT_TOKEN={clean_tg_bot}
 MONITORED_CHANNEL_IDS={clean_monitored}
 LOG_GROUP_ID={str(_extract_val(log_group_id, '')).strip()}
+DHAN_RESPONSE_GROUP_NAME={clean_dhan_response_group_name}
 TEST_GROUP_ID={str(_extract_val(test_group_id, '')).strip()}
 IGNORE_TELEGRAM_BACKLOG_ON_RESTART={str(_extract_val(ignore_backlog, 'true')).strip()}
 
@@ -1935,6 +1949,7 @@ SCRIP_MASTER_MAX_AGE_SEC={clean_scrip_max_age}
         "DHAN_TOTP_SECRET": clean_dhan_totp,
         "MONITORED_CHANNEL_IDS": clean_monitored,
         "LOG_GROUP_ID": str(_extract_val(log_group_id, '')).strip(),
+        "DHAN_RESPONSE_GROUP_NAME": clean_dhan_response_group_name,
         "TEST_GROUP_ID": str(_extract_val(test_group_id, '')).strip(),
         "IGNORE_TELEGRAM_BACKLOG_ON_RESTART": str(_extract_val(ignore_backlog, 'true')).strip(),
         "DHAN_CLIENT_ID": str(_extract_val(dhan_client_id, '')).strip(),
@@ -1996,7 +2011,10 @@ async def handle_setup_submission_async(request: Request):
         )
         return JSONResponse(status_code=403, content=rec.to_dict())
 
-    env_content, form_params = build_env_and_params_dict(**raw_data)
+    try:
+        env_content, form_params = build_env_and_params_dict(**raw_data)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": str(exc)})
     cfg = AppConfig.from_env()
     data_dir = os.path.abspath(getattr(cfg, "data_dir", "data"))
     env_path = os.path.abspath(".env")
@@ -2163,6 +2181,7 @@ def handle_setup_submission(
     tg_api_hash: str = Form(""),
     monitored_channel_ids: str = Form(""),
     log_group_id: str = Form(""),
+    dhan_response_group_name: str = Form(""),
     test_group_id: str = Form(""),
     ignore_backlog: str = Form("true"),
     # Dhan Credentials
@@ -2223,7 +2242,10 @@ def handle_setup_submission(
                     break
         if not _is_locked_v11_test:
             return HTMLResponse(status_code=403, content="Missing or invalid CSRF token")
-    env_content, form_params = build_env_and_params_dict(**kwargs)
+    try:
+        env_content, form_params = build_env_and_params_dict(**kwargs)
+    except ValueError as exc:
+        return HTMLResponse(status_code=422, content=escape_html(str(exc)))
     cfg = AppConfig.from_env()
     notifier = TelegramNotifier(cfg) if cfg.log_group_id else None
 

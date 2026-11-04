@@ -152,9 +152,16 @@ class OrderStatusReporter:
     Caller remains responsible for polling broker; reporter may read trade avg via
     existing read-only broker API but NEVER places/modifies/cancels orders.
     """
-    def __init__(self, journal_db: Any, broker: Any):
+    def __init__(self, journal_db: Any, broker: Any, dhan_response_enabled: bool = False):
         self.db = journal_db
         self.broker = broker
+        self.dhan_response_enabled = dhan_response_enabled
+
+    def _queue_final(self, order_id: str, key: str, text: str) -> bool:
+        """Mirror only verified terminal Dhan outcomes; legacy log path is unchanged."""
+        if self.dhan_response_enabled:
+            return self.db.enqueue_order_notification_once(order_id, key, text, mirror_final=True)
+        return self.db.enqueue_order_notification_once(order_id, key, text)
 
     def process(self, rec: dict, broker_order: dict, observed_at: float) -> bool:
         meta = rec.get("notification_meta")
@@ -204,7 +211,7 @@ class OrderStatusReporter:
                 return False  # keep terminal record under watcher until price verification
             event_key = "TRADED"
             text = format_order_outcome(meta, requested, filled, "TRADED", observed_at, price, protected)
-            self.db.enqueue_order_notification_once(oid, event_key, text)
+            self._queue_final(oid, event_key, text)
             if not protected:
                 rec["notification_protection_pending"] = True
             elif rec.get("notification_protection_pending"):
@@ -222,7 +229,7 @@ class OrderStatusReporter:
 
         if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
             text = format_order_outcome(meta, requested, filled, status, observed_at, price, protected)
-            self.db.enqueue_order_notification_once(oid, f"FINAL_{status}_{filled}", text)
+            self._queue_final(oid, f"FINAL_{status}_{filled}", text)
             return True
         # Pending/Transit/Triggered or indeterminate: leave initial awaiting card.
         return True

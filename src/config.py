@@ -135,6 +135,7 @@ class AppConfig:
     monitored_channel_ids: List[int] = field(default_factory=list)
     test_group_id: int = 0
     log_group_id: int = 0
+    dhan_response_group_name: str = ""  # Optional exact Telegram group title, outgoing only
     authorized_operator_id: int = 0
     ignore_backlog_on_restart: bool = True
 
@@ -198,6 +199,8 @@ class AppConfig:
         if pol not in ("STRICT_TIMESTAMP", "DARVAS_HTTP_SUCCESS"):
             raise ValueError(f"Invalid EQUITY_CMP_EXECUTION_POLICY '{self.equity_cmp_execution_policy}'; must be STRICT_TIMESTAMP or DARVAS_HTTP_SUCCESS")
         self.equity_cmp_execution_policy = pol
+        from src.notifier.dhan_response import normalize_group_name
+        self.dhan_response_group_name = normalize_group_name(self.dhan_response_group_name)
         for attr in (
             "equity_budget_inr",
             "equity_price_markup_pct",
@@ -258,6 +261,7 @@ class AppConfig:
             monitored_channel_ids=_int_list(env.get("MONITORED_CHANNEL_IDS", "")),
             test_group_id=_clean_int(env.get("TEST_GROUP_ID", "0")),
             log_group_id=_clean_int(env.get("LOG_GROUP_ID", "0")),
+            dhan_response_group_name=str(env.get("DHAN_RESPONSE_GROUP_NAME", "")).strip(),
             authorized_operator_id=_clean_int(env.get("AUTHORIZED_OPERATOR_TG_ID", "0")),
             ignore_backlog_on_restart=_bool(env.get("IGNORE_TELEGRAM_BACKLOG_ON_RESTART", "true"), default=True),
 
