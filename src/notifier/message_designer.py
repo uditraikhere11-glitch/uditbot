@@ -253,8 +253,8 @@ def render(event: str, values: Mapping[str, Any], required_lines: list[str],
     # Locked status always last. Replace only the code-owned leading status emoji.
     icon_status = escape(cfg["status_emoji"], quote=False)
     for i, line in enumerate(required_lines):
-        if i == 0 and line[:2] in ("✅ ", "❌ ", "⏳ ", "⚠️ "):
-            prefix, rest = line.split(" ", 1)
+        if i == 0 and any(line.startswith(icon + " ") for icon in ("✅", "❌", "⏳", "⚠️")):
+            _, rest = line.split(" ", 1)
             rendered.append((icon_status + " " if icon_status else "") + rest)
         else:
             rendered.append(line)
