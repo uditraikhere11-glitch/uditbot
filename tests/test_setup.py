@@ -26,9 +26,14 @@ class TestSetupApp(unittest.TestCase):
     def test_get_setup_page(self):
         if not HAS_TESTCLIENT:
             self.skipTest("TestClient unavailable")
-        resp = self.client.get("/")
+        home = self.client.get("/")
+        self.assertEqual(home.status_code, 200)
+        self.assertIn("UDITBOT", home.text)
+        self.assertIn('href="/setup"', home.text)
+        resp = self.client.get("/setup")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("Audit bot Setup", resp.text)
+        self.assertIn("Back to Control Center", resp.text)
         self.assertIn("Exchange Credentials", resp.text)
         self.assertIn("Bot Configuration", resp.text)
         self.assertIn("Risk Management", resp.text)
