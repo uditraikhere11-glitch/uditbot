@@ -316,9 +316,11 @@ def parse_fno_regex_detailed(
             {},
         )
 
-    # Standard regex path only matches `@`, `at`, `buy`, `around`, `cmp` anchors (leaving `premium`/`entry` to AI/adaptive)
+    # Preserve the historical explicit-anchor rule. The only new direct
+    # route is a strictly validated *immediate* post-contract numeric clause.
     anchor_prefix = price_res.source_span.split()[0].upper() if price_res.source_span else ""
-    if not (anchor_prefix.startswith("@") or anchor_prefix in ("AT", "BUY", "AROUND", "CMP")):
+    positional_ok = price_res.reason == "Validated unanchored post-contract premium"
+    if not (positional_ok or anchor_prefix.startswith("@") or anchor_prefix in ("AT", "BUY", "AROUND", "CMP")):
         return (
             None,
             "No standard regex option price anchor (@/at/buy/around/cmp) matched",

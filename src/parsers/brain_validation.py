@@ -610,6 +610,67 @@ def extract_equity_price_bounds(text: str) -> Tuple[bool, bool, float, float, st
     return res.is_valid, res.has_explicit_price, res.entry_min, res.entry_max, res.reason
 
 
+_FNO_POSITIONAL_PREMIUM_RE = re.compile(
+    r"[ \t]*[:=]?[ \t]*(?P<low>\d{1,10}(?:\.\d{1,6})?)"
+    r"(?:[ \t]*(?:-|~|to)[ \t]*(?P<high>\d{1,10}(?:\.\d{1,6})?))?[ \t]*",
+    re.IGNORECASE,
+)
+
+
+def _extract_fno_positional_premium(masked_sub: str, base_offset: int) -> Optional[PriceExtractionResult]:
+    """Recognize a strict immediate post-contract price line, never a later unrelated number.
+
+    SL/Target and clock clauses are already length-preservingly masked. The
+    price occupies the entire first nonblank line; no stripping of signs or
+    guessing ambiguous separators like comma, slash, 'and', or plain spaces.
+    """
+    leading = len(masked_sub) - len(masked_sub.lstrip(" \t\n"))
+    remainder = masked_sub[leading:]
+    if not remainder:
+        return None
+
+    line, _, later = remainder.partition("\n")
+    # Only number-led entry clauses are eligible; month/expiry/ordinary prose
+    # retain their existing handling. An optional ':' or '=' is harmless.
+    if not re.match(r"^(?:[:=][ \t]*)?[-+]?\s*\d", line):
+        return None
+
+    def reject(message: str) -> PriceExtractionResult:
+        return PriceExtractionResult(
+            status=PriceStatus.INVALID,
+            source_span=line.strip(),
+            span_offsets=(base_offset + leading, base_offset + leading + len(line)),
+            reason_code=DecisionReasonCode.INVALID_EXPLICIT_PRICE.value,
+            reason=message,
+        )
+
+    # Do not allow unrelated unmasked words/numbers on later lines. The
+    # harmless '+' suffix from 'Target 290+' may survive the target masker.
+    if re.search(r"[A-Za-z0-9@]", later):
+        return reject("Unanchored option premium followed by ambiguous extra text")
+    match = _FNO_POSITIONAL_PREMIUM_RE.fullmatch(line)
+    if match is None:
+        return reject("Malformed or ambiguous unanchored option premium")
+    lower = parse_clean_number_token(match.group("low"))
+    upper = parse_clean_number_token(match.group("high")) if match.group("high") else lower
+    if lower is None or upper is None or lower <= 0 or upper <= 0:
+        return reject("Non-positive or invalid unanchored option premium")
+    low, high = min(lower, upper), max(lower, upper)
+    # A single misplaced digit could raise a limit price dramatically.
+    if high > low * 1.5:
+        return reject("Option premium range exceeds conservative 50% width limit")
+
+    return PriceExtractionResult(
+        status=PriceStatus.VALID,
+        entry_min=low,
+        entry_max=high,
+        source_span=line.strip(),
+        span_offsets=(base_offset + leading, base_offset + leading + len(line)),
+        reason_code=DecisionReasonCode.OK.value,
+        reason="Validated unanchored post-contract premium",
+    )
+
+
 def extract_fno_entry_bounds(text: str, after_pos: int = 0) -> PriceExtractionResult:
     """
     Extracts and validates the mandatory F&O option entry premium from `text` starting at `after_pos`
@@ -668,6 +729,11 @@ def extract_fno_entry_bounds(text: str, after_pos: int = 0) -> PriceExtractionRe
         extracted.append((lo, hi, span, (abs_start, abs_end)))
 
     if not extracted:
+        # F&O-only fallback for an immediately adjacent unanchored premium.
+        # Both regex and AI candidate grounding call this same validator.
+        positional = _extract_fno_positional_premium(masked_sub, base_offset)
+        if positional is not None:
+            return positional
         return PriceExtractionResult(
             status=PriceStatus.ABSENT,
             entry_min=0.0,
