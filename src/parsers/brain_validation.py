@@ -1169,8 +1169,8 @@ def validate_equity_candidate(
     # ticker when the authoritative Dhan master verifies a different symbol.
     # This is a safety rejection, never a silent broker-order symbol rewrite.
     for company_mention in re.finditer(
-        r"(?:\\b(?:buy|biy|bought|boght|bougth|bot|baught|add|added|aded|asd)\\s+(?:in\\s+)?|#\\s*)"
-        r"([A-Za-z][A-Za-z0-9&.\\-]*)[ \\t\\r\\n]+([A-Za-z][A-Za-z0-9&.\\-]*)",
+        r"(?:\b(?:buy|biy|bought|boght|bougth|bot|baught|add|added|aded|asd)\s+(?:in\s+)?|#\s*)"
+        r"([A-Za-z][A-Za-z0-9&.\-]*)[ \t\r\n]+([A-Za-z][A-Za-z0-9&.\-]*)",
         raw_text or "",
         flags=re.IGNORECASE,
     ):
