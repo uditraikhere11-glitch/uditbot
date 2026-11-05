@@ -60,7 +60,8 @@ def cmd_status(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager):
     print(f"[*] Equity Sizing Mode     : {cfg.equity_sizing_mode} (Budget={cfg.equity_budget_inr:g} INR)")
     print(f"[*] Equity CMP Policy      : {getattr(cfg, 'equity_cmp_execution_policy', 'STRICT_TIMESTAMP')}")
     print(f"[*] FnO Sizing Mode        : {cfg.fno_sizing_mode} (Budget={cfg.fno_capital_per_trade:g} INR, Max Lots={cfg.fno_max_lots})")
-    print(f"[*] Protection (Post-Fill) : SL={cfg.sl_pct}% | Target={cfg.target_pct}%")
+    print(f"[*] Equity Protection    : SL={cfg.equity_sl_pct}% | Target={cfg.equity_target_pct}%")
+    print(f"[*] FnO Protection       : SL={cfg.fno_sl_pct}% | Target={cfg.fno_target_pct}%")
     print(f"[*] Risk Limits            : Max Order={cfg.max_order_amount_inr:g} | Min Funds={cfg.min_trade_funds_inr:g}")
     print(f"[*] Timing Thresholds      : Quote Staleness={cfg.max_quote_age_sec}s | Retry Timeout={cfg.partial_fill_retry_timeout_sec}s")
     print(f"[*] SQLite Journal Path    : {cfg.journal_db_path}")
@@ -361,7 +362,8 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
     mkt_open, mkt_reason = market_status()
     mkt_status = "OPEN" if mkt_open else "CLOSED"
     print(f"    [*] NSE Market Session   : {mkt_status} ({mkt_reason})")
-    print(f"    [*] Post-Fill Protection : SL={cfg.sl_pct}% | Target={cfg.target_pct}% (Forever OCO / Super Order)")
+    print(f"    [*] Equity Post-Fill     : SL={cfg.equity_sl_pct}% | Target={cfg.equity_target_pct}% (Forever OCO)")
+    print(f"    [*] FnO Post-Fill        : SL={cfg.fno_sl_pct}% | Target={cfg.fno_target_pct}% (Forever OCO / Super Order)")
     print(f"    [*] Risk Sizing Limits   : Equity Budget=INR {cfg.equity_budget_inr:g} | FnO Budget=INR {cfg.fno_capital_per_trade:g}")
 
     print("=======================================================")
