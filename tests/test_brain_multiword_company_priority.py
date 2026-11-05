@@ -46,8 +46,9 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
         self.assertIsNone(sig)
         self.assertIn("Unresolved or ambiguous", reason)
 
-    def test_missing_company_index_cannot_trade_shorter_ticker(self):
+    def test_no_verified_compound_cannot_trade_shorter_ticker(self):
         resolver_mod._NAME_INDEX.clear()
+        resolver_mod.VALID_EQUITY_SYMBOLS.discard("ARIHANTCAP")
         sig, reason = parse_equity_regex("Bought ARIHANT CAP", current_time=100.0, msg_timestamp=95.0)
         self.assertIsNone(sig)
         self.assertIn("Unresolved or ambiguous", reason)
@@ -57,6 +58,41 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
         sig, reason = parse_equity_regex("Bought YES BANK", current_time=100.0, msg_timestamp=95.0)
         self.assertIsNotNone(sig, reason)
         self.assertEqual(sig.symbol, "YESBANK")
+
+    def test_exact_joined_symbol_without_company_name_index(self):
+        resolver_mod._NAME_INDEX.clear()
+        for text in (
+            "Bought ARIHANT CAP",
+            "Bought\nARIHANT CAP",
+            "Bought #ARIHANT CAP",
+            "#ARIHANT CAP buy",
+        ):
+            with self.subTest(text=text):
+                sig, reason = parse_equity_regex(text, current_time=100.0, msg_timestamp=95.0)
+                self.assertIsNotNone(sig, reason)
+                self.assertEqual(sig.symbol, "ARIHANTCAP")
+                self.assertEqual(get_unique_stocks_in_message(text), {"ARIHANTCAP"})
+
+    def test_final_validator_rejects_shorter_symbol_across_parser_paths(self):
+        from src.parsers.brain_validation import validate_equity_candidate, PriceStatus
+        for text in ("Bought ARIHANT CAP", "Bought #ARIHANT CAP"):
+            with self.subTest(text=text):
+                sig, status, evidence, code, reason = validate_equity_candidate(
+                    symbol="ARIHANT", raw_text=text, msg_timestamp=95.0
+                )
+                self.assertIsNone(sig)
+                self.assertEqual(status, PriceStatus.INVALID)
+                self.assertIn("ARIHANTCAP", reason)
+
+    def test_brain_facade_uses_exact_joined_symbol(self):
+        from src.parsers.brain import parse_signal_brain
+        resolver_mod._NAME_INDEX.clear()
+        result = parse_signal_brain(
+            "Bought ARIHANT CAP", current_time=100.0,
+            msg_timestamp=95.0, enable_ai_fallback=False
+        )
+        self.assertEqual(result.action, SignalAction.BUY_ENTRY, result.reason)
+        self.assertEqual(result.equity_signal.symbol, "ARIHANTCAP")
 
     def test_colliding_abbreviations_fail_closed(self):
         index = build_name_index([

@@ -95,6 +95,7 @@ def resolve_company_name(
         meaningful = [word for word in words if len(word) > 1 and word != "AND"]
         if len(meaningful) < 2:
             return None
+
         for n in range(len(words), 1, -1):
             prefix = words[:n]
             exact = {ticker for name, ticker in candidates if name[:n] == prefix}
@@ -114,6 +115,14 @@ def resolve_company_name(
                     return None
                 if len(abbreviated) == 1:
                     return next(iter(abbreviated))
+
+        # If company-name labels cannot resolve the supplied words, try the
+        # *exact* concatenated ticker from the verified master. Do not override
+        # an ambiguous company-name match; never construct an unlisted ticker.
+        if len(words) == 2 and all(len(word) >= 3 for word in words):
+            compound = "".join(words)
+            if compound in VALID_EQUITY_SYMBOLS:
+                return compound
         return None
 
     # Preserve the established single-word behaviour only for a genuine

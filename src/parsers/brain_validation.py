@@ -1095,7 +1095,7 @@ def symbol_or_company_appears_in_text_with_offsets(
                     return True, norm[am.start():am.end()].strip(), (am.start(), am.end())
 
     # 3. Check company-name resolution via normalize_name & resolve_company_name
-    if _NAME_INDEX:
+    if _NAME_INDEX or VALID_EQUITY_SYMBOLS:
         words = normalize_name(upper_text)
         for i in range(len(words)):
             for length in range(min(6, len(words) - i), 0, -1):
@@ -1163,6 +1163,36 @@ def validate_equity_candidate(
 
     if VALID_EQUITY_SYMBOLS and clean_sym not in VALID_EQUITY_SYMBOLS:
         return None, PriceStatus.INVALID, {}, DecisionReasonCode.UNRESOLVED_SYMBOL.value, f"Symbol '{clean_sym}' not in VALID_EQUITY_SYMBOLS"
+
+    # Cross-parser instrument identity guard. Regex, adaptive rules and Gemini
+    # must not turn an explicit two-word stock mention into its shorter first
+    # ticker when the authoritative Dhan master verifies a different symbol.
+    # This is a safety rejection, never a silent broker-order symbol rewrite.
+    for company_mention in re.finditer(
+        r"(?:\b(?:buy|biy|bought|boght|bougth|bot|baught|add|added|aded|asd)\s+(?:in\s+)?|#\s*)"
+        r"([A-Za-z][A-Za-z0-9&.\-]*)[ \t\r\n]+([A-Za-z][A-Za-z0-9&.\-]*)",
+        raw_text or "",
+        flags=re.IGNORECASE,
+    ):
+        first, second = company_mention.groups()
+        if second.upper() in {
+            "AT", "CMP", "SL", "TARGET", "TGT", "ENTRY", "FOR", "NOW",
+            "TODAY", "ABOVE", "BELOW", "AROUND", "NEAR", "RS", "WITH",
+            "ON", "IN", "QTY", "LEVELS", "LEVEL", "ZONE", "BUY", "AND", "OR",
+        }:
+            continue
+        phrase_tokens = normalize_name(first + " " + second)
+        if len(phrase_tokens) != 2:
+            continue
+        more_specific = resolve_company_name(phrase_tokens)
+        if more_specific and more_specific != clean_sym:
+            return (
+                None,
+                PriceStatus.INVALID,
+                {"candidate_symbol": clean_sym, "verified_company_symbol": more_specific},
+                DecisionReasonCode.UNRESOLVED_SYMBOL.value,
+                f"Symbol '{clean_sym}' rejected: message identifies the more specific verified ticker '{more_specific}'",
+            )
 
     sym_ok, sym_span, sym_offsets = symbol_or_company_appears_in_text_with_offsets(
         clean_sym, raw_text, common_aliases=common_aliases

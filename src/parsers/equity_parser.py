@@ -185,7 +185,7 @@ def get_unique_stocks_in_message(text: str) -> Set[str]:
             cleaned = re.sub(r'\b' + re.escape(alias_phrase) + r'\b', ' ', cleaned, flags=re.IGNORECASE)
 
     # 2. If company name index is loaded, check if action/hashtag phrase resolves to a company name
-    if _NAME_INDEX:
+    if _NAME_INDEX or VALID_EQUITY_SYMBOLS:
         for pm in list(HASHTAG_PHRASE_PATTERN.finditer(cleaned)) + list(ACTION_PHRASE_PATTERN.finditer(cleaned)):
             p_tokens = _phrase_tokens(pm.group(1), skip_noise=True)
             resolved = _resolve_by_name(p_tokens)
@@ -350,7 +350,7 @@ def parse_equity_regex_detailed(
         )
         phrase = _phrase_tokens(phrase_match.group(1), skip_noise=False) if phrase_match else []
         if len(phrase) >= 2:
-            resolved_by_name = _resolve_by_name(phrase) if _NAME_INDEX else None
+            resolved_by_name = _resolve_by_name(phrase)
             resolved_alias = COMMON_STOCK_ALIASES.get(" ".join(normalize_name(" ".join(phrase))))
             if resolved_by_name or resolved_alias:
                 symbol = resolved_by_name or resolved_alias
@@ -366,7 +366,7 @@ def parse_equity_regex_detailed(
         phrase_match = ACTION_PHRASE_PATTERN.search(cleaned_text)
         if phrase_match:
             phrase = _phrase_tokens(phrase_match.group(1), skip_noise=True)
-            if _NAME_INDEX and len(phrase) >= 2:
+            if len(phrase) >= 2:
                 symbol = _resolve_by_name(phrase)
 
         if not symbol:
