@@ -95,6 +95,15 @@ def resolve_company_name(
         meaningful = [word for word in words if len(word) > 1 and word != "AND"]
         if len(meaningful) < 2:
             return None
+
+        # Exact ticker formed by the two supplied name words takes priority
+        # over a valid but shorter first-word ticker. Trust the Dhan master,
+        # never a guessed/unverified string. Example: ARIHANT CAP -> ARIHANTCAP.
+        if len(words) == 2 and all(len(word) >= 3 for word in words):
+            compound = "".join(words)
+            if compound in VALID_EQUITY_SYMBOLS:
+                return compound
+
         for n in range(len(words), 1, -1):
             prefix = words[:n]
             exact = {ticker for name, ticker in candidates if name[:n] == prefix}
