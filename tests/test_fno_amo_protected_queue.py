@@ -139,7 +139,7 @@ class TestFnoAmoExecutor(unittest.TestCase):
         with patch("src.main.market_status",return_value=(False,"Market Closed Post-Hours")), \
              patch("src.engine.config_manager.ConfigChangeTracker") as tracker:
             tracker.return_value.is_live_entry_blocked_by_transition.return_value=(False,"")
-            result=pipe._handle_fno_signal(signal(timestamp=self.t), "trusted", self.t)
+            result=pipe._handle_fno_signal(signal(timestamp=self.t), "trusted", self.t, injected_clock=self.t)
         self.assertTrue(result.is_valid,result.reason)
         self.assertIn("Order ID",result.reason)
         self.assertEqual(pipe._amo_queue.snapshot(),[])
@@ -152,6 +152,30 @@ class TestFnoAmoExecutor(unittest.TestCase):
         self.assertEqual(req.product_type.value,"MARGIN")
         self.assertEqual(pipe.watcher.track.call_args.kwargs["entry_only_amo"],True)
         self.assertEqual(pipe.watcher.track.call_args.kwargs["max_retries"],0)
+
+    def test_stale_fno_amo_signal_rejected_before_broker_post(self):
+        pipe = self.make_pipeline(self.t)
+        with patch("src.main.market_status", return_value=(False, "Market Closed Post-Hours")):
+            result = pipe._handle_fno_signal(
+                signal(timestamp=self.t - 61), "trusted", self.t, injected_clock=self.t
+            )
+        self.assertFalse(result.is_valid)
+        self.assertIn("signal age", result.reason)
+        pipe.broker.place_order.assert_not_called()
+        pipe.broker.place_super_order.assert_not_called()
+
+    def test_expired_fno_amo_contract_rejected_before_broker_post(self):
+        pipe = self.make_pipeline(self.t)
+        contract = pipe.resolver.resolve_option.return_value[0]
+        contract.expiry = date(2026, 11, 4)
+        with patch("src.main.market_status", return_value=(False, "Market Closed Post-Hours")):
+            result = pipe._handle_fno_signal(
+                signal(timestamp=self.t), "trusted", self.t, injected_clock=self.t
+            )
+        self.assertFalse(result.is_valid)
+        self.assertIn("expiry", result.reason)
+        pipe.broker.place_order.assert_not_called()
+        pipe.broker.place_super_order.assert_not_called()
 
     def test_fno_amo_disabled_keeps_original_market_close_behavior(self):
         pipe=self.make_pipeline(self.t)
@@ -181,7 +205,7 @@ class TestFnoAmoExecutor(unittest.TestCase):
         with patch("src.main.market_status",return_value=(False,"Market Closed Post-Hours")), \
              patch("src.engine.config_manager.ConfigChangeTracker") as tracker:
             tracker.return_value.is_live_entry_blocked_by_transition.return_value=(False,"")
-            result=pipe._handle_fno_signal(signal(timestamp=self.t),"trusted",self.t)
+            result=pipe._handle_fno_signal(signal(timestamp=self.t),"trusted",self.t,injected_clock=self.t)
         self.assertFalse(result.is_valid)
         self.assertEqual(pipe.broker.place_order.call_count,1)
         pipe.reconciliation_gate.halt_new_entries.assert_called()
