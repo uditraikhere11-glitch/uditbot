@@ -456,6 +456,14 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 # Do not silently rewrite other keys or request service restart on noop.
                 if new_content == previous:
                     return _json({"ok": True, "state": "UNCHANGED", "message": "F&O AMO setting already saved"})
+                if not requested:
+                    # Disable action invalidates all undisbursed local entries
+                    # before the coordinator handles service restart.
+                    from src.engine.fno_amo_queue import FnoAmoQueue
+                    try:
+                        FnoAmoQueue(data_dir, account_id=cfg.dhan_client_id).cancel_all_queued()
+                    except Exception:
+                        return _json({"error": "F&O AMO queued orders could not be cancelled safely"}, 503)
                 # Persist via established durable coordinator. No direct .env write.
                 read_only_broker = tracker.get_readonly_broker(env_path=env_path)
                 rec = tracker.enqueue_durable_configuration_update(
