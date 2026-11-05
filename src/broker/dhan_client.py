@@ -1983,7 +1983,7 @@ class DhanClient:
                         or order_req.product_type != ProductType.MARGIN):
                     return False, None, "F&O AMO BLOCKED: NSE_FNO MARGIN toggle/route invalid"
             else:
-                return False, None, "AMO BLOCKED: Unsupported exchange segment"
+                return False, None, "AMO BLOCKED: Only NSE_EQ CNC LIMIT or NSE_FNO MARGIN LIMIT with amoTime=OPEN is supported (unsupported exchange segment)"
             if (order_req.order_type != OrderType.LIMIT
                     or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"
                     or not str(order_req.security_id).strip()
