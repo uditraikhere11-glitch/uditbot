@@ -926,11 +926,26 @@ class TradingBotPipeline:
                 # The operator explicitly requested visibility of Dhan's real
                 # order ID. Never equate broker acknowledgement with a fill.
                 if broker_id and ok:
-                    user_card = (f"📨 F&O AMO accepted by Dhan\n"
-                                 f"{sig.symbol} {sig.strike:g}{sig.option_type} | Qty: {sizing.total_quantity}\n"
-                                 f"Dhan Order ID: {broker_id}\n"
-                                 f"Status: Broker acknowledged; awaiting market OPEN\n"
-                                 f"⚠️ No automatic SL/target. Monitor fills and manage exits manually.")
+                    # Use the same clean Telegram card as Equity AMO, with the
+                    # F&O broker ID retained. Trust a displayed status only if
+                    # it belongs to this specific submission response.
+                    broker_st = str(getattr(self.broker, "last_order_broker_status", "") or "").upper().strip()
+                    response_text = str(msg or "").upper()
+                    if not broker_st or not (
+                        f"STATUS={broker_st}" in response_text
+                        or f"({broker_st})" in response_text
+                    ):
+                        broker_st = "UNVERIFIED"
+                    user_card = format_amo_acknowledged(
+                        {
+                            "symbol": opt_trading_sym,
+                            "limit_price": limit_price,
+                            "order_id": broker_id,
+                            "entry_only_amo": True,
+                        },
+                        sizing.total_quantity, broker_st,
+                        allow_unverified=True,
+                    )
                 elif broker_id:
                     user_card = (f"⚠️ F&O AMO broker outcome unverified\n"
                                  f"{sig.symbol} {sig.strike:g}{sig.option_type} | Possible Dhan ID: {broker_id}\n"
