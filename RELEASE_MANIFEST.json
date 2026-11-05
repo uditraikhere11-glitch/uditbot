@@ -1,0 +1,119 @@
+{
+  "schema_version": "1.0",
+  "previous_version": "14.0.0",
+  "version": "14.0.1-rc.1",
+  "target_stable_version": "14.0.1",
+  "parent_main_baseline_sha": "2558157eeadf5cb63b7ffe04202f501cd5bff9f9",
+  "patch_identifier": "AB-V14-PR39-RESTORE-COMPAT-01",
+  "branch_name": "restore/pr39-v14-safety-on-amo-20261105",
+  "build_commit_resolution": "Resolved dynamically at runtime or CI via git rev-parse HEAD or AUDITBOT_BUILD_COMMIT",
+  "version_namespaces": {
+    "app_release_version": "Root VERSION file (SemVer, e.g. 14.0.1-rc.1) — updated only on code PRs",
+    "config_fingerprint": "v-<8-char-sha256> — runtime .env parameter fingerprint, independent of code SemVer",
+    "parser_rule_version": "BRAIN-v3.2 — signal parser rule and validation schema version"
+  },
+  "changed_paths": [
+    ".env.example",
+    ".github/workflows/ci.yml",
+    "CHANGELOG.md",
+    "RELEASE_MANIFEST.json",
+    "VERSION",
+    "auditbot_dhan_readonly_order_probe.py",
+    "bot",
+    "src/broker/dhan_client.py",
+    "src/cli.py",
+    "src/config.py",
+    "src/engine/config_manager.py",
+    "src/engine/protection_watcher.py",
+    "src/engine/reconciliation.py",
+    "src/engine/sizer.py",
+    "src/journal/db.py",
+    "src/main.py",
+    "src/models.py",
+    "src/notifier/execution_updates.py",
+    "src/notifier/outbox_worker.py",
+    "src/notifier/telegram_notifier.py",
+    "src/parsers/gemini_fallback.py",
+    "src/setup_app.py",
+    "src/setup_wizard.py",
+    "src/version.py",
+    "tests/__init__.py",
+    "tests/test_ab_v14_merge_gate_extra.py",
+    "tests/test_auditbot_v14_release_blockers.py",
+    "tests/test_cv13_01_to_05_corrections.py",
+    "tests/test_darvas_merged_features.py",
+    "tests/test_step23_step24.py",
+    "tests/test_v12_execution_safety.py",
+    "tests/test_v13_independent_audit_remediations.py",
+    "tests/test_v13_targeted_safety_corrections.py",
+    "tests/test_v14_protection_notify_final.py"
+  ],
+  "test_matrix": {
+    "independent_release_blockers_cmd": "python -W error::ResourceWarning -m unittest -v tests.test_auditbot_v14_release_blockers",
+    "independent_release_blockers_count": 10,
+    "independent_merge_gate_extra_cmd": "python -W error::ResourceWarning -m unittest -v tests.test_ab_v14_merge_gate_extra",
+    "independent_merge_gate_extra_count": 16,
+    "full_regression_suite_cmd": "python -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'",
+    "full_regression_suite_count": null,
+    "compile_check_cmd": "python -B -m compileall -q run.py auditbot_dhan_readonly_order_probe.py src tests",
+    "shell_syntax_check_cmd": "bash -n bot && for f in deploy/*.sh; do bash -n \"$f\"; done",
+    "version_governance_check_cmd": "python -m src.version --verify --base-ref origin/main",
+    "supported_python_versions": [
+      "3.11",
+      "3.12",
+      "3.13"
+    ],
+    "original_pr39_full_regression_suite_count": 505
+  },
+  "risk_assessment": {
+    "p0_defects_resolved": [
+      "P0-01",
+      "P0-02",
+      "P0-A",
+      "P0-B",
+      "P0-C"
+    ],
+    "p1_defects_resolved": [
+      "P1-02",
+      "P1-03",
+      "P1-04",
+      "P1-05",
+      "P1-06",
+      "P1-07",
+      "P1-D",
+      "SOURCE-ALLOWLIST-OVERLAP",
+      "NET-ISOLATION-01"
+    ],
+    "run_py_modified": false,
+    "run_py_git_blob_sha1": "cafebcdc4bc42d055b0c8d875a5b8f79e6539c30",
+    "live_broker_mutations_in_tests": 0,
+    "promotion_gate": "Promote VERSION from 14.0.1-rc.1 to 14.0.1 only after owner review, CI green on GitHub, and merge approval."
+  },
+  "verification_status": "INTEGRATION_CI_PENDING",
+  "integration": {
+    "baseline_commit": "2558157eeadf5cb63b7ffe04202f501cd5bff9f9",
+    "original_pr39_merge_commit": "60f4662359ef83c5c9dd3290d96bfbcb9af1bcd6",
+    "reverts_superseded": [
+      "#42"
+    ],
+    "preserved_feature_prs": [
+      "#40",
+      "#41",
+      "#43",
+      "#44",
+      "#45",
+      "#46",
+      "#47",
+      "#48"
+    ],
+    "compatibility_guards": [
+      "AMO is explicit opt-in and never routed via Super Order",
+      "is_amo remains durable in journal and watcher",
+      "Dhan Response final and AMO acknowledgement retained",
+      "verified STOP account binding retained",
+      "read-only exact-ID cancellation fallback retained"
+    ],
+    "ci_validation": "PENDING",
+    "live_deployment": "NOT_AUTHORIZED"
+  }
+}

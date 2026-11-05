@@ -794,6 +794,7 @@ class DhanClient:
         self._yahoo_quote_local = threading.local()
         self.last_ltp_meta: Optional[Dict[str, Any]] = None
         self.last_order_http_latency_ms: Optional[float] = None
+        self.last_super_leg_mod_results: Dict[str, Dict[str, Any]] = {}
         self.last_order_broker_status: str = ""
         self.last_funds_is_fallback: bool = False
 
@@ -1723,14 +1724,19 @@ class DhanClient:
     # SAFETY CORRECTION C.A: Structured Broker Collection Reads
     # =========================================================================
 
-    def _read_collection(self, path_suffix: str, label: str) -> Union[BrokerReadList, BrokerReadFailure]:
+    def _read_collection(
+        self,
+        path_suffix: str,
+        label: str,
+        bypass_test_mode: bool = False,
+    ) -> Union[BrokerReadList, BrokerReadFailure]:
         """
         Safety Correction C.A: Distinguishes:
         1. Successful response with zero records -> `BrokerReadList([], status="OK_EMPTY")`
         2. Successful response with records -> `BrokerReadList(records, status="OK_RECORDS")`
         3. Failed, malformed, or unavailable response -> `BrokerReadFailure(status=..., error=...)` (never `[]`)
         """
-        if self.cfg.trading_mode == TradingMode.TEST:
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
             return BrokerReadList([], status=BrokerReadStatus.OK_EMPTY.value, status_code=200)
 
         url = f"{BASE_URL}{path_suffix}"
@@ -1765,25 +1771,29 @@ class DhanClient:
             logger.error(err)
             return BrokerReadFailure(status=BrokerReadStatus.UNAVAILABLE.value, error=err, status_code=0)
 
-    def get_order_book(self) -> Union[BrokerReadList, BrokerReadFailure]:
+    def get_order_book(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
         """Retrieves today's complete order book: GET /v2/orders."""
-        return self._read_collection("/orders", "order_book")
+        return self._read_collection("/orders", "order_book", bypass_test_mode=bypass_test_mode)
 
-    def get_super_orders(self) -> Union[BrokerReadList, BrokerReadFailure]:
+    def get_super_orders(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
         """V12-05: Retrieves all Super Orders with nested legDetails: GET /v2/super/orders."""
-        return self._read_collection("/super/orders", "super_orders")
+        return self._read_collection("/super/orders", "super_orders", bypass_test_mode=bypass_test_mode)
 
-    def get_trade_book(self) -> Union[BrokerReadList, BrokerReadFailure]:
+    def get_trade_book(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
         """Retrieves today's trade executions: GET /v2/trades."""
-        return self._read_collection("/trades", "trade_book")
+        return self._read_collection("/trades", "trade_book", bypass_test_mode=bypass_test_mode)
 
-    def get_positions(self) -> Union[BrokerReadList, BrokerReadFailure]:
+    def get_positions(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
         """Retrieves net positions: GET /v2/positions."""
-        return self._read_collection("/positions", "positions")
+        return self._read_collection("/positions", "positions", bypass_test_mode=bypass_test_mode)
 
-    def get_forever_orders(self) -> Union[BrokerReadList, BrokerReadFailure]:
-        """Retrieves all Forever OCO orders: GET /v2/forever/orders."""
-        return self._read_collection("/forever/orders", "forever_orders")
+    def get_holdings(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
+        """P0-01 & P0-06: Retrieves demat holdings: GET /v2/holdings."""
+        return self._read_collection("/holdings", "holdings", bypass_test_mode=bypass_test_mode)
+
+    def get_forever_orders(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
+        """P0-06: Retrieve Forever OCO orders from the documented Dhan v2 endpoint."""
+        return self._read_collection("/forever/orders", "forever_orders", bypass_test_mode=bypass_test_mode)
 
     # =========================================================================
     # SAFETY CORRECTION B & C: Authoritative Broker Protection Verification
@@ -2234,44 +2244,96 @@ class DhanClient:
             elif not uncertain_outcome:
                 self.stop_manager.deregister_in_flight(corr_id)
 
+    def modify_super_order_leg(
+        self,
+        order_id: str,
+        leg_name: str,
+        price: float,
+        trailing_jump: float = 0.0,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """P0-04: Modifies a single Super Order leg (TARGET_LEG or STOP_LOSS_LEG) and returns structured outcome."""
+        if self.cfg.trading_mode == TradingMode.TEST:
+            return False, "SUPER ORDER MODIFY BLOCKED: System is in TEST mode", {"state": "REJECTED"}
+        leg_clean = str(leg_name or "").strip().upper()
+        if leg_clean == "TARGET_LEG":
+            body: Dict[str, Any] = {
+                "dhanClientId": self.cfg.dhan_client_id,
+                "orderId": str(order_id),
+                "legName": "TARGET_LEG",
+                "targetPrice": float(price),
+            }
+        elif leg_clean == "STOP_LOSS_LEG":
+            body = {
+                "dhanClientId": self.cfg.dhan_client_id,
+                "orderId": str(order_id),
+                "legName": "STOP_LOSS_LEG",
+                "stopLossPrice": float(price),
+                "trailingJump": float(trailing_jump),
+            }
+        else:
+            return False, f"Unsupported Super Order leg '{leg_name}'", {"state": "REJECTED"}
+
+        url = f"{BASE_URL}/super/orders/{order_id}"
+        try:
+            resp = self.session.put(url, headers=self._headers(), json=body, timeout=5)
+            if resp.status_code not in (200, 202):
+                st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code == 408) else "REJECTED"
+                msg = f"Failed to modify {leg_clean} ({resp.status_code}): {resp.text}"
+                return False, msg, {"state": st, "status_code": resp.status_code, "error": msg, "price": float(price)}
+            data = resp.json() if resp.text else {}
+            ord_st = str(data.get("orderStatus", "")).upper()
+            if ord_st in ("REJECTED", "CANCELLED", "EXPIRED"):
+                msg = f"Dhan rejected {leg_clean} modification: {data}"
+                return False, msg, {"state": "REJECTED", "status_code": resp.status_code, "error": msg, "price": float(price)}
+            return True, f"{leg_clean} modified to {price}", {
+                "state": "ACKED",
+                "status_code": resp.status_code,
+                "orderStatus": ord_st or "PENDING",
+                "price": float(price),
+            }
+        except Exception as e:
+            msg = f"HTTP exception modifying super order {order_id} ({leg_clean}): {e}"
+            return False, msg, {"state": "UNKNOWN", "error": msg, "price": float(price)}
+
     def modify_super_order_protection(
         self,
         order_id: str,
         stop_loss_price: float,
         target_price: float,
         trailing_jump: float = 0.0,
+        legs_to_modify: Optional[List[str]] = None,
     ) -> Tuple[bool, str]:
         if self.cfg.trading_mode == TradingMode.TEST:
             return False, "SUPER ORDER MODIFY BLOCKED: System is in TEST mode"
 
-        legs = [
-            {
-                "dhanClientId": self.cfg.dhan_client_id,
-                "orderId": str(order_id),
-                "legName": "TARGET_LEG",
-                "targetPrice": float(target_price),
-            },
-            {
-                "dhanClientId": self.cfg.dhan_client_id,
-                "orderId": str(order_id),
-                "legName": "STOP_LOSS_LEG",
-                "stopLossPrice": float(stop_loss_price),
-                "trailingJump": float(trailing_jump),
-            },
-        ]
-        url = f"{BASE_URL}/super/orders/{order_id}"
-        try:
-            for body in legs:
-                resp = self.session.put(url, headers=self._headers(), json=body, timeout=5)
-                if resp.status_code not in (200, 202):
-                    return False, f"Failed to modify {body['legName']} ({resp.status_code}): {resp.text}"
-                data = resp.json() if resp.text else {}
-                if str(data.get("orderStatus", "")).upper() in ("REJECTED", "CANCELLED", "EXPIRED"):
-                    return False, f"Dhan rejected {body['legName']} modification: {data}"
-            logger.info(f"Dhan super order {order_id}: SL -> {stop_loss_price}, target -> {target_price}")
-            return True, f"Super order {order_id} protection legs updated to SL={stop_loss_price}, Target={target_price}"
-        except Exception as e:
-            return False, f"HTTP exception modifying super order {order_id}: {e}"
+        requested_legs = [str(x).upper() for x in (legs_to_modify or ["TARGET_LEG", "STOP_LOSS_LEG"])]
+        leg_outcomes: Dict[str, Dict[str, Any]] = {}
+        self.last_super_leg_mod_results[str(order_id)] = leg_outcomes
+
+        if "TARGET_LEG" in requested_legs:
+            ok_t, msg_t, info_t = self.modify_super_order_leg(
+                order_id=order_id,
+                leg_name="TARGET_LEG",
+                price=float(target_price),
+            )
+            leg_outcomes["TARGET_LEG"] = info_t
+            if not ok_t:
+                leg_outcomes.setdefault("STOP_LOSS_LEG", {"state": "NOT_ATTEMPTED", "price": float(stop_loss_price)})
+                return False, msg_t
+
+        if "STOP_LOSS_LEG" in requested_legs:
+            ok_sl, msg_sl, info_sl = self.modify_super_order_leg(
+                order_id=order_id,
+                leg_name="STOP_LOSS_LEG",
+                price=float(stop_loss_price),
+                trailing_jump=float(trailing_jump),
+            )
+            leg_outcomes["STOP_LOSS_LEG"] = info_sl
+            if not ok_sl:
+                return False, msg_sl
+
+        logger.info(f"Dhan super order {order_id}: SL -> {stop_loss_price}, target -> {target_price}")
+        return True, f"Super order {order_id} protection legs updated to SL={stop_loss_price}, Target={target_price}"
 
     def cancel_super_order_leg(self, order_id: str, leg_name: str = "ENTRY_LEG") -> Tuple[bool, str]:
         if not order_id or not isinstance(order_id, str) or not order_id.strip():
@@ -2425,9 +2487,27 @@ class DhanClient:
         except Exception as e:
             return False, None, f"HTTP exception placing Forever OCO: {e}"
 
-    def order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
-        # V14_MANUAL_CANCEL_READ_FALLBACK
+    def cancel_forever_order(self, forever_order_id: str) -> Tuple[bool, str]:
+        """P0-05: Cancels a bot-owned Forever OCO order (`DELETE /v2/forever/orders/{order-id}`)."""
+        if not forever_order_id or not isinstance(forever_order_id, str) or not forever_order_id.strip():
+            return False, "Forever order cancellation rejected: missing forever_order_id"
+        oid_clean = forever_order_id.strip()
+        if not re.match(r"^[a-zA-Z0-9_-]+$", oid_clean):
+            return False, f"Forever order cancellation rejected: invalid characters in '{forever_order_id}'"
         if self.cfg.trading_mode == TradingMode.TEST:
+            return True, f"TEST mode: simulated Forever order cancel accepted (HTTP 202) for {oid_clean}"
+        url = f"{BASE_URL}/forever/orders/{oid_clean}"
+        try:
+            resp = self.session.delete(url, headers=self._headers(), timeout=5)
+            if resp.status_code in (200, 202):
+                return True, f"Forever order cancellation accepted (HTTP {resp.status_code}) for {oid_clean}"
+            return False, f"Failed to cancel Forever order ({resp.status_code}): {resp.text}"
+        except Exception as e:
+            return False, f"HTTP exception cancelling Forever order {oid_clean}: {e}"
+
+    def order_status(self, order_id: str, bypass_test_mode: bool = False) -> Optional[Dict[str, Any]]:
+        # V14_MANUAL_CANCEL_READ_FALLBACK
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
             return {"orderStatus": "TRADED", "filledQty": 0, "averageTradedPrice": 0.0}
 
         requested_id = str(order_id).strip()
@@ -2460,7 +2540,7 @@ class DhanClient:
             )
 
         # Read-only fallback for manually cancelled orders.
-        book = self.get_order_book()
+        book = self.get_order_book(bypass_test_mode=bypass_test_mode)
         if isinstance(book, list) and getattr(book, "ok", True):
             matches = [
                 x for x in book
@@ -2473,21 +2553,278 @@ class DhanClient:
 
         return None
 
-    def trades_avg_price(self, order_id: str) -> Optional[float]:
-        if self.cfg.trading_mode == TradingMode.TEST:
-            return None
+    @staticmethod
+    def normalize_order_trades_payload(
+        raw_payload: Any,
+        expected_order_id: Optional[str] = None,
+        expected_account_id: Optional[str] = None,
+        expected_security_id: Optional[str] = None,
+        expected_transaction_type: Optional[str] = None,
+        require_exchange_trade_id: bool = False,
+    ) -> Tuple[bool, List[Dict[str, Any]], str]:
+        """
+        P0-06: Normalizes and strictly validates Dhan `/v2/trades/{order-id}` responses.
+        Accepts BOTH:
+        - Documented Dhan v2 single trade object (`dict`)
+        - Multi-fill array of trade objects (`list` of `dict`s), or `{"data": [...]}` wrapper.
+        Validates `orderId`, `dhanClientId`, `securityId`, `transactionType`, `exchangeTradeId`,
+        `tradedQuantity > 0`, and `tradedPrice > 0.0`.
+        """
+        payload = raw_payload
+        if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], (list, dict)):
+            payload = payload["data"]
+
+        if isinstance(payload, dict):
+            if not payload:
+                return True, [], "OK_EMPTY"
+            if (
+                "tradedQuantity" not in payload
+                and "tradedPrice" not in payload
+                and ("errorCode" in payload or "errorMessage" in payload or "error" in payload)
+            ):
+                return False, [], f"Broker error object in trades payload: {payload}"
+            raw_list = [payload]
+        elif isinstance(payload, list):
+            if not payload:
+                return True, [], "OK_EMPTY"
+            if any(not isinstance(item, dict) for item in payload):
+                return False, [], "Malformed trades payload: list contains non-dict items"
+            raw_list = payload
+        else:
+            return False, [], f"Malformed trades payload: expected dict or list of dicts, got {type(payload).__name__}"
+
+        validated: List[Dict[str, Any]] = []
+        exp_oid = str(expected_order_id or "").strip()
+        exp_acct = str(expected_account_id or "").strip()
+        exp_sec = str(expected_security_id or "").strip()
+        exp_side = str(expected_transaction_type or "").strip().upper()
+
+        for idx, item in enumerate(raw_list):
+            if not isinstance(item, dict):
+                return False, [], "Malformed trade item: expected dict"
+
+            t_oid = str(item.get("orderId") or "").strip()
+            if exp_oid and t_oid and t_oid != exp_oid:
+                return False, [], f"Trade orderId mismatch ({t_oid} != {exp_oid})"
+
+            t_acct = str(item.get("dhanClientId") or "").strip()
+            if exp_acct and t_acct and t_acct != exp_acct:
+                return False, [], f"Trade dhanClientId mismatch ({t_acct} != {exp_acct})"
+
+            t_sec = str(item.get("securityId") or "").strip()
+            if exp_sec and t_sec and t_sec != exp_sec:
+                return False, [], f"Trade securityId mismatch ({t_sec} != {exp_sec})"
+
+            t_side = str(item.get("transactionType") or "").strip().upper()
+            if exp_side and t_side and t_side != exp_side:
+                return False, [], f"Trade transactionType mismatch ({t_side} != {exp_side})"
+
+            raw_qty = item.get("tradedQuantity")
+            if raw_qty is None or isinstance(raw_qty, bool):
+                return False, [], f"Missing or boolean tradedQuantity in trade record #{idx}"
+            try:
+                if isinstance(raw_qty, float) and not raw_qty.is_integer():
+                    return False, [], f"Fractional tradedQuantity ({raw_qty}) in trade record #{idx}"
+                qty = int(raw_qty)
+            except (ValueError, TypeError):
+                return False, [], f"Invalid tradedQuantity ({raw_qty!r}) in trade record #{idx}"
+            if qty <= 0:
+                return False, [], f"Non-positive tradedQuantity ({qty}) in trade record #{idx}"
+
+            raw_price = item.get("tradedPrice")
+            if raw_price is None or isinstance(raw_price, bool):
+                return False, [], f"Missing or boolean tradedPrice in trade record #{idx}"
+            try:
+                price = float(raw_price)
+            except (ValueError, TypeError):
+                return False, [], f"Invalid tradedPrice ({raw_price!r}) in trade record #{idx}"
+            if not math.isfinite(price) or price <= 0.0:
+                return False, [], f"Non-positive or non-finite tradedPrice ({price}) in trade record #{idx}"
+
+            raw_etid = item.get("exchangeTradeId")
+            if isinstance(raw_etid, bool):
+                return False, [], f"Boolean exchangeTradeId in trade record #{idx}"
+            etid = str(raw_etid or "").strip()
+            if etid in ("0", "None", "null"):
+                etid = ""
+            if require_exchange_trade_id and not etid:
+                return False, [], f"Missing exchangeTradeId in trade record #{idx}"
+
+            norm_item = dict(item)
+            norm_item["orderId"] = t_oid or exp_oid
+            norm_item["tradedQuantity"] = qty
+            norm_item["tradedPrice"] = price
+            norm_item["transactionType"] = t_side or exp_side or "BUY"
+            norm_item["exchangeTradeId"] = etid or f"{t_oid or exp_oid or 'ORD'}-TRD-{idx + 1}"
+            norm_item["_has_explicit_exchange_trade_id"] = bool(etid)
+            validated.append(norm_item)
+
+        return True, validated, "OK"
+
+    def get_trades_for_order(
+        self,
+        order_id: str,
+        expected_security_id: Optional[str] = None,
+        expected_transaction_type: Optional[str] = None,
+        require_exchange_trade_id: bool = False,
+        bypass_test_mode: bool = False,
+    ) -> Union[BrokerReadList, BrokerReadFailure]:
+        """
+        P0-06: Queries `GET /v2/trades/{order-id}` and accepts both single-dict and list-of-dicts shapes.
+        """
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
+            return BrokerReadList([], status=BrokerReadStatus.OK_EMPTY.value, status_code=200)
 
         url = f"{BASE_URL}/trades/{order_id}"
         try:
             resp = self.session.get(url, headers=self._headers(), timeout=5)
-            if resp.status_code == 200:
-                trades = resp.json()
-                if isinstance(trades, list) and trades:
-                    total_val = sum(float(t.get("tradedPrice", 0.0)) * int(t.get("tradedQuantity", 0)) for t in trades if isinstance(t, dict))
-                    total_qty = sum(int(t.get("tradedQuantity", 0)) for t in trades if isinstance(t, dict))
-                    if total_qty > 0:
-                        return round(total_val / total_qty, 4)
-            return None
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            if status_code == 200:
+                try:
+                    raw_data = resp.json()
+                except Exception as e:
+                    return BrokerReadFailure(
+                        status=BrokerReadStatus.MALFORMED.value,
+                        error=f"Malformed JSON in /trades/{order_id}: {e}",
+                        status_code=status_code,
+                    )
+                ok_norm, trades_list, norm_msg = self.normalize_order_trades_payload(
+                    raw_data,
+                    expected_order_id=str(order_id),
+                    expected_account_id=self.cfg.dhan_client_id or None,
+                    expected_security_id=expected_security_id,
+                    expected_transaction_type=expected_transaction_type,
+                    require_exchange_trade_id=require_exchange_trade_id,
+                )
+                if not ok_norm:
+                    return BrokerReadFailure(
+                        status=BrokerReadStatus.MALFORMED.value,
+                        error=norm_msg,
+                        status_code=status_code,
+                    )
+                return BrokerReadList(
+                    trades_list,
+                    status=BrokerReadStatus.OK_RECORDS.value if trades_list else BrokerReadStatus.OK_EMPTY.value,
+                    status_code=200,
+                )
+            return BrokerReadFailure(
+                status=BrokerReadStatus.FAILED.value,
+                error=f"Dhan /trades/{order_id} failed (HTTP {status_code}): {getattr(resp, 'text', '')}",
+                status_code=status_code,
+            )
         except Exception as e:
-            logger.error(f"HTTP exception fetching trades for {order_id}: {e}")
+            return BrokerReadFailure(
+                status=BrokerReadStatus.UNAVAILABLE.value,
+                error=f"HTTP exception fetching /trades/{order_id}: {e}",
+                status_code=0,
+            )
+
+    def trades_avg_price(
+        self,
+        order_id: str,
+        expected_security_id: Optional[str] = None,
+        expected_transaction_type: Optional[str] = None,
+        bypass_test_mode: bool = False,
+    ) -> Optional[float]:
+        """
+        P0-06: Calculates volume-weighted average execution price from `GET /v2/trades/{order-id}`.
+        Supports both Dhan's documented single-dict response and list-of-dicts responses.
+        """
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
             return None
+
+        res = self.get_trades_for_order(
+            order_id=order_id,
+            expected_security_id=expected_security_id,
+            expected_transaction_type=expected_transaction_type,
+            require_exchange_trade_id=False,
+            bypass_test_mode=bypass_test_mode,
+        )
+        if isinstance(res, list) and res:
+            total_val = sum(float(t["tradedPrice"]) * int(t["tradedQuantity"]) for t in res)
+            total_qty = sum(int(t["tradedQuantity"]) for t in res)
+            if total_qty > 0:
+                return round(total_val / total_qty, 4)
+        return None
+
+    def fetch_order_details_readonly(self, order_id: str) -> Dict[str, Any]:
+        """
+        P0-06: Read-only diagnostic query for a single Dhan order (`./bot order-details <order-id> --read-only`).
+        Works even when `TRADING_MODE=TEST` or Emergency STOP is active, without returning synthetic TEST stubs
+        or mutating any broker/local state.
+        """
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {"ok": False, "error": "Missing order_id"}
+
+        ord_detail = self.order_status(oid, bypass_test_mode=True)
+        trades_res = self.get_trades_for_order(oid, bypass_test_mode=True)
+        super_res = self.get_super_orders(bypass_test_mode=True)
+        forever_res = self.get_forever_orders(bypass_test_mode=True)
+
+        super_match = None
+        if isinstance(super_res, list):
+            for s_row in super_res:
+                if isinstance(s_row, dict) and str(s_row.get("orderId") or "") == oid:
+                    super_match = s_row
+                    break
+
+        forever_matches: List[Dict[str, Any]] = []
+        if isinstance(forever_res, list):
+            for f_row in forever_res:
+                if isinstance(f_row, dict) and (
+                    str(f_row.get("orderId") or "") == oid
+                    or str(f_row.get("parentOrderId") or "") == oid
+                    or (ord_detail and str(f_row.get("securityId") or "") == str(ord_detail.get("securityId") or ""))
+                ):
+                    forever_matches.append(f_row)
+
+        trades_list = list(trades_res) if isinstance(trades_res, list) else []
+        vwap = None
+        if trades_list:
+            t_val = sum(float(t["tradedPrice"]) * int(t["tradedQuantity"]) for t in trades_list)
+            t_qty = sum(int(t["tradedQuantity"]) for t in trades_list)
+            if t_qty > 0:
+                vwap = round(t_val / t_qty, 4)
+
+        return {
+            "ok": bool(ord_detail is not None or super_match is not None or trades_list),
+            "read_only": True,
+            "order_id_redacted": f"…{oid[-4:]}" if len(oid) > 4 else oid,
+            "order_detail": ord_detail,
+            "trades": trades_list,
+            "trades_status": getattr(trades_res, "status", "UNKNOWN"),
+            "trade_vwap": vwap,
+            "super_order": super_match,
+            "forever_orders": forever_matches,
+        }
+
+    def check_dhan_orders_readonly(self, limit: int = 10) -> Dict[str, Any]:
+        """
+        P0-06: Read-only diagnostic summary of Dhan orders, trades, Super Orders, Forever OCO orders,
+        positions, and holdings (`./bot check-dhan-orders --read-only`).
+        Works in both TEST and LIVE modes without synthetic stubs or state mutations.
+        """
+        ob = self.get_order_book() if False else self._read_collection("/orders", "order_book", bypass_test_mode=True)
+        tb = self._read_collection("/trades", "trade_book", bypass_test_mode=True)
+        sb = self._read_collection("/super/orders", "super_orders", bypass_test_mode=True)
+        fb = self.get_forever_orders(bypass_test_mode=True)
+        pos = self.get_positions(bypass_test_mode=True)
+        hold = self.get_holdings(bypass_test_mode=True)
+
+        return {
+            "ok": all(isinstance(x, list) for x in (ob, tb, sb, fb, pos)),
+            "read_only": True,
+            "order_book_status": getattr(ob, "status", "UNKNOWN"),
+            "orders": list(ob)[-limit:] if isinstance(ob, list) else [],
+            "trade_book_status": getattr(tb, "status", "UNKNOWN"),
+            "trades": list(tb)[-limit:] if isinstance(tb, list) else [],
+            "super_orders_status": getattr(sb, "status", "UNKNOWN"),
+            "super_orders": list(sb) if isinstance(sb, list) else [],
+            "forever_orders_status": getattr(fb, "status", "UNKNOWN"),
+            "forever_orders": list(fb) if isinstance(fb, list) else [],
+            "positions_status": getattr(pos, "status", "UNKNOWN"),
+            "positions": list(pos) if isinstance(pos, list) else [],
+            "holdings_status": getattr(hold, "status", "UNKNOWN"),
+            "holdings": list(hold) if isinstance(hold, list) else [],
+        }

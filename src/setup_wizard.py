@@ -5,7 +5,7 @@ Matches the configuration parameters from the visual setup specification:
 - Exchange Credentials (Dhan Client ID, Access Token / TOTP Secret, PIN)
 - Bot Configuration (Operator Name, Instance Name, Monitoring/Log Group ID, Test Group ID)
 - Risk Management (Max Drawdown %, Daily Trade Limit, Max Order Amount, Min Funds)
-- Sizing Defaults (Equity Budget, Product Type, Options Budget, Max Lots, SL/Target)
+- Sizing Defaults (Equity Budget, Product Type, Options Budget, Max Lots, F&O Price Markup %, SL/Target)
 - Execution Mode (TEST vs LIVE master switch)
 Writes safely to .env with 0600 file permissions.
 """
@@ -63,6 +63,7 @@ def run_setup_wizard(env_path: str = ".env") -> Dict[str, Any]:
     equity_product = prompt("Equity Product Type (CNC or MTF)", "CNC").upper()
     fno_capital = prompt("Stock Options Budget per Trade (INR)", "20000")
     fno_max_lots = prompt("Options Max Lots Cap (0 = no cap)", "3")
+    fno_price_markup_pct = prompt("F&O Price Markup (%)", "4.0")
     sl_pct = prompt("Default Stop Loss (%)", "3.0")
     target_pct = prompt("Default Target (%)", "3.0")
 
@@ -125,8 +126,9 @@ FNO_SIZING_MODE=BUDGET
 FNO_CAPITAL_PER_TRADE={fno_capital}
 FNO_FIXED_LOTS=1
 FNO_MAX_LOTS={fno_max_lots}
+FNO_PRICE_MARKUP_PCT={fno_price_markup_pct}
 
-# --- PROTECTION & TIMING (FOREVER OCO) ---
+# --- PROTECTION & TIMING (SUPER ORDER & FOREVER OCO) ---
 SL_PCT={sl_pct}
 TARGET_PCT={target_pct}
 SL_LIMIT_BUFFER_PCT=1.0

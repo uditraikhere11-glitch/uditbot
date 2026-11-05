@@ -37,6 +37,7 @@ from src.engine.config_manager import (
     check_service_is_active,
 )
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.version import get_app_version, get_git_commit_sha, get_release_summary, PARSER_RULE_VERSION
 
 app = FastAPI(title="Audit bot - Setup Dashboard")
 
@@ -895,7 +896,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="grid-2" style="margin-top: 10px;">
+        <div class="grid-3" style="margin-top: 10px;">
           <div class="form-group">
             <label>Stock Options Capital per Trade (INR)</label>
             <div class="input-wrap">
@@ -909,6 +910,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <input type="number" name="fno_max_lots" value="<!--FNO_MAX_LOTS-->" required>
             </div>
             <p class="help-text">Maximum whole lots per options signal</p>
+          </div>
+          <div class="form-group">
+            <label>F&amp;O Price Markup (%)</label>
+            <div class="input-wrap">
+              <input type="number" step="0.1" min="0" max="20" name="fno_price_markup_pct" value="<!--FNO_PRICE_MARKUP_PCT-->" required>
+            </div>
+            <p class="help-text">Ceiling markup above stated option entry max (default 4.0%)</p>
           </div>
         </div>
 
@@ -1031,7 +1039,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          Protection & Timing Rules (Forever OCO)
+          Protection & Timing Rules (Super Order & Forever OCO)
         </div>
 
         <div class="grid-3">
@@ -1529,6 +1537,20 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
 
     dhan_masked = _mask_account_id(cfg.dhan_client_id)
     dhan_badge = f'<span class="status-pill pill-neutral">Connected ({dhan_masked})</span>' if cfg.dhan_client_id else '<span class="status-pill pill-offline">Not Configured</span>'
+    prot_badge = f'<span class="status-pill pill-neutral">Rules: SL {cfg.sl_pct:g}% / Tgt {cfg.target_pct:g}% (0 Broker-Verified Active)</span>'
+    try:
+        if os.path.exists(cfg.journal_db_path):
+            from src.journal.db import JournalDB
+            _jdb = JournalDB(cfg.journal_db_path, account_id=cfg.dhan_client_id)
+            _m = _jdb.get_dashboard_summary()
+            _conf = int(_m.get("protection_confirmed", 0))
+            _unp = int(_m.get("protection_unprotected", 0))
+            if _unp > 0:
+                prot_badge = f'<span class="status-pill pill-danger">⚠️ {_unp} Unprotected / {_conf} Verified</span>'
+            elif _conf > 0:
+                prot_badge = f'<span class="status-pill pill-online">🛡️ {_conf} Broker-Verified Active</span>'
+    except Exception:
+        pass
 
     status_bar = f"""
     <div class="system-status-panel">
@@ -1537,7 +1559,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
           AuditBot Real-Time System Status
         </div>
-        <div class="status-header-tag">Safety Guardrails Active</div>
+        <div class="status-header-tag">Release v{get_app_version()} &bull; Safety Guardrails Active</div>
       </div>
       <div class="status-grid">
         <div class="status-card">
@@ -1563,6 +1585,10 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         <div class="status-card">
           <div class="status-card-label">Dhan Broker Account</div>
           <div class="status-card-val">{dhan_badge}</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-label">Protection Status</div>
+          <div class="status-card-val">{prot_badge}</div>
         </div>
       </div>
     </div>
@@ -1685,6 +1711,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--EQUITY_PRICE_MARKUP_PCT-->", str(cfg.equity_price_markup_pct))
         .replace("<!--FNO_CAPITAL_PER_TRADE-->", str(int(cfg.fno_capital_per_trade)))
         .replace("<!--FNO_MAX_LOTS-->", str(cfg.fno_max_lots))
+        .replace("<!--FNO_PRICE_MARKUP_PCT-->", str(getattr(cfg, "fno_price_markup_pct", 4.0)))
         # Risk
         .replace("<!--MAX_ORDER_AMOUNT_INR-->", str(int(cfg.max_order_amount_inr)))
         .replace("<!--MIN_TRADE_FUNDS_INR-->", f"{cfg.min_trade_funds_inr:g}")
@@ -1749,6 +1776,7 @@ def build_env_and_params_dict(
     equity_cmp_execution_policy=None,
     fno_capital_per_trade=20000.0,
     fno_max_lots=3,
+    fno_price_markup_pct=4.0,
     max_order_amount_inr=50000.0,
     min_trade_funds_inr=10000.0,
     test_mode_paper_funds_inr=100000.0,
@@ -1852,7 +1880,7 @@ def build_env_and_params_dict(
         "DHAN_TOTP_SECRET", "DHAN_ACCESS_TOKEN", "DHAN_TOKEN_FILE", "EQUITY_PRODUCT_TYPE",
         "EQUITY_SIZING_MODE", "EQUITY_BUDGET_INR", "EQUITY_FIXED_QTY", "EQUITY_PRICE_MARKUP_PCT",
         "EQUITY_CMP_EXECUTION_POLICY", "FNO_SIZING_MODE", "FNO_CAPITAL_PER_TRADE", "FNO_FIXED_LOTS",
-        "FNO_MAX_LOTS", "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK", "MAX_ORDER_AMOUNT_INR",
+        "FNO_MAX_LOTS", "FNO_PRICE_MARKUP_PCT", "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK", "MAX_ORDER_AMOUNT_INR",
         "MIN_TRADE_FUNDS_INR", "TEST_MODE_PAPER_FUNDS_INR", "MAX_DAILY_LOSS_INR",
         "MAX_DRAWDOWN_PCT", "MAX_DAILY_TRADES", "MAX_TOTAL_EXPOSURE_INR", "MAX_OPEN_POSITIONS",
         "INSUFFICIENT_FUNDS_POLICY", "MODE_SWITCH_POSITION_POLICY", "SL_PCT", "TARGET_PCT",
@@ -1911,6 +1939,7 @@ FNO_SIZING_MODE={clean_fno_mode}
 FNO_CAPITAL_PER_TRADE={_extract_val(fno_capital_per_trade, 20000.0)}
 FNO_FIXED_LOTS={clean_fno_lots}
 FNO_MAX_LOTS={_extract_val(fno_max_lots, 3)}
+FNO_PRICE_MARKUP_PCT={_extract_val(fno_price_markup_pct, 4.0)}
 ALLOW_NEXT_MONTH_EXPIRY_FALLBACK={clean_exp_fb}
 
 # --- RISK MANAGEMENT CONTROLS ---
@@ -1925,7 +1954,7 @@ MAX_OPEN_POSITIONS={_extract_val(max_open_positions, 5)}
 INSUFFICIENT_FUNDS_POLICY={clean_insufficient}
 MODE_SWITCH_POSITION_POLICY=REMAIN_UNTOUCHED
 
-# --- PROTECTION & TIMING (FOREVER OCO) ---
+# --- PROTECTION & TIMING (SUPER ORDER & FOREVER OCO) ---
 SL_PCT={_extract_val(sl_pct, 3.0)}
 TARGET_PCT={_extract_val(target_pct, 3.0)}
 SL_LIMIT_BUFFER_PCT={_extract_val(sl_limit_buffer_pct, 1.0)}
@@ -1963,6 +1992,7 @@ SCRIP_MASTER_MAX_AGE_SEC={clean_scrip_max_age}
         "FNO_CAPITAL_PER_TRADE": float(_extract_val(fno_capital_per_trade, 20000.0)),
         "FNO_FIXED_LOTS": clean_fno_lots,
         "FNO_MAX_LOTS": int(_extract_val(fno_max_lots, 3)),
+        "FNO_PRICE_MARKUP_PCT": _extract_val(fno_price_markup_pct, 4.0),
         "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK": clean_exp_fb,
         "MAX_ORDER_AMOUNT_INR": float(_extract_val(max_order_amount_inr, 50000.0)),
         "MIN_TRADE_FUNDS_INR": float(_extract_val(min_trade_funds_inr, 10000.0)),
@@ -2151,21 +2181,33 @@ async def handle_service_control(request: Request):
 
 @app.get("/setup/active-version")
 def get_active_version():
-    """CV13-06G: Returns currently running configuration version and latest change record."""
+    """CV13-06G: Returns currently running configuration fingerprint (`v-<hash>`) alongside application release SemVer."""
     tracker = ConfigChangeTracker(data_dir="data")
     info = tracker.get_active_running_version() or {}
     svc_state, _ = tracker.resolve_service_operating_state()
     is_active = (svc_state.value == "RUNNING")
     latest_rec = tracker.get_change_record()
+    short_cfg_ver = info.get("short_version", "v-UNKNOWN")
     return JSONResponse(content={
+        "app_release_version": get_app_version(),
+        "git_commit": get_git_commit_sha(short=True),
+        "parser_rule_version": PARSER_RULE_VERSION,
         "version_hash": info.get("version_hash", "UNKNOWN"),
-        "short_version": info.get("short_version", "v-UNKNOWN"),
+        "short_version": short_cfg_ver,
         "trading_mode": info.get("trading_mode", "UNKNOWN"),
         "service_running": is_active,
         "service_state": svc_state.value,
         "acknowledged_at": info.get("acknowledged_at"),
         "latest_change": latest_rec.to_dict() if latest_rec else None,
     })
+
+
+@app.get("/setup/release-version")
+def get_release_version_endpoint():
+    """Returns structured application release SemVer, git commit, parser rule version, and config fingerprint."""
+    tracker = ConfigChangeTracker(data_dir="data")
+    info = tracker.get_active_running_version() or {}
+    return JSONResponse(content=get_release_summary(config_fingerprint=info.get("short_version", "v-UNKNOWN")))
 
 
 @app.post("/setup", response_class=HTMLResponse)
@@ -2196,6 +2238,7 @@ def handle_setup_submission(
     equity_cmp_execution_policy: Optional[str] = Form(None),
     fno_capital_per_trade: float = Form(20000.0),
     fno_max_lots: int = Form(3),
+    fno_price_markup_pct: float = Form(4.0),
     # Risk
     max_order_amount_inr: float = Form(50000.0),
     min_trade_funds_inr: float = Form(10000.0),

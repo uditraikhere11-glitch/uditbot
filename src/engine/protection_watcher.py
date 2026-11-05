@@ -35,12 +35,15 @@ from src.engine.latency_monitor import GLOBAL_LATENCY_MONITOR
 from src.models import (
     OrderRequest,
     OrderType,
+    PositionLifecycleState,
     ProductType,
     ProtectionLevels,
+    ProtectionRoute,
     ProtectionVerificationResult,
     QuoteResult,
     TradingMode,
     TransactionType,
+    infer_record_protection_route,
 )
 from src.engine.sizer import calculate_protection_levels, round_to_tick
 from src.engine.market import IST, is_lifecycle_open, is_market_open
@@ -154,6 +157,10 @@ class ProtectionWatcher:
         auto_retry_enabled: bool = True,
         max_cancel_attempts: int = 3,
         cancel_backoff_sec: float = 2.0,
+        orphan_cancel_ack_timeout_sec: float = 10.0,
+        orphan_cancel_retry_backoff_sec: float = 5.0,
+        orphan_cancel_max_attempts: int = 3,
+        orphan_cancel_deadline_sec: float = 60.0,
     ):
         self.broker = broker
         self.sl_pct = sl_pct
@@ -182,6 +189,10 @@ class ProtectionWatcher:
         self.auto_retry_enabled = bool(auto_retry_enabled)
         self.max_cancel_attempts = max(1, int(max_cancel_attempts))
         self.cancel_backoff_sec = max(0.0, float(cancel_backoff_sec))
+        self.orphan_cancel_ack_timeout_sec = max(1.0, float(orphan_cancel_ack_timeout_sec))
+        self.orphan_cancel_retry_backoff_sec = max(1.0, float(orphan_cancel_retry_backoff_sec))
+        self.orphan_cancel_max_attempts = max(1, int(orphan_cancel_max_attempts))
+        self.orphan_cancel_deadline_sec = max(5.0, float(orphan_cancel_deadline_sec))
         self.pending: Dict[str, dict] = {}
         self.terminal_orders: Dict[str, dict] = {}
         self._lock = threading.RLock()
@@ -234,6 +245,23 @@ class ProtectionWatcher:
         rec.setdefault("cancel_exhausted", False)
         rec.setdefault("cancel_exhausted_alerted", False)
         rec.setdefault("confirmed_protection_ids", [])
+        if not rec.get("protection_route"):
+            rec["protection_route"] = infer_record_protection_route(rec)
+        rec.setdefault("position_state", PositionLifecycleState.PROTECTED.value if int(rec.get("protected_qty") or 0) > 0 else PositionLifecycleState.ENTRY.value)
+        rec.setdefault("exit_filled_qty", 0)
+        rec.setdefault("exit_vwap", 0.0)
+        rec.setdefault("realized_pnl", 0.0)
+        rec.setdefault("confirmed_position_open_qty", max(0, int(rec.get("filled_qty") or 0) - int(rec.get("exit_filled_qty") or 0)))
+        rec.setdefault("verified_leg_order_ids", [])
+        rec.setdefault("verified_leg_map", {})
+        rec.setdefault("orphaned_leg_cancel_states", {})
+        rec.setdefault("orphaned_leg_cancel_details", {})
+        rec.setdefault("orphaned_legs_cancelled", False)
+        rec.setdefault("orphaned_legs_manual_intervention_required", False)
+        rec.setdefault("orphaned_legs_escalation_alerted", False)
+        rec.setdefault("uncommitted_broker_sell_trades", [])
+        rec.setdefault("reconciliation_required", False)
+        rec.setdefault("persistence_uncertain", False)
 
     def _load(self):
         with self._lock:
@@ -420,6 +448,9 @@ class ProtectionWatcher:
         retry_reserved: bool = False,
         root_order_id: str = "",
         notification_meta: Optional[dict] = None,
+        protection_route: Optional[str] = None,
+        initial_sl_price: Optional[float] = None,
+        initial_target_price: Optional[float] = None,
         is_amo: bool = False,
     ) -> str:
         exp_str = ""
@@ -437,6 +468,10 @@ class ProtectionWatcher:
                     existing["trading_symbol"] = trading_symbol
                 if is_super_order:
                     existing["is_super_order"] = True
+                if protection_route:
+                    existing["protection_route"] = str(protection_route).strip().upper()
+                elif not existing.get("protection_route"):
+                    existing["protection_route"] = infer_record_protection_route(existing)
                 if tick_size and tick_size != TICK and existing.get("tick_size", TICK) == TICK:
                     existing["tick_size"] = float(tick_size)
                 if lot_size and int(lot_size) > 1 and existing.get("lot_size", 1) == 1:
@@ -470,6 +505,19 @@ class ProtectionWatcher:
                     "segment": segment,
                     "product_type": product_type,
                     "is_super_order": bool(is_super_order),
+                    "protection_route": (
+                        str(protection_route).strip().upper()
+                        if protection_route
+                        else ("SUPER_ORDER" if is_super_order else ("FOREVER_OCO" if str(product_type).upper() in ("CNC", "MTF") else "UNKNOWN"))
+                    ),
+                    "initial_protection_mode": "LIMIT_RELATIVE_INITIAL" if (is_super_order and initial_sl_price and initial_target_price) else "",
+                    "initial_sl_price": float(initial_sl_price or 0.0),
+                    "initial_target_price": float(initial_target_price or 0.0),
+                    "position_state": PositionLifecycleState.ENTRY.value,
+                    "exit_filled_qty": 0,
+                    "exit_vwap": 0.0,
+                    "realized_pnl": 0.0,
+                    "confirmed_position_open_qty": 0,
                     "is_amo": bool(is_amo),
                     "amo_activated_at": 0.0,
                     "tick_size": tick_size if tick_size and tick_size > 0 else TICK,
@@ -644,6 +692,47 @@ class ProtectionWatcher:
             self._save()
         return ok, msg
 
+    def _resolve_protection_route(self, rec: dict) -> str:
+        """P0-02: Resolves explicit protection_route without inferring from product_type == 'MARGIN'."""
+        route = infer_record_protection_route(rec)
+        rec["protection_route"] = route
+        if route == ProtectionRoute.SUPER_ORDER.value:
+            rec["is_super_order"] = True
+        return route
+
+    def _sync_position_lifecycle(self, rec: dict) -> bool:
+        if not self.journal_db or not hasattr(self.journal_db, "upsert_position_lifecycle"):
+            return True
+        try:
+            self.journal_db.upsert_position_lifecycle(
+                parent_order_id=str(rec.get("order_id") or ""),
+                symbol=str(rec.get("symbol") or ""),
+                trading_symbol=str(rec.get("trading_symbol") or rec.get("symbol") or ""),
+                security_id=str(rec.get("security_id") or ""),
+                exchange_segment=str(rec.get("segment") or "NSE_EQ"),
+                product_type=str(rec.get("product_type") or "CNC"),
+                protection_route=str(rec.get("protection_route") or self._resolve_protection_route(rec)),
+                position_state=str(rec.get("position_state") or PositionLifecycleState.ENTRY.value),
+                entry_qty=int(rec.get("qty") or 0),
+                buy_filled_qty=int(rec.get("filled_qty") or 0),
+                buy_vwap=float(rec.get("buy_vwap") or rec.get("original_market_price") or 0.0),
+                protected_qty=int(rec.get("protected_qty") or 0),
+                sl_price=float(rec.get("confirmed_sl_price") or rec.get("initial_sl_price") or 0.0),
+                target_price=float(rec.get("confirmed_target_price") or rec.get("initial_target_price") or 0.0),
+                sell_filled_qty=int(rec.get("exit_filled_qty") or 0),
+                sell_vwap=float(rec.get("exit_vwap") or 0.0),
+                confirmed_open_qty=int(rec.get("confirmed_position_open_qty") or max(0, int(rec.get("filled_qty") or 0) - int(rec.get("exit_filled_qty") or 0))),
+                realized_pnl=float(rec.get("realized_pnl") or 0.0),
+                triggered_leg=str(rec.get("triggered_leg") or ""),
+                manual_exit_detected=bool(rec.get("manual_exit_detected", False)),
+                orphaned_legs_detected=bool(rec.get("orphaned_legs_detected", False)),
+                now=self.clock(),
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[Protection] 🚨 Could not sync position lifecycle to SQLite for {rec.get('order_id')}: {e}")
+            return False
+
     def _find_unresolved_attempt(self, rec: dict, route_name: str) -> Optional[dict]:
         """CV13-01: Finds any existing unresolved protection attempt for `(parent_order_id, route_name)`."""
         pending_att = rec.get("pending_oco")
@@ -770,24 +859,59 @@ class ProtectionWatcher:
                             GLOBAL_LATENCY_MONITOR.record_fill_confirmed(str(rec["correlation_id"]))
                     except Exception:
                         pass
+                if filled > prev_filled:
+                    rec["confirmed_position_open_qty"] = max(0, filled - int(rec.get("exit_filled_qty") or 0))
+                    if rec.get("position_state") in (None, "", PositionLifecycleState.ENTRY.value):
+                        rec["position_state"] = PositionLifecycleState.POSITION_OPEN.value
                 if filled > prev_filled and self.journal_db and hasattr(self.journal_db, "record_fill"):
-                    try:
-                        avg_p = float(st.get("averageTradedPrice") or 0.0)
-                        self.journal_db.record_fill(
-                            broker_order_id=order_id,
-                            exchange_trade_id=f"{order_id}-FILL-{filled}",
-                            symbol=rec["symbol"],
-                            traded_price=avg_p,
-                            traded_quantity=filled - prev_filled,
-                            traded_at=current_time,
-                        )
-                    except Exception:
-                        pass
+                    recorded_real_trades = False
+                    if hasattr(self.broker, "get_trades_for_order"):
+                        try:
+                            t_res = self.broker.get_trades_for_order(order_id)
+                            if isinstance(t_res, list) and len(t_res) > 0:
+                                for tr in t_res:
+                                    if isinstance(tr, dict) and tr.get("exchangeTradeId") and float(tr.get("tradedPrice") or 0) > 0:
+                                        self.journal_db.record_fill(
+                                            broker_order_id=order_id,
+                                            exchange_trade_id=str(tr["exchangeTradeId"]),
+                                            symbol=rec["symbol"],
+                                            traded_price=float(tr["tradedPrice"]),
+                                            traded_quantity=int(tr["tradedQuantity"]),
+                                            traded_at=current_time,
+                                            transaction_type=str(tr.get("transactionType") or "BUY").upper(),
+                                            security_id=str(rec.get("security_id") or ""),
+                                            exchange_segment=str(rec.get("segment") or ""),
+                                            product_type=str(rec.get("product_type") or ""),
+                                            parent_order_id=order_id,
+                                            is_verified_trade=True,
+                                        )
+                                        recorded_real_trades = True
+                        except Exception:
+                            recorded_real_trades = False
+                    if not recorded_real_trades:
+                        try:
+                            avg_p = float(st.get("averageTradedPrice") or 0.0)
+                            self.journal_db.record_fill(
+                                broker_order_id=order_id,
+                                exchange_trade_id=f"{order_id}-FILL-{filled}",
+                                symbol=rec["symbol"],
+                                traded_price=avg_p,
+                                traded_quantity=filled - prev_filled,
+                                traded_at=current_time,
+                                transaction_type="BUY",
+                                security_id=str(rec.get("security_id") or ""),
+                                exchange_segment=str(rec.get("segment") or ""),
+                                product_type=str(rec.get("product_type") or ""),
+                                parent_order_id=order_id,
+                                is_verified_trade=False,
+                            )
+                        except Exception:
+                            pass
 
                 # 1. Reconcile any existing unresolved protection attempt (FOREVER_OCO or SUPER_ORDER)
-                #    OR protect newly executed units.
-                is_super = (str(rec.get("product_type", "CNC")).upper() == "MARGIN" and bool(rec.get("is_super_order")))
-                route_name = "SUPER_ORDER" if is_super else "FOREVER_OCO"
+                #    OR protect newly executed units (P0-02: use explicit protection_route, never product_type == MARGIN).
+                route_name = self._resolve_protection_route(rec)
+                is_super = (route_name == ProtectionRoute.SUPER_ORDER.value)
                 unresolved_att = self._find_unresolved_attempt(rec, route_name)
                 has_unresolved_attempt = unresolved_att is not None
                 new_qty = filled - int(rec.get("protected_qty") or 0)
@@ -946,18 +1070,30 @@ class ProtectionWatcher:
                         rec["auto_retry_result"] = {"ok": retry_ok, "child_order_id": child_id, "reason": retry_msg}
                         changed = True
 
-                # 4. Check terminal finalization
+                # 4. Check terminal finalization of entry phase (open positions remain supervised in terminal_orders)
                 if is_terminal and all_fills_protected and notify_ready:
                     if filled == 0:
+                        rec["position_state"] = PositionLifecycleState.POSITION_CLOSED.value
+                        rec["confirmed_position_open_qty"] = 0
                         logger.info(f"[Protection] {rec['symbol']} order {order_id} terminal ({rec['state']}) with 0 fills; closed.")
                     else:
+                        if rec.get("position_state") in (None, "", PositionLifecycleState.ENTRY.value, PositionLifecycleState.POSITION_OPEN.value):
+                            rec["position_state"] = PositionLifecycleState.PROTECTED.value
+                        rec["confirmed_position_open_qty"] = max(0, filled - int(rec.get("exit_filled_qty") or 0))
                         logger.info(f"[Protection] {rec['symbol']} order {order_id} terminal ({rec['state']}); all {rec['protected_qty']} units protected.")
+                    self._sync_position_lifecycle(rec)
 
                     with self._lock:
                         self.pending.pop(order_id, None)
                         rec["finalized_at"] = current_time
                         self.terminal_orders[order_id] = rec
                     changed = True
+
+            # 5. P0-03, P0-05 & P1-10: Continuous post-entry supervision for open positions
+            try:
+                changed |= self.supervise_open_positions(current_time=current_time)
+            except Exception as sup_err:
+                logger.warning(f"[Protection] Open-position supervision error: {sup_err}")
 
             if changed:
                 self._save()
@@ -1319,6 +1455,11 @@ class ProtectionWatcher:
             rec["protected_value"] = float(rec.get("protected_value") or 0.0) + (float(executed_chunk_price) * int(confirmed_qty))
 
         rec["protection_status"] = leg_status_label
+        rec["confirmed_sl_price"] = float(levels.sl_trigger)
+        rec["confirmed_target_price"] = float(levels.target_price)
+        rec["buy_vwap"] = float(cum_vwap if cum_vwap > 0 else executed_chunk_price)
+        rec["confirmed_position_open_qty"] = max(0, int(rec["protected_qty"]) - int(rec.get("exit_filled_qty") or 0))
+        rec["position_state"] = PositionLifecycleState.PROTECTED.value
         rec["retry_at"] = 0.0
         confirmed_ids = rec.get("confirmed_protection_ids")
         if not isinstance(confirmed_ids, list):
@@ -1370,6 +1511,7 @@ class ProtectionWatcher:
             except Exception as e:
                 logger.warning(f"[Protection] Could not record protection order to journal: {e}")
 
+        self._sync_position_lifecycle(rec)
         logger.info(
             f"[Protection] ✅ {rec['symbol']}: {confirmed_qty} units protected @ {executed_chunk_price} → "
             f"SL {levels.sl_trigger} / Target {levels.target_price} ({leg_status_label}, ID: {forever_or_super_id})."
@@ -1603,8 +1745,19 @@ class ProtectionWatcher:
 
     def _protect(self, rec: dict, st: dict, filled: int, new_qty: int) -> bool:
         with self._lock:
-            is_super = (str(rec.get("product_type", "CNC")).upper() == "MARGIN" and bool(rec.get("is_super_order")))
-            route_name = "SUPER_ORDER" if is_super else "FOREVER_OCO"
+            route_name = self._resolve_protection_route(rec)
+            if route_name == ProtectionRoute.UNKNOWN.value:
+                self._record_unprotected_and_halt(
+                    rec=rec,
+                    new_qty=max(1, new_qty),
+                    sl_trigger=0.0,
+                    sl_limit=0.0,
+                    target_price=0.0,
+                    status_label="UNPROTECTED",
+                    reason=f"Ambiguous or UNKNOWN protection_route for {rec.get('symbol')} ({rec.get('order_id')}); refusing to guess protection route",
+                )
+                return True
+            is_super = (route_name == ProtectionRoute.SUPER_ORDER.value)
 
             # Step 1: Before creating an attempt, find and reconcile any existing unresolved attempt for the same parent and route (CV13-01)
             existing_unresolved = self._find_unresolved_attempt(rec, route_name)
@@ -1740,7 +1893,7 @@ class ProtectionWatcher:
                     )
                 return False
 
-            # Step 3A: Super Order protection re-anchoring with authoritative verification
+            # Step 3A: Super Order protection re-anchoring with per-leg persistence and authoritative verification (P0-04)
             if is_super and hasattr(self.broker, "modify_super_order_protection"):
                 try:
                     ok_mod, mod_msg = self.broker.modify_super_order_protection(
@@ -1750,6 +1903,18 @@ class ProtectionWatcher:
                     )
                 except Exception as mod_exc:
                     ok_mod, mod_msg = False, f"HTTP exception modifying super order: {mod_exc}"
+
+                leg_mod_map = {}
+                raw_leg_map = getattr(self.broker, "last_super_leg_mod_results", None)
+                if isinstance(raw_leg_map, dict):
+                    leg_mod_map = raw_leg_map.get(str(rec["order_id"]), {}) or {}
+                t_leg_st = str((leg_mod_map.get("TARGET_LEG") or {}).get("state") or ("ACKED" if ok_mod else "FAILED"))
+                sl_leg_st = str((leg_mod_map.get("STOP_LOSS_LEG") or {}).get("state") or ("ACKED" if ok_mod else "FAILED"))
+                rec["target_leg_mod_state"] = t_leg_st
+                rec["sl_leg_mod_state"] = sl_leg_st
+                if isinstance(rec.get("pending_oco"), dict):
+                    rec["pending_oco"]["target_leg_state"] = t_leg_st
+                    rec["pending_oco"]["sl_leg_state"] = sl_leg_st
 
                 if ok_mod:
                     sv_ok, sv_msg, _ = self._verify_super_order_on_broker(
@@ -1762,6 +1927,20 @@ class ProtectionWatcher:
                     if sv_ok:
                         rec["pending_oco"] = None
                         rec["reanchor_status"] = "CONFIRMED"
+                        rec["target_leg_mod_state"] = "CONFIRMED"
+                        rec["sl_leg_mod_state"] = "CONFIRMED"
+                        if self.journal_db and hasattr(self.journal_db, "update_protection_attempt"):
+                            try:
+                                self.journal_db.update_protection_attempt(
+                                    attempt_id,
+                                    state="CONFIRMED",
+                                    broker_order_id=rec["order_id"],
+                                    target_leg_state="CONFIRMED",
+                                    sl_leg_state="CONFIRMED",
+                                    now=self.clock(),
+                                )
+                            except Exception:
+                                pass
                         self._record_confirmed_protection(
                             rec=rec,
                             forever_or_super_id=f"SUPER-{rec['order_id']}-{filled}",
@@ -1786,6 +1965,8 @@ class ProtectionWatcher:
                                     state="ACKED_UNVERIFIED",
                                     broker_order_id=rec["order_id"],
                                     error_msg=sv_msg,
+                                    target_leg_state=t_leg_st,
+                                    sl_leg_state=sl_leg_st,
                                     now=self.clock(),
                                 )
                             except Exception:
@@ -1804,7 +1985,7 @@ class ProtectionWatcher:
                         return True
                 else:
                     rec["reanchor_status"] = "FAILED"
-                    ambig = _is_ambiguous_message(mod_msg)
+                    ambig = _is_ambiguous_message(mod_msg) or (t_leg_st == "ACKED" and sl_leg_st != "ACKED")
                     if ambig:
                         rec["pending_oco"]["state"] = "UNKNOWN"
                         rec["pending_oco"]["oco_id"] = rec["order_id"]
@@ -1817,6 +1998,8 @@ class ProtectionWatcher:
                                 state="UNKNOWN" if ambig else "REJECTED",
                                 broker_order_id=rec["order_id"],
                                 error_msg=mod_msg,
+                                target_leg_state=t_leg_st,
+                                sl_leg_state=sl_leg_st,
                                 now=self.clock(),
                             )
                         except Exception:
@@ -2363,7 +2546,8 @@ class ProtectionWatcher:
             root_oid = str(rec.get("root_order_id") or order_id)
             corr_id = generate_correlation_id("RTRY", underlying, self.clock())
             parent_corr = rec.get("correlation_id") or order_id
-            use_super_route = bool(rec.get("is_super_order", False)) or (segment in ("NSE_FNO", "BSE_FNO") and prod_type == ProductType.MARGIN)
+            resolved_parent_route = self._resolve_protection_route(rec)
+            use_super_route = (resolved_parent_route == ProtectionRoute.SUPER_ORDER.value) or bool(rec.get("is_super_order", False)) or (segment in ("NSE_FNO", "BSE_FNO") and prod_type == ProductType.MARGIN)
 
             rec["retry_count"] += 1
             rec["retry_reserved"] = True
@@ -2601,8 +2785,1041 @@ class ProtectionWatcher:
             return self.broker.order_status(oid)
         return None
 
+    def has_open_monitored_positions(self) -> bool:
+        """P0-03 & P1-10: Returns True if any filled position in terminal_orders is still open and awaiting exit."""
+        with self._lock:
+            for rec in self.terminal_orders.values():
+                if not isinstance(rec, dict):
+                    continue
+                if str(rec.get("order_id") or "").startswith("DRY-"):
+                    continue
+                if int(rec.get("filled_qty") or 0) > 0 and str(rec.get("position_state") or "PROTECTED") != PositionLifecycleState.POSITION_CLOSED.value:
+                    return True
+        return False
+
+    def supervise_open_positions(self, current_time: Optional[float] = None) -> bool:
+        """
+        P0-03, P0-05, P0-09 & P1-10:
+        Continuously supervises open protected positions after entry fill:
+        - Checks Super Order / Forever OCO leg states (`TARGET_LEG`, `STOP_LOSS_LEG`).
+        - Distinguishes leg `TRIGGERED` / Super Order `CLOSED` (trigger event) from actual SELL tradebook fill.
+        - Confirms exit fills strictly from SELL tradebook rows (`GET /v2/trades` / `GET /v2/trades/{order-id}`),
+          updates `fills` with real `exchangeTradeId` (`transaction_type='SELL'`), and calculates gross realized P&L.
+        - Detects manual exits / partial manual sales via `get_positions()` / `get_holdings()` when bot-owned
+          protective legs remain resting, halts new risk-increasing entries, alerts the owner, and cancels
+          verified orphaned bot-owned exit legs when position is flat.
+        """
+        now_ts = float(current_time if current_time is not None else self.clock())
+        with self._lock:
+            open_recs = [
+                rec for rec in self.terminal_orders.values()
+                if isinstance(rec, dict)
+                and not str(rec.get("order_id") or "").startswith("DRY-")
+                and int(rec.get("filled_qty") or 0) > 0
+                and str(rec.get("position_state") or "PROTECTED") != PositionLifecycleState.POSITION_CLOSED.value
+            ]
+        if not open_recs:
+            return False
+
+        # Read broker snapshots once per pass if available (avoiding calls on unconfigured mocks)
+        is_real_dhan_unmocked_session = (
+            type(self.broker).__name__ == "DhanClient"
+            and not hasattr(getattr(getattr(self.broker, "session", None), "get", None), "mock_calls")
+            and "unittest.mock" not in str(type(getattr(getattr(self.broker, "session", None), "get", None)))
+            and (os.environ.get("AUDITBOT_TEST_ISOLATION") == "1" or "unittest" in os.sys.modules)
+        )
+
+        unreadable_books = set()
+
+        def _safe_list_call(attr_name: str) -> Optional[List[Dict[str, Any]]]:
+            fn = getattr(self.broker, attr_name, None)
+            if not callable(fn):
+                return None
+            if is_real_dhan_unmocked_session and not hasattr(fn, "mock_calls") and "unittest.mock" not in str(type(fn)):
+                return None
+            try:
+                res = fn()
+                if res is None or "Mock" in type(res).__name__:
+                    return None
+                if type(res).__name__ == "BrokerReadFailure":
+                    unreadable_books.add(attr_name)
+                    return None
+                if isinstance(res, list):
+                    if all(isinstance(x, dict) for x in res):
+                        return list(res)
+                    unreadable_books.add(attr_name)
+                    return None
+                unreadable_books.add(attr_name)
+            except Exception:
+                unreadable_books.add(attr_name)
+            return None
+
+        super_book = _safe_list_call("get_super_orders")
+        forever_book = _safe_list_call("get_forever_orders")
+        trade_book = _safe_list_call("get_trade_book")
+        positions_book = _safe_list_call("get_positions")
+        holdings_book = _safe_list_call("get_holdings")
+
+        changed = False
+        gate = getattr(self.broker, "reconciliation_gate", None)
+
+        if unreadable_books:
+            unreadable_msg = f"Unreadable broker response during position supervision ({sorted(unreadable_books)})"
+            logger.error(f"[Protection] 🚨 {unreadable_msg}")
+            if gate is not None and hasattr(gate, "halt_new_entries"):
+                gate.halt_new_entries(unreadable_msg)
+            for rec in open_recs:
+                rec["unreadable_broker_response"] = True
+                changed = True
+
+        if (
+            super_book is None
+            and forever_book is None
+            and trade_book is None
+            and positions_book is None
+            and holdings_book is None
+        ):
+            return changed
+
+        active_states = {"PENDING", "TRANSIT", "OPEN", "ACTIVE", "CONFIRM", "CONFIRMED"}
+        terminal_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "CLOSED", "TRADED"}
+        dead_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
+
+        # Precompute all verified leg order IDs across all tracked bot orders to detect cross-order collisions
+        all_bot_leg_owners: Dict[str, str] = {}
+        with self._lock:
+            all_known_recs = list(self.pending.values()) + list(self.terminal_orders.values())
+        for k_rec in all_known_recs:
+            if not isinstance(k_rec, dict):
+                continue
+            k_oid = str(k_rec.get("order_id") or "").strip()
+            if not k_oid:
+                continue
+            all_bot_leg_owners[k_oid] = k_oid
+            for v_id in (k_rec.get("verified_leg_order_ids") or []):
+                vs = str(v_id or "").strip()
+                if vs and not vs.startswith("SUPER-"):
+                    all_bot_leg_owners[vs] = k_oid
+            for cid_k in (k_rec.get("confirmed_protection_ids") or []):
+                cs = str(cid_k or "").strip()
+                if cs and not cs.startswith("SUPER-"):
+                    all_bot_leg_owners[cs] = k_oid
+
+        for rec in open_recs:
+            oid = str(rec.get("order_id") or "").strip()
+            sec_id = str(rec.get("security_id") or "").strip()
+            seg = str(rec.get("segment") or "NSE_EQ").strip().upper()
+            prod = str(rec.get("product_type") or "CNC").strip().upper()
+            route = self._resolve_protection_route(rec)
+            buy_filled = int(rec.get("filled_qty") or 0)
+            if buy_filled <= 0 or not oid:
+                continue
+
+            expected_client_id = str(
+                rec.get("account_id")
+                or getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "")
+                or getattr(self.journal_db, "account_id", "")
+                or ""
+            ).strip()
+
+            prev_pos_state = str(rec.get("position_state") or PositionLifecycleState.PROTECTED.value)
+            prev_sell_qty = int(rec.get("exit_filled_qty") or 0)
+            prev_trig_leg = str(rec.get("triggered_leg") or "")
+
+            # P0-A: Build strictly verified parent-linked exit leg order IDs (no string-prefix splitting or same-instrument guessing)
+            leg_id_to_name: Dict[str, str] = {}
+            saved_leg_map = rec.get("verified_leg_map")
+            if isinstance(saved_leg_map, dict):
+                for k_id, v_leg in saved_leg_map.items():
+                    ks = str(k_id or "").strip()
+                    vs = str(v_leg or "").strip().upper()
+                    if ks and vs in ("TARGET_LEG", "STOP_LOSS_LEG"):
+                        leg_id_to_name[ks] = vs
+
+            leg_order_ids = {oid}
+            for saved_id in (rec.get("verified_leg_order_ids") or []):
+                s_id = str(saved_id or "").strip()
+                if s_id and not s_id.startswith("SUPER-"):
+                    leg_order_ids.add(s_id)
+            for explicit_key in ("sl_order_id", "tp_order_id", "exit_order_id"):
+                ex_id = str(rec.get(explicit_key) or "").strip()
+                if ex_id and not ex_id.startswith("SUPER-"):
+                    leg_order_ids.add(ex_id)
+                    if explicit_key == "sl_order_id":
+                        leg_id_to_name.setdefault(ex_id, "STOP_LOSS_LEG")
+                    elif explicit_key == "tp_order_id":
+                        leg_id_to_name.setdefault(ex_id, "TARGET_LEG")
+            for cid_p in (rec.get("confirmed_protection_ids") or []):
+                s_cid = str(cid_p or "").strip()
+                if s_cid and not s_cid.startswith("SUPER-"):
+                    leg_order_ids.add(s_cid)
+
+            leg_cancel_states: Dict[str, str] = {}
+            if isinstance(rec.get("orphaned_leg_cancel_states"), dict):
+                for k_c, v_c in rec["orphaned_leg_cancel_states"].items():
+                    leg_cancel_states[str(k_c)] = str(v_c)
+
+            leg_cancel_details: Dict[str, Dict[str, Any]] = {}
+            if isinstance(rec.get("orphaned_leg_cancel_details"), dict):
+                for k_d, v_d in rec["orphaned_leg_cancel_details"].items():
+                    if isinstance(v_d, dict):
+                        leg_cancel_details[str(k_d)] = dict(v_d)
+
+            def _ensure_leg_detail(leg_key: str, leg_oid_val: str, leg_type_val: str, cur_st: str) -> Dict[str, Any]:
+                det = leg_cancel_details.get(leg_key)
+                if not isinstance(det, dict):
+                    det = {
+                        "leg_key": leg_key,
+                        "leg_order_id": str(leg_oid_val or ""),
+                        "leg_type": str(leg_type_val or leg_key),
+                        "state": str(leg_cancel_states.get(leg_key) or "ACTIVE"),
+                        "last_broker_status": str(cur_st or "UNKNOWN"),
+                        "first_requested_at": 0.0,
+                        "last_requested_at": 0.0,
+                        "last_readback_at": now_ts,
+                        "attempt_count": 0,
+                        "max_attempts": int(self.orphan_cancel_max_attempts),
+                        "next_retry_at": 0.0,
+                        "deadline_at": 0.0,
+                        "last_error": "",
+                        "escalated": False,
+                        "escalated_at": None,
+                    }
+                    leg_cancel_details[leg_key] = det
+                else:
+                    if leg_oid_val:
+                        det["leg_order_id"] = str(leg_oid_val)
+                    if cur_st:
+                        det["last_broker_status"] = str(cur_st)
+                    det["last_readback_at"] = now_ts
+                    det.setdefault("max_attempts", int(self.orphan_cancel_max_attempts))
+                    det.setdefault("attempt_count", 0)
+                    det.setdefault("first_requested_at", 0.0)
+                    det.setdefault("last_requested_at", 0.0)
+                    det.setdefault("next_retry_at", 0.0)
+                    det.setdefault("deadline_at", 0.0)
+                    det.setdefault("last_error", "")
+                    det.setdefault("escalated", False)
+                    det.setdefault("escalated_at", None)
+                return det
+
+            resting_protective_qty = 0
+            triggered_leg = prev_trig_leg
+            both_legs_dead = False
+            ambiguous_super_closed = False
+            so_match: Optional[Dict[str, Any]] = None
+            t_leg: Optional[Dict[str, Any]] = None
+            sl_leg: Optional[Dict[str, Any]] = None
+            t_st = ""
+            sl_st = ""
+            parent_st = ""
+            fo_matches: List[Dict[str, Any]] = []
+
+            # 1. Inspect Super Order or Forever OCO leg states (P0-B, P0-C & P1-02)
+            if route == ProtectionRoute.SUPER_ORDER.value and isinstance(super_book, list):
+                cand_so = next((r for r in super_book if isinstance(r, dict) and str(r.get("orderId") or "").strip() == oid), None)
+                if isinstance(cand_so, dict):
+                    so_client = str(cand_so.get("dhanClientId") or "").strip()
+                    so_sec = str(cand_so.get("securityId") or "").strip()
+                    so_seg = str(cand_so.get("exchangeSegment") or "").strip().upper()
+                    so_prod = str(cand_so.get("productType") or "").strip().upper()
+                    ownership_ok = (
+                        (not so_client or not expected_client_id or so_client == expected_client_id)
+                        and (not so_sec or not sec_id or so_sec == sec_id)
+                        and (not so_seg or not seg or so_seg == seg)
+                        and (not so_prod or not prod or so_prod == prod)
+                    )
+                    if ownership_ok:
+                        so_match = cand_so
+                        parent_st = str(so_match.get("orderStatus") or "").strip().upper()
+                        legs = so_match.get("legDetails") if isinstance(so_match.get("legDetails"), list) else []
+                        t_leg = next((l for l in legs if isinstance(l, dict) and str(l.get("legName") or "").upper() == "TARGET_LEG"), None)
+                        sl_leg = next((l for l in legs if isinstance(l, dict) and str(l.get("legName") or "").upper() == "STOP_LOSS_LEG"), None)
+                        for lg, lg_name in ((t_leg, "TARGET_LEG"), (sl_leg, "STOP_LOSS_LEG")):
+                            if isinstance(lg, dict) and lg.get("orderId"):
+                                lg_oid = str(lg["orderId"]).strip()
+                                if lg_oid:
+                                    leg_order_ids.add(lg_oid)
+                                    leg_id_to_name[lg_oid] = lg_name
+                                    all_bot_leg_owners[lg_oid] = oid
+
+                        rec["verified_leg_order_ids"] = sorted(leg_order_ids - {oid})
+                        rec["verified_leg_map"] = dict(leg_id_to_name)
+
+                        t_st = str((t_leg or {}).get("orderStatus") or "").strip().upper()
+                        sl_st = str((sl_leg or {}).get("orderStatus") or "").strip().upper()
+                        t_trig_q = int((t_leg or {}).get("triggeredQuantity") or 0)
+                        sl_trig_q = int((sl_leg or {}).get("triggeredQuantity") or 0)
+
+                        if t_st in terminal_leg_states:
+                            leg_cancel_states["TARGET_LEG"] = "CONFIRMED_TERMINAL"
+                            t_det = _ensure_leg_detail("TARGET_LEG", str((t_leg or {}).get("orderId") or ""), "TARGET_LEG", t_st)
+                            t_det["state"] = "CONFIRMED_TERMINAL"
+                            t_det["next_retry_at"] = 0.0
+                        if sl_st in terminal_leg_states:
+                            leg_cancel_states["STOP_LOSS_LEG"] = "CONFIRMED_TERMINAL"
+                            sl_det = _ensure_leg_detail("STOP_LOSS_LEG", str((sl_leg or {}).get("orderId") or ""), "STOP_LOSS_LEG", sl_st)
+                            sl_det["state"] = "CONFIRMED_TERMINAL"
+                            sl_det["next_retry_at"] = 0.0
+
+                        t_triggered = (t_st in ("TRIGGERED", "PART_TRADED", "TRADED") or t_trig_q > 0)
+                        sl_triggered = (sl_st in ("TRIGGERED", "PART_TRADED", "TRADED") or sl_trig_q > 0)
+
+                        # P0-C: Require unambiguous leg trigger evidence; never infer TARGET_LEG from parent CLOSED
+                        if t_triggered and sl_triggered:
+                            triggered_leg = ""
+                            ambiguous_super_closed = True
+                            rec["ambiguous_super_closed"] = True
+                            rec["exit_evidence_status"] = "CONTRADICTORY_LEG_STATES"
+                        elif t_triggered:
+                            triggered_leg = "TARGET_LEG"
+                            rec["ambiguous_super_closed"] = False
+                            rec["exit_evidence_status"] = "LEG_CONFIRMED"
+                        elif sl_triggered:
+                            triggered_leg = "STOP_LOSS_LEG"
+                            rec["ambiguous_super_closed"] = False
+                            rec["exit_evidence_status"] = "LEG_CONFIRMED"
+                        elif parent_st == "CLOSED" and not triggered_leg:
+                            triggered_leg = ""
+                            ambiguous_super_closed = True
+                            rec["ambiguous_super_closed"] = True
+                            rec["exit_evidence_status"] = "AWAITING_LEG_OR_FILL_EVIDENCE"
+
+                        if t_st in active_states or sl_st in active_states:
+                            t_rem = int((t_leg or {}).get("remainingQuantity") or (t_leg or {}).get("quantity") or buy_filled)
+                            sl_rem = int((sl_leg or {}).get("remainingQuantity") or (sl_leg or {}).get("quantity") or buy_filled)
+                            resting_protective_qty = max(t_rem if t_st in active_states else 0, sl_rem if sl_st in active_states else 0)
+                        elif t_st in dead_leg_states and sl_st in dead_leg_states:
+                            both_legs_dead = True
+
+            elif route == ProtectionRoute.FOREVER_OCO.value and isinstance(forever_book, list):
+                rec_corr = str(rec.get("correlation_id") or "").strip()
+                fo_matches = [
+                    r for r in forever_book
+                    if isinstance(r, dict)
+                    and (
+                        str(r.get("orderId") or "").strip() in leg_order_ids
+                        or (rec_corr and str(r.get("correlationId") or "").strip() == rec_corr)
+                    )
+                    and (not sec_id or str(r.get("securityId") or "").strip() == sec_id)
+                    and (not prod or str(r.get("productType") or "").strip().upper() == prod)
+                    and (not expected_client_id or not r.get("dhanClientId") or str(r.get("dhanClientId")).strip() == expected_client_id)
+                ]
+                if fo_matches:
+                    any_active = False
+                    all_dead = True
+                    fo_trig_legs = set()
+                    for fr in fo_matches:
+                        f_oid = str(fr.get("orderId") or "").strip()
+                        f_leg = str(fr.get("legName") or "").strip().upper()
+                        if f_oid:
+                            leg_order_ids.add(f_oid)
+                            all_bot_leg_owners[f_oid] = oid
+                            if f_leg in ("TARGET_LEG", "STOP_LOSS_LEG"):
+                                leg_id_to_name[f_oid] = f_leg
+                        f_st = str(fr.get("orderStatus") or "").strip().upper()
+                        if f_oid and f_st in terminal_leg_states:
+                            leg_cancel_states[f_oid] = "CONFIRMED_TERMINAL"
+                            f_det = _ensure_leg_detail(f_oid, f_oid, f_leg or "FOREVER_OCO", f_st)
+                            f_det["state"] = "CONFIRMED_TERMINAL"
+                            f_det["next_retry_at"] = 0.0
+                        if f_st in ("TRIGGERED", "PART_TRADED", "TRADED"):
+                            if f_leg in ("TARGET_LEG", "STOP_LOSS_LEG"):
+                                fo_trig_legs.add(f_leg)
+                            all_dead = False
+                        elif f_st in active_states:
+                            any_active = True
+                            all_dead = False
+                            resting_protective_qty = max(resting_protective_qty, int(fr.get("quantity") or 0))
+                    rec["verified_leg_order_ids"] = sorted(leg_order_ids - {oid})
+                    rec["verified_leg_map"] = dict(leg_id_to_name)
+                    if len(fo_trig_legs) == 1:
+                        triggered_leg = next(iter(fo_trig_legs))
+                    elif len(fo_trig_legs) > 1:
+                        triggered_leg = ""
+                        ambiguous_super_closed = True
+                        rec["ambiguous_super_closed"] = True
+                    if all_dead and not any_active and not triggered_leg:
+                        both_legs_dead = True
+
+            # 2. Collect strictly parent-linked, verified SELL tradebook executions (P0-A, P0-01, P0-03 & P0-09)
+            sell_trades: List[Dict[str, Any]] = []
+            seen_trade_ids = set()
+
+            def _verify_parent_sell_trade(tr: Any, expected_oid: Optional[str] = None) -> Tuple[bool, str]:
+                if not isinstance(tr, dict):
+                    return False, "NON_DICT_TRADE"
+                t_side = str(tr.get("transactionType") or "").strip().upper()
+                if t_side != "SELL":
+                    return False, "NOT_SELL"
+                t_oid = str(tr.get("orderId") or "").strip()
+                if not t_oid:
+                    return False, "MISSING_ORDER_ID"
+                if expected_oid is not None and t_oid != expected_oid:
+                    return False, "ORDER_ID_MISMATCH_FOR_QUERY"
+                if t_oid not in leg_order_ids:
+                    return False, "UNLINKED_ORDER_ID"
+                owner_oid = all_bot_leg_owners.get(t_oid)
+                if owner_oid and owner_oid != oid:
+                    return False, "OWNED_BY_OTHER_BOT_ORDER"
+                p_link = str(tr.get("parentOrderId") or tr.get("superOrderId") or "").strip()
+                if p_link and p_link != oid and p_link not in leg_order_ids:
+                    return False, "PARENT_ORDER_ID_MISMATCH"
+
+                t_sec = str(tr.get("securityId") or "").strip()
+                t_seg = str(tr.get("exchangeSegment") or "").strip().upper()
+                t_prod = str(tr.get("productType") or "").strip().upper()
+                if sec_id and t_sec != sec_id:
+                    return False, "CONTRACT_SECURITY_MISMATCH"
+                if seg and t_seg != seg:
+                    return False, "CONTRACT_SEGMENT_MISMATCH"
+                if prod and t_prod != prod:
+                    return False, "CONTRACT_PRODUCT_MISMATCH"
+
+                t_client = str(tr.get("dhanClientId") or tr.get("clientId") or "").strip()
+                if t_client and expected_client_id and t_client != expected_client_id:
+                    return False, "BROKER_ACCOUNT_MISMATCH"
+
+                etid = str(tr.get("exchangeTradeId") or "").strip()
+                if not etid or etid.upper() in ("0", "NONE", "NULL"):
+                    return False, "MISSING_EXCHANGE_TRADE_ID"
+
+                raw_q = tr.get("tradedQuantity")
+                raw_p = tr.get("tradedPrice")
+                if isinstance(raw_q, bool) or isinstance(raw_p, bool):
+                    return False, "BOOLEAN_QTY_OR_PRICE"
+                try:
+                    qty_t = int(raw_q)
+                    prc_t = float(raw_p)
+                except (ValueError, TypeError):
+                    return False, "NON_NUMERIC_QTY_OR_PRICE"
+                if qty_t <= 0 or prc_t <= 0.0 or not math.isfinite(prc_t):
+                    return False, "NON_POSITIVE_OR_NON_FINITE_QTY_PRICE"
+
+                if self.journal_db and hasattr(self.journal_db, "get_fill_by_exchange_trade_id"):
+                    try:
+                        ex_fill = self.journal_db.get_fill_by_exchange_trade_id(etid)
+                        if isinstance(ex_fill, dict):
+                            ex_parent = str(ex_fill.get("parent_order_id") or "").strip()
+                            ex_boid = str(ex_fill.get("broker_order_id") or "").strip()
+                            if (ex_parent and ex_parent != oid and ex_parent not in leg_order_ids) or (ex_boid and ex_boid not in leg_order_ids):
+                                return False, "EXCHANGE_TRADE_ID_CLAIMED_BY_OTHER_ORDER"
+                    except Exception:
+                        pass
+                return True, "OK"
+
+            # Replay any previously staged uncommitted broker SELL fills before scanning fresh tradebook
+            for staged_tr in (rec.get("uncommitted_broker_sell_trades") or []):
+                if isinstance(staged_tr, dict):
+                    is_ok, _ = _verify_parent_sell_trade(staged_tr)
+                    if is_ok:
+                        etid_s = str(staged_tr.get("exchangeTradeId") or "").strip()
+                        if etid_s and etid_s not in seen_trade_ids:
+                            seen_trade_ids.add(etid_s)
+                            sell_trades.append(staged_tr)
+
+            if isinstance(trade_book, list):
+                for tr in trade_book:
+                    if not isinstance(tr, dict):
+                        continue
+                    if str(tr.get("transactionType") or "").strip().upper() != "SELL":
+                        continue
+                    t_oid = str(tr.get("orderId") or "").strip()
+                    is_ok, v_reason = _verify_parent_sell_trade(tr)
+                    if is_ok:
+                        etid = str(tr.get("exchangeTradeId") or "").strip()
+                        if etid not in seen_trade_ids:
+                            seen_trade_ids.add(etid)
+                            sell_trades.append(tr)
+                    elif t_oid in leg_order_ids:
+                        rec["unverified_trade_detected"] = True
+                        rec["unverified_trade_reason"] = v_reason
+                        unv_msg = f"Unverified/malformed broker SELL trade row on order {t_oid} (parent {oid}): {v_reason}"
+                        logger.error(f"[Protection] 🚨 {unv_msg}")
+                        if gate is not None and hasattr(gate, "halt_new_entries"):
+                            gate.halt_new_entries(unv_msg)
+                        changed = True
+                    elif (
+                        str(tr.get("securityId") or "").strip() == sec_id
+                        and str(tr.get("exchangeSegment") or "").strip().upper() == seg
+                        and str(tr.get("productType") or "").strip().upper() == prod
+                        and t_oid not in all_bot_leg_owners
+                    ):
+                        rec["external_unlinked_sell_observed"] = True
+
+            if hasattr(self.broker, "get_trades_for_order"):
+                for l_oid in sorted(leg_order_ids):
+                    if l_oid.startswith("SUPER-"):
+                        continue
+                    try:
+                        if is_real_dhan_unmocked_session and not hasattr(self.broker.get_trades_for_order, "mock_calls") and "unittest.mock" not in str(type(self.broker.get_trades_for_order)):
+                            continue
+                        t_ord_res = self.broker.get_trades_for_order(l_oid)
+                        if t_ord_res is None or "Mock" in type(t_ord_res).__name__:
+                            continue
+                        if type(t_ord_res).__name__ == "BrokerReadFailure":
+                            rec["unreadable_broker_response"] = True
+                            if gate is not None and hasattr(gate, "halt_new_entries"):
+                                gate.halt_new_entries(f"Broker get_trades_for_order({l_oid}) failed during exit reconciliation")
+                            changed = True
+                            continue
+                        if isinstance(t_ord_res, list):
+                            for tr in t_ord_res:
+                                if not isinstance(tr, dict):
+                                    continue
+                                if str(tr.get("transactionType") or "").strip().upper() != "SELL":
+                                    continue
+                                is_ok, v_reason = _verify_parent_sell_trade(tr, expected_oid=l_oid)
+                                if is_ok:
+                                    etid = str(tr.get("exchangeTradeId") or "").strip()
+                                    if etid not in seen_trade_ids:
+                                        seen_trade_ids.add(etid)
+                                        sell_trades.append(tr)
+                                else:
+                                    rec["unverified_trade_detected"] = True
+                                    rec["unverified_trade_reason"] = v_reason
+                                    if gate is not None and hasattr(gate, "halt_new_entries"):
+                                        gate.halt_new_entries(f"Rejected unverified SELL trade from get_trades_for_order({l_oid}): {v_reason}")
+                                    changed = True
+                    except Exception:
+                        pass
+
+            # P0-01: Preserve external broker truth separately from durable acknowledged SQLite accounting.
+            broker_observed_sell_qty = sum(int(t["tradedQuantity"]) for t in sell_trades)
+            broker_observed_sell_val = sum(int(t["tradedQuantity"]) * float(t["tradedPrice"]) for t in sell_trades)
+            broker_observed_sell_vwap = (
+                round(broker_observed_sell_val / broker_observed_sell_qty, 4)
+                if broker_observed_sell_qty > 0
+                else 0.0
+            )
+            rec["broker_observed_exit_filled_qty"] = broker_observed_sell_qty
+            rec["broker_observed_exit_vwap"] = broker_observed_sell_vwap
+
+            journal_persistence_failed = False
+            journal_failure_reasons: List[str] = []
+            uncommitted_sell_trades: List[Dict[str, Any]] = []
+
+            for st_row in sell_trades:
+                etid_cur = str(st_row["exchangeTradeId"]).strip()
+                b_oid_cur = str(st_row.get("orderId") or oid).strip()
+                if self.journal_db and hasattr(self.journal_db, "record_fill"):
+                    try:
+                        self.journal_db.record_fill(
+                            broker_order_id=b_oid_cur,
+                            exchange_trade_id=etid_cur,
+                            symbol=rec["symbol"],
+                            traded_price=float(st_row["tradedPrice"]),
+                            traded_quantity=int(st_row["tradedQuantity"]),
+                            traded_at=now_ts,
+                            transaction_type="SELL",
+                            security_id=sec_id,
+                            exchange_segment=seg,
+                            product_type=prod,
+                            parent_order_id=oid,
+                            is_verified_trade=True,
+                        )
+                        if hasattr(self.journal_db, "get_fill_by_exchange_trade_id"):
+                            persisted_row = self.journal_db.get_fill_by_exchange_trade_id(etid_cur)
+                            if not isinstance(persisted_row, dict) or str(persisted_row.get("parent_order_id") or "").strip() != oid:
+                                journal_persistence_failed = True
+                                journal_failure_reasons.append(f"Fill {etid_cur} not present in SQLite after record_fill")
+                                uncommitted_sell_trades.append(dict(st_row))
+                    except Exception as db_err:
+                        journal_persistence_failed = True
+                        journal_failure_reasons.append(f"{type(db_err).__name__}: {db_err}")
+                        uncommitted_sell_trades.append(dict(st_row))
+
+            rec["uncommitted_broker_sell_trades"] = uncommitted_sell_trades
+
+            # Recompute canonical position accounting strictly from durable SQLite fills when journal_db is active
+            if self.journal_db and hasattr(self.journal_db, "get_position_accounting"):
+                try:
+                    acct_summary = self.journal_db.get_position_accounting(oid)
+                    sell_qty = int(acct_summary.get("sell_filled_qty") or 0)
+                    sell_vwap = float(acct_summary.get("sell_vwap") or 0.0) if sell_qty > 0 else float(rec.get("exit_vwap") or 0.0)
+                    if float(acct_summary.get("buy_vwap") or 0.0) > 0:
+                        rec["buy_vwap"] = float(acct_summary["buy_vwap"])
+                except Exception as acct_err:
+                    journal_persistence_failed = True
+                    journal_failure_reasons.append(f"get_position_accounting failed: {acct_err}")
+                    sell_qty = prev_sell_qty
+                    sell_vwap = float(rec.get("exit_vwap") or 0.0)
+            else:
+                sell_qty = broker_observed_sell_qty
+                sell_vwap = broker_observed_sell_vwap if broker_observed_sell_qty > 0 else float(rec.get("exit_vwap") or 0.0)
+
+            # P0-C: If triggered_leg was not identified from leg status, check if verified SELL fills map unambiguously to a known leg ID
+            if not triggered_leg:
+                fill_leg_candidates = set()
+                for st_row in sell_trades:
+                    s_oid = str(st_row.get("orderId") or "").strip()
+                    if s_oid in leg_id_to_name:
+                        fill_leg_candidates.add(leg_id_to_name[s_oid])
+                if not fill_leg_candidates and self.journal_db and hasattr(self.journal_db, "get_sell_fills_for_parent"):
+                    try:
+                        for db_f in self.journal_db.get_sell_fills_for_parent(oid):
+                            b_oid = str(db_f.get("broker_order_id") or "").strip()
+                            if b_oid in leg_id_to_name:
+                                fill_leg_candidates.add(leg_id_to_name[b_oid])
+                    except Exception:
+                        pass
+                if len(fill_leg_candidates) == 1:
+                    triggered_leg = next(iter(fill_leg_candidates))
+                    ambiguous_super_closed = False
+                    rec["ambiguous_super_closed"] = False
+                    rec["exit_evidence_status"] = "FILL_CONFIRMED"
+
+            confirmed_open_qty = max(0, buy_filled - sell_qty)
+
+            # 3. P0-05, P0-B & P1-02: Reconcile against broker positions/holdings for manual exits & orphaned legs
+            broker_net_qty: Optional[int] = None
+            if isinstance(positions_book, list):
+                for p_row in positions_book:
+                    if (
+                        isinstance(p_row, dict)
+                        and str(p_row.get("securityId") or "").strip() == sec_id
+                        and str(p_row.get("exchangeSegment") or seg).strip().upper() == seg
+                        and str(p_row.get("productType") or prod).strip().upper() == prod
+                    ):
+                        try:
+                            raw_nq = p_row.get("netQty")
+                            if isinstance(raw_nq, bool) or raw_nq is None:
+                                broker_net_qty = None
+                            else:
+                                broker_net_qty = int(raw_nq)
+                        except (ValueError, TypeError):
+                            broker_net_qty = None
+                        break
+            if broker_net_qty is None and prod == "CNC" and isinstance(holdings_book, list):
+                for h_row in holdings_book:
+                    if isinstance(h_row, dict) and str(h_row.get("securityId") or "").strip() == sec_id:
+                        try:
+                            raw_hq = h_row.get("totalQty") if h_row.get("totalQty") is not None else h_row.get("availableQty")
+                            if isinstance(raw_hq, bool) or raw_hq is None:
+                                broker_net_qty = None
+                            else:
+                                broker_net_qty = int(raw_hq)
+                        except (ValueError, TypeError):
+                            broker_net_qty = None
+                        break
+
+            # Compute aggregate open bot quantity across all open parent orders sharing (sec_id, seg, prod)
+            # Use max(sell_qty, broker_observed_sell_qty) when checking manual exit so a broker-filled exit with a local DB error
+            # is recognized as a persistence error rather than a manual external sale.
+            effective_parent_open_qty = max(0, buy_filled - max(sell_qty, broker_observed_sell_qty))
+            aggregate_contract_open_qty = 0
+            for o_rec in open_recs:
+                if (
+                    str(o_rec.get("security_id") or "").strip() == sec_id
+                    and str(o_rec.get("segment") or "NSE_EQ").strip().upper() == seg
+                    and str(o_rec.get("product_type") or "CNC").strip().upper() == prod
+                ):
+                    if str(o_rec.get("order_id") or "").strip() == oid:
+                        aggregate_contract_open_qty += effective_parent_open_qty
+                    else:
+                        o_buy = int(o_rec.get("filled_qty") or 0)
+                        o_sell = max(int(o_rec.get("exit_filled_qty") or 0), int(o_rec.get("broker_observed_exit_filled_qty") or 0))
+                        aggregate_contract_open_qty += max(0, o_buy - o_sell)
+
+            has_orphan_condition = (
+                broker_net_qty is not None
+                and (
+                    (broker_net_qty < effective_parent_open_qty and resting_protective_qty > broker_net_qty)
+                    or (broker_net_qty < aggregate_contract_open_qty and resting_protective_qty > 0)
+                    or (rec.get("orphaned_legs_detected", False) and not rec.get("orphaned_legs_cancelled", False))
+                )
+            )
+            if has_orphan_condition:
+                rec["manual_exit_detected"] = True
+                rec["orphaned_legs_detected"] = True
+                orphan_msg = (
+                    f"Manual exit / position reduction detected for {rec['symbol']} ({oid}): "
+                    f"broker netQty={broker_net_qty} < bot openQty={effective_parent_open_qty} (contract aggregate={aggregate_contract_open_qty}) "
+                    f"while protective legs remain resting for {resting_protective_qty} units."
+                )
+                logger.critical(f"[Protection] 🚨 {orphan_msg}")
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(orphan_msg)
+                if not rec.get("orphaned_legs_alerted", False):
+                    rec["orphaned_legs_alerted"] = True
+                    if self.journal_db:
+                        if hasattr(self.journal_db, "record_system_event"):
+                            try:
+                                self.journal_db.record_system_event("MANUAL_EXIT_ORPHANED_LEGS", orphan_msg)
+                            except Exception:
+                                pass
+                        if hasattr(self.journal_db, "enqueue_outbox"):
+                            try:
+                                self.journal_db.enqueue_outbox(
+                                    "CRITICAL_ORPHANED_LEGS_ALERT",
+                                    {
+                                        "text": f"🚨 [ORPHANED_PROTECTION_LEGS] {orphan_msg}",
+                                        "priority": "HIGH",
+                                        "order_id": oid,
+                                        "symbol": rec["symbol"],
+                                    },
+                                )
+                            except Exception:
+                                pass
+
+                # P0-B & P1-02: Durable, bounded per-leg cancellation state machine when position is flat (broker_net_qty == 0)
+                if broker_net_qty == 0 and not rec.get("orphaned_legs_cancelled", False):
+                    def _step_leg_cancellation(
+                        lg_key: str,
+                        lg_oid_val: str,
+                        lg_type_val: str,
+                        lg_obj_val: Optional[Dict[str, Any]],
+                        lg_st_val: str,
+                        cancel_callable: Optional[Callable[[], Any]],
+                        book_available: bool,
+                    ) -> str:
+                        det = _ensure_leg_detail(lg_key, lg_oid_val, lg_type_val, lg_st_val if book_available else "READBACK_UNAVAILABLE")
+                        max_att = int(det.get("max_attempts") or self.orphan_cancel_max_attempts)
+                        cur_att = int(det.get("attempt_count") or 0)
+                        first_req = float(det.get("first_requested_at") or 0.0)
+                        deadline = float(det.get("deadline_at") or 0.0)
+                        next_retry = float(det.get("next_retry_at") or 0.0)
+
+                        # 1. Terminal confirmation from authoritative broker readback always resolves the leg
+                        if book_available and lg_st_val in terminal_leg_states:
+                            det["state"] = "CONFIRMED_TERMINAL"
+                            det["last_broker_status"] = lg_st_val
+                            det["next_retry_at"] = 0.0
+                            leg_cancel_states[lg_key] = "CONFIRMED_TERMINAL"
+                            return "CONFIRMED_TERMINAL"
+
+                        # 2. If broker readback failed or leg is missing from book, never issue blind cancel mutations
+                        if not book_available or lg_obj_val is None:
+                            det["last_broker_status"] = "READBACK_UNAVAILABLE" if not book_available else "MISSING_IN_BOOK"
+                            if first_req > 0.0 and deadline > 0.0 and now_ts >= deadline:
+                                det["state"] = "MANUAL_INTERVENTION_REQUIRED"
+                                det["escalated"] = True
+                                det["escalated_at"] = det.get("escalated_at") or now_ts
+                                leg_cancel_states[lg_key] = "MANUAL_INTERVENTION_REQUIRED"
+                                return "MANUAL_INTERVENTION_REQUIRED"
+                            cur_s = str(leg_cancel_states.get(lg_key) or det.get("state") or "UNKNOWN")
+                            if cur_s == "ACTIVE":
+                                cur_s = "UNKNOWN"
+                            det["state"] = cur_s
+                            leg_cancel_states[lg_key] = cur_s
+                            return cur_s
+
+                        # 3. Leg is confirmed active in broker book (PENDING / TRANSIT / OPEN / ACTIVE / CONFIRM)
+                        if lg_st_val in active_states:
+                            if first_req > 0.0 and deadline > 0.0 and now_ts >= deadline:
+                                det["state"] = "MANUAL_INTERVENTION_REQUIRED"
+                                det["escalated"] = True
+                                det["escalated_at"] = det.get("escalated_at") or now_ts
+                                det["last_error"] = det.get("last_error") or f"Cancellation ACK remained {lg_st_val} past {self.orphan_cancel_deadline_sec:g}s deadline"
+                                leg_cancel_states[lg_key] = "MANUAL_INTERVENTION_REQUIRED"
+                                return "MANUAL_INTERVENTION_REQUIRED"
+
+                            if cur_att > 0 and now_ts < next_retry:
+                                # Still within bounded readback / backoff window; do not issue duplicate cancel mutation
+                                cur_s = str(leg_cancel_states.get(lg_key) or det.get("state") or "ACK_UNKNOWN")
+                                det["state"] = cur_s
+                                leg_cancel_states[lg_key] = cur_s
+                                return cur_s
+
+                            if cur_att >= max_att:
+                                det["state"] = "MANUAL_INTERVENTION_REQUIRED"
+                                det["escalated"] = True
+                                det["escalated_at"] = det.get("escalated_at") or now_ts
+                                det["last_error"] = det.get("last_error") or f"Exhausted {cur_att}/{max_att} safe cancel attempts while broker reports {lg_st_val}"
+                                leg_cancel_states[lg_key] = "MANUAL_INTERVENTION_REQUIRED"
+                                return "MANUAL_INTERVENTION_REQUIRED"
+
+                            if cancel_callable is None:
+                                det["state"] = "UNKNOWN"
+                                leg_cancel_states[lg_key] = "UNKNOWN"
+                                return "UNKNOWN"
+
+                            # Issue bounded cancel request / retry
+                            if first_req <= 0.0:
+                                first_req = now_ts
+                                det["first_requested_at"] = first_req
+                                det["deadline_at"] = first_req + self.orphan_cancel_deadline_sec
+                            cur_att += 1
+                            det["attempt_count"] = cur_att
+                            det["last_requested_at"] = now_ts
+                            det["state"] = "REQUESTED"
+                            leg_cancel_states[lg_key] = "REQUESTED"
+                            try:
+                                c_res = cancel_callable()
+                                if isinstance(c_res, tuple) and len(c_res) >= 2:
+                                    c_ok, c_msg = bool(c_res[0]), str(c_res[1])
+                                else:
+                                    c_ok, c_msg = bool(c_res), str(c_res)
+                            except Exception as c_exc:
+                                c_ok, c_msg = False, f"{type(c_exc).__name__}: {c_exc}"
+
+                            backoff_sec = self.orphan_cancel_retry_backoff_sec * (2 ** max(0, cur_att - 1))
+                            if c_ok:
+                                wait_sec = max(self.orphan_cancel_ack_timeout_sec, backoff_sec)
+                                det["state"] = "ACK_UNKNOWN"
+                                det["last_error"] = c_msg
+                                det["next_retry_at"] = now_ts + wait_sec
+                                leg_cancel_states[lg_key] = "ACK_UNKNOWN"
+                                return "ACK_UNKNOWN"
+                            else:
+                                det["state"] = "REJECTED"
+                                det["last_error"] = c_msg or "Cancel rejected by broker"
+                                det["next_retry_at"] = now_ts + backoff_sec
+                                leg_cancel_states[lg_key] = "REJECTED"
+                                return "REJECTED"
+
+                        # Unrecognized broker leg status
+                        det["state"] = "UNKNOWN"
+                        leg_cancel_states[lg_key] = "UNKNOWN"
+                        return "UNKNOWN"
+
+                    if route == ProtectionRoute.SUPER_ORDER.value:
+                        has_cancel_fn = hasattr(self.broker, "cancel_super_order_leg")
+                        book_ok = so_match is not None and isinstance(super_book, list)
+                        for lg_name, lg_obj, lg_st in (
+                            ("TARGET_LEG", t_leg, t_st),
+                            ("STOP_LOSS_LEG", sl_leg, sl_st),
+                        ):
+                            lg_oid_s = str((lg_obj or {}).get("orderId") or "")
+                            _step_leg_cancellation(
+                                lg_key=lg_name,
+                                lg_oid_val=lg_oid_s,
+                                lg_type_val=lg_name,
+                                lg_obj_val=lg_obj,
+                                lg_st_val=lg_st,
+                                cancel_callable=(lambda l_n=lg_name: self.broker.cancel_super_order_leg(oid, l_n)) if has_cancel_fn else None,
+                                book_available=book_ok,
+                            )
+                        rec["orphaned_leg_cancel_states"] = dict(leg_cancel_states)
+                        rec["orphaned_leg_cancel_details"] = dict(leg_cancel_details)
+                        rec["orphaned_legs_cancelled"] = (
+                            leg_cancel_states.get("TARGET_LEG") == "CONFIRMED_TERMINAL"
+                            and leg_cancel_states.get("STOP_LOSS_LEG") == "CONFIRMED_TERMINAL"
+                        )
+                    elif route == ProtectionRoute.FOREVER_OCO.value:
+                        owned_f_ids = [
+                            str(x).strip()
+                            for x in (rec.get("confirmed_protection_ids") or [])
+                            if str(x).strip() and not str(x).strip().startswith("SUPER-")
+                        ]
+                        fo_by_id = {str(fr.get("orderId") or "").strip(): fr for fr in fo_matches if str(fr.get("orderId") or "").strip()}
+                        has_fo_cancel = hasattr(self.broker, "cancel_forever_order")
+                        book_ok = isinstance(forever_book, list) and bool(fo_by_id)
+                        for f_id in owned_f_ids:
+                            fr_row = fo_by_id.get(f_id)
+                            f_st = str((fr_row or {}).get("orderStatus") or "").strip().upper()
+                            f_leg_t = str((fr_row or {}).get("legName") or "FOREVER_OCO").strip().upper()
+                            _step_leg_cancellation(
+                                lg_key=f_id,
+                                lg_oid_val=f_id,
+                                lg_type_val=f_leg_t,
+                                lg_obj_val=fr_row,
+                                lg_st_val=f_st,
+                                cancel_callable=(lambda fid=f_id: self.broker.cancel_forever_order(fid)) if has_fo_cancel else None,
+                                book_available=book_ok,
+                            )
+                        rec["orphaned_leg_cancel_states"] = dict(leg_cancel_states)
+                        rec["orphaned_leg_cancel_details"] = dict(leg_cancel_details)
+                        rec["orphaned_legs_cancelled"] = bool(owned_f_ids) and all(
+                            leg_cancel_states.get(fid) == "CONFIRMED_TERMINAL" for fid in owned_f_ids
+                        )
+
+                    # Check if any leg escalated to MANUAL_INTERVENTION_REQUIRED
+                    escalated_legs = [
+                        k for k, v in leg_cancel_states.items() if v == "MANUAL_INTERVENTION_REQUIRED"
+                    ]
+                    if escalated_legs and not rec.get("orphaned_legs_cancelled", False):
+                        rec["orphaned_legs_manual_intervention_required"] = True
+                        esc_details_str = ", ".join(
+                            f"{k}(state={leg_cancel_details.get(k, {}).get('state')}, "
+                            f"broker={leg_cancel_details.get(k, {}).get('last_broker_status')}, "
+                            f"attempts={leg_cancel_details.get(k, {}).get('attempt_count')})"
+                            for k in escalated_legs
+                        )
+                        esc_msg = (
+                            f"Orphaned protective leg cancellation requires manual intervention for {rec['symbol']} ({oid}): "
+                            f"{esc_details_str}. New entries remain halted."
+                        )
+                        logger.critical(f"[Protection] 🚨 {esc_msg}")
+                        if gate is not None and hasattr(gate, "halt_new_entries"):
+                            gate.halt_new_entries(esc_msg)
+                        if not rec.get("orphaned_legs_escalation_alerted", False):
+                            rec["orphaned_legs_escalation_alerted"] = True
+                            if self.journal_db:
+                                if hasattr(self.journal_db, "record_system_event"):
+                                    try:
+                                        self.journal_db.record_system_event("ORPHANED_LEG_CANCEL_ESCALATED", esc_msg)
+                                    except Exception:
+                                        pass
+                                if hasattr(self.journal_db, "enqueue_outbox"):
+                                    try:
+                                        self.journal_db.enqueue_outbox(
+                                            "CRITICAL_ORPHANED_LEG_ESCALATION",
+                                            {
+                                                "text": f"🚨 [MANUAL_INTERVENTION_REQUIRED] {esc_msg}",
+                                                "priority": "HIGH",
+                                                "order_id": oid,
+                                                "symbol": rec["symbol"],
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                    elif rec.get("orphaned_legs_cancelled", False):
+                        rec["orphaned_legs_manual_intervention_required"] = False
+                changed = True
+
+            # 4. Update position lifecycle state and emit notifications (P0-01, P0-C, P0-03 & P0-07)
+            buy_vwap = float(rec.get("buy_vwap") or rec.get("original_market_price") or 0.0)
+            rec["triggered_leg"] = triggered_leg if triggered_leg else ""
+            if leg_cancel_states:
+                rec["orphaned_leg_cancel_states"] = dict(leg_cancel_states)
+            if leg_cancel_details:
+                rec["orphaned_leg_cancel_details"] = dict(leg_cancel_details)
+
+            if journal_persistence_failed:
+                # P0-01: Database write/read failed while recording or reading exit fills.
+                # NEVER transition to POSITION_CLOSED or emit a closed confirmation card!
+                rec["reconciliation_required"] = True
+                rec["persistence_uncertain"] = True
+                rec["last_persistence_error"] = "; ".join(journal_failure_reasons)
+                rec["exit_filled_qty"] = sell_qty
+                rec["exit_vwap"] = sell_vwap
+                rec["confirmed_position_open_qty"] = confirmed_open_qty
+                rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                if broker_observed_sell_qty >= buy_filled > 0:
+                    rec["broker_exit_already_executed"] = True
+                persist_msg = (
+                    f"Journal persistence failure during exit reconciliation for {rec['symbol']} ({oid}): "
+                    f"broker_observed_sell={broker_observed_sell_qty}, durable_sell={sell_qty}, "
+                    f"errors={rec['last_persistence_error']}"
+                )
+                logger.critical(f"[Protection] 🚨 {persist_msg}")
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(persist_msg)
+                if not rec.get("persistence_failure_alerted", False):
+                    rec["persistence_failure_alerted"] = True
+                    if self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
+                        try:
+                            self.execution_reporter.process_exit_event(
+                                rec,
+                                "RECONCILIATION_REQUIRED",
+                                observed_at=now_ts,
+                                triggered_leg=triggered_leg,
+                                sell_qty=sell_qty,
+                                buy_vwap=buy_vwap,
+                                sell_vwap=sell_vwap,
+                            )
+                        except Exception:
+                            pass
+                changed = True
+            elif ambiguous_super_closed and not triggered_leg and sell_qty == 0:
+                # P0-C: Parent CLOSED with both legs PENDING, missing, stale, or contradictory ->
+                # retain active monitoring, never fabricate TARGET_LEG or Position Closed, and halt new entries.
+                amb_msg = (
+                    f"Ambiguous Super Order state for {rec['symbol']} ({oid}): parent={parent_st}, "
+                    f"target_leg={t_st or 'MISSING'}, sl_leg={sl_st or 'MISSING'}, verified_sell_qty=0."
+                )
+                logger.warning(f"[Protection] ⚠️ {amb_msg}")
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(amb_msg)
+                rec["confirmed_position_open_qty"] = confirmed_open_qty
+                changed = True
+            elif sell_qty >= buy_filled > 0 and (broker_net_qty is None or broker_net_qty == 0 or broker_net_qty <= aggregate_contract_open_qty):
+                realized_pnl = round((sell_vwap - buy_vwap) * buy_filled, 2) if (buy_vwap > 0 and sell_vwap > 0) else 0.0
+                rec["exit_filled_qty"] = sell_qty
+                rec["exit_vwap"] = sell_vwap
+                rec["realized_pnl"] = realized_pnl
+                rec["confirmed_position_open_qty"] = 0
+                rec["reconciliation_required"] = False
+                rec["persistence_uncertain"] = False
+                rec["last_persistence_error"] = ""
+                rec["position_state"] = PositionLifecycleState.POSITION_CLOSED.value
+                # Commit position lifecycle to SQLite BEFORE confirming closure or emitting POSITION_CLOSED notification
+                if not self._sync_position_lifecycle(rec):
+                    rec["reconciliation_required"] = True
+                    rec["persistence_uncertain"] = True
+                    rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                    if gate is not None and hasattr(gate, "halt_new_entries"):
+                        gate.halt_new_entries(f"Failed to persist POSITION_CLOSED lifecycle row for {rec['symbol']} ({oid})")
+                else:
+                    if self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
+                        self.execution_reporter.process_exit_event(
+                            rec,
+                            "POSITION_CLOSED",
+                            observed_at=now_ts,
+                            triggered_leg=triggered_leg,
+                            sell_qty=sell_qty,
+                            buy_vwap=buy_vwap,
+                            sell_vwap=sell_vwap,
+                            realized_pnl=realized_pnl,
+                        )
+                changed = True
+            elif 0 < sell_qty < buy_filled:
+                part_pnl = round((sell_vwap - buy_vwap) * sell_qty, 2) if (buy_vwap > 0 and sell_vwap > 0) else 0.0
+                rec["exit_filled_qty"] = sell_qty
+                rec["exit_vwap"] = sell_vwap
+                rec["realized_pnl"] = part_pnl
+                rec["confirmed_position_open_qty"] = confirmed_open_qty
+                rec["reconciliation_required"] = False
+                rec["persistence_uncertain"] = False
+                rec["position_state"] = PositionLifecycleState.EXIT_PART_FILLED.value
+                if not self._sync_position_lifecycle(rec):
+                    rec["reconciliation_required"] = True
+                    rec["persistence_uncertain"] = True
+                    rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                    if gate is not None and hasattr(gate, "halt_new_entries"):
+                        gate.halt_new_entries(f"Failed to persist EXIT_PART_FILLED lifecycle row for {rec['symbol']} ({oid})")
+                elif sell_qty != prev_sell_qty and self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
+                    self.execution_reporter.process_exit_event(
+                        rec,
+                        "EXIT_PARTIAL_FILLED",
+                        observed_at=now_ts,
+                        triggered_leg=triggered_leg,
+                        sell_qty=sell_qty,
+                        buy_vwap=buy_vwap,
+                        sell_vwap=sell_vwap,
+                        realized_pnl=part_pnl,
+                    )
+                changed = True
+            elif triggered_leg and sell_qty == 0:
+                # P0-03 & P0-C: Verified triggered leg without SELL tradebook fill is EXIT_TRIGGERED, NOT closed!
+                rec["position_state"] = PositionLifecycleState.EXIT_TRIGGERED.value
+                rec["confirmed_position_open_qty"] = confirmed_open_qty
+                if (prev_pos_state != PositionLifecycleState.EXIT_TRIGGERED.value or triggered_leg != prev_trig_leg):
+                    ev_key = "SL_TRIGGERED" if "STOP" in triggered_leg.upper() else "TARGET_TRIGGERED"
+                    if self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
+                        self.execution_reporter.process_exit_event(
+                            rec,
+                            ev_key,
+                            observed_at=now_ts,
+                            triggered_leg=triggered_leg,
+                            sell_qty=0,
+                            buy_vwap=buy_vwap,
+                        )
+                    changed = True
+            elif both_legs_dead and confirmed_open_qty > 0 and (broker_net_qty is None or broker_net_qty > 0):
+                rec["position_state"] = PositionLifecycleState.UNPROTECTED.value
+                self._record_unprotected_and_halt(
+                    rec=rec,
+                    new_qty=confirmed_open_qty,
+                    sl_trigger=float(rec.get("confirmed_sl_price") or 0.0),
+                    sl_limit=float(rec.get("confirmed_sl_price") or 0.0),
+                    target_price=float(rec.get("confirmed_target_price") or 0.0),
+                    status_label="UNPROTECTED",
+                    reason=f"Protective exit legs for {rec['symbol']} ({oid}) became terminal (cancelled/rejected/expired) while {confirmed_open_qty} units remain open",
+                )
+                changed = True
+
+            if (changed or rec.get("position_state") != prev_pos_state) and rec.get("position_state") not in (
+                PositionLifecycleState.POSITION_CLOSED.value,
+                PositionLifecycleState.EXIT_PART_FILLED.value,
+            ):
+                self._sync_position_lifecycle(rec)
+
+        return changed
+
     def should_poll(self, is_market_open_fn: Optional[Callable[[], bool]] = None) -> bool:
-        if bool(self.pending):
+        if bool(self.pending) or self.has_open_monitored_positions():
             return True
         if is_lifecycle_open():
             return True
