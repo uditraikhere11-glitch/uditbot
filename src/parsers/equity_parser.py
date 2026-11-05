@@ -353,6 +353,12 @@ def parse_equity_regex_detailed(
             resolved_by_name = _resolve_by_name(phrase)
             if resolved_by_name:
                 symbol = resolved_by_name
+            elif normalize_name(phrase[0])[0] in _NAME_INDEX:
+                return (
+                    None, "Unresolved or ambiguous multi-word company name",
+                    SignalAction.BLOCKED, DecisionReasonCode.UNRESOLVED_SYMBOL.value,
+                    PriceStatus.ABSENT, {},
+                )
 
     # --- Stage 2: Action pattern fallback (company name phrase or ticker) ---
     if not symbol:
@@ -361,6 +367,12 @@ def parse_equity_regex_detailed(
             phrase = _phrase_tokens(phrase_match.group(1), skip_noise=True)
             if _NAME_INDEX and len(phrase) >= 2:
                 symbol = _resolve_by_name(phrase)
+                if not symbol and normalize_name(phrase[0])[0] in _NAME_INDEX:
+                    return (
+                        None, "Unresolved or ambiguous multi-word company name",
+                        SignalAction.BLOCKED, DecisionReasonCode.UNRESOLVED_SYMBOL.value,
+                        PriceStatus.ABSENT, {},
+                    )
 
         if not symbol:
             for alias_phrase, canonical in sorted(COMMON_STOCK_ALIASES.items(), key=lambda x: -len(x[0])):
