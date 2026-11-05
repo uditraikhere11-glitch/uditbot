@@ -1,8 +1,7 @@
-"""UDITBOT Control Center read-only status and safe Equity AMO configuration routes.
+"""Authenticated Control Center status and independent Equity/F&O AMO settings.
 
-This module deliberately does not implement order placement, systemd control,
-F&O AMO, or Emergency STOP changes. It reuses the existing Setup service API
-and ConfigChangeTracker's durable serialized configuration coordinator.
+F&O AMO routes only change configuration or cancel LOCAL staged signals. They
+never submit a naked option order; dispatch uses protected Super Orders at OPEN.
 """
 
 from __future__ import annotations
@@ -36,6 +35,7 @@ _PENDING_STATES = {
 _ALLOWED_IDLE = {"RUNNING", "STOPPED_BY_OWNER", "STOPPED_OTHER", "FAILED"}
 _CONFIG_KEY = "EQUITY_AMO_ENABLED"
 _KEY_LINE = re.compile(r"^[ \t]*EQUITY_AMO_ENABLED[ \t]*=", re.IGNORECASE)
+_ALLOWED_AMO_KEYS = {"EQUITY_AMO_ENABLED", "FNO_AMO_ENABLED"}
 
 
 def _json(payload: Dict[str, Any], code: int = 200) -> JSONResponse:
@@ -66,19 +66,22 @@ def _owner_stop_pending(tracker: ConfigChangeTracker) -> bool:
     return bool(isinstance(rec, dict) and rec.get("deferred_stop_pending"))
 
 
-def _single_key_change(content: str, enabled: bool) -> str:
+def _single_key_change(content: str, enabled: bool, key: str = _CONFIG_KEY) -> str:
     """Preserve bytes outside one existing .env assignment (newline-style inclusive).
 
     Refuse duplicate/case-insensitive keys, CR-only line separators and corrupted
     values, instead of producing an ambiguous config. Never serialize secrets.
     """
+    if key not in _ALLOWED_AMO_KEYS:
+        raise ValueError("Unsupported AMO configuration key")
+    key_line = re.compile(r"^[ \t]*" + re.escape(key) + r"[ \t]*=", re.IGNORECASE)
     if "\x00" in content or ("\r" in content and "\r\n" not in content):
         raise ValueError("Configuration file has unsupported line encoding")
     value = "true" if enabled else "false"
     lines = content.splitlines(keepends=True)
-    idxs = [i for i, s in enumerate(lines) if _KEY_LINE.match(s)]
+    idxs = [i for i, s in enumerate(lines) if key_line.match(s)]
     if len(idxs) > 1:
-        raise ValueError("Duplicate EQUITY_AMO_ENABLED keys must be repaired in Setup")
+        raise ValueError(f"Duplicate {key} keys must be repaired in Setup")
     if idxs:
         i = idxs[0]
         original = lines[i]
@@ -95,7 +98,7 @@ def _single_key_change(content: str, enabled: bool) -> str:
         nl = "\r\n" if "\r\n" in content else "\n"
         if lines and not lines[-1].endswith(("\n", "\r")):
             lines[-1] += nl
-        lines.append(f"{_CONFIG_KEY}={value}{nl}")
+        lines.append(f"{key}={value}{nl}")
     return "".join(lines)
 
 
@@ -107,6 +110,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     state = str(raw.get("service_state") or "UNKNOWN")
     verified = raw.get("runtime_verified") is True and state == "RUNNING"
     saved = bool(cfg.equity_amo_enabled)
+    fno_saved = bool(cfg.fno_amo_enabled)
     newest = tracker.get_change_record()
     pending = _pending(tracker)
     stopping = _owner_stop_pending(tracker)
@@ -138,7 +142,14 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         "equity_amo_active": active,
         "equity_amo_can_edit": can_edit,
         "equity_amo_message": msg,
-        "fno_amo_supported": False,
+        "fno_amo_supported": True,
+        "fno_amo_route": "LOCAL_STAGED_PROTECTED_SUPER_AT_OPEN",
+        "fno_amo_saved": fno_saved,
+        "fno_amo_active": fno_saved if verified else None,
+        "fno_amo_can_edit": can_edit,
+        "fno_amo_message": (
+            msg + " · F&O AMO stages locally; no broker order until market OPEN"
+        ),
         "latest_change_state": newest.state.value if newest else None,
         "latest_change_id": newest.change_id if newest else None,
         "transition_gate_active": gate.get("active", True),
@@ -262,6 +273,7 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
         except Exception:
             return _json({"service_state": "UNKNOWN", "runtime_verified": False,
                           "equity_amo_can_edit": False, "equity_amo_active": None,
+                           "fno_amo_can_edit": False, "fno_amo_active": None,
                           "warning": "Unable to verify service configuration"}, 503)
 
     @app.get("/control/health")
