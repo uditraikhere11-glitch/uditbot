@@ -162,6 +162,7 @@ class TradingBotPipeline:
         """V12-23: Reloads configuration from .env into the active pipeline."""
         with self._pipeline_lock:
             self.cfg = AppConfig.from_env(env_file=env_file)
+            self._amo_queue = None
             self.risk_manager.cfg = self.cfg
             self.broker.cfg = self.cfg
             self.notifier = TelegramNotifier(self.cfg)
@@ -423,8 +424,14 @@ class TradingBotPipeline:
         No broker /orders F&O AMO is placed.
         """
         with self._pipeline_lock:
-            if not (self.cfg.trading_mode == TradingMode.LIVE
-                    and self.cfg.fno_active and self.cfg.fno_amo_enabled):
+            if not self.cfg.fno_amo_enabled:
+                # A switch-off must not leave deferred entries eligible for a
+                # later re-enable, even across service restarts.
+                path = os.path.join(self.cfg.data_dir, "fno_amo_queue.sqlite3")
+                if os.path.isfile(path) and not os.path.islink(path):
+                    self._get_fno_amo_queue().cancel_all_queued()
+                return False
+            if not (self.cfg.trading_mode == TradingMode.LIVE and self.cfg.fno_active):
                 return False
             is_open, _ = market_status()
             if not is_open:
@@ -818,6 +825,13 @@ class TradingBotPipeline:
                 used_super = True
             else:
                 ok, broker_id, msg = self.broker.place_order(order_req)
+
+            if ok and not broker_id:
+                # A claimed F&O AMO must never be recorded as successfully
+                # submitted without an authoritative broker identifier.
+                ok = False
+                msg = "Broker submission outcome UNKNOWN: success response lacked order ID"
+                self.reconciliation_gate.halt_new_entries(msg)
 
             if trace is not None:
                 trace.mark_l10_dhan_ack(dhan_http_ms=getattr(self.broker, "last_order_http_latency_ms", None))
