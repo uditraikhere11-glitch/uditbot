@@ -813,6 +813,8 @@ _KEY_ALIASES: Dict[str, str] = {
     "fno_fixed_lots": "fno_fixed_lots",
     "fno_max_lots": "fno_max_lots",
     "allow_next_month_expiry_fallback": "allow_next_month_expiry_fallback",
+    "fno_amo_enabled": "fno_amo_enabled",
+    "fno_amo_max_age_sec": "fno_amo_max_age_sec",
     "equity_sl_pct": "equity_sl_pct",
     "equity_target_pct": "equity_target_pct",
     "fno_sl_pct": "fno_sl_pct",
@@ -854,6 +856,7 @@ _BOOL_CANONICAL_FIELDS: Set[str] = {
     "ignore_backlog_on_restart",
     "allow_next_month_expiry_fallback",
     "equity_amo_enabled",
+    "fno_amo_enabled",
 }
 
 _INT_CANONICAL_FIELDS: Set[str] = {
@@ -872,6 +875,7 @@ _FLOAT_CANONICAL_FIELDS: Set[str] = {
     "equity_budget_inr",
     "equity_price_markup_pct",
     "equity_amo_max_reference_age_sec",
+    "fno_amo_max_age_sec",
     "fno_capital_per_trade",
     "equity_sl_pct",
     "equity_target_pct",

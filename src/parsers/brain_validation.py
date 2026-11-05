@@ -178,7 +178,7 @@ _TARGET_CLAUSE_MASK_RE = re.compile(
 _OPTION_CONTRACT_CANDIDATE_RE = re.compile(
     r"(?<![A-Za-z0-9&\-])#?\s*(?P<sym>[A-Za-z][A-Za-z&\-]*)"
     r"(?:\s+(?:(?P<pre_day>\d{1,2})(?:st|nd|rd|th)?\s+)?(?P<pre_mon>JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T|TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?))?"
-    r"\s+(?P<strike>\d+(?:,\d+)*(?:\.\d+)?)\s*(?P<opt>CE|PE|CALL|PUT)\b",
+    r"\s*(?P<strike>\d+(?:,\d+)*(?:\.\d+)?)\s*(?P<opt>CE|PE|CALL|PUT)\b",
     re.IGNORECASE,
 )
 
@@ -965,33 +965,57 @@ def detect_multiple_option_contracts(text: str) -> Tuple[bool, List[str], str]:
     if len(contracts) > 1:
         return True, contracts, f"Multiple/mixed option contracts detected: {contracts}"
 
-    # BRAIN-V3-02: Check if another valid stock ticker or action-bound ticker is mentioned alongside the option contract
-    # e.g. "BUY SBIN? RELIANCE 800 PE @100" or "#SBIN RELIANCE 800 PE @100"
+    # A stock name occurring in commentary does NOT constitute a second contract.
+    # In particular, "in mind", "add slowly", "limited qty", and "#Positional"
+    # must not be treated as additional F&O underlyings.  A second fully formed
+    # contract is already rejected above; retain the legacy conflicting-header
+    # protection only when another symbol is attached to the actual trade line.
     if len(contract_syms) == 1:
         primary_sym = next(iter(contract_syms))
-        other_syms: Set[str] = set()
-        for hm in re.finditer(r"#\s*([A-Za-z][A-Za-z0-9&\-]{1,14})\b", norm):
-            cand = hm.group(1).upper()
-            if cand != primary_sym and cand not in _NON_CONTRACT_WORDS:
-                if not VALID_EQUITY_SYMBOLS or cand in VALID_EQUITY_SYMBOLS:
-                    other_syms.add(cand)
-        for am in re.finditer(
-            r"\b(?:buy|bought|add|added|in|sell|watch)\s+#?\s*([A-Za-z][A-Za-z0-9&\-]{1,14})\b",
-            norm,
+        primary_match = next(
+            m for m in _OPTION_CONTRACT_CANDIDATE_RE.finditer(norm)
+            if m.group("sym").upper() == primary_sym
+        )
+        line_start = norm.rfind("\n", 0, primary_match.start()) + 1
+        prefix = norm[line_start:primary_match.start()]
+        conflict = re.search(
+            r"(?:^|\s)(?:(?:buy|bought|add|added|sell)\s+#?(?P<action_sym>[A-Za-z][A-Za-z0-9&\-]{1,14})|#(?P<hash_sym>[A-Za-z][A-Za-z0-9&\-]{1,14}))\s*[?!,:-]?\s*$",
+            prefix,
             flags=re.IGNORECASE,
-        ):
-            cand = am.group(1).upper()
+        )
+        if conflict:
+            cand = (conflict.group("action_sym") or conflict.group("hash_sym")).upper()
+            # Metadata hashtags are not trade symbols even when placed before
+            # the contract header.  This exemption is F&O-only.
+            metadata = {
+                "POSITIONAL", "INTRADAY", "SWING", "HOLDING", "LEARNING",
+                "DISCLAIMER", "BREAKOUT", "CHART", "NEWS", "VIEW",
+                "WATCHLIST", "MOMENTUM", "LEVELS", "TARGET", "SL",
+            }
+            if (
+                cand != primary_sym
+                and cand not in _NON_CONTRACT_WORDS
+                and cand not in metadata
+                and (not VALID_EQUITY_SYMBOLS or cand in VALID_EQUITY_SYMBOLS)
+            ):
+                all_found = sorted((primary_sym, cand))
+                return True, all_found, f"Conflicting underlyings in option contract header: {all_found}"
+
+        # A separate explicit BUY line with another symbol and entry premium is
+        # also actionable (unlike free-form commentary without a premium).
+        for line in norm.splitlines():
+            buy_m = re.match(
+                r"^\s*(?:buy|bought|add|added)\s+#?(?P<sym>[A-Za-z][A-Za-z0-9&\-]{1,14})\s*(?:@|at|cmp\s*@?)\s*\d",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if not buy_m:
+                continue
+            cand = buy_m.group("sym").upper()
             if cand != primary_sym and cand not in _NON_CONTRACT_WORDS:
                 if not VALID_EQUITY_SYMBOLS or cand in VALID_EQUITY_SYMBOLS:
-                    other_syms.add(cand)
-        if VALID_EQUITY_SYMBOLS:
-            for wm in re.finditer(r"\b([A-Za-z][A-Za-z0-9&\-]{2,14})\b", norm):
-                cand = wm.group(1).upper()
-                if cand != primary_sym and cand not in _NON_CONTRACT_WORDS and cand in VALID_EQUITY_SYMBOLS:
-                    other_syms.add(cand)
-        if other_syms:
-            all_found = sorted({primary_sym} | other_syms)
-            return True, all_found, f"Conflicting/multiple underlyings in option message: {all_found}"
+                    all_found = sorted((primary_sym, cand))
+                    return True, all_found, f"Second actionable trade line in option message: {all_found}"
 
     return False, contracts, ""
 
@@ -1408,10 +1432,6 @@ def validate_fno_candidate(
     if is_neg:
         return None, PriceStatus.INVALID, {}, DecisionReasonCode.ANALYSIS_COMMENTARY.value, neg_reason
 
-    is_multi, _, multi_reason = detect_multiple_option_contracts(norm)
-    if is_multi:
-        return None, PriceStatus.INVALID, {}, DecisionReasonCode.AMBIGUOUS_CONTRACT.value, multi_reason
-
     clean_sym = (symbol or "").strip().upper() if isinstance(symbol, str) else ""
     idx_set = index_underlyings or {
         "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYBANK",
@@ -1433,6 +1453,13 @@ def validate_fno_candidate(
             DecisionReasonCode.UNRESOLVED_SYMBOL.value,
             f"Invalid non-symbol keyword '{clean_sym}' cannot be an option underlying",
         )
+
+
+    # Check genuine multiple contracts only after primary-index rejection, so
+    # NIFTY/SENSEX report INDEX_REJECTED instead of a spurious ambiguity.
+    is_multi, _, multi_reason = detect_multiple_option_contracts(norm)
+    if is_multi:
+        return None, PriceStatus.INVALID, {}, DecisionReasonCode.AMBIGUOUS_CONTRACT.value, multi_reason
 
     sym_ok, sym_span, sym_offsets = symbol_or_company_appears_in_text_with_offsets(clean_sym, norm)
     if not sym_ok or sym_offsets is None:
