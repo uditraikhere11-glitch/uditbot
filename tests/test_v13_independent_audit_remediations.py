@@ -324,6 +324,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
         c = DhanClient(self.cfg, self.stop)
         c.order_status = Mock(return_value={"orderStatus": "TRADED", "filledQty": 10, "averageTradedPrice": 10.01})
         c.trades_avg_price = Mock(return_value=10.01)
+        c.session.get = Mock(return_value=SimpleNamespace(status_code=200, text="[]", json=lambda: []))
         c.get_positions = Mock(return_value=[{"securityId": "3045", "netQty": 10}])
         c.session.post = Mock(
             return_value=SimpleNamespace(

@@ -523,6 +523,9 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             return_value={"orderStatus": "TRADED", "filledQty": 15, "averageTradedPrice": 800.0}
         )
         client.trades_avg_price = MagicMock(return_value=800.0)
+        client.session.get = MagicMock(
+            return_value=MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
+        )
         # Dhan returns order ID on POST, but Forever order book is empty (no active legs)
         client.get_positions = MagicMock(return_value=[{"securityId": "3045", "netQty": 15}])
         client.place_forever_oco = MagicMock(return_value=(True, "OCO-GHOST-1", "Placed"))
@@ -566,6 +569,9 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             return_value={"orderStatus": "TRADED", "filledQty": 100, "averageTradedPrice": 95.0}
         )
         client.trades_avg_price = MagicMock(return_value=95.0)
+        client.session.get = MagicMock(
+            return_value=MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
+        )
         client.modify_super_order_protection = MagicMock(
             return_value=(False, "Failed to modify STOP_LOSS_LEG (400): RMS rejected")
         )

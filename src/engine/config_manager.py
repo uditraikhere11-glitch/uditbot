@@ -539,6 +539,21 @@ class ReadOnlyDhanBrokerAdapter:
             raise RuntimeError("Broker positions read is unavailable; cannot verify missing LIVE journal")
         return self._get_cached("positions", self._broker.get_positions)
 
+    def get_holdings(self) -> Any:
+        if hasattr(self._broker, "get_holdings"):
+            return self._get_cached("holdings", self._broker.get_holdings)
+        return []
+
+    def get_trade_book(self) -> Any:
+        if hasattr(self._broker, "get_trade_book"):
+            return self._get_cached("trade_book", self._broker.get_trade_book)
+        return []
+
+    def get_trades_for_order(self, order_id: str) -> Any:
+        if hasattr(self._broker, "get_trades_for_order"):
+            return self._broker.get_trades_for_order(order_id)
+        return []
+
     def evaluate_forever_oco_protection(self, *args, **kwargs) -> Any:
         if hasattr(self._broker, "evaluate_forever_oco_protection"):
             return self._broker.evaluate_forever_oco_protection(*args, **kwargs)
@@ -808,6 +823,7 @@ _KEY_ALIASES: Dict[str, str] = {
     "equity_cmp_execution_policy": "equity_cmp_execution_policy",
     "equity_amo_enabled": "equity_amo_enabled",
     "equity_amo_max_reference_age_sec": "equity_amo_max_reference_age_sec",
+    "equity_protection_route": "equity_protection_route",
     "fno_sizing_mode": "fno_sizing_mode",
     "fno_capital_per_trade": "fno_capital_per_trade",
     "fno_fixed_lots": "fno_fixed_lots",
@@ -839,6 +855,7 @@ _EXCLUDED_NON_HASH_FIELDS: Set[str] = {
     "journal_db_path",
     "dhan_token_file",
     "_loaded_from_env",
+    "_explicit_equity_protection_route",
     "is_live_mode",
     "csrf_token",
     "confirm_live",
@@ -890,6 +907,7 @@ _UPPER_ENUM_FIELDS: Set[str] = {
     "equity_product_type",
     "equity_sizing_mode",
     "equity_cmp_execution_policy",
+    "equity_protection_route",
     "fno_sizing_mode",
     "insufficient_funds_policy",
     "mode_switch_position_policy",
@@ -2087,6 +2105,7 @@ class ConfigChangeTracker:
                 "sl_pct", "SL_PCT",
                 "target_pct", "TARGET_PCT",
                 "fno_max_lots", "FNO_MAX_LOTS",
+                "equity_price_markup_pct", "EQUITY_PRICE_MARKUP_PCT",
                 "min_trade_funds_inr", "MIN_TRADE_FUNDS_INR",
             ):
                 if k in params and isinstance(params[k], bool):
@@ -2111,6 +2130,10 @@ class ConfigChangeTracker:
             fno_lots = int(params.get("fno_max_lots", params.get("FNO_MAX_LOTS", 3)))
             if fno_lots <= 0:
                 return False, "F&O Max Lots must be at least 1"
+
+            eq_route = str(params.get("equity_protection_route", params.get("EQUITY_PROTECTION_ROUTE", "FOREVER_OCO")) or "FOREVER_OCO").upper().strip()
+            if eq_route not in ("FOREVER_OCO", "SUPER_ORDER"):
+                return False, f"Invalid EQUITY_PROTECTION_ROUTE '{eq_route}'; must be FOREVER_OCO or SUPER_ORDER"
 
             cmp_pol = str(params.get("equity_cmp_execution_policy", params.get("EQUITY_CMP_EXECUTION_POLICY", "STRICT_TIMESTAMP"))).upper().strip()
             if cmp_pol not in ("STRICT_TIMESTAMP", "DARVAS_HTTP_SUCCESS"):
@@ -2417,7 +2440,7 @@ class ConfigChangeTracker:
 
             if filled > 0:
                 prot_verified = 0
-                if prod == "MARGIN" and oid in so_by_id:
+                if oid in so_by_id:
                     if not so_loaded:
                         return False, "BROKER_RECONCILIATION_FAILED: Super Order book unavailable to verify filled MARGIN order."
                     ver_so = verify_super_order_record(so_by_id[oid], oid, expected_security_id=sec_id or None, expected_segment=seg or None, expected_product_type=prod or None)
@@ -2922,9 +2945,10 @@ class ConfigChangeTracker:
                             linked_so_ids.append(s_oid)
 
                 prod_up = str(prod_type or "CNC").strip().upper()
-                if prod_up == "MARGIN" and not so_book_loaded and not fo_book_loaded:
+                is_super_hint = bool(linked_so_ids) or bool((w_rec or {}).get("is_super_order")) or (str((w_rec or {}).get("protection_route") or "").upper() == "SUPER_ORDER")
+                if (prod_up == "MARGIN" or is_super_hint) and not so_book_loaded and not fo_book_loaded:
                     return 0, "BROKER_RECONCILIATION_FAILED: Broker Super Order book unavailable to confirm protective legs."
-                if prod_up != "MARGIN" and not fo_book_loaded:
+                if prod_up != "MARGIN" and not is_super_hint and not fo_book_loaded and not so_book_loaded:
                     return 0, "BROKER_RECONCILIATION_FAILED: Broker Forever OCO book unavailable to confirm protective legs."
 
                 total_verified = 0

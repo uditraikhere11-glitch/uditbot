@@ -42,6 +42,196 @@ class SignalType(str, Enum):
     OPTION = "OPTION"
 
 
+class ProtectionRoute(str, Enum):
+    SUPER_ORDER = "SUPER_ORDER"
+    FOREVER_OCO = "FOREVER_OCO"
+    UNKNOWN = "UNKNOWN"
+
+
+class PositionLifecycleState(str, Enum):
+    ENTRY = "ENTRY"
+    POSITION_OPEN = "POSITION_OPEN"
+    PROTECTED = "PROTECTED"
+    EXIT_TRIGGERED = "EXIT_TRIGGERED"
+    EXIT_PART_FILLED = "EXIT_PART_FILLED"
+    EXIT_FILLED = "EXIT_FILLED"
+    POSITION_CLOSED = "POSITION_CLOSED"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+    PERSISTENCE_UNCERTAIN = "PERSISTENCE_UNCERTAIN"
+    UNPROTECTED = "UNPROTECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+class NotificationLifecycleState(str, Enum):
+    SIGNAL_ACCEPTED = "SIGNAL_ACCEPTED"
+    ORDER_SUBMITTED = "ORDER_SUBMITTED"
+    ORDER_ACK_PENDING = "ORDER_ACK_PENDING"
+    ENTRY_PARTIAL_FILLED = "ENTRY_PARTIAL_FILLED"
+    ENTRY_FILLED_VERIFIED = "ENTRY_FILLED_VERIFIED"
+    PROTECTION_PENDING = "PROTECTION_PENDING"
+    PROTECTION_VERIFIED_ACTIVE = "PROTECTION_VERIFIED_ACTIVE"
+    PROTECTION_UNVERIFIED = "PROTECTION_UNVERIFIED"
+    PROTECTION_REJECTED = "PROTECTION_REJECTED"
+    TARGET_TRIGGERED = "TARGET_TRIGGERED"
+    SL_TRIGGERED = "SL_TRIGGERED"
+    EXIT_PARTIAL_FILLED = "EXIT_PARTIAL_FILLED"
+    EXIT_FILLED = "EXIT_FILLED"
+    POSITION_CLOSED = "POSITION_CLOSED"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+    ORDER_REJECTED = "ORDER_REJECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+# P0-01: Explicit Dhan v2 product/segment/protection-route capability matrix.
+# Dhan Super Order API (/v2/super/orders) supports CNC, INTRADAY, MARGIN, MTF across NSE_EQ, BSE_EQ, NSE_FNO, BSE_FNO.
+# Dhan Forever Order API (/v2/forever/orders) supports CNC and MTF (note: CNC SELL OCO on existing holdings requires DDPI/POA or T+1 settlement).
+PROTECTION_CAPABILITY_MATRIX: Dict[Tuple[str, str], Dict[str, Any]] = {
+    ("NSE_EQ", "CNC"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value, ProtectionRoute.FOREVER_OCO.value),
+        "default_new_entry_route": ProtectionRoute.FOREVER_OCO.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": True,
+    },
+    ("BSE_EQ", "CNC"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value, ProtectionRoute.FOREVER_OCO.value),
+        "default_new_entry_route": ProtectionRoute.FOREVER_OCO.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": True,
+    },
+    ("NSE_EQ", "MTF"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value, ProtectionRoute.FOREVER_OCO.value),
+        "default_new_entry_route": ProtectionRoute.FOREVER_OCO.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("BSE_EQ", "MTF"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value, ProtectionRoute.FOREVER_OCO.value),
+        "default_new_entry_route": ProtectionRoute.FOREVER_OCO.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("NSE_EQ", "INTRADAY"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value,),
+        "default_new_entry_route": ProtectionRoute.SUPER_ORDER.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("BSE_EQ", "INTRADAY"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value,),
+        "default_new_entry_route": ProtectionRoute.SUPER_ORDER.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("NSE_FNO", "MARGIN"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value,),
+        "default_new_entry_route": ProtectionRoute.SUPER_ORDER.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("BSE_FNO", "MARGIN"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value,),
+        "default_new_entry_route": ProtectionRoute.SUPER_ORDER.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("NSE_FNO", "INTRADAY"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value,),
+        "default_new_entry_route": ProtectionRoute.SUPER_ORDER.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+    ("BSE_FNO", "INTRADAY"): {
+        "supported_routes": (ProtectionRoute.SUPER_ORDER.value,),
+        "default_new_entry_route": ProtectionRoute.SUPER_ORDER.value,
+        "same_day_atomic_route": ProtectionRoute.SUPER_ORDER.value,
+        "forever_oco_requires_settled_holdings_or_ddpi": False,
+    },
+}
+
+
+def resolve_protection_route_capability(
+    exchange_segment: str,
+    product_type: str,
+    preferred_route: Optional[str] = None,
+) -> Tuple[bool, str, str]:
+    """
+    P0-01 & P0-02: Validates `(exchange_segment, product_type, preferred_route)` against
+    `PROTECTION_CAPABILITY_MATRIX`.
+    Returns `(is_supported, resolved_route, detail_message)`.
+    Never infers protection route from `product_type == "MARGIN"` alone.
+    """
+    seg = str(exchange_segment or "").strip().upper()
+    prod = str(product_type or "").strip().upper()
+    cap = PROTECTION_CAPABILITY_MATRIX.get((seg, prod))
+    if not cap:
+        return (
+            False,
+            ProtectionRoute.UNKNOWN.value,
+            f"Unsupported segment/product combination ({seg}/{prod}) in protection capability matrix",
+        )
+    supported = cap["supported_routes"]
+    if preferred_route is not None and str(preferred_route).strip() != "":
+        req_route = str(preferred_route).strip().upper()
+        if req_route not in supported:
+            return (
+                False,
+                ProtectionRoute.UNKNOWN.value,
+                f"Protection route '{req_route}' is not supported for {seg}/{prod} (supported: {', '.join(supported)})",
+            )
+        return True, req_route, f"Verified route {req_route} for {seg}/{prod}"
+    default_route = str(cap["default_new_entry_route"])
+    return True, default_route, f"Default route {default_route} for {seg}/{prod}"
+
+
+def infer_record_protection_route(rec: Dict[str, Any]) -> str:
+    """
+    P0-02: Resolves the authoritative `protection_route` for a watcher or journal record.
+    - Uses explicit `protection_route` (`SUPER_ORDER` or `FOREVER_OCO`) when present.
+    - Returns `UNKNOWN` if explicitly marked `UNKNOWN` or if ambiguous.
+    - Safely migrates legacy records when unambiguous (`is_super_order=True` -> `SUPER_ORDER`;
+      `is_super_order=False` with `product_type in ('CNC', 'MTF')` -> `FOREVER_OCO`).
+    """
+    if not isinstance(rec, dict):
+        return ProtectionRoute.UNKNOWN.value
+    explicit = str(rec.get("protection_route") or "").strip().upper()
+    if explicit in (ProtectionRoute.SUPER_ORDER.value, ProtectionRoute.FOREVER_OCO.value):
+        return explicit
+    if explicit == ProtectionRoute.UNKNOWN.value:
+        return ProtectionRoute.UNKNOWN.value
+
+    raw_super = rec.get("is_super_order")
+    prod = str(rec.get("product_type") or "").strip().upper()
+    seg = str(rec.get("segment") or rec.get("exchange_segment") or "").strip().upper()
+
+    if raw_super is True or (isinstance(raw_super, int) and not isinstance(raw_super, bool) and raw_super == 1):
+        if (seg, prod) in PROTECTION_CAPABILITY_MATRIX and ProtectionRoute.SUPER_ORDER.value in PROTECTION_CAPABILITY_MATRIX[(seg, prod)]["supported_routes"]:
+            return ProtectionRoute.SUPER_ORDER.value
+        if not seg and prod in ("CNC", "MTF", "MARGIN", "INTRADAY"):
+            return ProtectionRoute.SUPER_ORDER.value
+        return ProtectionRoute.UNKNOWN.value
+
+    if raw_super is False or (isinstance(raw_super, int) and not isinstance(raw_super, bool) and raw_super == 0):
+        if prod in ("CNC", "MTF"):
+            return ProtectionRoute.FOREVER_OCO.value
+        return ProtectionRoute.UNKNOWN.value
+
+    # Legacy record where is_super_order was omitted (None)
+    pending_oco = rec.get("pending_oco")
+    if isinstance(pending_oco, dict) and str(pending_oco.get("route") or "").strip().upper() in (
+        ProtectionRoute.SUPER_ORDER.value,
+        ProtectionRoute.FOREVER_OCO.value,
+    ):
+        return str(pending_oco["route"]).strip().upper()
+    if prod in ("CNC", "MTF") and bool(
+        rec.get("forever_order_id")
+        or rec.get("oco_order_id")
+        or rec.get("confirmed_protection_ids")
+    ):
+        return ProtectionRoute.FOREVER_OCO.value
+
+    return ProtectionRoute.UNKNOWN.value
+
+
 class ProtectionVerificationStatus(str, Enum):
     VERIFIED_ACTIVE = "VERIFIED_ACTIVE"
     UNVERIFIED = "UNVERIFIED"
@@ -226,6 +416,7 @@ class ValidationResult(BaseModel):
     freshness_verified: Optional[bool] = None
     quote_freshness_status: Optional[str] = None
     broker_order_status: Optional[str] = None
+    protection_route: Optional[str] = None
 
 
 class SizingResult(BaseModel):

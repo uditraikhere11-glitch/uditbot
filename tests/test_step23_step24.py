@@ -7,7 +7,8 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from src.broker.yahoo_observer import YahooObservation
 
 from src.config import AppConfig
 from src.engine.lock import SingletonListenerLock
@@ -96,17 +97,55 @@ class TestStep23And24(unittest.TestCase):
         self.assertIn("Signals Received", out)
 
     def test_cmd_check_dhan_output(self):
-        """Verifies check-dhan diagnostic displays token, marketfeed, and execution readiness."""
+        """Verifies check-dhan diagnostic displays token, marketfeed, Yahoo observation, and execution readiness without network calls."""
         cfg = AppConfig.from_env()
         output_capture = io.StringIO()
-        with patch("sys.stdout", output_capture):
+
+        mock_dhan_instance = MagicMock()
+        mock_dhan_instance.token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.mock_dhan_jwt_token"
+        mock_dhan_instance.last_funds_is_fallback = False
+        mock_dhan_instance.get_fund_limits.return_value = (True, 150000.00, "OK")
+        mock_dhan_instance.get_ltp.return_value = (True, 2950.50, "OK")
+
+        mock_yahoo_obs = YahooObservation(
+            ticker="RELIANCE.NS",
+            symbol="RELIANCE",
+            exchange_segment="NSE_EQ",
+            reported_price=2951.25,
+            quote_timestamp=1762270000.0,
+            measured_age_sec=1.20,
+            exchange="NSI",
+            currency="INR",
+            market_state="REGULAR",
+            delayed_by_sec=0,
+            delay_status="REALTIME",
+            is_success=True,
+            status_code=200,
+            executable=False,
+        )
+        mock_yahoo_instance = MagicMock()
+        mock_yahoo_instance.observe.return_value = mock_yahoo_obs
+
+        with patch("src.broker.dhan_client.DhanClient", return_value=mock_dhan_instance) as mock_dhan_cls, \
+             patch("src.broker.yahoo_observer.YahooObserver", return_value=mock_yahoo_instance) as mock_yahoo_cls, \
+             patch("sys.stdout", output_capture):
             cmd_check_dhan(cfg, self.stop_mgr)
 
         out = output_capture.getvalue()
         self.assertIn("DHAN API CONNECTION & EXECUTION DIAGNOSTIC", out)
+        self.assertIn("Access Token        : PRESENT", out)
         self.assertIn("Testing Dhan API Authentication", out)
+        self.assertIn("[OK] AUTHENTICATION SUCCESSFUL (BROKER CONFIRMED)", out)
+        self.assertIn("Available Ledger Balance: INR 150,000.00", out)
         self.assertIn("Testing Market Data Feed", out)
+        self.assertIn("[OK] MARKETFEED CONNECTED", out)
+        self.assertIn("Live Quote for RELIANCE (Sec ID 2885): INR 2,950.50", out)
+        self.assertIn("Yahoo Finance Observational Diagnostic (Darvas Observer)", out)
+        self.assertIn("YAHOO_FINANCE_DARVAS_OBSERVER (executable=False)", out)
+        self.assertIn("Reported Price      : INR 2,951.25", out)
         self.assertIn("Order Execution Readiness Matrix", out)
+        mock_dhan_cls.assert_called_once_with(cfg, stop_manager=self.stop_mgr)
+        mock_yahoo_cls.assert_called_once_with()
 
 
 if __name__ == "__main__":

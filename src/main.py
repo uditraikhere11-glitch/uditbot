@@ -25,7 +25,8 @@ from typing import Optional
 from src.config import AppConfig
 from src.models import (
     TradingMode, ProductType, OrderType, TransactionType,
-    SignalAction, SignalType, OrderRequest, ValidationResult
+    SignalAction, SignalType, OrderRequest, ValidationResult,
+    ProtectionRoute, resolve_protection_route_capability,
 )
 from src.parsers.equity_parser import parse_equity_regex, filter_equity_message
 from src.parsers.fno_parser import parse_fno_regex, looks_like_option
@@ -227,6 +228,11 @@ class TradingBotPipeline:
 
             if getattr(self.cfg, "enforce_source_allowlist", False) and not allowed_channels:
                 reason = "Source allowlist is empty (MONITORED_CHANNEL_IDS not configured)"
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
+
+            if self.cfg.log_group_id and channel_id != 0 and channel_id == self.cfg.log_group_id:
+                reason = f"Ignored log destination channel message ({channel_id} is LOG_GROUP_ID)"
+                self.db.record_signal(channel_id, message_id, "UNKNOWN", "", "BLOCKED", text, "IGNORED_LOG_GROUP", reason)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
 
             if self.cfg.trading_mode == TradingMode.LIVE and self.cfg.test_group_id and channel_id == self.cfg.test_group_id:
@@ -464,6 +470,7 @@ class TradingBotPipeline:
             self.dispatch_notification("TRADE_LOG", rej_card)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=res_reason, signal_type=SignalType.OPTION, symbol=sig.symbol, log_card=rej_card)
 
+        fno_markup_pct = 4.0
         limit_price = calculate_option_limit_price(sig.entry_max, contract.tick_size)
 
         sizing = size_option(
@@ -542,6 +549,8 @@ class TradingBotPipeline:
                 price=order_req.price,
                 quantity=order_req.quantity,
                 is_super_order=True,
+                protection_route=ProtectionRoute.SUPER_ORDER.value,
+                markup_pct=fno_markup_pct,
                 original_market_price=sig.entry_max,
                 tick_size=contract.tick_size,
                 lot_size=contract.lot_size,
@@ -683,16 +692,13 @@ class TradingBotPipeline:
                 sl_limit_buffer_pct=self.cfg.sl_limit_buffer_pct,
                 tick_size=contract.tick_size,
             )
-            used_super = False
-            if hasattr(self.broker, "place_super_order"):
-                ok, broker_id, msg = self.broker.place_super_order(
-                    order_req,
-                    stop_loss_price=init_levels.sl_trigger,
-                    target_price=init_levels.target_price,
-                )
-                used_super = True
-            else:
-                ok, broker_id, msg = self.broker.place_order(order_req)
+            # P0-01 & P0-04: F&O MARGIN entries strictly require Super Order; never fall back to unprotected place_order
+            ok, broker_id, msg = self.broker.place_super_order(
+                order_req,
+                stop_loss_price=init_levels.sl_trigger,
+                target_price=init_levels.target_price,
+            )
+            used_super = True
 
             if trace is not None:
                 trace.mark_l10_dhan_ack(dhan_http_ms=getattr(self.broker, "last_order_http_latency_ms", None))
@@ -734,6 +740,26 @@ class TradingBotPipeline:
                 status=status,
             )
 
+            fno_meta = {
+                "symbol": sig.symbol,
+                "trading_symbol": opt_trading_sym,
+                "source": source_name,
+                "segment": "FNO",
+                "action": "BUY",
+                "mode": "LIVE",
+                "stated_price": sig.entry_max,
+                "markup_pct": fno_markup_pct,
+                "limit_price": limit_price,
+                "strike": contract.strike,
+                "option_type": contract.option_type,
+                "expiry": contract.expiry.isoformat() if hasattr(contract.expiry, "isoformat") else str(contract.expiry or ""),
+                "lot_size": contract.lot_size,
+                "lots": sizing.units,
+                "protection_route": ProtectionRoute.SUPER_ORDER.value,
+                "initial_sl_price": init_levels.sl_trigger,
+                "initial_target_price": init_levels.target_price,
+                "signal_received_at": fno_received_at,
+            }
             if ok and broker_id:
                 self.watcher.track(
                     order_id=broker_id,
@@ -746,16 +772,15 @@ class TradingBotPipeline:
                     product_type=ProductType.MARGIN.value,
                     original_market_price=sig.entry_max,
                     is_super_order=used_super,
+                    protection_route=ProtectionRoute.SUPER_ORDER.value,
+                    initial_sl_price=init_levels.sl_trigger,
+                    initial_target_price=init_levels.target_price,
                     tick_size=contract.tick_size,
                     lot_size=contract.lot_size,
                     option_type=contract.option_type,
                     strike=contract.strike,
                     expiry=contract.expiry,
-                    notification_meta={
-                        "symbol": sig.symbol, "source": source_name,
-                        "segment": "FNO", "action": "BUY", "mode": "LIVE",
-                        "limit_price": limit_price, "signal_received_at": fno_received_at,
-                    },
+                    notification_meta=fno_meta,
                 )
 
             log_card = format_trade_log(
@@ -771,17 +796,9 @@ class TradingBotPipeline:
                 timestamp=now,
             )
             user_card = (
-                format_order_submitted({
-                    "symbol": sig.symbol, "source": source_name,
-                    "segment": "FNO", "action": "BUY", "mode": "LIVE",
-                    "limit_price": limit_price, "signal_received_at": fno_received_at,
-                }, sizing.total_quantity)
+                format_order_submitted(fno_meta, sizing.total_quantity)
                 if ok and broker_id else
-                format_order_failed({
-                    "symbol": sig.symbol, "source": source_name,
-                    "segment": "FNO", "action": "BUY", "mode": "LIVE",
-                    "limit_price": limit_price, "signal_received_at": fno_received_at,
-                }, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
+                format_order_failed(fno_meta, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
             )
             self.dispatch_notification("TRADE_LOG", user_card)
 
@@ -1040,6 +1057,26 @@ class TradingBotPipeline:
             trading_mode=self.cfg.trading_mode,
         )
 
+        # P0-01 & P0-02: Resolve equity protection route from capability matrix (AMO always uses regular order + FOREVER_OCO post-fill)
+        # Keep the pre-PR39 normal cash-equity order route unless the operator
+        # explicitly configures an approved alternative. Never branch on test mocks.
+        pref_eq_route = (
+            ProtectionRoute.FOREVER_OCO.value
+            if pre_price_amo
+            else str(getattr(self.cfg, "equity_protection_route", ProtectionRoute.FOREVER_OCO.value) or ProtectionRoute.FOREVER_OCO.value).upper().strip()
+        )
+        cap_ok, eq_prot_route, cap_msg = resolve_protection_route_capability(
+            inst.exchange_segment,
+            self.cfg.equity_product_type.value,
+            preferred_route=pref_eq_route,
+        )
+        if not cap_ok:
+            reason = f"Entry blocked: {cap_msg}"
+            self.latency_monitor.record_rejection(reason)
+            self.db.record_signal(sig.channel_id, sig.message_id, "EQUITY", inst.symbol, "BLOCKED", sig.raw_text, "REJECTED_UNPROTECTABLE", reason)
+            return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
+        eq_is_super = (eq_prot_route == ProtectionRoute.SUPER_ORDER.value)
+
         try:
             self.db.record_order_intent(
                 correlation_id=correlation_id,
@@ -1051,8 +1088,10 @@ class TradingBotPipeline:
                 order_type=order_req.order_type.value,
                 price=order_req.price,
                 quantity=order_req.quantity,
-                is_super_order=False,
+                is_super_order=eq_is_super,
                 is_amo=pre_price_amo,
+                protection_route=eq_prot_route,
+                markup_pct=self.cfg.equity_price_markup_pct,
                 original_market_price=ref_price,
                 tick_size=inst.tick_size,
                 lot_size=inst.lot_size,
@@ -1091,6 +1130,8 @@ class TradingBotPipeline:
                 product_type=self.cfg.equity_product_type.value,
                 dry_price=limit_price,
                 original_market_price=ref_price,
+                is_super_order=eq_is_super,
+                protection_route=eq_prot_route,
                 tick_size=inst.tick_size,
                 lot_size=inst.lot_size,
             )
@@ -1152,6 +1193,7 @@ class TradingBotPipeline:
                 freshness_verified=trace.freshness_verified if used_live_quote else True,
                 quote_freshness_status=trace.quote_freshness_status if used_live_quote else "STATED_PRICE",
                 broker_order_status="TEST_VALIDATED",
+                protection_route=eq_prot_route,
             )
         else:
             eval_mkt_dt = None
@@ -1222,10 +1264,35 @@ class TradingBotPipeline:
 
             order_req.after_market_order = is_amo_order
             order_req.amo_time = "OPEN"
+            if is_amo_order:
+                eq_is_super = False
+                eq_prot_route = ProtectionRoute.FOREVER_OCO.value
+
+            if eq_is_super and not hasattr(self.broker, "place_super_order"):
+                reason = f"LIVE Order Blocked: {eq_prot_route} required for {inst.symbol} ({self.cfg.equity_product_type.value}) but broker adapter lacks place_super_order"
+                self.latency_monitor.record_rejection(reason)
+                self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
+                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
             self.db.update_order_intent(correlation_id, state="SUBMITTING")
             trace.mark_l9_dhan_start()
 
-            ok, broker_id, msg = self.broker.place_order(order_req)
+            eq_init_levels = calculate_protection_levels(
+                executed_price=limit_price,
+                quantity=sizing.total_quantity,
+                sl_pct=self.cfg.sl_pct,
+                target_pct=self.cfg.target_pct,
+                sl_limit_buffer_pct=self.cfg.sl_limit_buffer_pct,
+                tick_size=inst.tick_size,
+            )
+            if eq_is_super:
+                # P0-01: Submit atomic Super Order for same-day CNC/MTF; NEVER fall back to unprotected place_order on failure!
+                ok, broker_id, msg = self.broker.place_super_order(
+                    order_req,
+                    stop_loss_price=eq_init_levels.sl_trigger,
+                    target_price=eq_init_levels.target_price,
+                )
+            else:
+                ok, broker_id, msg = self.broker.place_order(order_req)
             trace.mark_l10_dhan_ack(dhan_http_ms=getattr(self.broker, "last_order_http_latency_ms", None))
             trace.mark_completed()
 
@@ -1282,6 +1349,10 @@ class TradingBotPipeline:
                     qty=sizing.total_quantity,
                     product_type=self.cfg.equity_product_type.value,
                     original_market_price=ref_price,
+                    is_super_order=eq_is_super,
+                    protection_route=eq_prot_route,
+                    initial_sl_price=eq_init_levels.sl_trigger if eq_is_super else None,
+                    initial_target_price=eq_init_levels.target_price if eq_is_super else None,
                     tick_size=inst.tick_size,
                     lot_size=inst.lot_size,
                     notification_meta={
@@ -1292,7 +1363,11 @@ class TradingBotPipeline:
                         "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
                         "quote_threshold_sec": self.cfg.max_quote_age_sec,
                         "quote_accepted": True,
-                        "limit_price": limit_price, "signal_received_at": trace.ist_received_time,
+                        "limit_price": limit_price,
+                        "protection_route": eq_prot_route,
+                        "initial_sl_price": eq_init_levels.sl_trigger if eq_is_super else None,
+                        "initial_target_price": eq_init_levels.target_price if eq_is_super else None,
+                        "signal_received_at": trace.ist_received_time,
                     },
                 )
 
@@ -1358,6 +1433,9 @@ class TradingBotPipeline:
                     "quote_age_sec": getattr(last_q, "age_sec", None) if used_live_quote else None,
                     "quote_threshold_sec": self.cfg.max_quote_age_sec,
                     "quote_accepted": True, "limit_price": limit_price,
+                    "protection_route": eq_prot_route,
+                    "initial_sl_price": eq_init_levels.sl_trigger if eq_is_super else None,
+                    "initial_target_price": eq_init_levels.target_price if eq_is_super else None,
                     "signal_received_at": trace.ist_received_time,
                 }, sizing.total_quantity)
                 if ok and broker_id else
@@ -1409,6 +1487,7 @@ class TradingBotPipeline:
                 freshness_verified=trace.freshness_verified if used_live_quote else True,
                 quote_freshness_status=trace.quote_freshness_status if used_live_quote else "STATED_PRICE",
                 broker_order_status=broker_display_st,
+                protection_route=eq_prot_route,
             )
 
 
