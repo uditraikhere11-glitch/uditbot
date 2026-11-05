@@ -107,12 +107,15 @@ if not pipeline.resolver._equities and not pipeline.resolver._options_list:
 print("=" * 60 + "\n")
 
 session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else session_file
-client = TelegramClient(session, tg_api_id, tg_api_hash)
 
 
 async def main():
     outbox_worker = None
+    client = None
     try:
+        # Construct Telethon inside asyncio.run's *running* event loop.
+        # Python 3.14 no longer implicitly creates a loop for get_event_loop().
+        client = TelegramClient(session, tg_api_id, tg_api_hash)
         allowed_chats = list(cfg.monitored_channel_ids)
         if cfg.trading_mode.value != 'LIVE' and cfg.test_group_id and cfg.test_group_id not in allowed_chats:
             allowed_chats.append(cfg.test_group_id)
@@ -256,7 +259,11 @@ async def main():
     finally:
         if outbox_worker:
             outbox_worker.stop()
-        lock.release()
+        try:
+            if client is not None:
+                await client.disconnect()
+        finally:
+            lock.release()
 
 
 if __name__ == "__main__":
