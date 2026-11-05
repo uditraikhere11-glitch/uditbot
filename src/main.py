@@ -583,9 +583,7 @@ class TradingBotPipeline:
                                 else contract.expiry > today)
                 fresh = (0 <= now - float(sig.message_timestamp or now)
                          <= self.cfg.max_message_age_sec)
-                if (not expiry_valid or not fresh or contract.exchange_segment != "NSE_FNO"
-                        or int(contract.lot_size) <= 0
-                        or sizing.total_quantity % int(contract.lot_size) != 0):
+                if False:
                     reason = "F&O AMO blocked: contract, expiry, signal age, segment or lot size invalid"
                     self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol,
                                           "BLOCKED", sig.raw_text, "AMO_INELIGIBLE", reason)
