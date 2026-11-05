@@ -11,6 +11,7 @@ from src.config import AppConfig
 from src.engine.config_manager import ConfigChangeTracker, compute_config_version
 from src.engine.protection_watcher import ProtectionWatcher
 from src.engine.sizer import calculate_protection_levels
+from unittest.mock import patch
 from src.setup_app import build_env_and_params_dict
 
 
@@ -105,6 +106,61 @@ class TestIndependentSegmentProtection(unittest.TestCase):
             ):
                 self.assertIn(f"{key}={expected}", env_text)
                 self.assertEqual(params[key], expected)
+
+    def test_actual_dry_run_post_fill_uses_segment_specific_levels(self):
+        # Exercise the actual watcher fill path; synthetic DRY orders cannot
+        # submit a Dhan order. Spy on price calculation, not broker mutation.
+        with tempfile.TemporaryDirectory() as td:
+            watcher = ProtectionWatcher(
+                broker=object(),
+                path=os.path.join(td, "dry-fill.json"),
+                dry_run=True, sl_pct=3, target_pct=3,
+                equity_sl_pct=1, equity_target_pct=1,
+                fno_sl_pct=3, fno_target_pct=3,
+            )
+            watcher.track(
+                order_id="DRY-EQ-1", symbol="SBIN", security_id="3045",
+                segment="NSE_EQ", product_type="CNC",
+                qty=10, dry_price=100.0,
+            )
+            watcher.track(
+                order_id="DRY-FO-1", symbol="HAL", security_id="4567",
+                segment="NSE_FNO", product_type="MARGIN",
+                qty=75, dry_price=100.0,
+            )
+            with patch(
+                "src.engine.protection_watcher.calculate_protection_levels",
+                wraps=calculate_protection_levels,
+            ) as levels_spy:
+                watcher.check_once()
+
+            actual = [
+                (call.kwargs["sl_pct"], call.kwargs["target_pct"])
+                for call in levels_spy.call_args_list
+            ]
+            self.assertEqual(actual, [(1.0, 1.0), (3.0, 3.0)])
+            self.assertFalse(hasattr(watcher.broker, "place_order"))
+
+    def test_policy_snapshot_survives_watcher_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "restart.json")
+            first = ProtectionWatcher(
+                broker=object(), path=path, dry_run=True,
+                sl_pct=3, target_pct=3, equity_sl_pct=1, equity_target_pct=1,
+                fno_sl_pct=3, fno_target_pct=3,
+            )
+            first.track(order_id="EQ-PENDING", symbol="SBIN", security_id="3045",
+                        segment="NSE_EQ", qty=10)
+            second = ProtectionWatcher(
+                broker=object(), path=path, dry_run=True,
+                sl_pct=3, target_pct=3, equity_sl_pct=8, equity_target_pct=9,
+                fno_sl_pct=3, fno_target_pct=3,
+            )
+            self.assertEqual(
+                (second.pending["EQ-PENDING"]["protection_sl_pct"],
+                 second.pending["EQ-PENDING"]["protection_target_pct"]),
+                (1.0, 1.0),
+            )
 
     def test_invalid_segment_protection_rejected_before_apply(self):
         with tempfile.TemporaryDirectory() as td:
