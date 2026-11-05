@@ -28,6 +28,46 @@ class TestDhanAMOAcknowledgement(unittest.TestCase):
         self.assertNotIn("Order Executed", text)
         self.assertNotIn("Order ID", text)
 
+    def test_fno_amo_matches_equity_card_with_broker_id(self):
+        text = format_amo_acknowledged(
+            {
+                "symbol": "HAL28NOV4750CE", "limit_price": 120.45,
+                "order_id": "DHAN-456", "entry_only_amo": True,
+            }, 75, "TRANSIT", allow_unverified=True,
+        )
+        self.assertIn("🌙 <b>Dhan AMO Acknowledgement</b>", text)
+        self.assertIn("• Symbol: HAL28NOV4750CE", text)
+        self.assertIn("• Quantity: 75", text)
+        self.assertIn("• Limit Price: ₹120.45", text)
+        self.assertIn("• Dhan Order ID: DHAN-456", text)
+        self.assertIn("• Dhan Status: TRANSIT", text)
+        self.assertIn("✅ <b>AMO Accepted by Dhan</b>", text)
+        self.assertIn("NOT EXECUTED", text)
+        self.assertIn("No automatic SL/target", text)
+        self.assertNotIn("Order Executed", text)
+
+    def test_fno_amo_unverified_status_never_claims_queued(self):
+        text = format_amo_acknowledged(
+            {"symbol": "HAL28NOV4750CE", "limit_price": 120.45,
+             "order_id": "DHAN-456", "entry_only_amo": True},
+            75, "TRADED", allow_unverified=True,
+        )
+        self.assertIn("• Dhan Status: TRADED", text)
+        self.assertIn("Broker status needs verification", text)
+        self.assertNotIn("AMO Accepted by Dhan", text)
+        self.assertNotIn("Queued for market OPEN", text)
+        self.assertNotIn("NOT EXECUTED", text)
+
+    def test_fno_amo_html_escapes_symbol_and_order_id(self):
+        text = format_amo_acknowledged(
+            {"symbol": "<BAD&CO>", "limit_price": 12.0,
+             "order_id": "<id&123>", "entry_only_amo": True},
+            1, "PENDING", allow_unverified=True,
+        )
+        self.assertIn("&lt;BAD&amp;CO&gt;", text)
+        self.assertIn("&lt;id&amp;123&gt;", text)
+        self.assertNotIn("<id&123>", text)
+
     def test_ambiguous_broker_status_does_not_format_ack(self):
         for status in ("UNKNOWN", "REJECTED", "TRADED", "", "CANCELLED"):
             with self.subTest(status=status), self.assertRaises(ValueError):
