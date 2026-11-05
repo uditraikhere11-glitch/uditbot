@@ -116,6 +116,7 @@ class TestFnoAmoExecutor(unittest.TestCase):
             option_type="CE", strike=4750, trading_symbol="HAL28NOV4750CE"
         ),"resolved")
         pipe.broker=MagicMock()
+        pipe.watcher=MagicMock()
         pipe.stop_manager=MagicMock()
         pipe.stop_manager.is_stopped.return_value=False
         pipe.reconciliation_gate=MagicMock()
