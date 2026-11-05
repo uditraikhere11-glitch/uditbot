@@ -193,7 +193,8 @@ class TestFnoAmoExecutor(unittest.TestCase):
         self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"QUEUED")
         pipe.cfg.fno_amo_enabled=False
         self.assertFalse(pipe.dispatch_due_fno_amo())
-        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"QUEUED")
+        # Switching AMO OFF must invalidate staged work, not leave a latent entry.
+        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"CANCELLED")
 
 
 if __name__=="__main__":
