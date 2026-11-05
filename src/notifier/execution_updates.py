@@ -146,21 +146,44 @@ def format_order_outcome(meta: Mapping[str, Any], requested_qty: int, filled_qty
     return "\n".join(lines)
 
 
-def format_amo_acknowledged(meta: Mapping[str, Any], quantity: int, broker_status: str) -> str:
-    """Format a confirmed Dhan acceptance, explicitly not an executed trade."""
-    status = str(broker_status).upper().strip()
-    if status not in {"TRANSIT", "PENDING"}:
+def format_amo_acknowledged(
+    meta: Mapping[str, Any], quantity: int, broker_status: str, *,
+    allow_unverified: bool = False,
+) -> str:
+    """Dhan AMO acknowledgement; F&O may show its order ID and entry-only warning.
+
+    Default behaviour for existing Equity AMO notices is unchanged. An explicit
+    F&O opt-in permits a non-PENDING broker status to be shown without claiming
+    the order is queued, accepted for OPEN, or executed.
+    """
+    status = str(broker_status or "").upper().strip()
+    queued = status in {"TRANSIT", "PENDING"}
+    if not queued and not allow_unverified:
         raise ValueError("AMO queued acknowledgement requires TRANSIT or PENDING")
-    return "\n".join((
+
+    lines = [
         "🌙 <b>Dhan AMO Acknowledgement</b>",
         f"• Symbol: {_safe(meta.get('symbol', 'UNKNOWN'))}",
         f"• Quantity: {int(quantity)}",
         f"• Limit Price: {_money(meta.get('limit_price'))}",
-        f"• Dhan Status: {_safe(status)}",
-        "✅ <b>AMO Accepted by Dhan</b>",
-        "⏳ Queued for market OPEN — NOT EXECUTED",
-        "A separate confirmation will follow only after a broker-verified fill or final rejection/cancellation.",
-    ))
+    ]
+    if meta.get("order_id"):
+        lines.append(f"• Dhan Order ID: {_safe(meta['order_id'])}")
+    lines.append(f"• Dhan Status: {_safe(status or 'UNVERIFIED')}")
+    if queued:
+        lines.extend((
+            "✅ <b>AMO Accepted by Dhan</b>",
+            "⏳ Queued for market OPEN — NOT EXECUTED",
+            "A separate confirmation will follow only after a broker-verified fill or final rejection/cancellation.",
+        ))
+    else:
+        lines.extend((
+            "⚠️ <b>Broker status needs verification</b>",
+            "Order ID received; check Dhan before assuming a queued order or a fill.",
+        ))
+    if meta.get("entry_only_amo"):
+        lines.append("⚠️ F&O AMO: No automatic SL/target.")
+    return "\n".join(lines)
 
 
 class OrderStatusReporter:
