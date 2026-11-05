@@ -102,6 +102,15 @@ class FnoAmoQueue:
                 "UPDATE fno_amo SET state='EXPIRED',reason='Queue lifetime expired',processed_at=? "
                 "WHERE state='QUEUED' AND expires_at<=?", (now, now)
             )
+            # A previous broker outcome may be unknown. Stop ALL further
+            # queued entries until an operator reconciles the ambiguity.
+            unresolved = con.execute(
+                "SELECT COUNT(*) FROM fno_amo WHERE account_id=? "
+                "AND state IN ('DISPATCHING','UNCERTAIN')", (self.account_id,)
+            ).fetchone()[0]
+            if unresolved:
+                con.execute("COMMIT")
+                return None
             row = con.execute(
                 "SELECT * FROM fno_amo WHERE state='QUEUED' AND account_id=? "
                 "AND expires_at>? AND created_at<=? ORDER BY created_at ASC LIMIT 1",
@@ -151,6 +160,24 @@ class FnoAmoQueue:
                             (time.time(), str(item_id), self.account_id)).rowcount
             con.execute("COMMIT")
             return n == 1
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+
+    def cancel_all_queued(self) -> int:
+        """Disabling the F&O AMO switch invalidates every undisbursed signal."""
+        con = self._conn()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            changed = con.execute(
+                "UPDATE fno_amo SET state='CANCELLED',reason='F&O AMO disabled by operator',"
+                "processed_at=? WHERE account_id=? AND state='QUEUED'",
+                (time.time(), self.account_id)
+            ).rowcount
+            con.execute("COMMIT")
+            return int(changed)
         except Exception:
             con.execute("ROLLBACK")
             raise
