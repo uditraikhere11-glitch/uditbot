@@ -1,0 +1,24 @@
+name: Isolated audit snapshot 20261106
+on:
+  push:
+    branches:
+      - audit/latest-amo-snapshot-20261106
+permissions:
+  contents: read
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive exact reviewed commit
+        run: |
+          git archive --format=tar HEAD | gzip -9 > uditbot-audit-source.tar.gz
+          git rev-parse HEAD > audit_sha.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: current-amo-source-20261106
+          path: |
+            uditbot-audit-source.tar.gz
+            audit_sha.txt
+          retention-days: 1
