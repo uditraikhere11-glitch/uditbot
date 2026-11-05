@@ -90,6 +90,11 @@ def resolve_company_name(
     # only when at least three characters uniquely identify the company.
     # Never silently drop a supplied second word to trade a shorter ticker.
     if len(words) >= 2:
+        # Never infer a company from initials alone (e.g. #M&M must not
+        # become M&MFIN just because the company name has those initials).
+        meaningful = [word for word in words if len(word) > 1 and word != "AND"]
+        if len(meaningful) < 2:
+            return None
         for n in range(len(words), 1, -1):
             prefix = words[:n]
             exact = {ticker for name, ticker in candidates if name[:n] == prefix}
