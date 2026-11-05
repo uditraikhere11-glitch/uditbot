@@ -17,8 +17,6 @@ import os
 import sys
 from html import escape as escape_html
 from src.notifier.dhan_response import normalize_group_name
-from src.control_center_ui import render_control_center
-from src.control_center_backend import register_control_center_routes
 from typing import Optional
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -41,7 +39,6 @@ from src.engine.config_manager import (
 from src.notifier.telegram_notifier import TelegramNotifier
 
 app = FastAPI(title="Audit bot - Setup Dashboard")
-register_control_center_routes(app, SETUP_CSRF_TOKEN)
 
 
 def ensure_webui_coordinator_started(
@@ -635,7 +632,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
-    <a href="/" style="display:inline-block;margin-bottom:16px;color:#93c5fd;text-decoration:none;font-weight:600">← Back to Control Center</a>
     <div class="header">
       <div class="icon-badge">
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
@@ -1490,10 +1486,6 @@ def _mask_account_id(acct: str) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def get_control_center_page():
-    return HTMLResponse(content=render_control_center(SETUP_CSRF_TOKEN), headers={"Cache-Control": "no-store"})
-
-@app.get("/setup", response_class=HTMLResponse)
 def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     cfg = AppConfig.from_env()
 
