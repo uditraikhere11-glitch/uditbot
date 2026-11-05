@@ -200,14 +200,21 @@ def parse_fno_regex_detailed(
             {},
         )
 
-    # 5. Multiple / mixed / shorthand option contracts & conflicting underlyings blocker (A07 + BRAIN-V3-02)
-    is_multi_opt, _, multi_reason = detect_multiple_option_contracts(norm)
-    if is_multi_opt:
+    # 5. F&O-only cancellation gate.  Plain commentary is ignored, but a
+    # cancellation/withdrawal anywhere in the message overrides the trade line.
+    cancellation = re.search(
+        r"\b(?:cancelled|canceled|cancel|cancellation|withdrawn|called?\s+off|"
+        r"ignore\s+(?:this|the)\s+(?:call|trade|signal)|"
+        r"skip\s+(?:this|the)\s+(?:call|trade|entry))\b",
+        norm,
+        flags=re.IGNORECASE,
+    )
+    if cancellation:
         return (
             None,
-            multi_reason,
+            f"Cancelled/withdrawn option entry detected ({cancellation.group(0)!r})",
             SignalAction.BLOCKED,
-            DecisionReasonCode.AMBIGUOUS_CONTRACT.value,
+            DecisionReasonCode.ANALYSIS_COMMENTARY.value,
             PriceStatus.ABSENT,
             {},
         )
@@ -245,6 +252,20 @@ def parse_fno_regex_detailed(
             f"Index option rejected ({symbol}); single-stock options only",
             SignalAction.BLOCKED,
             DecisionReasonCode.INDEX_REJECTED.value,
+            PriceStatus.ABSENT,
+            {},
+        )
+
+    # F&O index rejection precedes multiple-contract diagnosis: index signals
+    # must report INDEX_REJECTED even when trailing commentary has hashtags.
+    # Multiple genuine contracts and conflicting header symbols remain blocked.
+    is_multi_opt, _, multi_reason = detect_multiple_option_contracts(norm)
+    if is_multi_opt:
+        return (
+            None,
+            multi_reason,
+            SignalAction.BLOCKED,
+            DecisionReasonCode.AMBIGUOUS_CONTRACT.value,
             PriceStatus.ABSENT,
             {},
         )
