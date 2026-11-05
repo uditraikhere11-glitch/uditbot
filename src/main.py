@@ -51,6 +51,7 @@ from src.notifier.execution_updates import (
     OrderStatusReporter, format_order_submitted, format_order_failed, format_amo_acknowledged,
 )
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.notifier.message_designer import load as load_telegram_templates
 from src.engine.reconciliation import StartupReconciliationGate
 
 logger = logging.getLogger("trading_bot")
@@ -941,6 +942,14 @@ class TradingBotPipeline:
                     user_card = format_amo_acknowledged(
                         {
                             "symbol": opt_trading_sym,
+                            "underlying": sig.symbol,
+                            "expiry": str(contract.expiry),
+                            "lots": sizing.units,
+                            "source": source_name,
+                            "mode": "LIVE",
+                            "signal_received_at": fno_received_at,
+                            "response_ms": getattr(self.broker, "last_order_http_latency_ms", None),
+                            "data_dir": self.cfg.data_dir,
                             "limit_price": limit_price,
                             "order_id": broker_id,
                             "entry_only_amo": True,
@@ -1542,6 +1551,22 @@ class TradingBotPipeline:
                     "signal_received_at": trace.ist_received_time,
                 }, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
             )
+            # Existing Equity Telegram appearance remains the default. Only
+            # replace it when this operator explicitly enables the Equity AMO
+            # design; broker placement and follow-up logic are unchanged.
+            if (ok and broker_id and is_amo_order
+                    and broker_display_st in ("TRANSIT", "PENDING")
+                    and load_telegram_templates(self.cfg.data_dir)["templates"]["equity_amo"]["enabled"]):
+                user_card = format_amo_acknowledged(
+                    {
+                        "symbol": inst.symbol, "limit_price": limit_price,
+                        "order_id": broker_id, "source": source_name,
+                        "mode": "LIVE", "signal_received_at": trace.ist_received_time,
+                        "response_ms": getattr(self.broker, "last_order_http_latency_ms", None),
+                        "data_dir": self.cfg.data_dir,
+                    },
+                    sizing.total_quantity, broker_display_st,
+                )
             self.dispatch_notification("TRADE_LOG", user_card)
 
             

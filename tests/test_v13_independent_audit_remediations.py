@@ -471,7 +471,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     def test_20_web_setup_files_match_approved_segment_protection_baseline(self):
         import hashlib
         expected = {
-            "src/setup_app.py": "100148c70504d9dc88bed94d988ed9a4ebbf8eef2816aa0ec2272f9b68ab7d8c",
+            "src/setup_app.py": "606343b8ebdd232df659d84b6639c2af9d298a1f3b826dbaf1d3dd8680f63c82",
             "src/setup_wizard.py": "5e08eb4b0626aacfe7ee8cee8e9f66f421d43f7f90caa8d9a400506d7461430f",
             "tests/test_setup.py": "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e",
         }

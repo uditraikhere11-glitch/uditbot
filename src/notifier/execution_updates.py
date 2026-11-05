@@ -13,6 +13,8 @@ import math
 from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
+from src.notifier.message_designer import render as render_custom_telegram
+
 LOGGER = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -90,7 +92,22 @@ def format_order_submitted(meta: Mapping[str, Any], quantity: int) -> str:
     else:
         lines.extend(("", "⏳ <b>Status: Order Submitted</b>", "Awaiting Dhan execution confirmation."))
     lines.extend(_tail(meta, meta.get("signal_received_at"), "Signal Received"))
-    return "\n".join(lines)
+    original = "\n".join(lines)
+    if meta.get("is_amo"):
+        return original  # The separate broker-acknowledgement card covers AMOs.
+    values = {
+        "symbol": meta.get("symbol"), "contract": meta.get("contract"),
+        "expiry": meta.get("expiry"), "quantity": quantity,
+        "lots": meta.get("lots"), "limit_price": _money(meta.get("limit_price")),
+        "source": meta.get("source"), "segment": meta.get("segment"),
+        "action": meta.get("action"), "mode": meta.get("mode"),
+        "signal_time": _ist(meta.get("signal_received_at")),
+    }
+    return (render_custom_telegram(
+        "submitted", values,
+        ["⏳ <b>Status: Order Submitted</b>", "Awaiting Dhan execution confirmation."],
+        data_dir=meta.get("data_dir"),
+    ) or original)
 
 
 def format_order_failed(meta: Mapping[str, Any], quantity: int, *, uncertain: bool = False) -> str:
@@ -100,7 +117,22 @@ def format_order_failed(meta: Mapping[str, Any], quantity: int, *, uncertain: bo
     else:
         lines.extend(("", "❌ <b>Status: Order Rejected</b>", "Dhan did not acknowledge the order."))
     lines.extend(_tail(meta, meta.get("signal_received_at"), "Signal Received"))
-    return "\n".join(lines)
+    original = "\n".join(lines)
+    values = {
+        "symbol": meta.get("symbol"), "contract": meta.get("contract"),
+        "quantity": quantity, "lots": meta.get("lots"),
+        "limit_price": _money(meta.get("limit_price")),
+        "source": meta.get("source"), "action": meta.get("action"),
+        "segment": meta.get("segment"), "mode": meta.get("mode"),
+        "signal_time": _ist(meta.get("signal_received_at")),
+    }
+    required = (["⚠️ <b>Status: Submission Unconfirmed</b>",
+                 "Broker response uncertain; do not automatically resubmit."]
+                if uncertain else
+                ["❌ <b>Status: Order Rejected</b>", "Dhan did not acknowledge the order."])
+    event = "unverified" if uncertain else "rejected"
+    return render_custom_telegram(event, values, required,
+                                  data_dir=meta.get("data_dir")) or original
 
 
 def format_order_outcome(meta: Mapping[str, Any], requested_qty: int, filled_qty: int,
@@ -143,7 +175,36 @@ def format_order_outcome(meta: Mapping[str, Any], requested_qty: int, filled_qty
         protected = "✅ Verified Active" if protection_verified else "⏳ Pending Broker Verification"
         lines.extend(("", f"🛡️ Protection: {protected}"))
     lines.extend(_tail(meta, observed_at, "Execution Confirmed" if complete else "Status Checked"))
-    return "\n".join(lines)
+    original = "\n".join(lines)
+    values = {
+        "symbol": meta.get("symbol"), "contract": meta.get("contract"),
+        "quantity": requested_qty, "filled_qty": filled_qty,
+        "fill_price": _money(execution_price) if execution_price is not None else None,
+        "trade_value": _money(execution_price * filled_qty) if execution_price is not None else None,
+        "broker_status": status, "source": meta.get("source"), "action": meta.get("action"),
+        "segment": meta.get("segment"), "mode": meta.get("mode"),
+        "signal_time": _ist(meta.get("signal_received_at")),
+        "protection": "Verified Active" if protection_verified else "Pending Broker Verification",
+    }
+    if complete:
+        event = "executed"
+        required = ["✅ <b>Status: Order Executed</b>", f"Filled: {filled_qty}/{requested_qty}"]
+    elif status == "PART_TRADED":
+        event = "partial"
+        required = ["⏳ <b>Status: Partially Executed</b>", f"Filled: {filled_qty}/{requested_qty}"]
+    elif status == "UNVERIFIED_EXECUTION":
+        event = "unverified"
+        required = ["⚠️ <b>Status: Fill Verification Pending</b>",
+                    f"Broker-reported filled quantity: {filled_qty}/{requested_qty}"]
+    else:
+        event = "final"
+        required = [f"❌ <b>Status: Order {_safe(status.title())}</b>",
+                    f"Filled: {filled_qty}/{requested_qty}"]
+    if filled_qty > 0:
+        protection = "✅ Verified Active" if protection_verified else "⏳ Pending Broker Verification"
+        required.append("🛡️ Protection: " + protection)
+    return render_custom_telegram(event, values, required,
+                                  data_dir=meta.get("data_dir")) or original
 
 
 def format_amo_acknowledged(
@@ -183,7 +244,35 @@ def format_amo_acknowledged(
         ))
     if meta.get("entry_only_amo"):
         lines.append("⚠️ F&O AMO: No automatic SL/target.")
-    return "\n".join(lines)
+    original = "\n".join(lines)
+    values = {
+        "symbol": meta.get("underlying") or meta.get("symbol"),
+        "contract": meta.get("symbol") if meta.get("entry_only_amo") else None,
+        "expiry": meta.get("expiry"), "quantity": int(quantity),
+        "lots": meta.get("lots"), "limit_price": _money(meta.get("limit_price")),
+        "order_id": meta.get("order_id"), "broker_status": status or "UNVERIFIED",
+        "source": meta.get("source"), "mode": meta.get("mode"),
+        "signal_time": _ist(meta.get("signal_received_at")) if meta.get("signal_received_at") else None,
+        "response_ms": (str(meta.get("response_ms")) + " ms") if meta.get("response_ms") is not None else None,
+        "segment": "F&O" if meta.get("entry_only_amo") else "EQUITY",
+    }
+    if queued:
+        required = [
+            "✅ <b>AMO Accepted by Dhan</b>",
+            "⏳ Queued for market OPEN — NOT EXECUTED",
+            "A separate confirmation will follow only after a broker-verified fill or final rejection/cancellation.",
+        ]
+    else:
+        required = [
+            "⚠️ <b>Broker status needs verification</b>",
+            "Order ID received; check Dhan before assuming a queued order or a fill.",
+        ]
+    if meta.get("entry_only_amo"):
+        required.append("⚠️ F&O AMO: No automatic SL/target.")
+    return (render_custom_telegram(
+        "fno_amo" if meta.get("entry_only_amo") else "equity_amo",
+        values, required, data_dir=meta.get("data_dir"),
+    ) or original)
 
 
 class OrderStatusReporter:
