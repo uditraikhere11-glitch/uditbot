@@ -79,22 +79,50 @@ def resolve_company_name(
     Map the words after 'bought'/'buy' to a ticker by company name,
     e.g. ('MANIPAL', 'PAYMENT') -> 'MPIMANIPAL'.
     """
-    words = tuple(phrase_words)
+    words = normalize_name(" ".join(phrase_words))
     if not words:
         return None
     idx = name_index if name_index is not None else _NAME_INDEX
     candidates = idx.get(words[0], [])
-    for n in range(len(words), 0, -1):
-        prefix = words[:n]
-        tickers = {t for name, t in candidates if name[:n] == prefix}
-        if len(tickers) > 1:
-            return None  # ambiguous: don't guess
-        if len(tickers) == 1:
-            ticker = tickers.pop()
-            meaningful = [w for w in prefix if len(w) > 1 and w != "AND"]
-            if len(meaningful) >= 2 or (n == 1 and len(prefix[0]) > 1 and ticker.startswith(prefix[0])):
-                return ticker
+
+    # The second company-name word is stronger evidence than the first.
+    # Match the longest exact prefix first; allow a last-word abbreviation
+    # only when at least three characters uniquely identify the company.
+    # Never silently drop a supplied second word to trade a shorter ticker.
+    if len(words) >= 2:
+        # Never infer a company from initials alone (e.g. #M&M must not
+        # become M&MFIN just because the company name has those initials).
+        meaningful = [word for word in words if len(word) > 1 and word != "AND"]
+        if len(meaningful) < 2:
             return None
+        for n in range(len(words), 1, -1):
+            prefix = words[:n]
+            exact = {ticker for name, ticker in candidates if name[:n] == prefix}
+            if len(exact) > 1:
+                return None
+            if len(exact) == 1:
+                return next(iter(exact))
+
+            if len(prefix[-1]) >= 3:
+                abbreviated = {
+                    ticker for name, ticker in candidates
+                    if len(name) >= n
+                    and name[: n - 1] == prefix[: n - 1]
+                    and name[n - 1].startswith(prefix[-1])
+                }
+                if len(abbreviated) > 1:
+                    return None
+                if len(abbreviated) == 1:
+                    return next(iter(abbreviated))
+        return None
+
+    # Preserve the established single-word behaviour only for a genuine
+    # single-word phrase; ambiguity must still fail closed.
+    tickers = {ticker for name, ticker in candidates if name[:1] == words}
+    if len(tickers) == 1:
+        ticker = next(iter(tickers))
+        if len(words[0]) > 1 and ticker.startswith(words[0]):
+            return ticker
     return None
 
 
