@@ -2540,7 +2540,12 @@ class DhanClient:
             )
 
         # Read-only fallback for manually cancelled orders.
-        book = self.get_order_book(bypass_test_mode=bypass_test_mode)
+        # Preserve the legacy zero-argument order-book mock/read path for
+        # ordinary watcher checks, while explicit read-only probes bypass TEST stubs.
+        book = (
+            self.get_order_book(bypass_test_mode=True)
+            if bypass_test_mode else self.get_order_book()
+        )
         if isinstance(book, list) and getattr(book, "ok", True):
             matches = [
                 x for x in book
