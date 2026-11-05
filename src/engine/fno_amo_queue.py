@@ -185,10 +185,13 @@ class FnoAmoQueue:
             con.close()
 
     def snapshot(self, limit: int = 50) -> list[Dict[str, Any]]:
-        with self._conn() as con:
+        con = self._conn()
+        try:
             rows = con.execute(
                 "SELECT item_id,account_id,source,symbol,created_at,expires_at,expiry,state,reason "
                 "FROM fno_amo WHERE account_id=? ORDER BY created_at DESC LIMIT ?",
                 (self.account_id, min(50, max(1, int(limit))))
             ).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            con.close()
