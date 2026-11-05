@@ -164,21 +164,8 @@ async def main():
                     return False
             return False
 
-        # Locally staged F&O AMOs are released one at a time at verified
-        # market OPEN, via the existing protected Super Order executor.
-        # No queued F&O AMO is ever sent as a naked regular order overnight.
-        async def _fno_amo_open_dispatcher():
-            while True:
-                try:
-                    await asyncio.to_thread(pipeline.dispatch_due_fno_amo)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logging.getLogger("run").exception(
-                        "F&O AMO dispatcher failed closed (queued records retained)"
-                    )
-                await asyncio.sleep(30.0)
-        asyncio.create_task(_fno_amo_open_dispatcher())
+        # Broker-native F&O AMO submits immediately while market is closed.
+        # Legacy locally queued signals are never replayed into a new order route.
 
         # STEP 16: Start durable Outbox Worker background task
         outbox_worker = OutboxWorker(

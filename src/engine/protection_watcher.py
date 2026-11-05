@@ -226,6 +226,11 @@ class ProtectionWatcher:
         rec.setdefault("cancel_reason", "")
         rec.setdefault("entry_timeout_elapsed", bool(rec.get("timed_out_cancel", False)))
         rec.setdefault("is_amo", False)
+        rec.setdefault("entry_only_amo", False)
+        rec.setdefault("amo_manual_risk_alerted", False)
+        if rec.get("entry_only_amo"):
+            rec["retry_eligible"] = False
+            rec["max_retries"] = 0
         rec.setdefault("amo_activated_at", 0.0)
         rec.setdefault(
             "cancel_requested",
@@ -441,6 +446,7 @@ class ProtectionWatcher:
         root_order_id: str = "",
         notification_meta: Optional[dict] = None,
         is_amo: bool = False,
+        entry_only_amo: bool = False,
         protection_sl_pct: Optional[float] = None,
         protection_target_pct: Optional[float] = None,
     ) -> str:
@@ -485,6 +491,8 @@ class ProtectionWatcher:
                     existing["notification_meta"] = dict(notification_meta)
                 if is_amo:
                     existing["is_amo"] = True
+                if entry_only_amo:
+                    existing["entry_only_amo"] = True
                 if order_id not in self.pending and order_id in self.terminal_orders:
                     pass
                 else:
@@ -507,6 +515,8 @@ class ProtectionWatcher:
                     "protection_target_pct": chosen_target,
                     "is_super_order": bool(is_super_order),
                     "is_amo": bool(is_amo),
+                    "entry_only_amo": bool(entry_only_amo),
+                    "amo_manual_risk_alerted": False,
                     "amo_activated_at": 0.0,
                     "tick_size": tick_size if tick_size and tick_size > 0 else TICK,
                     "lot_size": int(lot_size) if lot_size and int(lot_size > 0) else 1,
@@ -828,7 +838,14 @@ class ProtectionWatcher:
                 has_unresolved_attempt = unresolved_att is not None
                 new_qty = filled - int(rec.get("protected_qty") or 0)
 
-                should_call_protect = (
+                if rec.get("entry_only_amo") and filled > 0 and not rec.get("amo_manual_risk_alerted"):
+                    rec["amo_manual_risk_alerted"] = True
+                    logger.critical("F&O AMO FILL %s: %s units have NO AUTOMATIC SL/TARGET. Manual exit required.",
+                                    order_id, filled)
+                    changed = True
+                # Explicitly do not attempt MARGIN Forever OCO or modify a
+                # Super Order that does not exist for this entry-only AMO.
+                should_call_protect = not rec.get("entry_only_amo") and (
                     has_unresolved_attempt
                     or (filled > prev_filled and new_qty > 0)
                     or (new_qty > 0 and current_time >= float(rec.get("retry_at") or 0.0))
@@ -1639,6 +1656,10 @@ class ProtectionWatcher:
 
     def _protect(self, rec: dict, st: dict, filled: int, new_qty: int) -> bool:
         with self._lock:
+            # Defense in depth: an entry-only AMO is deliberately unmanaged;
+            # do not convert it to an unsupported MARGIN Forever OCO.
+            if rec.get("entry_only_amo"):
+                return False
             is_super = (str(rec.get("product_type", "CNC")).upper() == "MARGIN" and bool(rec.get("is_super_order")))
             route_name = "SUPER_ORDER" if is_super else "FOREVER_OCO"
 
@@ -2064,6 +2085,9 @@ class ProtectionWatcher:
         rec = self.pending.get(order_id) or self.terminal_orders.get(order_id)
         if not rec:
             return False, 0, f"Order {order_id} not in tracking"
+        if rec.get("entry_only_amo"):
+            rec["retry_eligible"] = False
+            return False, 0, "F&O entry-only AMO automatic retry is disabled"
 
         t_blocked, t_reason = self._is_transition_gate_blocking_new_entries()
         if t_blocked:
@@ -2179,11 +2203,16 @@ class ProtectionWatcher:
         new_qty = filled - rec["protected_qty"]
 
         if new_qty > 0:
-            logger.warning(
-                f"[Protection] LATE FILL DETECTED for terminal order {order_id} ({rec['symbol']}): "
-                f"{new_qty} additional shares filled (total filled: {filled}). Placing protection."
-            )
-            self._protect(rec, st, filled, new_qty)
+            if rec.get("entry_only_amo"):
+                logger.critical("F&O AMO LATE FILL %s (%s): %s units without SL/target; manual exit required",
+                                order_id, rec['symbol'], filled)
+                rec["amo_manual_risk_alerted"] = True
+            else:
+                logger.warning(
+                    f"[Protection] LATE FILL DETECTED for terminal order {order_id} ({rec['symbol']}): "
+                    f"{new_qty} additional shares filled (total filled: {filled}). Placing protection."
+                )
+                self._protect(rec, st, filled, new_qty)
             self._save()
             return True
         return False

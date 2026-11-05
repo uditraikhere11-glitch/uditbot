@@ -12,8 +12,9 @@ BACKEND CONTRACT (implemented by the authenticated Control Center facade):
   POST /control/amo/fno/cancel
   POST /setup/service-control  (already exists)
 
-F&O AMO is locally staged after hours and dispatched only as a protected
-Super Order at verified market OPEN, not as a bare broker AMO.
+F&O AMO sends an entry-only LIMIT order directly to Dhan's documented /orders
+API after hours. Dhan's order ID confirms acknowledgement, NOT execution.
+Local queued entries from older builds are never automatically dispatched.
 """
 
 from html import escape
@@ -94,10 +95,10 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
     <input id="equity-amo" class="toggle" type="checkbox" role="switch" aria-label="Enable Equity AMO" disabled>
   </div>
   <div class="row"><div><div class="row-title">F&amp;O AMO</div>
-    <div class="row-sub">NSE stock options · queued LOCALLY after hours · protected Super Order at OPEN</div></div>
+    <div class="row-sub">NSE stock options · broker AMO at OPEN · entry only (no SL/TP)</div></div>
     <input id="fno-amo" class="toggle" type="checkbox" role="switch" aria-label="Enable F&O AMO" disabled>
   </div>
-  <div class="status-note">AMO dispatch preference: <b>Market Open</b>. Equity uses broker AMO; F&amp;O uses a local queue (maximum 18 hours) and a protected Super Order only after verified OPEN. Staging does not mean an order was sent to Dhan. Emergency STOP and LIVE/TEST remain independent.</div>
+  <div class="status-note">AMO preference: <b>Market Open</b>. Both Equity and F&amp;O send orders to Dhan immediately after hours. Dhan order ID confirms receipt, not a fill. F&amp;O AMO has NO automatic SL/target; review any filled position manually. Legacy local F&amp;O entries are never dispatched. Switching OFF does not cancel submitted Dhan orders.</div>
   <div id="amo-feedback" role="status" aria-live="polite">AMO settings have not been changed.</div>
 </section>
 <section aria-label="AMO order reconciliation">
@@ -145,7 +146,7 @@ async function refreshStatus(){
       'Equity AMO saved: '+(s.equity_amo_saved?'ON':'OFF')+
       ' · F&O AMO saved: '+(s.fno_amo_saved?'ON':'OFF')+
       ' · F&O runtime: '+(s.fno_amo_active===true?'ON':s.fno_amo_active===false?'OFF':'UNVERIFIED')+
-      ' · F&O route: local staging → protected OPEN');
+      ' · F&O route: broker native AMO /orders (entry only)');
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
   }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;
     $('equity-amo').disabled=true;$('fno-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
@@ -211,7 +212,7 @@ $('equity-amo').addEventListener('change',async()=>{
 $('fno-amo').addEventListener('change',async()=>{
   const requested=$('fno-amo').checked;
   if(!current){$('fno-amo').checked=!requested;return}
-  if(requested&&!confirm('Enable F&O AMO? Fresh option signals may be queued locally after hours and submitted as REAL protected Super Orders at verified market OPEN.')) {
+  if(requested&&!confirm('Enable broker-native F&O AMO? Eligible NSE stock option orders will be sent to Dhan after hours. Dhan will return a real Order ID if acknowledged. NO automatic SL or target will protect a filled position.')) {
     $('fno-amo').checked=false;return;
   }
   $('fno-amo').disabled=true;setText('amo-feedback','Requesting F&O AMO setting through safety coordinator…');
@@ -248,13 +249,13 @@ async function refreshOrders(){
       const el=document.createElement('div');el.className='order';
       const label=document.createElement('span');
       label.textContent='F&O '+String(item.symbol||'Unknown')+' · '+String(item.state||'UNKNOWN')+
-        ' · '+(item.state==='QUEUED'?'LOCAL only — not sent to Dhan':'Review broker status if dispatched');
+        ' · LEGACY local record · '+(item.state==='QUEUED'?'NOT DISPATCHED — review or cancel':'Never auto-dispatched by this patch');
       el.append(label);
       if(item.state==='QUEUED'){
         const button=document.createElement('button');button.type='button';
-        button.textContent='Cancel staged';
+        button.textContent='Cancel legacy staged';
         button.addEventListener('click',async()=>{
-          if(!confirm('Cancel this locally staged F&O AMO before dispatch?'))return;
+          if(!confirm('Cancel this legacy local record? This does not cancel any Dhan orders.'))return;
           button.disabled=true;
           try{
             const out=await requestJSON('/control/amo/fno/cancel',{method:'POST',

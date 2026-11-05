@@ -423,6 +423,9 @@ class TradingBotPipeline:
         stay DISPATCHING/UNCERTAIN for manual Dhan reconciliation, never auto-retry.
         No broker /orders F&O AMO is placed.
         """
+        # Old local-queue records are legacy only. Never auto-submit them after
+        # changing order route; the owner must review/cancel them explicitly.
+        return False
         with self._pipeline_lock:
             if not self.cfg.fno_amo_enabled:
                 # A switch-off must not leave deferred entries eligible for a
@@ -566,50 +569,30 @@ class TradingBotPipeline:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=sizing.error_reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
-        # Protected F&O AMO is LOCAL staging only: Dhan Super Order API does
-        # not document broker AMO fields. Never send an unprotected regular order.
-        if is_live and not amo_dispatch and self.cfg.fno_amo_enabled:
+        # Broker-side regular AMO only, with no automated stop/target. The user
+        # explicitly selected broker acknowledgement/orderId over Super protection.
+        # This path must never enqueue a local entry for next-day execution.
+        is_amo_order = False
+        if is_live and not amo_dispatch and bool(self.cfg.fno_amo_enabled):
             market_open, market_reason = market_status()
-            if not market_open and _is_eligible_amo_closed_session(market_reason):
+            is_amo_order = not market_open and _is_eligible_amo_closed_session(market_reason)
+            if is_amo_order:
                 local_dt = datetime.fromtimestamp(now, IST)
                 today = local_dt.date()
                 expiry_valid = (contract.expiry >= today if local_dt.hour < 9
                                 else contract.expiry > today)
                 fresh = (0 <= now - float(sig.message_timestamp or now)
                          <= self.cfg.max_message_age_sec)
-                if (not expiry_valid or not fresh
-                        or contract.exchange_segment != "NSE_FNO"):
-                    reason = "F&O AMO blocked: expired/invalid session, source age, or unsupported option segment"
-                    self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "AMO_INELIGIBLE", reason)
-                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
-                try:
-                    queued, note = self._get_fno_amo_queue().enqueue(
-                        signal=sig, source=source_name, contract_id=str(contract.security_id),
-                        expiry=contract.expiry.isoformat(), now=now,
-                        max_age_sec=float(self.cfg.fno_amo_max_age_sec),
-                    )
-                except Exception as exc:
-                    queued, note = False, "Durable AMO queue unavailable: " + type(exc).__name__
-                    logger.exception("F&O AMO persistence failed closed")
-                if queued:
-                    reason = "F&O AMO staged LOCALLY for OPEN; not yet sent to Dhan or executed"
+                if (not expiry_valid or not fresh or contract.exchange_segment != "NSE_FNO"
+                        or int(contract.lot_size) <= 0
+                        or sizing.total_quantity % int(contract.lot_size) != 0):
+                    reason = "F&O AMO blocked: contract, expiry, signal age, segment or lot size invalid"
                     self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol,
-                                          "AMO_QUEUED", sig.raw_text, "AMO_LOCAL_QUEUED", reason)
-                    card = format_trade_log(
-                        symbol=sig.symbol, source_name=source_name, original_message=sig.raw_text,
-                        segment="FNO", status=reason, dhan_order_details="None (Local queue only)",
-                        heads_up="Will be rechecked for margin, expiry, funds and protection at market open",
-                        is_live=True, is_processed=False, timestamp=now,
-                    )
-                    self.dispatch_notification("TRADE_LOG", card)
-                    return ValidationResult(is_valid=True, action=SignalAction.BUY_ENTRY,
-                                            reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol,
-                                            log_card=card, limit_price=limit_price,
-                                            quantity_or_lots=sizing.units, calculated_exposure=sizing.total_cost)
-                self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol,
-                                      "BLOCKED", sig.raw_text, "AMO_QUEUE_REJECTED", note)
-                return ValidationResult(is_valid=False, action=SignalAction.BLOCKED,
-                                        reason=note, signal_type=SignalType.OPTION, symbol=sig.symbol)
+                                          "BLOCKED", sig.raw_text, "AMO_INELIGIBLE", reason)
+                    return ValidationResult(is_valid=False, action=SignalAction.BLOCKED,
+                                            reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
+                heads_up_note = ("F&O AMO goes directly to Dhan for market OPEN. "
+                                 "No automatic SL or target is attached; monitor and exit manually if filled.")
         if trace is not None:
             trace.mark_l7_sized()
 
@@ -634,7 +617,7 @@ class TradingBotPipeline:
         if trace is not None:
             trace.mark_l8_preflight()
 
-        if is_live and not hasattr(self.broker, "place_super_order"):
+        if is_live and not is_amo_order and not hasattr(self.broker, "place_super_order"):
             reason = "Entry blocked: MARGIN options require supported Super Order protection route (Forever OCO unsupported for MARGIN)"
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_UNPROTECTABLE", reason)
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
@@ -655,6 +638,8 @@ class TradingBotPipeline:
             price=limit_price,
             quantity=sizing.total_quantity,
             trading_mode=self.cfg.trading_mode,
+            after_market_order=is_amo_order,
+            amo_time="OPEN",
         )
 
         tranches_info = ""
@@ -673,7 +658,8 @@ class TradingBotPipeline:
                 order_type=order_req.order_type.value,
                 price=order_req.price,
                 quantity=order_req.quantity,
-                is_super_order=True,
+                is_super_order=not is_amo_order,
+                is_amo=is_amo_order,
                 original_market_price=sig.entry_max,
                 tick_size=contract.tick_size,
                 lot_size=contract.lot_size,
@@ -756,8 +742,10 @@ class TradingBotPipeline:
                 m_open, m_msg = market_status(eval_mkt_dt) if eval_mkt_dt is not None else market_status()
             except TypeError:
                 m_open, m_msg = market_status()
-            if not m_open:
-                reason = f"LIVE Order Blocked: {m_msg}"
+            if ((not m_open and not (is_amo_order and _is_eligible_amo_closed_session(m_msg)))
+                    or (m_open and is_amo_order)):
+                reason = (f"LIVE Order Blocked: {m_msg}" if not is_amo_order
+                          else "LIVE Order Blocked: F&O AMO session changed before submission")
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
                 self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_MARKET_CLOSED", reason)
                 rej_card = format_trade_log(
@@ -788,7 +776,7 @@ class TradingBotPipeline:
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
             pre_submit_now = injected_clock if injected_clock is not None else time.time()
-            if not amo_dispatch and (pre_submit_now - (sig.message_timestamp or now)) > self.cfg.max_message_age_sec:
+            if (pre_submit_now - (sig.message_timestamp or now)) > self.cfg.max_message_age_sec:
                 reason = f"LIVE Order Blocked: signal aged past {self.cfg.max_message_age_sec}s before submission"
                 self.latency_monitor.record_rejection(reason)
                 self.db.update_order_intent(correlation_id, state="REJECTED", error_msg=reason)
@@ -807,16 +795,22 @@ class TradingBotPipeline:
 
             self.db.update_order_intent(correlation_id, state="SUBMITTING")
 
-            init_levels = calculate_protection_levels(
-                executed_price=limit_price,
-                quantity=sizing.total_quantity,
-                sl_pct=self.cfg.fno_sl_pct,
-                target_pct=self.cfg.fno_target_pct,
-                sl_limit_buffer_pct=self.cfg.sl_limit_buffer_pct,
-                tick_size=contract.tick_size,
-            )
+            init_levels = None
+            if not is_amo_order:
+                init_levels = calculate_protection_levels(
+                    executed_price=limit_price,
+                    quantity=sizing.total_quantity,
+                    sl_pct=self.cfg.fno_sl_pct,
+                    target_pct=self.cfg.fno_target_pct,
+                    sl_limit_buffer_pct=self.cfg.sl_limit_buffer_pct,
+                    tick_size=contract.tick_size,
+                )
             used_super = False
-            if hasattr(self.broker, "place_super_order"):
+            if is_amo_order:
+                # Dhan /orders is the documented F&O AMO entry route.
+                # SL/target intentionally omitted as requested by the owner.
+                ok, broker_id, msg = self.broker.place_order(order_req)
+            elif hasattr(self.broker, "place_super_order"):
                 ok, broker_id, msg = self.broker.place_super_order(
                     order_req,
                     stop_loss_price=init_levels.sl_trigger,
@@ -824,7 +818,7 @@ class TradingBotPipeline:
                 )
                 used_super = True
             else:
-                ok, broker_id, msg = self.broker.place_order(order_req)
+                ok, broker_id, msg = False, None, "F&O Super Order broker route unavailable"
 
             if ok and not broker_id:
                 # A claimed F&O AMO must never be recorded as successfully
@@ -873,8 +867,13 @@ class TradingBotPipeline:
                 status=status,
             )
 
-            if ok and broker_id:
+            # A known broker ID with an UNKNOWN status can still fill; keep
+            # tracking it while never automatically resubmitting the entry.
+            if broker_id and (ok or intent_state == "UNKNOWN"):
                 self.watcher.track(
+                    is_amo=is_amo_order,
+                    entry_only_amo=is_amo_order,
+                    max_retries=0 if is_amo_order else 1,
                     order_id=broker_id,
                     correlation_id=correlation_id,
                     symbol=sig.symbol,
@@ -893,6 +892,8 @@ class TradingBotPipeline:
                     notification_meta={
                         "symbol": sig.symbol, "source": source_name,
                         "segment": "FNO", "action": "BUY", "mode": "LIVE",
+                        "is_amo": is_amo_order,
+                        "entry_only_amo": is_amo_order,
                         "limit_price": limit_price, "signal_received_at": fno_received_at,
                     },
                 )
@@ -902,7 +903,8 @@ class TradingBotPipeline:
                 source_name=source_name,
                 original_message=sig.raw_text,
                 segment="FNO",
-                status="Message sent to Dhan" if ok else f"Order Failed ({status}): {msg}",
+                status=("F&O AMO received by Dhan (order ID issued; not executed)" if ok and is_amo_order
+                        else "Message sent to Dhan" if ok else f"Order Failed ({status}): {msg}"),
                 dhan_order_details=order_details,
                 heads_up=heads_up_note,
                 is_live=True,
@@ -922,12 +924,26 @@ class TradingBotPipeline:
                     "limit_price": limit_price, "signal_received_at": fno_received_at,
                 }, sizing.total_quantity, uncertain=(status == "UNKNOWN" or (ok and not broker_id)))
             )
+            if is_amo_order:
+                # The operator explicitly requested visibility of Dhan's real
+                # order ID. Never equate broker acknowledgement with a fill.
+                if broker_id and ok:
+                    user_card = (f"📨 F&O AMO accepted by Dhan\n"
+                                 f"{sig.symbol} {sig.strike:g}{sig.option_type} | Qty: {sizing.total_quantity}\n"
+                                 f"Dhan Order ID: {broker_id}\n"
+                                 f"Status: Broker acknowledged; awaiting market OPEN\n"
+                                 f"⚠️ No automatic SL/target. Monitor fills and manage exits manually.")
+                elif broker_id:
+                    user_card = (f"⚠️ F&O AMO broker outcome unverified\n"
+                                 f"{sig.symbol} {sig.strike:g}{sig.option_type} | Possible Dhan ID: {broker_id}\n"
+                                 f"Do not resubmit before checking Dhan orders.")
             self.dispatch_notification("TRADE_LOG", user_card)
 
             return ValidationResult(
                 is_valid=ok,
                 action=SignalAction.BUY_ENTRY,
-                reason=f"LIVE Order placed on Dhan: {broker_id}" if ok else f"Dhan order placement failed: {msg}",
+                reason=(f"Dhan F&O AMO acknowledged (not filled), Order ID: {broker_id}" if ok and is_amo_order
+                        else f"LIVE Order placed on Dhan: {broker_id}" if ok else f"Dhan order placement failed: {msg}"),
                 signal_type=SignalType.OPTION,
                 symbol=sig.symbol,
                 security_id=contract.security_id,

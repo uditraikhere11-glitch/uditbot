@@ -143,12 +143,12 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         "equity_amo_can_edit": can_edit,
         "equity_amo_message": msg,
         "fno_amo_supported": True,
-        "fno_amo_route": "LOCAL_STAGED_PROTECTED_SUPER_AT_OPEN",
+        "fno_amo_route": "DHAN_REGULAR_ORDERS_FNO_AMO_ENTRY_ONLY",
         "fno_amo_saved": fno_saved,
         "fno_amo_active": fno_saved if verified else None,
         "fno_amo_can_edit": can_edit,
         "fno_amo_message": (
-            msg + " · F&O AMO stages locally; no broker order until market OPEN"
+            msg + " · F&O sends broker /orders AMO after hours; no automatic SL/target"
         ),
         "latest_change_state": newest.state.value if newest else None,
         "latest_change_id": newest.change_id if newest else None,
@@ -293,7 +293,7 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 queue = FnoAmoQueue(data_dir, account_id=cfg.dhan_client_id)
                 response["fno_local_queue"] = queue.snapshot()
                 count = sum(x["state"] == "QUEUED" for x in response["fno_local_queue"])
-                response["summary"] += f" · F&O local queue: {count} staged"
+                response["summary"] += f" · LEGACY local F&O queue: {count} NOT auto-dispatched"
             except Exception:
                 response["fno_local_queue"] = []
                 response["summary"] += " · F&O local queue unreadable (verify on VM)"
@@ -399,7 +399,7 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             return _json({
                 "ok": cancelled,
                 "state": "CANCELLED" if cancelled else "NOT_QUEUED",
-                "message": "Local F&O AMO cancelled before market-open dispatch" if cancelled
+                "message": "Legacy local F&O entry cancelled (no Dhan order was submitted)" if cancelled
                            else "Already dispatched, terminal, or not found. Check Dhan before any broker action.",
             }, 200 if cancelled else 409)
         except Exception:
@@ -478,7 +478,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             # Coordinator wakes AFTER releasing outer cross-process lock.
             try:
                 tracker.start_coordinator_daemon(env_path=env_path, broker=read_only_broker, stop_when_idle=False)
-                message = "F&O AMO update queued for verified safe application"
+                message = ("F&O AMO setting queued for verified application; switching it OFF "
+                           "will not cancel any existing Dhan broker orders")
             except Exception:
                 message = "F&O AMO queued durably; coordinator wake not confirmed. Verify configuration status before retrying."
             return _json({"ok": True, "change_id": change_id, "state": state_name,

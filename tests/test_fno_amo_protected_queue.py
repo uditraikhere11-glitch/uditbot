@@ -116,6 +116,11 @@ class TestFnoAmoExecutor(unittest.TestCase):
             option_type="CE", strike=4750, trading_symbol="HAL28NOV4750CE"
         ),"resolved")
         pipe.broker=MagicMock()
+        pipe.broker.get_fund_limits.return_value=(True,200000,"OK")
+        pipe.broker.place_order.return_value=(True,"112111182198","Dhan order acknowledged")
+        pipe.risk_manager=MagicMock()
+        pipe.risk_manager.validate_order_risk.return_value=(True,"OK")
+        pipe.latency_monitor=MagicMock()
         pipe.watcher=MagicMock()
         pipe.stop_manager=MagicMock()
         pipe.stop_manager.is_stopped.return_value=False
@@ -129,16 +134,24 @@ class TestFnoAmoExecutor(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.t=datetime(2026,11,5,17,0,tzinfo=IST).timestamp()
 
-    def test_closed_market_locally_queues_without_placing_order(self):
+    def test_closed_market_submits_directly_to_dhan_and_receives_order_id(self):
         pipe=self.make_pipeline(self.t)
-        with patch("src.main.market_status",return_value=(False,"Market Closed Post-Hours")):
+        with patch("src.main.market_status",return_value=(False,"Market Closed Post-Hours")), \
+             patch("src.engine.config_manager.ConfigChangeTracker") as tracker:
+            tracker.return_value.is_live_entry_blocked_by_transition.return_value=(False,"")
             result=pipe._handle_fno_signal(signal(timestamp=self.t), "trusted", self.t)
         self.assertTrue(result.is_valid,result.reason)
-        self.assertIn("LOCALLY",result.reason)
-        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"QUEUED")
-        pipe.broker.get_fund_limits.assert_not_called()
-        pipe.broker.place_order.assert_not_called()
+        self.assertIn("Order ID",result.reason)
+        self.assertEqual(pipe._amo_queue.snapshot(),[])
+        pipe.broker.place_order.assert_called_once()
         pipe.broker.place_super_order.assert_not_called()
+        req=pipe.broker.place_order.call_args.args[0]
+        self.assertTrue(req.after_market_order)
+        self.assertEqual(req.amo_time,"OPEN")
+        self.assertEqual(req.exchange_segment,"NSE_FNO")
+        self.assertEqual(req.product_type.value,"MARGIN")
+        self.assertEqual(pipe.watcher.track.call_args.kwargs["entry_only_amo"],True)
+        self.assertEqual(pipe.watcher.track.call_args.kwargs["max_retries"],0)
 
     def test_fno_amo_disabled_keeps_original_market_close_behavior(self):
         pipe=self.make_pipeline(self.t)
@@ -152,49 +165,37 @@ class TestFnoAmoExecutor(unittest.TestCase):
         pipe.broker.place_order.assert_not_called()
         pipe.broker.place_super_order.assert_not_called()
 
-    def test_market_open_claim_dispatches_one_via_existing_protected_path(self):
+    def test_market_open_never_replays_legacy_local_queue(self):
         pipe=self.make_pipeline(self.t)
         pipe._amo_queue.enqueue(signal(timestamp=self.t), "trusted", "S123",
                                 "2026-11-28", self.t)
-        mock_result=ValidationResult(is_valid=True,action=SignalAction.BUY_ENTRY,
-                                      signal_type=SignalType.OPTION,
-                                      reason="LIVE Order placed on Dhan: PROTECTED-123")
         with patch("src.main.market_status",return_value=(True,"OPEN")), \
-             patch("src.main.time.time",return_value=self.t+10), \
-             patch.object(pipe,"_handle_fno_signal",return_value=mock_result) as protected:
-            self.assertTrue(pipe.dispatch_due_fno_amo())
+             patch.object(pipe,"_handle_fno_signal") as executor:
             self.assertFalse(pipe.dispatch_due_fno_amo())
-        self.assertEqual(protected.call_count,1)
-        opts=protected.call_args.kwargs
-        self.assertTrue(opts["amo_dispatch"])
-        self.assertEqual(opts["expected_amo_contract_id"],"S123")
-        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"SUBMITTED")
+        executor.assert_not_called()
+        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"QUEUED")
 
-    def test_ambiguous_dhan_reply_never_auto_retries(self):
+    def test_uncertain_dhan_reply_with_order_id_is_not_retryable(self):
         pipe=self.make_pipeline(self.t)
-        pipe._amo_queue.enqueue(signal(timestamp=self.t), "trusted", "S123",
-                                "2026-11-28", self.t)
-        failure=ValidationResult(is_valid=False,action=SignalAction.BLOCKED,
-                                 reason="Dhan connection timed out")
-        with patch("src.main.market_status",return_value=(True,"OPEN")), \
-             patch("src.main.time.time",return_value=self.t+10), \
-             patch.object(pipe,"_handle_fno_signal",return_value=failure) as executor:
-            self.assertTrue(pipe.dispatch_due_fno_amo())
-            self.assertFalse(pipe.dispatch_due_fno_amo())
-        self.assertEqual(executor.call_count,1)
-        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"UNCERTAIN")
+        pipe.broker.place_order.return_value=(False,"112111182198","outcome UNKNOWN")
+        with patch("src.main.market_status",return_value=(False,"Market Closed Post-Hours")), \
+             patch("src.engine.config_manager.ConfigChangeTracker") as tracker:
+            tracker.return_value.is_live_entry_blocked_by_transition.return_value=(False,"")
+            result=pipe._handle_fno_signal(signal(timestamp=self.t),"trusted",self.t)
+        self.assertFalse(result.is_valid)
+        self.assertEqual(pipe.broker.place_order.call_count,1)
+        pipe.reconciliation_gate.halt_new_entries.assert_called()
+        self.assertEqual(pipe.watcher.track.call_args.kwargs["entry_only_amo"],True)
 
-    def test_disabled_or_closed_does_not_claim(self):
+    def test_switch_off_does_not_dispatch_legacy_local_queue(self):
         pipe=self.make_pipeline(self.t)
         pipe._amo_queue.enqueue(signal(timestamp=self.t), "trusted", "S123",
                                 "2026-11-28", self.t)
         with patch("src.main.market_status",return_value=(False,"Market Closed Post-Hours")):
             self.assertFalse(pipe.dispatch_due_fno_amo())
-        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"QUEUED")
         pipe.cfg.fno_amo_enabled=False
         self.assertFalse(pipe.dispatch_due_fno_amo())
-        # Switching AMO OFF must invalidate staged work, not leave a latent entry.
-        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"CANCELLED")
+        self.assertEqual(pipe._amo_queue.snapshot()[0]["state"],"QUEUED")
 
 
 if __name__=="__main__":

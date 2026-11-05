@@ -30,6 +30,8 @@ import re
 import struct
 import threading
 import time
+from datetime import datetime, time as clock_time
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
 from src.broker.yahoo_observer import (
@@ -1966,16 +1968,34 @@ class DhanClient:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} orders are forbidden on BUY-ONLY entry path"
 
-        # AMO must be an explicit broker request, never a bypass of the normal market-hours gate.
+        # AMO is a documented Dhan /orders flag. Keep independent segment
+        # switches and do not allow naked F&O order entry in other cases.
         is_amo = bool(getattr(order_req, "after_market_order", False))
+        is_fno_amo = is_amo and str(order_req.exchange_segment).upper() == "NSE_FNO"
         if is_amo:
-            if not bool(getattr(self.cfg, "equity_amo_enabled", False)):
-                return False, None, "AMO BLOCKED: EQUITY_AMO_ENABLED is false"
-            if (str(order_req.exchange_segment).upper() != "NSE_EQ"
-                    or order_req.product_type != ProductType.CNC
-                    or order_req.order_type != OrderType.LIMIT
-                    or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"):
-                return False, None, "AMO BLOCKED: Only NSE_EQ CNC LIMIT with amoTime=OPEN is supported"
+            segment = str(order_req.exchange_segment).upper()
+            if segment == "NSE_EQ":
+                if (not bool(getattr(self.cfg, "equity_amo_enabled", False))
+                        or order_req.product_type != ProductType.CNC):
+                    return False, None, "Equity AMO BLOCKED: NSE_EQ CNC toggle/route invalid"
+            elif segment == "NSE_FNO":
+                if (not bool(getattr(self.cfg, "fno_amo_enabled", False))
+                        or order_req.product_type != ProductType.MARGIN):
+                    return False, None, "F&O AMO BLOCKED: NSE_FNO MARGIN toggle/route invalid"
+            else:
+                return False, None, "AMO BLOCKED: Unsupported exchange segment"
+            if (order_req.order_type != OrderType.LIMIT
+                    or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"
+                    or not str(order_req.security_id).strip()
+                    or int(order_req.quantity) <= 0 or float(order_req.price) <= 0):
+                return False, None, "AMO BLOCKED: Requires positive LIMIT price/quantity, securityId and OPEN"
+            if segment == "NSE_FNO":
+                # Our 15:25 trading gate closes before Dhan's 15:30 F&O
+                # AMO window begins. Refuse the 5-minute unsafe overlap.
+                now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+                if (now_ist.weekday() < 5
+                        and clock_time(9, 15) <= now_ist.time() < clock_time(15, 30)):
+                    return False, None, "F&O AMO BLOCKED: Dhan F&O AMO window not yet open (15:30 IST)"
             from src.engine.market import market_status
             m_open, m_reason = market_status()
             if m_open or not m_reason.startswith((
@@ -2059,7 +2079,13 @@ class DhanClient:
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 data = resp.json() if resp.text else {}
-                order_id = str(data.get("orderId", "")).strip()
+                raw_order_id = data.get("orderId", "")
+                order_id = str(raw_order_id).strip() if raw_order_id is not None else ""
+                if is_fno_amo and (not order_id.isascii() or not order_id.isdecimal() or len(order_id) < 6):
+                    # No acknowledgement without an authentic Dhan order ID.
+                    # Never resubmit an UNKNOWN broker outcome automatically.
+                    uncertain_outcome = True
+                    return False, None, "F&O AMO outcome UNKNOWN: Dhan did not return a valid order ID; manually reconcile correlation ID"
                 if not order_id:
                     uncertain_outcome = True
                     rec_ok, rec_oid, rec_msg = self._reconcile_uncertain_submission(corr_id, str(order_req.security_id))
@@ -2070,9 +2096,17 @@ class DhanClient:
                 self.last_order_broker_status = raw_ord_st or "TRANSIT"
                 if raw_ord_st == "REJECTED":
                     return False, None, f"Dhan order rejected by RMS: {data}"
+                if is_fno_amo:
+                    if raw_ord_st in ("CANCELLED", "EXPIRED", "FAILED"):
+                        return False, None, f"F&O AMO not accepted by Dhan (status={raw_ord_st})"
+                    if raw_ord_st not in ("TRANSIT", "PENDING"):
+                        uncertain_outcome = True
+                        return False, order_id, f"F&O AMO outcome UNKNOWN: unverified broker status={raw_ord_st or 'MISSING'}"
                 return True, order_id, f"Order acknowledged by Dhan (status={self.last_order_broker_status})"
             elif self.is_token_error(resp.status_code, resp.text):
                 uncertain_outcome = True
+                if is_fno_amo:
+                    return False, None, f"F&O AMO outcome UNKNOWN: Dhan authentication failure ({resp.status_code}); manual correlation reconciliation required"
                 if self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
                     logger.warning(f"Dhan auth error on /orders ({corr_id}). Refreshing token for read-reconciliation only (no resubmission)...")
                     self.generate_token_with_totp(force=False, rejected_token=self.token)
@@ -2083,6 +2117,8 @@ class DhanClient:
                 return False, None, f"Dhan auth error ({resp.status_code}) on {corr_id}; {rec_msg}"
             elif resp.status_code >= 500 or resp.status_code == 408:
                 uncertain_outcome = True
+                if is_fno_amo:
+                    return False, None, f"F&O AMO outcome UNKNOWN: Dhan HTTP {resp.status_code}; check Dhan order book before resubmission"
                 rec_ok, rec_oid, rec_msg = self._reconcile_uncertain_submission(corr_id, str(order_req.security_id))
                 if rec_ok and rec_oid:
                     uncertain_outcome = False
