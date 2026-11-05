@@ -170,7 +170,7 @@ _SL_CLAUSE_MASK_RE = re.compile(
     re.IGNORECASE,
 )
 _TARGET_CLAUSE_MASK_RE = re.compile(
-    r"\b(?:targets?|tgt|tp)\b\s*(?:(?:at|@|is|around|near|above|[:\-=])\s*)*(?:(?:rs\.?|inr|₹)\s*)?[-+]?[A-Za-z0-9,.\s/\-]+?(?=\b(?:sl|stop\s*-?\s*loss|buy|bought|add|added|entry|premium|price|cmp)\b|@|$|\n)",
+    r"\b(?:targets?|tgt|tp)\b\s*(?:(?:at|@|is|around|near|above|[:\-=])\s*)*(?:(?:rs\.?|inr|₹)\s*)?[-+]?[A-Za-z0-9,.\s/\-+]+?(?=\b(?:sl|stop\s*-?\s*loss|buy|bought|add|added|entry|premium|price|cmp)\b|@|$|\n)",
     re.IGNORECASE,
 )
 
