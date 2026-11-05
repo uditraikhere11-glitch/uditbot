@@ -813,6 +813,10 @@ _KEY_ALIASES: Dict[str, str] = {
     "fno_fixed_lots": "fno_fixed_lots",
     "fno_max_lots": "fno_max_lots",
     "allow_next_month_expiry_fallback": "allow_next_month_expiry_fallback",
+    "equity_sl_pct": "equity_sl_pct",
+    "equity_target_pct": "equity_target_pct",
+    "fno_sl_pct": "fno_sl_pct",
+    "fno_target_pct": "fno_target_pct",
     "sl_pct": "sl_pct",
     "target_pct": "target_pct",
     "sl_limit_buffer_pct": "sl_limit_buffer_pct",
@@ -869,6 +873,10 @@ _FLOAT_CANONICAL_FIELDS: Set[str] = {
     "equity_price_markup_pct",
     "equity_amo_max_reference_age_sec",
     "fno_capital_per_trade",
+    "equity_sl_pct",
+    "equity_target_pct",
+    "fno_sl_pct",
+    "fno_target_pct",
     "sl_pct",
     "target_pct",
     "sl_limit_buffer_pct",
@@ -2086,6 +2094,10 @@ class ConfigChangeTracker:
                 "fno_capital_per_trade", "FNO_CAPITAL_PER_TRADE",
                 "sl_pct", "SL_PCT",
                 "target_pct", "TARGET_PCT",
+                "equity_sl_pct", "EQUITY_SL_PCT",
+                "equity_target_pct", "EQUITY_TARGET_PCT",
+                "fno_sl_pct", "FNO_SL_PCT",
+                "fno_target_pct", "FNO_TARGET_PCT",
                 "fno_max_lots", "FNO_MAX_LOTS",
                 "min_trade_funds_inr", "MIN_TRADE_FUNDS_INR",
             ):
@@ -2107,6 +2119,17 @@ class ConfigChangeTracker:
             target_pct = float(params.get("target_pct", params.get("TARGET_PCT", 3.0)))
             if not (math.isfinite(target_pct) and 0.0 < target_pct <= 100.0):
                 return False, "Target percentage must be between 0.1% and 100%"
+
+            # Independent segment rules; reject invalid values before .env save/restart.
+            for field_name, env_key, default_val, max_allowed in (
+                ("equity_sl_pct", "EQUITY_SL_PCT", 1.0, 50.0),
+                ("equity_target_pct", "EQUITY_TARGET_PCT", 1.0, 100.0),
+                ("fno_sl_pct", "FNO_SL_PCT", 3.0, 50.0),
+                ("fno_target_pct", "FNO_TARGET_PCT", 3.0, 100.0),
+            ):
+                value = float(params.get(field_name, params.get(env_key, default_val)))
+                if not (math.isfinite(value) and 0.0 < value <= max_allowed):
+                    return False, f"{env_key} must be greater than 0% and at most {max_allowed:g}%"
 
             fno_lots = int(params.get("fno_max_lots", params.get("FNO_MAX_LOTS", 3)))
             if fno_lots <= 0:

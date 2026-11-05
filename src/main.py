@@ -123,6 +123,10 @@ class TradingBotPipeline:
             broker=self.broker,
             sl_pct=config.sl_pct,
             target_pct=config.target_pct,
+            equity_sl_pct=config.equity_sl_pct,
+            equity_target_pct=config.equity_target_pct,
+            fno_sl_pct=config.fno_sl_pct,
+            fno_target_pct=config.fno_target_pct,
             sl_limit_buffer_pct=config.sl_limit_buffer_pct,
             path=os.path.join(config.data_dir, "pending_protection.json"),
             dry_run=(config.trading_mode == TradingMode.TEST),
@@ -160,6 +164,10 @@ class TradingBotPipeline:
             self.notifier = TelegramNotifier(self.cfg)
             self.watcher.sl_pct = self.cfg.sl_pct
             self.watcher.target_pct = self.cfg.target_pct
+            self.watcher.equity_sl_pct = self.cfg.equity_sl_pct
+            self.watcher.equity_target_pct = self.cfg.equity_target_pct
+            self.watcher.fno_sl_pct = self.cfg.fno_sl_pct
+            self.watcher.fno_target_pct = self.cfg.fno_target_pct
             self.watcher.sl_limit_buffer_pct = self.cfg.sl_limit_buffer_pct
             self.watcher.order_timeout_sec = self.cfg.order_timeout_sec
             self.watcher.retry_timeout_sec = getattr(self.cfg, "partial_fill_retry_timeout_sec", 2.0)
@@ -473,7 +481,9 @@ class TradingBotPipeline:
             max_lots=self.cfg.fno_max_lots,
             lot_size=contract.lot_size,
             limit_price=limit_price,
-            targets=sig.targets,
+            # Recommendation targets must never determine our lot tranches or exits.
+            # One F&O order is sized independently of provider SL/targets.
+            targets=None,
         )
         if not sizing.is_valid:
             self.db.record_signal(sig.channel_id, sig.message_id, "OPTION", sig.symbol, "BLOCKED", sig.raw_text, "REJECTED_SIZE", sizing.error_reason)
@@ -678,8 +688,8 @@ class TradingBotPipeline:
             init_levels = calculate_protection_levels(
                 executed_price=limit_price,
                 quantity=sizing.total_quantity,
-                sl_pct=self.cfg.sl_pct,
-                target_pct=self.cfg.target_pct,
+                sl_pct=self.cfg.fno_sl_pct,
+                target_pct=self.cfg.fno_target_pct,
                 sl_limit_buffer_pct=self.cfg.sl_limit_buffer_pct,
                 tick_size=contract.tick_size,
             )
