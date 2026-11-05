@@ -17,6 +17,7 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
             ("NSE", "ARIHANT", "Arihant Limited"),
             ("NSE", "ARIHANTCAP", "Arihant Capital Markets Limited"),
             ("NSE", "SBIN", "State Bank of India"),
+            ("NSE", "YESBANK", "Yes Bank"),
             ("NSE", "RELIANCE", "Reliance Industries Limited"),
         ])
 
@@ -44,6 +45,18 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
         sig, reason = parse_equity_regex("Bought ARIHANT COSMO", current_time=100.0, msg_timestamp=95.0)
         self.assertIsNone(sig)
         self.assertIn("Unresolved or ambiguous", reason)
+
+    def test_missing_company_index_cannot_trade_shorter_ticker(self):
+        resolver_mod._NAME_INDEX.clear()
+        sig, reason = parse_equity_regex("Bought ARIHANT CAP", current_time=100.0, msg_timestamp=95.0)
+        self.assertIsNone(sig)
+        self.assertIn("Unresolved or ambiguous", reason)
+
+    def test_known_multiword_alias_without_index_still_works(self):
+        resolver_mod._NAME_INDEX.clear()
+        sig, reason = parse_equity_regex("Bought YES BANK", current_time=100.0, msg_timestamp=95.0)
+        self.assertIsNotNone(sig, reason)
+        self.assertEqual(sig.symbol, "YESBANK")
 
     def test_colliding_abbreviations_fail_closed(self):
         index = build_name_index([
