@@ -1437,8 +1437,8 @@ class TradingBotPipeline:
             eq_init_levels = calculate_protection_levels(
                 executed_price=limit_price,
                 quantity=sizing.total_quantity,
-                sl_pct=self.cfg.sl_pct,
-                target_pct=self.cfg.target_pct,
+                sl_pct=self.cfg.equity_sl_pct,
+                target_pct=self.cfg.equity_target_pct,
                 sl_limit_buffer_pct=self.cfg.sl_limit_buffer_pct,
                 tick_size=inst.tick_size,
             )

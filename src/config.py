@@ -170,7 +170,7 @@ class AppConfig:
     fno_fixed_lots: int = 1
     fno_max_lots: int = 3
     allow_next_month_expiry_fallback: bool = True
-    fno_amo_enabled: bool = False  # Opt-in local staging; protected Super Order only at market OPEN
+    fno_amo_enabled: bool = False  # Opt-in broker-native F&O AMO; entry-only without automatic SL/target
     fno_amo_max_age_sec: float = 64800.0  # 18 hours; weekends/holidays expire safely
 
     # Independent, operator-configurable protection by execution segment.
