@@ -3,15 +3,18 @@
 This module is pure HTML/JS rendering. Importing it never changes a service,
 credential, configuration, broker order, or running trading process.
 
-BACKEND CONTRACT (endpoints are NOT implemented by this proposal):
+BACKEND CONTRACT (implemented by the authenticated Control Center facade):
   GET  /control/status
   GET  /control/health
   GET  /control/amo/orders
   POST /control/amo/equity
+  POST /control/amo/fno
+  POST /control/amo/fno/cancel
   POST /setup/service-control  (already exists)
 
-F&O AMO intentionally remains noninteractive until the protected Dhan API route
-is independently verified and approved.
+F&O AMO sends an entry-only LIMIT order directly to Dhan's documented /orders
+API after hours. Dhan's order ID confirms acknowledgement, NOT execution.
+Local queued entries from older builds are never automatically dispatched.
 """
 
 from html import escape
@@ -92,10 +95,10 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
     <input id="equity-amo" class="toggle" type="checkbox" role="switch" aria-label="Enable Equity AMO" disabled>
   </div>
   <div class="row"><div><div class="row-title">F&amp;O AMO</div>
-    <div class="row-sub">Stock options · disabled until protected Dhan API route is verified</div></div>
+    <div class="row-sub">NSE stock options · broker AMO at OPEN · entry only (no SL/TP)</div></div>
     <input id="fno-amo" class="toggle" type="checkbox" role="switch" aria-label="Enable F&O AMO" disabled>
   </div>
-  <div class="status-note">AMO dispatch preference: <b>Market Open</b>. Enabling a switch never changes Emergency STOP or LIVE/TEST mode.</div>
+  <div class="status-note">AMO preference: <b>Market Open</b>. Both Equity and F&amp;O send orders to Dhan immediately after hours. Dhan order ID confirms receipt, not a fill. F&amp;O AMO has NO automatic SL/target; review any filled position manually. Legacy local F&amp;O entries are never dispatched. Switching OFF does not cancel submitted Dhan orders.</div>
   <div id="amo-feedback" role="status" aria-live="polite">AMO settings have not been changed.</div>
 </section>
 <section aria-label="AMO order reconciliation">
@@ -137,11 +140,16 @@ async function refreshStatus(){
     $('stop').disabled=state!=='RUNNING';
     $('equity-amo').checked=s.equity_amo_saved===true;
     $('equity-amo').disabled=s.equity_amo_can_edit!==true;
-    setText('amo-feedback',s.equity_amo_message||('Equity AMO saved: '+(s.equity_amo_saved?'ON':'OFF')+
-      ' · active: '+(s.equity_amo_active===true?'ON':s.equity_amo_active===false?'OFF':'UNVERIFIED')));
+    $('fno-amo').checked=s.fno_amo_saved===true;
+    $('fno-amo').disabled=s.fno_amo_can_edit!==true;
+    setText('amo-feedback',
+      'Equity AMO saved: '+(s.equity_amo_saved?'ON':'OFF')+
+      ' · F&O AMO saved: '+(s.fno_amo_saved?'ON':'OFF')+
+      ' · F&O runtime: '+(s.fno_amo_active===true?'ON':s.fno_amo_active===false?'OFF':'UNVERIFIED')+
+      ' · F&O route: broker native AMO /orders (entry only)');
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
   }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;
-    $('equity-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
+    $('equity-amo').disabled=true;$('fno-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
     setText('info','Cannot verify bot state: '+err.message+' (controls disabled)')}
 }
 async function serviceAction(action){
@@ -201,6 +209,30 @@ $('equity-amo').addEventListener('change',async()=>{
   }catch(err){setText('amo-feedback','Equity AMO change/status verification failed: '+err.message)}
   await refreshStatus();
 });
+$('fno-amo').addEventListener('change',async()=>{
+  const requested=$('fno-amo').checked;
+  if(!current){$('fno-amo').checked=!requested;return}
+  if(requested&&!confirm('Enable broker-native F&O AMO? Eligible NSE stock option orders will be sent to Dhan after hours. Dhan will return a real Order ID if acknowledged. NO automatic SL or target will protect a filled position.')) {
+    $('fno-amo').checked=false;return;
+  }
+  $('fno-amo').disabled=true;setText('amo-feedback','Requesting F&O AMO setting through safety coordinator…');
+  try{
+    const r=await requestJSON('/control/amo/fno',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:requested,csrf_token:csrf})});
+    setText('amo-feedback',r.message||('Requested: '+String(r.state||'PENDING')));
+    if(r.change_id){
+      const id=encodeURIComponent(String(r.change_id));
+      for(let i=0;i<15;i++){
+        await new Promise(resolve=>setTimeout(resolve,1500));
+        const rec=await requestJSON('/setup/change-status/'+id);
+        const st=String(rec.state||'UNKNOWN');
+        setText('amo-feedback','F&O AMO configuration: '+st+' · '+String(rec.reason||''));
+        if(['APPLIED_VERIFIED','SAVED_FOR_NEXT_START','REJECTED','APPLY_FAILED'].includes(st))break;
+      }
+    }
+  }catch(err){setText('amo-feedback','F&O AMO change not verified: '+err.message)}
+  await refreshStatus();
+});
 async function refreshOrders(){
   $('refresh-orders').disabled=true;$('orders').replaceChildren();
   try{
@@ -212,6 +244,30 @@ async function refreshOrders(){
       const right=document.createElement('span');right.className='muted';
       right.textContent=String(order.status||'UNKNOWN')+' · '+String(order.protection||'Protection unverified');
       el.append(left,right);$('orders').append(el);
+    }
+    for(const item of (Array.isArray(r.fno_local_queue)?r.fno_local_queue:[])){
+      const el=document.createElement('div');el.className='order';
+      const label=document.createElement('span');
+      label.textContent='F&O '+String(item.symbol||'Unknown')+' · '+String(item.state||'UNKNOWN')+
+        ' · LEGACY local record · '+(item.state==='QUEUED'?'NOT DISPATCHED — review or cancel':'Never auto-dispatched by this patch');
+      el.append(label);
+      if(item.state==='QUEUED'){
+        const button=document.createElement('button');button.type='button';
+        button.textContent='Cancel legacy staged';
+        button.addEventListener('click',async()=>{
+          if(!confirm('Cancel this legacy local record? This does not cancel any Dhan orders.'))return;
+          button.disabled=true;
+          try{
+            const out=await requestJSON('/control/amo/fno/cancel',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({item_id:String(item.item_id),csrf_token:csrf})});
+            setText('order-counts',String(out.message||'Cancellation recorded'));
+          }catch(err){setText('order-counts','F&O local cancellation unverified: '+err.message)}
+          await refreshOrders();
+        });
+        el.append(button);
+      }
+      $('orders').append(el);
     }
   }catch(err){setText('order-counts','Cannot verify AMO orders: '+err.message)}
   $('refresh-orders').disabled=false;

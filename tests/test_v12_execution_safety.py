@@ -597,10 +597,10 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
         sig = inspect.signature(cmd_web)
         self.assertEqual(sig.parameters["host"].default, "127.0.0.1")
 
-        # Verify byte-for-byte SHA-256 parity of protected setup files
+        # Verify byte-for-byte SHA-256 parity of intentionally updated protection setup files
         for rel_path, expected in [
-            ("src/setup_app.py", "04fcc42921ed3be01256ce9616b349579fe781a01b7fc8da5aa822fb9297e605"),
-            ("src/setup_wizard.py", "3ef353bbcd580499a929c9fb29a69c5eaf5e89918556b07fe770ca3736075c8f"),
+            ("src/setup_app.py", "100148c70504d9dc88bed94d988ed9a4ebbf8eef2816aa0ec2272f9b68ab7d8c"),
+            ("src/setup_wizard.py", "5e08eb4b0626aacfe7ee8cee8e9f66f421d43f7f90caa8d9a400506d7461430f"),
             ("tests/test_setup.py", "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e"),
         ]:
             with open(rel_path, "rb") as fh:

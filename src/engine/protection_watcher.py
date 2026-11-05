@@ -157,14 +157,24 @@ class ProtectionWatcher:
         auto_retry_enabled: bool = True,
         max_cancel_attempts: int = 3,
         cancel_backoff_sec: float = 2.0,
+        equity_sl_pct: Optional[float] = None,
+        equity_target_pct: Optional[float] = None,
+        fno_sl_pct: Optional[float] = None,
+        fno_target_pct: Optional[float] = None,
         orphan_cancel_ack_timeout_sec: float = 10.0,
         orphan_cancel_retry_backoff_sec: float = 5.0,
         orphan_cancel_max_attempts: int = 3,
         orphan_cancel_deadline_sec: float = 60.0,
     ):
         self.broker = broker
+        # Legacy fields apply only to previously tracked records without an
+        # explicit policy snapshot and older direct ProtectionWatcher callers.
         self.sl_pct = sl_pct
         self.target_pct = target_pct
+        self.equity_sl_pct = sl_pct if equity_sl_pct is None else equity_sl_pct
+        self.equity_target_pct = target_pct if equity_target_pct is None else equity_target_pct
+        self.fno_sl_pct = sl_pct if fno_sl_pct is None else fno_sl_pct
+        self.fno_target_pct = target_pct if fno_target_pct is None else fno_target_pct
         self.sl_limit_buffer_pct = sl_limit_buffer_pct
         self.path = path or os.environ.get("PENDING_PROTECTION_FILE") or DEFAULT_PATH
         self.dry_run = dry_run
@@ -227,6 +237,11 @@ class ProtectionWatcher:
         rec.setdefault("cancel_reason", "")
         rec.setdefault("entry_timeout_elapsed", bool(rec.get("timed_out_cancel", False)))
         rec.setdefault("is_amo", False)
+        rec.setdefault("entry_only_amo", False)
+        rec.setdefault("amo_manual_risk_alerted", False)
+        if rec.get("entry_only_amo"):
+            rec["retry_eligible"] = False
+            rec["max_retries"] = 0
         rec.setdefault("amo_activated_at", 0.0)
         rec.setdefault(
             "cancel_requested",
@@ -424,6 +439,16 @@ class ProtectionWatcher:
             except Exception as e:
                 logger.error(f"[Protection] Could not write {self.path}: {e}")
 
+    def _protection_for_segment(self, segment: str) -> tuple[float, float]:
+        """Choose separate Equity or stock-option protection for NEW orders."""
+        seg = str(segment or "").strip().upper()
+        if seg in ("NSE_EQ", "BSE_EQ"):
+            return float(self.equity_sl_pct), float(self.equity_target_pct)
+        if seg in ("NSE_FNO", "BSE_FNO", "NSE_FO", "BSE_FO"):
+            return float(self.fno_sl_pct), float(self.fno_target_pct)
+        # Legacy compatibility for direct non-trading watcher callers.
+        return float(self.sl_pct), float(self.target_pct)
+
     def track(
         self,
         order_id: str,
@@ -449,10 +474,23 @@ class ProtectionWatcher:
         root_order_id: str = "",
         notification_meta: Optional[dict] = None,
         is_amo: bool = False,
+        entry_only_amo: bool = False,
+        protection_sl_pct: Optional[float] = None,
+        protection_target_pct: Optional[float] = None,
         protection_route: Optional[str] = None,
         initial_sl_price: Optional[float] = None,
         initial_target_price: Optional[float] = None,
     ) -> str:
+        chosen_sl, chosen_target = self._protection_for_segment(segment)
+        if protection_sl_pct is not None:
+            chosen_sl = float(protection_sl_pct)
+        if protection_target_pct is not None:
+            chosen_target = float(protection_target_pct)
+        if not (
+            math.isfinite(chosen_sl) and 0 < chosen_sl <= 50
+            and math.isfinite(chosen_target) and 0 < chosen_target <= 100
+        ):
+            raise ValueError("Invalid per-order protection percentages")
         exp_str = ""
         if isinstance(expiry, date):
             exp_str = expiry.isoformat()
@@ -488,6 +526,8 @@ class ProtectionWatcher:
                     existing["notification_meta"] = dict(notification_meta)
                 if is_amo:
                     existing["is_amo"] = True
+                if entry_only_amo:
+                    existing["entry_only_amo"] = True
                 if order_id not in self.pending and order_id in self.terminal_orders:
                     pass
                 else:
@@ -504,8 +544,14 @@ class ProtectionWatcher:
                     "security_id": str(security_id),
                     "segment": segment,
                     "product_type": product_type,
+                    # Immutable protection policy snapshot for this parent order.
+                    # Reloading WebUI settings cannot retarget an existing order.
+                    "protection_sl_pct": chosen_sl,
+                    "protection_target_pct": chosen_target,
                     "is_super_order": bool(is_super_order),
                     "is_amo": bool(is_amo),
+                    "entry_only_amo": bool(entry_only_amo),
+                    "amo_manual_risk_alerted": False,
                     "amo_activated_at": 0.0,
                     "protection_route": (
                         str(protection_route).strip().upper()
@@ -916,7 +962,14 @@ class ProtectionWatcher:
                 has_unresolved_attempt = unresolved_att is not None
                 new_qty = filled - int(rec.get("protected_qty") or 0)
 
-                should_call_protect = (
+                if rec.get("entry_only_amo") and filled > 0 and not rec.get("amo_manual_risk_alerted"):
+                    rec["amo_manual_risk_alerted"] = True
+                    logger.critical("F&O AMO FILL %s: %s units have NO AUTOMATIC SL/TARGET. Manual exit required.",
+                                    order_id, filled)
+                    changed = True
+                # Explicitly do not attempt MARGIN Forever OCO or modify a
+                # Super Order that does not exist for this entry-only AMO.
+                should_call_protect = not rec.get("entry_only_amo") and (
                     has_unresolved_attempt
                     or (filled > prev_filled and new_qty > 0)
                     or (new_qty > 0 and current_time >= float(rec.get("retry_at") or 0.0))
@@ -1745,6 +1798,10 @@ class ProtectionWatcher:
 
     def _protect(self, rec: dict, st: dict, filled: int, new_qty: int) -> bool:
         with self._lock:
+            # Defense in depth: an entry-only AMO is deliberately unmanaged;
+            # do not convert it to an unsupported MARGIN Forever OCO.
+            if rec.get("entry_only_amo"):
+                return False
             route_name = self._resolve_protection_route(rec)
             if route_name == ProtectionRoute.UNKNOWN.value:
                 self._record_unprotected_and_halt(
@@ -1793,11 +1850,15 @@ class ProtectionWatcher:
 
             inst_tick = float(rec.get("tick_size") or TICK)
             target_qty = filled if is_super else new_qty
+            # Legacy records from before this upgrade retain their original
+            # shared protection defaults; new orders use the persisted snapshot.
+            sl_pct = float(rec.get("protection_sl_pct", self.sl_pct))
+            target_pct = float(rec.get("protection_target_pct", self.target_pct))
             levels = calculate_protection_levels(
                 executed_price=executed_chunk,
                 quantity=target_qty,
-                sl_pct=self.sl_pct,
-                target_pct=self.target_pct,
+                sl_pct=sl_pct,
+                target_pct=target_pct,
                 sl_limit_buffer_pct=self.sl_limit_buffer_pct,
                 tick_size=inst_tick,
             )
@@ -1808,8 +1869,8 @@ class ProtectionWatcher:
             if self.dry_run and str(rec["order_id"]).startswith("DRY-"):
                 logger.info(
                     f"[DRY RUN] Protected {new_qty}x {rec['symbol']} @ {executed_chunk}: "
-                    f"Target {levels.target_price} (+{self.target_pct:g}%), "
-                    f"SL Trigger {levels.sl_trigger} (-{self.sl_pct:g}%, Limit {levels.sl_limit})"
+                    f"Target {levels.target_price} (+{target_pct:g}%), "
+                    f"SL Trigger {levels.sl_trigger} (-{sl_pct:g}%, Limit {levels.sl_limit})"
                 )
                 self._record_confirmed_protection(
                     rec=rec,
@@ -2207,6 +2268,9 @@ class ProtectionWatcher:
         rec = self.pending.get(order_id) or self.terminal_orders.get(order_id)
         if not rec:
             return False, 0, f"Order {order_id} not in tracking"
+        if rec.get("entry_only_amo"):
+            rec["retry_eligible"] = False
+            return False, 0, "F&O entry-only AMO automatic retry is disabled"
 
         t_blocked, t_reason = self._is_transition_gate_blocking_new_entries()
         if t_blocked:
@@ -2322,11 +2386,16 @@ class ProtectionWatcher:
         new_qty = filled - rec["protected_qty"]
 
         if new_qty > 0:
-            logger.warning(
-                f"[Protection] LATE FILL DETECTED for terminal order {order_id} ({rec['symbol']}): "
-                f"{new_qty} additional shares filled (total filled: {filled}). Placing protection."
-            )
-            self._protect(rec, st, filled, new_qty)
+            if rec.get("entry_only_amo"):
+                logger.critical("F&O AMO LATE FILL %s (%s): %s units without SL/target; manual exit required",
+                                order_id, rec['symbol'], filled)
+                rec["amo_manual_risk_alerted"] = True
+            else:
+                logger.warning(
+                    f"[Protection] LATE FILL DETECTED for terminal order {order_id} ({rec['symbol']}): "
+                    f"{new_qty} additional shares filled (total filled: {filled}). Placing protection."
+                )
+                self._protect(rec, st, filled, new_qty)
             self._save()
             return True
         return False
@@ -2680,8 +2749,8 @@ class ProtectionWatcher:
             init_levels = calculate_protection_levels(
                 executed_price=price,
                 quantity=retry_qty,
-                sl_pct=self.sl_pct,
-                target_pct=self.target_pct,
+                sl_pct=float(rec.get("protection_sl_pct", self.sl_pct)),
+                target_pct=float(rec.get("protection_target_pct", self.target_pct)),
                 sl_limit_buffer_pct=self.sl_limit_buffer_pct,
                 tick_size=inst_tick,
             )
@@ -2756,6 +2825,8 @@ class ProtectionWatcher:
             max_retries=1,
             retry_reserved=True,
             notification_meta=dict(rec.get("notification_meta") or {}) or None,
+            protection_sl_pct=float(rec.get("protection_sl_pct", self.sl_pct)),
+            protection_target_pct=float(rec.get("protection_target_pct", self.target_pct)),
         )
 
         with self._lock:

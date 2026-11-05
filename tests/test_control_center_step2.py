@@ -99,7 +99,8 @@ class ControlApiTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.env = os.path.join(self.tmp.name, '.env')
         Path(self.env).write_text('TRADING_MODE=TEST\nDHAN_PIN=unmodified\nEQUITY_AMO_ENABLED=false\n', encoding='utf-8')
-        self.cfg = types.SimpleNamespace(equity_amo_enabled=False,data_dir=self.tmp.name)
+        self.cfg = types.SimpleNamespace(equity_amo_enabled=False,fno_amo_enabled=False,
+                                         dhan_client_id="OFFLINE",data_dir=self.tmp.name)
         self.tracker = MagicMock()
         self.tracker.pending_op_file = os.path.join(self.tmp.name,'pending.json')
         self.tracker.deferred_env_file = os.path.join(self.tmp.name,'deferred.env')
@@ -177,7 +178,9 @@ class ControlApiTests(unittest.TestCase):
         r=self.client.get('/control/status')
         self.assertEqual(r.status_code,200)
         self.assertEqual(r.headers['cache-control'],'no-store')
-        self.assertFalse(r.json()['fno_amo_supported'])
+        self.assertTrue(r.json()['fno_amo_supported'])
+        self.assertFalse(r.json()['fno_amo_saved'])
+        self.assertFalse(r.json()['fno_amo_active'] is True)
         self.assertNotIn('unmodified',r.text)
         self.tracker.enqueue_durable_configuration_update.assert_not_called()
 
@@ -187,10 +190,27 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(r.json()['state'],'UNCHANGED')
         self.tracker.enqueue_durable_configuration_update.assert_not_called()
 
-    def test_fno_amo_post_does_not_exist(self):
+    def test_fno_amo_uses_same_safe_coordinator_with_separate_key(self):
         r=self.client.post('/control/amo/fno',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,404)
+        self.assertEqual(r.status_code,202,r.text)
+        kw=self.tracker.enqueue_durable_configuration_update.call_args.kwargs
+        self.assertIn('FNO_AMO_ENABLED=true',kw['env_content'])
+        self.assertIn('DHAN_PIN=unmodified',kw['env_content'])
+        self.assertEqual(Path(self.env).read_text(),
+                         'TRADING_MODE=TEST\nDHAN_PIN=unmodified\nEQUITY_AMO_ENABLED=false\n')
+
+    def test_fno_amo_csrf_and_boolean_fail_closed(self):
+        for csrf in ('forged',''):
+            self.assertEqual(self.client.post('/control/amo/fno',json={
+                'enabled':True,'csrf_token':csrf}).status_code,403)
+        self.assertEqual(self.client.post('/control/amo/fno',json={
+            'enabled':'yes','csrf_token':'test-csrf'}).status_code,422)
         self.tracker.enqueue_durable_configuration_update.assert_not_called()
+
+    def test_fno_local_cancel_requires_valid_csrf(self):
+        r=self.client.post('/control/amo/fno/cancel',
+                           json={'item_id':'-1:2','csrf_token':'forged'})
+        self.assertEqual(r.status_code,403)
 
     def test_health_endpoint_is_read_only_and_bounded(self):
         with patch('src.control_center_backend.build_control_health',return_value={'summary':'test','checks':[]}):

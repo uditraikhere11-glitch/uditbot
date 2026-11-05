@@ -942,7 +942,7 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         eq_oid = "SIM-SUP-1"
         worker.process_pending_events(now=sim_clock[0])
 
-        # 09:45:02 IST — YESBANK fills at ₹15.55 -> re-anchors SL to ₹15.05, Target to ₹16.05
+        # 09:45:02 IST — YESBANK fills at ₹15.55 -> re-anchors SL to ₹15.35, Target to ₹15.75
         sim_clock[0] += 2.0
         qty_eq = order_status_book[eq_oid]["quantity"]
         order_status_book[eq_oid].update({"orderStatus": "TRADED", "filledQty": qty_eq, "averageTradedPrice": 15.55})
@@ -960,13 +960,13 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         positions_book["11915"] = {"securityId": "11915", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": qty_eq}
         pipe.watcher.check_once()
         worker.process_pending_events(now=sim_clock[0])
-        self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["confirmed_sl_price"], 15.05)
-        self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["confirmed_target_price"], 16.05)
+        self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["confirmed_sl_price"], 15.35)
+        self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["confirmed_target_price"], 15.75)
 
-        # 10:15:00 IST — YESBANK Target Leg triggers and fills at ₹16.05
+        # 10:15:00 IST — YESBANK Target Leg triggers and fills at ₹15.75
         sim_clock[0] += 1800.0
         super_book[eq_oid] = _active_super_order_record(
-            eq_oid, "11915", "NSE_EQ", "CNC", qty_eq, 15.05, 16.05,
+            eq_oid, "11915", "NSE_EQ", "CNC", qty_eq, 15.35, 15.75,
             parent_status="CLOSED", target_status="TRADED", target_triggered_qty=qty_eq,
         )
         trade_book.append({
@@ -977,13 +977,13 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
             "exchangeSegment": "NSE_EQ",
             "productType": "CNC",
             "tradedQuantity": qty_eq,
-            "tradedPrice": 16.05,
+            "tradedPrice": 15.75,
         })
         positions_book["11915"]["netQty"] = 0
         pipe.watcher.check_once()
         worker.process_pending_events(now=sim_clock[0])
         self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["position_state"], PositionLifecycleState.POSITION_CLOSED.value)
-        self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["realized_pnl"], round((16.05 - 15.55) * qty_eq, 2))
+        self.assertEqual(pipe.watcher.terminal_orders[eq_oid]["realized_pnl"], round((15.75 - 15.55) * qty_eq, 2))
 
         # --- LEG B: 11:00:00 IST — POLYCAB 5000 CE @ 98-100 -> Limit ₹104.00 (1 lot = 125 qty) ---
         sim_clock[0] += 2700.0
