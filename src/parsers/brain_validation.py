@@ -170,7 +170,7 @@ _SL_CLAUSE_MASK_RE = re.compile(
     re.IGNORECASE,
 )
 _TARGET_CLAUSE_MASK_RE = re.compile(
-    r"\b(?:targets?|tgt|tp)\b\s*(?:(?:at|@|is|around|near|above|[:\-=])\s*)*(?:(?:rs\.?|inr|₹)\s*)?[-+]?[A-Za-z0-9,.\s/\-]+?(?=\b(?:sl|stop\s*-?\s*loss|buy|bought|add|added|entry|premium|price|cmp)\b|@|$|\n)",
+    r"\b(?:targets?|tgt|tp)\b\s*(?:(?:at|@|is|around|near|above|[:\-=])\s*)*(?:(?:rs\.?|inr|₹)\s*)?[-+]?[A-Za-z0-9,.\s/\-+]+?(?=\b(?:sl|stop\s*-?\s*loss|buy|bought|add|added|entry|premium|price|cmp)\b|@|$|\n)",
     re.IGNORECASE,
 )
 
@@ -178,7 +178,7 @@ _TARGET_CLAUSE_MASK_RE = re.compile(
 _OPTION_CONTRACT_CANDIDATE_RE = re.compile(
     r"(?<![A-Za-z0-9&\-])#?\s*(?P<sym>[A-Za-z][A-Za-z&\-]*)"
     r"(?:\s+(?:(?P<pre_day>\d{1,2})(?:st|nd|rd|th)?\s+)?(?P<pre_mon>JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T|TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?))?"
-    r"\s+(?P<strike>\d+(?:,\d+)*(?:\.\d+)?)\s*(?P<opt>CE|PE|CALL|PUT)\b",
+    r"\s*(?P<strike>\d+(?:,\d+)*(?:\.\d+)?)\s*(?P<opt>CE|PE|CALL|PUT)\b",
     re.IGNORECASE,
 )
 
@@ -610,6 +610,67 @@ def extract_equity_price_bounds(text: str) -> Tuple[bool, bool, float, float, st
     return res.is_valid, res.has_explicit_price, res.entry_min, res.entry_max, res.reason
 
 
+_FNO_POSITIONAL_PREMIUM_RE = re.compile(
+    r"[ \t]*[:=]?[ \t]*(?P<low>\d{1,10}(?:\.\d{1,6})?)"
+    r"(?:[ \t]*(?:-|~|to)[ \t]*(?P<high>\d{1,10}(?:\.\d{1,6})?))?[ \t]*",
+    re.IGNORECASE,
+)
+
+
+def _extract_fno_positional_premium(masked_sub: str, base_offset: int) -> Optional[PriceExtractionResult]:
+    """Recognize a strict immediate post-contract price line, never a later unrelated number.
+
+    SL/Target and clock clauses are already length-preservingly masked. The
+    price occupies the entire first nonblank line; no stripping of signs or
+    guessing ambiguous separators like comma, slash, 'and', or plain spaces.
+    """
+    leading = len(masked_sub) - len(masked_sub.lstrip(" \t\n"))
+    remainder = masked_sub[leading:]
+    if not remainder:
+        return None
+
+    line, _, later = remainder.partition("\n")
+    # Only number-led entry clauses are eligible; month/expiry/ordinary prose
+    # retain their existing handling. An optional ':' or '=' is harmless.
+    if not re.match(r"^(?:[:=][ \t]*)?[-+]?\s*\d", line):
+        return None
+
+    def reject(message: str) -> PriceExtractionResult:
+        return PriceExtractionResult(
+            status=PriceStatus.INVALID,
+            source_span=line.strip(),
+            span_offsets=(base_offset + leading, base_offset + leading + len(line)),
+            reason_code=DecisionReasonCode.INVALID_EXPLICIT_PRICE.value,
+            reason=message,
+        )
+
+    # Do not allow unrelated unmasked words/numbers on later lines. The
+    # harmless '+' suffix from 'Target 290+' may survive the target masker.
+    if re.search(r"[A-Za-z0-9@]", later):
+        return reject("Unanchored option premium followed by ambiguous extra text")
+    match = _FNO_POSITIONAL_PREMIUM_RE.fullmatch(line)
+    if match is None:
+        return reject("Malformed or ambiguous unanchored option premium")
+    lower = parse_clean_number_token(match.group("low"))
+    upper = parse_clean_number_token(match.group("high")) if match.group("high") else lower
+    if lower is None or upper is None or lower <= 0 or upper <= 0:
+        return reject("Non-positive or invalid unanchored option premium")
+    low, high = min(lower, upper), max(lower, upper)
+    # A single misplaced digit could raise a limit price dramatically.
+    if high > low * 1.5:
+        return reject("Option premium range exceeds conservative 50% width limit")
+
+    return PriceExtractionResult(
+        status=PriceStatus.VALID,
+        entry_min=low,
+        entry_max=high,
+        source_span=line.strip(),
+        span_offsets=(base_offset + leading, base_offset + leading + len(line)),
+        reason_code=DecisionReasonCode.OK.value,
+        reason="Validated unanchored post-contract premium",
+    )
+
+
 def extract_fno_entry_bounds(text: str, after_pos: int = 0) -> PriceExtractionResult:
     """
     Extracts and validates the mandatory F&O option entry premium from `text` starting at `after_pos`
@@ -668,6 +729,11 @@ def extract_fno_entry_bounds(text: str, after_pos: int = 0) -> PriceExtractionRe
         extracted.append((lo, hi, span, (abs_start, abs_end)))
 
     if not extracted:
+        # F&O-only fallback for an immediately adjacent unanchored premium.
+        # Both regex and AI candidate grounding call this same validator.
+        positional = _extract_fno_positional_premium(masked_sub, base_offset)
+        if positional is not None:
+            return positional
         return PriceExtractionResult(
             status=PriceStatus.ABSENT,
             entry_min=0.0,
@@ -899,33 +965,57 @@ def detect_multiple_option_contracts(text: str) -> Tuple[bool, List[str], str]:
     if len(contracts) > 1:
         return True, contracts, f"Multiple/mixed option contracts detected: {contracts}"
 
-    # BRAIN-V3-02: Check if another valid stock ticker or action-bound ticker is mentioned alongside the option contract
-    # e.g. "BUY SBIN? RELIANCE 800 PE @100" or "#SBIN RELIANCE 800 PE @100"
+    # A stock name occurring in commentary does NOT constitute a second contract.
+    # In particular, "in mind", "add slowly", "limited qty", and "#Positional"
+    # must not be treated as additional F&O underlyings.  A second fully formed
+    # contract is already rejected above; retain the legacy conflicting-header
+    # protection only when another symbol is attached to the actual trade line.
     if len(contract_syms) == 1:
         primary_sym = next(iter(contract_syms))
-        other_syms: Set[str] = set()
-        for hm in re.finditer(r"#\s*([A-Za-z][A-Za-z0-9&\-]{1,14})\b", norm):
-            cand = hm.group(1).upper()
-            if cand != primary_sym and cand not in _NON_CONTRACT_WORDS:
-                if not VALID_EQUITY_SYMBOLS or cand in VALID_EQUITY_SYMBOLS:
-                    other_syms.add(cand)
-        for am in re.finditer(
-            r"\b(?:buy|bought|add|added|in|sell|watch)\s+#?\s*([A-Za-z][A-Za-z0-9&\-]{1,14})\b",
-            norm,
+        primary_match = next(
+            m for m in _OPTION_CONTRACT_CANDIDATE_RE.finditer(norm)
+            if m.group("sym").upper() == primary_sym
+        )
+        line_start = norm.rfind("\n", 0, primary_match.start()) + 1
+        prefix = norm[line_start:primary_match.start()]
+        conflict = re.search(
+            r"(?:^|\s)(?:(?:buy|bought|add|added|sell)\s+#?(?P<action_sym>[A-Za-z][A-Za-z0-9&\-]{1,14})|#(?P<hash_sym>[A-Za-z][A-Za-z0-9&\-]{1,14}))\s*[?!,:-]?\s*$",
+            prefix,
             flags=re.IGNORECASE,
-        ):
-            cand = am.group(1).upper()
+        )
+        if conflict:
+            cand = (conflict.group("action_sym") or conflict.group("hash_sym")).upper()
+            # Metadata hashtags are not trade symbols even when placed before
+            # the contract header.  This exemption is F&O-only.
+            metadata = {
+                "POSITIONAL", "INTRADAY", "SWING", "HOLDING", "LEARNING",
+                "DISCLAIMER", "BREAKOUT", "CHART", "NEWS", "VIEW",
+                "WATCHLIST", "MOMENTUM", "LEVELS", "TARGET", "SL",
+            }
+            if (
+                cand != primary_sym
+                and cand not in _NON_CONTRACT_WORDS
+                and cand not in metadata
+                and (not VALID_EQUITY_SYMBOLS or cand in VALID_EQUITY_SYMBOLS)
+            ):
+                all_found = sorted((primary_sym, cand))
+                return True, all_found, f"Conflicting underlyings in option contract header: {all_found}"
+
+        # A separate explicit BUY line with another symbol and entry premium is
+        # also actionable (unlike free-form commentary without a premium).
+        for line in norm.splitlines():
+            buy_m = re.match(
+                r"^\s*(?:buy|bought|add|added)\s+#?(?P<sym>[A-Za-z][A-Za-z0-9&\-]{1,14})\s*(?:@|at|cmp\s*@?)\s*\d",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if not buy_m:
+                continue
+            cand = buy_m.group("sym").upper()
             if cand != primary_sym and cand not in _NON_CONTRACT_WORDS:
                 if not VALID_EQUITY_SYMBOLS or cand in VALID_EQUITY_SYMBOLS:
-                    other_syms.add(cand)
-        if VALID_EQUITY_SYMBOLS:
-            for wm in re.finditer(r"\b([A-Za-z][A-Za-z0-9&\-]{2,14})\b", norm):
-                cand = wm.group(1).upper()
-                if cand != primary_sym and cand not in _NON_CONTRACT_WORDS and cand in VALID_EQUITY_SYMBOLS:
-                    other_syms.add(cand)
-        if other_syms:
-            all_found = sorted({primary_sym} | other_syms)
-            return True, all_found, f"Conflicting/multiple underlyings in option message: {all_found}"
+                    all_found = sorted((primary_sym, cand))
+                    return True, all_found, f"Second actionable trade line in option message: {all_found}"
 
     return False, contracts, ""
 
@@ -1342,10 +1432,6 @@ def validate_fno_candidate(
     if is_neg:
         return None, PriceStatus.INVALID, {}, DecisionReasonCode.ANALYSIS_COMMENTARY.value, neg_reason
 
-    is_multi, _, multi_reason = detect_multiple_option_contracts(norm)
-    if is_multi:
-        return None, PriceStatus.INVALID, {}, DecisionReasonCode.AMBIGUOUS_CONTRACT.value, multi_reason
-
     clean_sym = (symbol or "").strip().upper() if isinstance(symbol, str) else ""
     idx_set = index_underlyings or {
         "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYBANK",
@@ -1367,6 +1453,13 @@ def validate_fno_candidate(
             DecisionReasonCode.UNRESOLVED_SYMBOL.value,
             f"Invalid non-symbol keyword '{clean_sym}' cannot be an option underlying",
         )
+
+
+    # Check genuine multiple contracts only after primary-index rejection, so
+    # NIFTY/SENSEX report INDEX_REJECTED instead of a spurious ambiguity.
+    is_multi, _, multi_reason = detect_multiple_option_contracts(norm)
+    if is_multi:
+        return None, PriceStatus.INVALID, {}, DecisionReasonCode.AMBIGUOUS_CONTRACT.value, multi_reason
 
     sym_ok, sym_span, sym_offsets = symbol_or_company_appears_in_text_with_offsets(clean_sym, norm)
     if not sym_ok or sym_offsets is None:

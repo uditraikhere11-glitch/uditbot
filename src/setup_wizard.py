@@ -63,8 +63,10 @@ def run_setup_wizard(env_path: str = ".env") -> Dict[str, Any]:
     equity_product = prompt("Equity Product Type (CNC or MTF)", "CNC").upper()
     fno_capital = prompt("Stock Options Budget per Trade (INR)", "20000")
     fno_max_lots = prompt("Options Max Lots Cap (0 = no cap)", "3")
-    sl_pct = prompt("Default Stop Loss (%)", "3.0")
-    target_pct = prompt("Default Target (%)", "3.0")
+    equity_sl_pct = prompt("Equity Stop Loss (%)", "1.0")
+    equity_target_pct = prompt("Equity Target (%)", "1.0")
+    fno_sl_pct = prompt("F&O Stop Loss (%)", "3.0")
+    fno_target_pct = prompt("F&O Target (%)", "3.0")
 
     # 6. Execution Mode
     print("\n--- [6] Execution Mode ---")
@@ -127,8 +129,13 @@ FNO_FIXED_LOTS=1
 FNO_MAX_LOTS={fno_max_lots}
 
 # --- PROTECTION & TIMING (FOREVER OCO) ---
-SL_PCT={sl_pct}
-TARGET_PCT={target_pct}
+EQUITY_SL_PCT={equity_sl_pct}
+EQUITY_TARGET_PCT={equity_target_pct}
+FNO_SL_PCT={fno_sl_pct}
+FNO_TARGET_PCT={fno_target_pct}
+# Kept for backwards-compatible legacy integrations only:
+SL_PCT=3.0
+TARGET_PCT=3.0
 SL_LIMIT_BUFFER_PCT=1.0
 MAX_QUOTE_AGE_SEC=2.0
 PARTIAL_FILL_RETRY_TIMEOUT_SEC=2.0

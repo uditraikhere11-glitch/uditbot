@@ -1036,18 +1036,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="grid-3">
           <div class="form-group">
-            <label>Default Stop Loss (%)</label>
+            <label>Equity Stop Loss (%)</label>
             <div class="input-wrap">
-              <input type="number" step="0.1" name="sl_pct" value="<!--SL_PCT-->" required>
+              <input type="number" min="0.1" max="50" step="0.1" name="equity_sl_pct" value="<!--EQUITY_SL_PCT-->" required>
             </div>
-            <p class="help-text">Calculated from executed fill price</p>
+            <p class="help-text">Cash Equity only: default 1% below executed fill</p>
           </div>
           <div class="form-group">
-            <label>Default Target (%)</label>
+            <label>Equity Target (%)</label>
             <div class="input-wrap">
-              <input type="number" step="0.1" name="target_pct" value="<!--TARGET_PCT-->" required>
+              <input type="number" min="0.1" max="100" step="0.1" name="equity_target_pct" value="<!--EQUITY_TARGET_PCT-->" required>
             </div>
-            <p class="help-text">Calculated from executed fill price</p>
+            <p class="help-text">Cash Equity only: default 1% above executed fill</p>
+          </div>
+          <div class="form-group">
+            <label>F&amp;O Stop Loss (%)</label>
+            <div class="input-wrap">
+              <input type="number" min="0.1" max="50" step="0.1" name="fno_sl_pct" value="<!--FNO_SL_PCT-->" required>
+            </div>
+            <p class="help-text">Stock options only: default 3% below executed fill</p>
           </div>
           <div class="form-group">
             <label>SL Limit Buffer (%)</label>
@@ -1057,6 +1064,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <p class="help-text">Buffer between SL trigger and limit</p>
           </div>
         </div>
+
+        <div class="grid-3" style="margin-top: 10px;">
+          <div class="form-group">
+            <label>F&amp;O Target (%)</label>
+            <div class="input-wrap">
+              <input type="number" min="0.1" max="100" step="0.1" name="fno_target_pct" value="<!--FNO_TARGET_PCT-->" required>
+            </div>
+            <p class="help-text">Stock options only: default 3% above executed fill</p>
+          </div>
+        </div>
+        <!-- Backwards-compatible form keys, not used for segment protection -->
+        <input type="hidden" name="sl_pct" value="<!--SL_PCT-->">
+        <input type="hidden" name="target_pct" value="<!--TARGET_PCT-->">
+        <p class="help-text">Provider Telegram SL / targets are informational only. Protection uses these independent values after execution.</p>
 
         <div class="grid-3" style="margin-top: 10px;">
           <div class="form-group">
@@ -1694,6 +1715,10 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--MAX_TOTAL_EXPOSURE_INR-->", str(int(cfg.max_total_exposure_inr)))
         .replace("<!--MAX_OPEN_POSITIONS-->", str(cfg.max_open_positions))
         # Protection & Timing
+        .replace("<!--EQUITY_SL_PCT-->", str(cfg.equity_sl_pct))
+        .replace("<!--EQUITY_TARGET_PCT-->", str(cfg.equity_target_pct))
+        .replace("<!--FNO_SL_PCT-->", str(cfg.fno_sl_pct))
+        .replace("<!--FNO_TARGET_PCT-->", str(cfg.fno_target_pct))
         .replace("<!--SL_PCT-->", str(cfg.sl_pct))
         .replace("<!--TARGET_PCT-->", str(cfg.target_pct))
         .replace("<!--SL_LIMIT_BUFFER_PCT-->", str(cfg.sl_limit_buffer_pct))
@@ -1758,6 +1783,10 @@ def build_env_and_params_dict(
     max_drawdown_pct=None,
     max_total_exposure_inr=150000.0,
     max_open_positions=5,
+    equity_sl_pct=1.0,
+    equity_target_pct=1.0,
+    fno_sl_pct=3.0,
+    fno_target_pct=3.0,
     sl_pct=3.0,
     target_pct=3.0,
     sl_limit_buffer_pct=1.0,
@@ -1855,7 +1884,9 @@ def build_env_and_params_dict(
         "FNO_MAX_LOTS", "ALLOW_NEXT_MONTH_EXPIRY_FALLBACK", "MAX_ORDER_AMOUNT_INR",
         "MIN_TRADE_FUNDS_INR", "TEST_MODE_PAPER_FUNDS_INR", "MAX_DAILY_LOSS_INR",
         "MAX_DRAWDOWN_PCT", "MAX_DAILY_TRADES", "MAX_TOTAL_EXPOSURE_INR", "MAX_OPEN_POSITIONS",
-        "INSUFFICIENT_FUNDS_POLICY", "MODE_SWITCH_POSITION_POLICY", "SL_PCT", "TARGET_PCT",
+        "INSUFFICIENT_FUNDS_POLICY", "MODE_SWITCH_POSITION_POLICY",
+        "EQUITY_SL_PCT", "EQUITY_TARGET_PCT", "FNO_SL_PCT", "FNO_TARGET_PCT",
+        "SL_PCT", "TARGET_PCT",
         "SL_LIMIT_BUFFER_PCT", "MAX_MESSAGE_AGE_SEC", "DEDUP_WINDOW_SEC", "MAX_QUOTE_AGE_SEC",
         "ORDER_TIMEOUT_SEC", "PARTIAL_FILL_RETRY_TIMEOUT_SEC", "SCRIP_MASTER_MAX_AGE_SEC",
     }
@@ -1925,7 +1956,12 @@ MAX_OPEN_POSITIONS={_extract_val(max_open_positions, 5)}
 INSUFFICIENT_FUNDS_POLICY={clean_insufficient}
 MODE_SWITCH_POSITION_POLICY=REMAIN_UNTOUCHED
 
-# --- PROTECTION & TIMING (FOREVER OCO) ---
+# --- SEGMENT-SPECIFIC PROTECTION (FOREVER OCO / SUPER ORDER) ---
+EQUITY_SL_PCT={_extract_val(equity_sl_pct, 1.0)}
+EQUITY_TARGET_PCT={_extract_val(equity_target_pct, 1.0)}
+FNO_SL_PCT={_extract_val(fno_sl_pct, 3.0)}
+FNO_TARGET_PCT={_extract_val(fno_target_pct, 3.0)}
+# Legacy-only fields below are not applied to new order protection.
 SL_PCT={_extract_val(sl_pct, 3.0)}
 TARGET_PCT={_extract_val(target_pct, 3.0)}
 SL_LIMIT_BUFFER_PCT={_extract_val(sl_limit_buffer_pct, 1.0)}
@@ -1974,6 +2010,10 @@ SCRIP_MASTER_MAX_AGE_SEC={clean_scrip_max_age}
         "MAX_OPEN_POSITIONS": int(_extract_val(max_open_positions, 5)),
         "INSUFFICIENT_FUNDS_POLICY": clean_insufficient,
         "MODE_SWITCH_POSITION_POLICY": "REMAIN_UNTOUCHED",
+        "EQUITY_SL_PCT": float(_extract_val(equity_sl_pct, 1.0)),
+        "EQUITY_TARGET_PCT": float(_extract_val(equity_target_pct, 1.0)),
+        "FNO_SL_PCT": float(_extract_val(fno_sl_pct, 3.0)),
+        "FNO_TARGET_PCT": float(_extract_val(fno_target_pct, 3.0)),
         "SL_PCT": float(_extract_val(sl_pct, 3.0)),
         "TARGET_PCT": float(_extract_val(target_pct, 3.0)),
         "SL_LIMIT_BUFFER_PCT": float(_extract_val(sl_limit_buffer_pct, 1.0)),
@@ -2207,6 +2247,10 @@ def handle_setup_submission(
     max_total_exposure_inr: float = Form(150000.0),
     max_open_positions: int = Form(5),
     # Protection & Timing
+    equity_sl_pct: float = Form(1.0),
+    equity_target_pct: float = Form(1.0),
+    fno_sl_pct: float = Form(3.0),
+    fno_target_pct: float = Form(3.0),
     sl_pct: float = Form(3.0),
     target_pct: float = Form(3.0),
     sl_limit_buffer_pct: float = Form(1.0),

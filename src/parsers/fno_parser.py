@@ -200,14 +200,21 @@ def parse_fno_regex_detailed(
             {},
         )
 
-    # 5. Multiple / mixed / shorthand option contracts & conflicting underlyings blocker (A07 + BRAIN-V3-02)
-    is_multi_opt, _, multi_reason = detect_multiple_option_contracts(norm)
-    if is_multi_opt:
+    # 5. F&O-only cancellation gate.  Plain commentary is ignored, but a
+    # cancellation/withdrawal anywhere in the message overrides the trade line.
+    cancellation = re.search(
+        r"\b(?:cancelled|canceled|cancel|cancellation|withdrawn|called?\s+off|"
+        r"ignore\s+(?:this|the)\s+(?:call|trade|signal)|"
+        r"skip\s+(?:this|the)\s+(?:call|trade|entry))\b",
+        norm,
+        flags=re.IGNORECASE,
+    )
+    if cancellation:
         return (
             None,
-            multi_reason,
+            f"Cancelled/withdrawn option entry detected ({cancellation.group(0)!r})",
             SignalAction.BLOCKED,
-            DecisionReasonCode.AMBIGUOUS_CONTRACT.value,
+            DecisionReasonCode.ANALYSIS_COMMENTARY.value,
             PriceStatus.ABSENT,
             {},
         )
@@ -217,6 +224,18 @@ def parse_fno_regex_detailed(
     # 6. Locate the Option Contract Header (`SYM [EXPIRY] STRIKE CE/PE`)
     m = CONTRACT_HEADER_PATTERN.search(cleaned_text) or CONTRACT_GLUED_PATTERN.search(cleaned_text)
     if not m:
+        # Shorthand multi-strike expressions have no single parseable contract
+        # header, but must still be BLOCKED rather than silently IGNORED.
+        is_multi_opt, _, multi_reason = detect_multiple_option_contracts(norm)
+        if is_multi_opt:
+            return (
+                None,
+                multi_reason,
+                SignalAction.BLOCKED,
+                DecisionReasonCode.AMBIGUOUS_CONTRACT.value,
+                PriceStatus.ABSENT,
+                {},
+            )
         return (
             None,
             "No option trade pattern matched",
@@ -245,6 +264,20 @@ def parse_fno_regex_detailed(
             f"Index option rejected ({symbol}); single-stock options only",
             SignalAction.BLOCKED,
             DecisionReasonCode.INDEX_REJECTED.value,
+            PriceStatus.ABSENT,
+            {},
+        )
+
+    # F&O index rejection precedes multiple-contract diagnosis: index signals
+    # must report INDEX_REJECTED even when trailing commentary has hashtags.
+    # Multiple genuine contracts and conflicting header symbols remain blocked.
+    is_multi_opt, _, multi_reason = detect_multiple_option_contracts(norm)
+    if is_multi_opt:
+        return (
+            None,
+            multi_reason,
+            SignalAction.BLOCKED,
+            DecisionReasonCode.AMBIGUOUS_CONTRACT.value,
             PriceStatus.ABSENT,
             {},
         )
@@ -316,9 +349,11 @@ def parse_fno_regex_detailed(
             {},
         )
 
-    # Standard regex path only matches `@`, `at`, `buy`, `around`, `cmp` anchors (leaving `premium`/`entry` to AI/adaptive)
+    # Preserve the historical explicit-anchor rule. The only new direct
+    # route is a strictly validated *immediate* post-contract numeric clause.
     anchor_prefix = price_res.source_span.split()[0].upper() if price_res.source_span else ""
-    if not (anchor_prefix.startswith("@") or anchor_prefix in ("AT", "BUY", "AROUND", "CMP")):
+    positional_ok = price_res.reason == "Validated unanchored post-contract premium"
+    if not (positional_ok or anchor_prefix.startswith("@") or anchor_prefix in ("AT", "BUY", "AROUND", "CMP")):
         return (
             None,
             "No standard regex option price anchor (@/at/buy/around/cmp) matched",

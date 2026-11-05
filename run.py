@@ -167,6 +167,9 @@ async def main():
                     return False
             return False
 
+        # Broker-native F&O AMO submits immediately while market is closed.
+        # Legacy locally queued signals are never replayed into a new order route.
+
         # STEP 16: Start durable Outbox Worker background task
         outbox_worker = OutboxWorker(
             journal_db=pipeline.db,
@@ -254,16 +257,28 @@ async def main():
                 message_id=event.id,
                 raw_text=text,
             )
+            # An edited source signal must never remain staged for next open.
+            try:
+                await asyncio.to_thread(
+                    pipeline._get_fno_amo_queue().cancel_queued,
+                    f"{event.chat_id}:{event.id}",
+                )
+            except Exception:
+                logging.getLogger("run").exception(
+                    "F&O AMO edit cancellation failed closed; operator review required"
+                )
 
         await client.run_until_disconnected()
     finally:
-        if outbox_worker:
-            outbox_worker.stop()
         try:
-            if client is not None:
-                await client.disconnect()
+            if outbox_worker:
+                outbox_worker.stop()
         finally:
-            lock.release()
+            try:
+                if client is not None:
+                    await client.disconnect()
+            finally:
+                lock.release()
 
 
 if __name__ == "__main__":

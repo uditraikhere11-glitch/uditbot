@@ -162,8 +162,17 @@ class AppConfig:
     fno_fixed_lots: int = 1
     fno_max_lots: int = 3
     allow_next_month_expiry_fallback: bool = True
+    fno_amo_enabled: bool = False  # Opt-in local staging; protected Super Order only at market OPEN
+    fno_amo_max_age_sec: float = 64800.0  # 18 hours; weekends/holidays expire safely
 
-    # Protection (Post-Fill)
+    # Independent, operator-configurable protection by execution segment.
+    # Provider-supplied Telegram SL/targets are never authoritative.
+    equity_sl_pct: float = 1.0
+    equity_target_pct: float = 1.0
+    fno_sl_pct: float = 3.0
+    fno_target_pct: float = 3.0
+    # Legacy shared fields remain for older integrations only; not used for
+    # new Equity/F&O order protection in the trading pipeline.
     sl_pct: float = 3.0
     target_pct: float = 3.0
     sl_limit_buffer_pct: float = 1.0
@@ -205,6 +214,11 @@ class AppConfig:
             "equity_budget_inr",
             "equity_price_markup_pct",
             "fno_capital_per_trade",
+            "fno_amo_max_age_sec",
+            "equity_sl_pct",
+            "equity_target_pct",
+            "fno_sl_pct",
+            "fno_target_pct",
             "sl_pct",
             "target_pct",
             "sl_limit_buffer_pct",
@@ -226,6 +240,15 @@ class AppConfig:
                 raise ValueError(f"Configuration field '{attr}' must be a finite number, got {val!r}")
             if float(val) < 0.0:
                 raise ValueError(f"Configuration field '{attr}' cannot be negative, got {val!r}")
+        if not 0 < float(self.fno_amo_max_age_sec) <= 64800.0:
+            raise ValueError("FNO_AMO_MAX_AGE_SEC must be greater than 0 and at most 64800 seconds")
+        for field_name, cap in (
+            ("equity_sl_pct", 50.0), ("fno_sl_pct", 50.0),
+            ("equity_target_pct", 100.0), ("fno_target_pct", 100.0),
+        ):
+            value = float(getattr(self, field_name))
+            if value <= 0 or value > cap:
+                raise ValueError(f"Configuration field '{field_name}' must be above 0 and at most {cap:g}%")
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None, env_file: str = ".env") -> "AppConfig":
@@ -285,7 +308,13 @@ class AppConfig:
             fno_fixed_lots=_clean_int(env.get("FNO_FIXED_LOTS", "1"), 1),
             fno_max_lots=_clean_int(env.get("FNO_MAX_LOTS", "3"), 3),
             allow_next_month_expiry_fallback=_bool(env.get("ALLOW_NEXT_MONTH_EXPIRY_FALLBACK", "true"), default=True),
+            fno_amo_enabled=_bool(env.get("FNO_AMO_ENABLED", "false"), default=False),
+            fno_amo_max_age_sec=_clean_float(env.get("FNO_AMO_MAX_AGE_SEC", "64800"), 64800.0),
 
+            equity_sl_pct=_clean_float(env.get("EQUITY_SL_PCT", "1.0"), 1.0),
+            equity_target_pct=_clean_float(env.get("EQUITY_TARGET_PCT", "1.0"), 1.0),
+            fno_sl_pct=_clean_float(env.get("FNO_SL_PCT", "3.0"), 3.0),
+            fno_target_pct=_clean_float(env.get("FNO_TARGET_PCT", "3.0"), 3.0),
             sl_pct=_clean_float(env.get("SL_PCT", "3.0"), 3.0),
             target_pct=_clean_float(env.get("TARGET_PCT", "3.0"), 3.0),
             sl_limit_buffer_pct=_clean_float(env.get("SL_LIMIT_BUFFER_PCT", "1.0"), 1.0),
