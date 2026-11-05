@@ -46,8 +46,9 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
         self.assertIsNone(sig)
         self.assertIn("Unresolved or ambiguous", reason)
 
-    def test_missing_company_index_cannot_trade_shorter_ticker(self):
+    def test_no_verified_compound_cannot_trade_shorter_ticker(self):
         resolver_mod._NAME_INDEX.clear()
+        resolver_mod.VALID_EQUITY_SYMBOLS.discard("ARIHANTCAP")
         sig, reason = parse_equity_regex("Bought ARIHANT CAP", current_time=100.0, msg_timestamp=95.0)
         self.assertIsNone(sig)
         self.assertIn("Unresolved or ambiguous", reason)
