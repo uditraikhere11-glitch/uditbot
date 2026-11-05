@@ -224,6 +224,18 @@ def parse_fno_regex_detailed(
     # 6. Locate the Option Contract Header (`SYM [EXPIRY] STRIKE CE/PE`)
     m = CONTRACT_HEADER_PATTERN.search(cleaned_text) or CONTRACT_GLUED_PATTERN.search(cleaned_text)
     if not m:
+        # Shorthand multi-strike expressions have no single parseable contract
+        # header, but must still be BLOCKED rather than silently IGNORED.
+        is_multi_opt, _, multi_reason = detect_multiple_option_contracts(norm)
+        if is_multi_opt:
+            return (
+                None,
+                multi_reason,
+                SignalAction.BLOCKED,
+                DecisionReasonCode.AMBIGUOUS_CONTRACT.value,
+                PriceStatus.ABSENT,
+                {},
+            )
         return (
             None,
             "No option trade pattern matched",
