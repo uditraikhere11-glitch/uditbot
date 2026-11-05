@@ -62,7 +62,7 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
         resolver_mod._NAME_INDEX.clear()
         for text in (
             "Bought ARIHANT CAP",
-            "Bought\\nARIHANT CAP",
+            "Bought\nARIHANT CAP",
             "Bought #ARIHANT CAP",
             "#ARIHANT CAP buy",
         ):
