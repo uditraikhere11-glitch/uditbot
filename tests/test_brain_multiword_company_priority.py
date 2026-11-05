@@ -27,7 +27,7 @@ class TestMultiwordCompanySymbolPriority(unittest.TestCase):
         resolver_mod._NAME_INDEX.update(self.index_before)
 
     def test_abbreviated_second_word_overrides_shorter_valid_ticker(self):
-        for text in ("Bought ARIHANT CAP", "Bought\\nARIHANT CAP", "Bought #ARIHANT CAP", "Bought ARIHANT CAP at CMP"):
+        for text in ("Bought ARIHANT CAP", "Bought\nARIHANT CAP", "Bought #ARIHANT CAP", "Bought ARIHANT CAP at CMP"):
             with self.subTest(text=text):
                 sig, reason = parse_equity_regex(text, current_time=100.0, msg_timestamp=95.0)
                 self.assertIsNotNone(sig, reason)
