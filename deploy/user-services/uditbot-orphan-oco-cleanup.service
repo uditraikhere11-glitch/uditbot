@@ -1,0 +1,15 @@
+[Unit]
+Description=AuditBot isolated bot-owned Forever OCO cleanup (opt-in)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/uditbot
+ExecStart=%h/uditbot/venv/bin/python3 -m src.engine.orphan_cleanup --execute
+TimeoutStartSec=90
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
