@@ -83,7 +83,8 @@ class FreshInstallTests(unittest.TestCase):
 
     def test_installer_no_live_autostart(self):
         script = (ROOT / 'deploy' / 'fresh_install.sh').read_text()
-        self.assertIn('deploy/install_vm_services.sh', script)\n        self.assertIn('AUDITBOT_SKIP_TOKEN_TIMER_START=1', script)
+        self.assertIn('deploy/install_vm_services.sh', script)
+        self.assertIn('AUDITBOT_SKIP_TOKEN_TIMER_START=1', script)
         self.assertIn('TRADING_MODE=TEST', script)
         self.assertIn('systemctl is-active --quiet trading_bot.service', script)
         self.assertNotIn('systemctl start trading_bot.service', script)
