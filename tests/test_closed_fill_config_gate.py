@@ -115,6 +115,32 @@ class ClosedFillConfigGateTests(unittest.TestCase):
         # Reconciliation must be idempotent, not dependent on the original UI tick.
         self.assertTrue(self.check(broker)[0])
 
+    def test_next_day_old_order_remains_closed_only_with_fresh_broker_checks(self):
+        broker = self.broker()
+        self.assertTrue(self.check(broker)[0])
+
+        # Next session Dhan does not return yesterday's order/trade book.
+        broker.get_order_book.return_value = []
+        broker.get_trade_book.return_value = []
+        self.assertTrue(self.check(broker)[0])
+
+        # A new holding next session invalidates the historical proof.
+        broker.get_holdings.return_value = [
+            {"securityId": "11915", "totalQty": 1, "dpQty": 1}
+        ]
+        self.assertEqual(self.check(broker)[2], "UNPROTECTED_POSITION")
+
+    def test_next_day_pending_order_invalidates_historical_proof(self):
+        broker = self.broker()
+        self.assertTrue(self.check(broker)[0])
+        broker.get_order_book.return_value = [{
+            "orderId": "NEXT-DAY-PENDING", "securityId": "11915",
+            "exchangeSegment": "NSE_EQ", "transactionType": "BUY",
+            "orderStatus": "PENDING", "filledQty": 0,
+        }]
+        broker.get_trade_book.return_value = []
+        self.assertEqual(self.check(broker)[2], "UNPROTECTED_POSITION")
+
     def test_delivery_or_t1_holding_still_blocks(self):
         broker = self.broker()
         broker.get_holdings.return_value = [{
