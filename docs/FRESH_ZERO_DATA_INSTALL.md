@@ -29,7 +29,10 @@ The installer refuses existing production services or runtime data. It:
    Telegram Bot API token, Telegram log/test groups and phone.
 4. Saves .env and token privately (0600), never commits them, and never copies historical data.
 5. Installs systemd trading/WebUI/daily token-refresh services using the existing service installer.
-   **Trading stays stopped and in TEST mode**. Equity and F&O AMO start disabled.\n   The token-refresh timer is installed but intentionally **disabled** until the new account is verified,\n   preventing a surprise Dhan TOTP login that could invalidate credentials used by another bot.\n   After verifying it is a dedicated account, opt in with `sudo systemctl enable --now dhan-token-refresh.timer`.
+   **Trading stays stopped and in TEST mode**. Equity and F&O AMO start disabled.
+   The token-refresh timer is installed but intentionally **disabled** until the new account is verified,
+   preventing a surprise Dhan TOTP login that could invalidate credentials used by another bot.
+   After verifying it is a dedicated account, opt in with `sudo systemctl enable --now dhan-token-refresh.timer`.
 6. Stages the independent orphan Forever OCO cleanup timer **disabled**; it must be
    enabled only after reviewing bot-owned orders, holdings and read-only preview results.
 7. Runs Python syntax and VM installation regression tests.
