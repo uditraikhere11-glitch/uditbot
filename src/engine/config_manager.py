@@ -539,6 +539,17 @@ class ReadOnlyDhanBrokerAdapter:
             raise RuntimeError("Broker positions read is unavailable; cannot verify missing LIVE journal")
         return self._get_cached("positions", self._broker.get_positions)
 
+    def get_holdings(self) -> Any:
+        """Holdings (including T1/MTF) must never be inferred from empty positions."""
+        if not hasattr(self._broker, "get_holdings"):
+            raise RuntimeError("Broker holdings read unavailable; zero exposure cannot be proven")
+        return self._get_cached("holdings", self._broker.get_holdings)
+
+    def get_trade_book(self) -> Any:
+        if not hasattr(self._broker, "get_trade_book"):
+            raise RuntimeError("Broker trade book read unavailable; closed fill cannot be proven")
+        return self._get_cached("trade_book", self._broker.get_trade_book)
+
     def evaluate_forever_oco_protection(self, *args, **kwargs) -> Any:
         if hasattr(self._broker, "evaluate_forever_oco_protection"):
             return self._broker.evaluate_forever_oco_protection(*args, **kwargs)
@@ -2284,6 +2295,129 @@ class ConfigChangeTracker:
 
         return ("VALID_JOURNAL", "Trade journal database is valid and accessible.")
 
+    def _broker_proves_filled_buy_is_closed(
+        self,
+        broker: Any,
+        entry: Optional[Dict[str, Any]],
+        required_filled: int,
+        order_book: List[Dict[str, Any]],
+        forever_rows: List[Dict[str, Any]],
+        super_rows: List[Dict[str, Any]],
+        previously_verified: bool = False,
+    ) -> bool:
+        """
+        A historical BUY fill is not necessarily an open position. Release its
+        protection requirement ONLY when current, successful Dhan read-only
+        snapshots prove there is no remaining exposure or executable exit leg.
+
+        Never infer flatness from /positions alone: CNC/T1/MTF inventory lives
+        in /holdings. A same-day execution also needs an offsetting trade-book
+        SELL. Any absent, stale, malformed or contradictory evidence fails closed.
+        """
+        terminal = {"TRADED", "CLOSED", "CANCELLED", "REJECTED", "EXPIRED"}
+        if not isinstance(entry, dict):
+            return False
+        sec = str(entry.get("securityId") or "").strip()
+        oid = str(entry.get("orderId") or "").strip()
+        seg = str(entry.get("exchangeSegment") or "").strip().upper()
+        if not sec or not oid or not seg or required_filled <= 0:
+            return False
+        if str(entry.get("transactionType") or "").upper() != "BUY":
+            return False
+        if str(entry.get("orderStatus") or "").strip().upper() not in terminal:
+            return False
+        try:
+            if int(entry.get("filledQty") or entry.get("tradedQuantity") or 0) < required_filled:
+                return False
+            positions = broker.get_positions()
+            holdings = broker.get_holdings()
+            trades = broker.get_trade_book()
+        except Exception:
+            return False
+        if not all(isinstance(rows, list) and getattr(rows, "ok", True)
+                   for rows in (positions, holdings, trades)):
+            return False
+
+        try:
+            # A partially unreadable broker collection cannot establish flatness.
+            for pos in positions:
+                if not isinstance(pos, dict) or not str(pos.get("securityId") or "").strip():
+                    return False
+                if str(pos["securityId"]).strip() == sec:
+                    qty = pos.get("netQty")
+                    if qty is None or isinstance(qty, bool) or int(qty) != 0:
+                        return False
+
+            for holding in holdings:
+                if not isinstance(holding, dict) or not str(holding.get("securityId") or "").strip():
+                    return False
+                if str(holding["securityId"]).strip() != sec:
+                    continue
+                # totalQty includes delivered and T1, but also check every
+                # reported inventory component to avoid a misleading zero.
+                fields = (
+                    "totalQty", "dpQty", "t1Qty", "availableQty",
+                    "mtf_qty", "mtf_t1_qty", "collateralQty",
+                )
+                if holding.get("totalQty") is None:
+                    return False
+                for field_name in fields:
+                    value = holding.get(field_name)
+                    if value is not None and (isinstance(value, bool) or float(value) != 0):
+                        return False
+
+            # /trades is today's executions. A BUY visible there cannot be
+            # declared closed merely because positions/holdings lag the fill.
+            # Require an offsetting SELL on the same instrument.
+            net_today = 0
+            saw_parent_fill = False
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    return False
+                if str(trade.get("securityId") or "").strip() != sec:
+                    continue
+                if str(trade.get("exchangeSegment") or "").strip().upper() not in ("", seg):
+                    continue
+                side = str(trade.get("transactionType") or "").strip().upper()
+                qty = trade.get("tradedQuantity")
+                if side not in ("BUY", "SELL") or qty is None or isinstance(qty, bool):
+                    return False
+                n = int(qty)
+                if n <= 0:
+                    return False
+                net_today += n if side == "BUY" else -n
+                if str(trade.get("orderId") or "").strip() == oid and side == "BUY":
+                    saw_parent_fill = True
+            if (not previously_verified and not saw_parent_fill) or net_today > 0:
+                return False
+
+            # The parent must be terminal, and no other executable regular,
+            # Forever OCO or Super order may still affect this security.
+            for other in order_book:
+                if not isinstance(other, dict):
+                    return False
+                if str(other.get("securityId") or "").strip() == sec:
+                    if str(other.get("orderStatus") or "").strip().upper() not in terminal:
+                        return False
+            for other in forever_rows:
+                if not isinstance(other, dict):
+                    return False
+                if str(other.get("securityId") or "").strip() == sec:
+                    if str(other.get("orderStatus") or "").strip().upper() not in terminal:
+                        return False
+            for other in super_rows:
+                if not isinstance(other, dict):
+                    return False
+                if str(other.get("securityId") or "").strip() == sec:
+                    if str(other.get("orderStatus") or "").strip().upper() not in terminal:
+                        return False
+                    for leg in other.get("legDetails") or []:
+                        if not isinstance(leg, dict) or str(leg.get("orderStatus") or "").strip().upper() not in terminal:
+                            return False
+        except (ValueError, TypeError, OverflowError):
+            return False
+        return True
+
     def _reconcile_missing_journal_with_broker(
         self,
         db_path: str,
@@ -3022,6 +3156,83 @@ class ConfigChangeTracker:
 
             broker_Fatal_err: List[str] = []
 
+            def _flat_closed_fill(corr_id: str, b_oid: str, filled: int, sec_id: str = "") -> bool:
+                """Verify genuine closure and durably retire ONLY that closed parent's stale gate."""
+                entry = order_book_by_id.get(b_oid) or order_book_by_corr.get(corr_id)
+                watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
+                previously_verified = False
+                if not isinstance(entry, dict):
+                    # Dhan's /orders and /trades contain today's orders only.
+                    # Reuse a durable, earlier broker proof of the parent fill,
+                    # but RECHECK current positions/holdings/orders on every pass.
+                    proof = (watcher or {}).get("broker_flat_proof") or {}
+                    if not isinstance(proof, dict):
+                        return False
+                    try:
+                        proof_oid = str(proof.get("order_id") or "").strip()
+                        proof_sec = str(proof.get("security_id") or "").strip()
+                        proof_seg = str(proof.get("exchange_segment") or "").strip()
+                        proof_filled = int(proof.get("filled_qty") or 0)
+                        proof_time = float(proof.get("verified_at") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        return False
+                    if (not proof_oid or not proof_sec or not proof_seg
+                            or proof_filled < filled or proof_time <= 0
+                            or (b_oid and b_oid != corr_id and b_oid != proof_oid)
+                            or (sec_id and sec_id != proof_sec)):
+                        return False
+                    entry = {
+                        "orderId": proof_oid, "securityId": proof_sec,
+                        "exchangeSegment": proof_seg, "transactionType": "BUY",
+                        "orderStatus": "TRADED", "filledQty": proof_filled,
+                    }
+                    previously_verified = True
+                actual_oid = str(entry.get("orderId") or "").strip()
+                actual_sec = str(entry.get("securityId") or "").strip()
+                if (not actual_oid or (b_oid and b_oid != corr_id and b_oid != actual_oid)
+                        or (sec_id and sec_id != actual_sec)
+                        or has_unresolved_prot_attempts):
+                    return False
+                if watcher and (watcher.get("pending_oco") or watcher.get("retry_reserved")
+                                or watcher.get("retry_eligible")):
+                    return False
+                fo_rows = [leg for group in fo_groups.values() for leg in group]
+                if not self._broker_proves_filled_buy_is_closed(
+                    valid_live_broker, entry, filled,
+                    list(order_book_by_id.values()), fo_rows, list(so_by_id.values()),
+                    previously_verified=previously_verified,
+                ):
+                    return False
+                # Never invent protection credit. The historical fill remains TRADED,
+                # with its true protected quantity, but no longer represents risk.
+                w_rec = watcher_map.get(actual_oid) or watcher
+                if w_rec:
+                    w_rec["broker_flat_verified_at"] = now_ts
+                    w_rec["broker_flat_proof"] = {
+                        "order_id": actual_oid,
+                        "security_id": actual_sec,
+                        "exchange_segment": str(entry.get("exchangeSegment") or "").strip().upper(),
+                        "filled_qty": int(filled),
+                        "verified_at": now_ts,
+                    }
+                    w_rec["_is_terminal_col"] = True
+                    stored_w = {k: v for k, v in w_rec.items() if k != "_is_terminal_col"}
+                    cur.execute(
+                        "UPDATE watcher_orders SET is_terminal = 1, record_json = ?, updated_at = ? WHERE order_id = ?",
+                        (json.dumps(stored_w), now_ts, str(w_rec.get("order_id") or actual_oid)),
+                    )
+                cur.execute(
+                    """UPDATE protection_orders SET status = 'CLOSED_NO_EXPOSURE_VERIFIED'
+                       WHERE parent_order_id IN (?, ?, ?) AND status IN ('UNPROTECTED', 'UNVERIFIED')""",
+                    (actual_oid, b_oid, corr_id),
+                )
+                logger.info(
+                    "Broker verified no remaining exposure/exit obligations for filled order %s; "
+                    "retired its stale configuration gate without fabricating protection.",
+                    actual_oid,
+                )
+                return True
+
             def _resolve_terminal_status(corr_id: str, b_oid: str) -> Optional[Tuple[str, int, float, str]]:
                 if valid_live_broker is None:
                     return None
@@ -3072,7 +3283,7 @@ class ConfigChangeTracker:
                         if b_err:
                             broker_Fatal_err.append(b_err)
                             return None
-                        if prot_q >= b_filled:
+                        if prot_q >= b_filled or _flat_closed_fill(corr_id, b_oid_actual, b_filled, sec_id):
                             return (b_st, b_filled, b_avg_p, b_oid_actual)
                 return None
 
@@ -3198,7 +3409,7 @@ class ConfigChangeTracker:
                             w_copy = {k: v for k, v in w_target.items() if k != "_is_terminal_col"}
                             w_copy["state"] = resolved_st
                             w_copy["filled_qty"] = int(filled_q)
-                            if filled_q > 0:
+                            if filled_q > 0 and not w_target.get("broker_flat_verified_at"):
                                 w_copy["protected_qty"] = max(int(w_copy.get("protected_qty") or 0), int(filled_q))
                             w_copy["terminal_confirmed"] = True
                             try:
@@ -3233,7 +3444,9 @@ class ConfigChangeTracker:
                         if b_err:
                             con.rollback()
                             return False, b_err
-                        if ver_q < w_filled:
+                        if ver_q < w_filled and not _flat_closed_fill(
+                            w_cid, w_oid, w_filled, str(w_rec.get("security_id") or "")
+                        ):
                             con.rollback()
                             return (
                                 False,
@@ -3272,7 +3485,9 @@ class ConfigChangeTracker:
                             if b_err:
                                 con.rollback()
                                 return False, b_err
-                            if ver_q < b_filled:
+                            if ver_q < b_filled and not _flat_closed_fill(
+                                o_cid, o_boid or o_cid, b_filled, str(odict.get("security_id") or "")
+                            ):
                                 con.rollback()
                                 return (
                                     False,

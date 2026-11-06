@@ -1783,6 +1783,10 @@ class DhanClient:
         """Retrieves net positions: GET /v2/positions."""
         return self._read_collection("/positions", "positions")
 
+    def get_holdings(self) -> Union[BrokerReadList, BrokerReadFailure]:
+        """Retrieves delivery, T1 and MTF holdings: GET /v2/holdings."""
+        return self._read_collection("/holdings", "holdings")
+
     def get_forever_orders(self) -> Union[BrokerReadList, BrokerReadFailure]:
         """Retrieves all Forever OCO orders: GET /v2/forever/orders."""
         return self._read_collection("/forever/orders", "forever_orders")
