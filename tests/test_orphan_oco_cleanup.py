@@ -200,6 +200,24 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(out["cancel_requested"], [])
         self.assertEqual(len(out["failed"]), 1)
 
+    def test_broker_rejected_cancel_reply_not_success(self):
+        self.broker.session.delete.return_value = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"orderId": OCO_ID, "orderStatus": "REJECTED"},
+        )
+        out = self.run_scan(execute=True)
+        self.assertEqual(out["cancel_requested"], [])
+        self.assertEqual(len(out["failed"]), 1)
+
+    def test_cancel_reply_cannot_misidentify_order_id(self):
+        self.broker.session.delete.return_value = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"orderId": "OTHER-OCO", "orderStatus": "CANCELLED"},
+        )
+        out = self.run_scan(execute=True)
+        self.assertEqual(out["cancel_requested"], [])
+        self.assertEqual(len(out["failed"]), 1)
+
     def test_test_mode_never_sends_delete(self):
         self.broker.cfg.trading_mode = TradingMode.TEST
         out = self.run_scan(execute=True)
