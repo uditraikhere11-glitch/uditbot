@@ -3155,6 +3155,50 @@ class ConfigChangeTracker:
 
             broker_Fatal_err: List[str] = []
 
+            def _flat_closed_fill(corr_id: str, b_oid: str, filled: int, sec_id: str = "") -> bool:
+                """Verify genuine closure and durably retire ONLY that closed parent's stale gate."""
+                entry = order_book_by_id.get(b_oid) or order_book_by_corr.get(corr_id)
+                if not isinstance(entry, dict):
+                    return False
+                actual_oid = str(entry.get("orderId") or "").strip()
+                actual_sec = str(entry.get("securityId") or "").strip()
+                if (not actual_oid or (b_oid and b_oid != corr_id and b_oid != actual_oid)
+                        or (sec_id and sec_id != actual_sec)
+                        or has_unresolved_prot_attempts):
+                    return False
+                watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
+                if watcher and (watcher.get("pending_oco") or watcher.get("retry_reserved")
+                                or watcher.get("retry_eligible")):
+                    return False
+                fo_rows = [leg for group in fo_groups.values() for leg in group]
+                if not self._broker_proves_filled_buy_is_closed(
+                    valid_live_broker, entry, filled,
+                    list(order_book_by_id.values()), fo_rows, list(so_by_id.values())
+                ):
+                    return False
+                # Never invent protection credit. The historical fill remains TRADED,
+                # with its true protected quantity, but no longer represents risk.
+                w_rec = watcher_map.get(actual_oid) or watcher
+                if w_rec:
+                    w_rec["broker_flat_verified_at"] = now_ts
+                    w_rec["_is_terminal_col"] = True
+                    stored_w = {k: v for k, v in w_rec.items() if k != "_is_terminal_col"}
+                    cur.execute(
+                        "UPDATE watcher_orders SET is_terminal = 1, record_json = ?, updated_at = ? WHERE order_id = ?",
+                        (json.dumps(stored_w), now_ts, str(w_rec.get("order_id") or actual_oid)),
+                    )
+                cur.execute(
+                    """UPDATE protection_orders SET status = 'CLOSED_NO_EXPOSURE_VERIFIED'
+                       WHERE parent_order_id IN (?, ?, ?) AND status IN ('UNPROTECTED', 'UNVERIFIED')""",
+                    (actual_oid, b_oid, corr_id),
+                )
+                logger.info(
+                    "Broker verified no remaining exposure/exit obligations for filled order %s; "
+                    "retired its stale configuration gate without fabricating protection.",
+                    actual_oid,
+                )
+                return True
+
             def _resolve_terminal_status(corr_id: str, b_oid: str) -> Optional[Tuple[str, int, float, str]]:
                 if valid_live_broker is None:
                     return None
@@ -3205,7 +3249,7 @@ class ConfigChangeTracker:
                         if b_err:
                             broker_Fatal_err.append(b_err)
                             return None
-                        if prot_q >= b_filled:
+                        if prot_q >= b_filled or _flat_closed_fill(corr_id, b_oid_actual, b_filled, sec_id):
                             return (b_st, b_filled, b_avg_p, b_oid_actual)
                 return None
 
@@ -3331,7 +3375,7 @@ class ConfigChangeTracker:
                             w_copy = {k: v for k, v in w_target.items() if k != "_is_terminal_col"}
                             w_copy["state"] = resolved_st
                             w_copy["filled_qty"] = int(filled_q)
-                            if filled_q > 0:
+                            if filled_q > 0 and not w_target.get("broker_flat_verified_at"):
                                 w_copy["protected_qty"] = max(int(w_copy.get("protected_qty") or 0), int(filled_q))
                             w_copy["terminal_confirmed"] = True
                             try:
@@ -3366,7 +3410,9 @@ class ConfigChangeTracker:
                         if b_err:
                             con.rollback()
                             return False, b_err
-                        if ver_q < w_filled:
+                        if ver_q < w_filled and not _flat_closed_fill(
+                            w_cid, w_oid, w_filled, str(w_rec.get("security_id") or "")
+                        ):
                             con.rollback()
                             return (
                                 False,
@@ -3405,7 +3451,9 @@ class ConfigChangeTracker:
                             if b_err:
                                 con.rollback()
                                 return False, b_err
-                            if ver_q < b_filled:
+                            if ver_q < b_filled and not _flat_closed_fill(
+                                o_cid, o_boid or o_cid, b_filled, str(odict.get("security_id") or "")
+                            ):
                                 con.rollback()
                                 return (
                                     False,
