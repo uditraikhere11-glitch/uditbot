@@ -130,6 +130,7 @@ def create_config(root: Path, home: Path) -> None:
     content = '# NEW private AuditBot instance — zero inherited data\n' + ''.join(
         f'{k}={safe_value(v)}\n' for k, v in config.items()
     )
+    validated_token = safe_value(token) if token else ''
     os.umask(0o077)
     created_env = False
     try:
@@ -142,7 +143,7 @@ def create_config(root: Path, home: Path) -> None:
         if token:
             fd = os.open(token_path, flags, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(safe_value(token) + '\n')
+                f.write(validated_token + '\n')
             os.chmod(token_path, 0o600)
     except Exception:
         if created_env:
