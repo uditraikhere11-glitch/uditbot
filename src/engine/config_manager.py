@@ -2303,6 +2303,7 @@ class ConfigChangeTracker:
         order_book: List[Dict[str, Any]],
         forever_rows: List[Dict[str, Any]],
         super_rows: List[Dict[str, Any]],
+        previously_verified: bool = False,
     ) -> bool:
         """
         A historical BUY fill is not necessarily an open position. Release its
@@ -2387,7 +2388,7 @@ class ConfigChangeTracker:
                 net_today += n if side == "BUY" else -n
                 if str(trade.get("orderId") or "").strip() == oid and side == "BUY":
                     saw_parent_fill = True
-            if not saw_parent_fill or net_today > 0:
+            if (not previously_verified and not saw_parent_fill) or net_today > 0:
                 return False
 
             # The parent must be terminal, and no other executable regular,
@@ -3158,22 +3159,48 @@ class ConfigChangeTracker:
             def _flat_closed_fill(corr_id: str, b_oid: str, filled: int, sec_id: str = "") -> bool:
                 """Verify genuine closure and durably retire ONLY that closed parent's stale gate."""
                 entry = order_book_by_id.get(b_oid) or order_book_by_corr.get(corr_id)
+                watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
+                previously_verified = False
                 if not isinstance(entry, dict):
-                    return False
+                    # Dhan's /orders and /trades contain today's orders only.
+                    # Reuse a durable, earlier broker proof of the parent fill,
+                    # but RECHECK current positions/holdings/orders on every pass.
+                    proof = (watcher or {}).get("broker_flat_proof") or {}
+                    if not isinstance(proof, dict):
+                        return False
+                    try:
+                        proof_oid = str(proof.get("order_id") or "").strip()
+                        proof_sec = str(proof.get("security_id") or "").strip()
+                        proof_seg = str(proof.get("exchange_segment") or "").strip()
+                        proof_filled = int(proof.get("filled_qty") or 0)
+                        proof_time = float(proof.get("verified_at") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        return False
+                    if (not proof_oid or not proof_sec or not proof_seg
+                            or proof_filled < filled or proof_time <= 0
+                            or (b_oid and b_oid != corr_id and b_oid != proof_oid)
+                            or (sec_id and sec_id != proof_sec)):
+                        return False
+                    entry = {
+                        "orderId": proof_oid, "securityId": proof_sec,
+                        "exchangeSegment": proof_seg, "transactionType": "BUY",
+                        "orderStatus": "TRADED", "filledQty": proof_filled,
+                    }
+                    previously_verified = True
                 actual_oid = str(entry.get("orderId") or "").strip()
                 actual_sec = str(entry.get("securityId") or "").strip()
                 if (not actual_oid or (b_oid and b_oid != corr_id and b_oid != actual_oid)
                         or (sec_id and sec_id != actual_sec)
                         or has_unresolved_prot_attempts):
                     return False
-                watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
                 if watcher and (watcher.get("pending_oco") or watcher.get("retry_reserved")
                                 or watcher.get("retry_eligible")):
                     return False
                 fo_rows = [leg for group in fo_groups.values() for leg in group]
                 if not self._broker_proves_filled_buy_is_closed(
                     valid_live_broker, entry, filled,
-                    list(order_book_by_id.values()), fo_rows, list(so_by_id.values())
+                    list(order_book_by_id.values()), fo_rows, list(so_by_id.values()),
+                    previously_verified=previously_verified,
                 ):
                     return False
                 # Never invent protection credit. The historical fill remains TRADED,
@@ -3181,6 +3208,13 @@ class ConfigChangeTracker:
                 w_rec = watcher_map.get(actual_oid) or watcher
                 if w_rec:
                     w_rec["broker_flat_verified_at"] = now_ts
+                    w_rec["broker_flat_proof"] = {
+                        "order_id": actual_oid,
+                        "security_id": actual_sec,
+                        "exchange_segment": str(entry.get("exchangeSegment") or "").strip().upper(),
+                        "filled_qty": int(filled),
+                        "verified_at": now_ts,
+                    }
                     w_rec["_is_terminal_col"] = True
                     stored_w = {k: v for k, v in w_rec.items() if k != "_is_terminal_col"}
                     cur.execute(
