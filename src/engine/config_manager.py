@@ -539,6 +539,17 @@ class ReadOnlyDhanBrokerAdapter:
             raise RuntimeError("Broker positions read is unavailable; cannot verify missing LIVE journal")
         return self._get_cached("positions", self._broker.get_positions)
 
+    def get_holdings(self) -> Any:
+        """Holdings (including T1/MTF) must never be inferred from empty positions."""
+        if not hasattr(self._broker, "get_holdings"):
+            raise RuntimeError("Broker holdings read unavailable; zero exposure cannot be proven")
+        return self._get_cached("holdings", self._broker.get_holdings)
+
+    def get_trade_book(self) -> Any:
+        if not hasattr(self._broker, "get_trade_book"):
+            raise RuntimeError("Broker trade book read unavailable; closed fill cannot be proven")
+        return self._get_cached("trade_book", self._broker.get_trade_book)
+
     def evaluate_forever_oco_protection(self, *args, **kwargs) -> Any:
         if hasattr(self._broker, "evaluate_forever_oco_protection"):
             return self._broker.evaluate_forever_oco_protection(*args, **kwargs)
@@ -2283,6 +2294,128 @@ class ConfigChangeTracker:
             )
 
         return ("VALID_JOURNAL", "Trade journal database is valid and accessible.")
+
+    def _broker_proves_filled_buy_is_closed(
+        self,
+        broker: Any,
+        entry: Optional[Dict[str, Any]],
+        required_filled: int,
+        order_book: List[Dict[str, Any]],
+        forever_rows: List[Dict[str, Any]],
+        super_rows: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        A historical BUY fill is not necessarily an open position. Release its
+        protection requirement ONLY when current, successful Dhan read-only
+        snapshots prove there is no remaining exposure or executable exit leg.
+
+        Never infer flatness from /positions alone: CNC/T1/MTF inventory lives
+        in /holdings. A same-day execution also needs an offsetting trade-book
+        SELL. Any absent, stale, malformed or contradictory evidence fails closed.
+        """
+        terminal = {"TRADED", "CLOSED", "CANCELLED", "REJECTED", "EXPIRED"}
+        if not isinstance(entry, dict):
+            return False
+        sec = str(entry.get("securityId") or "").strip()
+        oid = str(entry.get("orderId") or "").strip()
+        seg = str(entry.get("exchangeSegment") or "").strip().upper()
+        if not sec or not oid or not seg or required_filled <= 0:
+            return False
+        if str(entry.get("transactionType") or "").upper() != "BUY":
+            return False
+        if str(entry.get("orderStatus") or "").strip().upper() not in terminal:
+            return False
+        try:
+            if int(entry.get("filledQty") or entry.get("tradedQuantity") or 0) < required_filled:
+                return False
+            positions = broker.get_positions()
+            holdings = broker.get_holdings()
+            trades = broker.get_trade_book()
+        except Exception:
+            return False
+        if not all(isinstance(rows, list) and getattr(rows, "ok", True)
+                   for rows in (positions, holdings, trades)):
+            return False
+
+        try:
+            # A partially unreadable broker collection cannot establish flatness.
+            for pos in positions:
+                if not isinstance(pos, dict) or not str(pos.get("securityId") or "").strip():
+                    return False
+                if str(pos["securityId"]).strip() == sec:
+                    qty = pos.get("netQty")
+                    if qty is None or isinstance(qty, bool) or int(qty) != 0:
+                        return False
+
+            for holding in holdings:
+                if not isinstance(holding, dict) or not str(holding.get("securityId") or "").strip():
+                    return False
+                if str(holding["securityId"]).strip() != sec:
+                    continue
+                # totalQty includes delivered and T1, but also check every
+                # reported inventory component to avoid a misleading zero.
+                fields = (
+                    "totalQty", "dpQty", "t1Qty", "availableQty",
+                    "mtf_qty", "mtf_t1_qty", "collateralQty",
+                )
+                if holding.get("totalQty") is None:
+                    return False
+                for field_name in fields:
+                    value = holding.get(field_name)
+                    if value is not None and (isinstance(value, bool) or float(value) != 0):
+                        return False
+
+            # /trades is today's executions. A BUY visible there cannot be
+            # declared closed merely because positions/holdings lag the fill.
+            # Require an offsetting SELL on the same instrument.
+            net_today = 0
+            saw_parent_fill = False
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    return False
+                if str(trade.get("securityId") or "").strip() != sec:
+                    continue
+                if str(trade.get("exchangeSegment") or "").strip().upper() not in ("", seg):
+                    continue
+                side = str(trade.get("transactionType") or "").strip().upper()
+                qty = trade.get("tradedQuantity")
+                if side not in ("BUY", "SELL") or qty is None or isinstance(qty, bool):
+                    return False
+                n = int(qty)
+                if n <= 0:
+                    return False
+                net_today += n if side == "BUY" else -n
+                if str(trade.get("orderId") or "").strip() == oid and side == "BUY":
+                    saw_parent_fill = True
+            if not saw_parent_fill or net_today > 0:
+                return False
+
+            # The parent must be terminal, and no other executable regular,
+            # Forever OCO or Super order may still affect this security.
+            for other in order_book:
+                if not isinstance(other, dict):
+                    return False
+                if str(other.get("securityId") or "").strip() == sec:
+                    if str(other.get("orderStatus") or "").strip().upper() not in terminal:
+                        return False
+            for other in forever_rows:
+                if not isinstance(other, dict):
+                    return False
+                if str(other.get("securityId") or "").strip() == sec:
+                    if str(other.get("orderStatus") or "").strip().upper() not in terminal:
+                        return False
+            for other in super_rows:
+                if not isinstance(other, dict):
+                    return False
+                if str(other.get("securityId") or "").strip() == sec:
+                    if str(other.get("orderStatus") or "").strip().upper() not in terminal:
+                        return False
+                    for leg in other.get("legDetails") or []:
+                        if not isinstance(leg, dict) or str(leg.get("orderStatus") or "").strip().upper() not in terminal:
+                            return False
+        except (ValueError, TypeError, OverflowError):
+            return False
+        return True
 
     def _reconcile_missing_journal_with_broker(
         self,
