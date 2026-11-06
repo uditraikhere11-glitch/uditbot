@@ -31,6 +31,35 @@ Non-CNC or ambiguous entries fail closed. Broker failures and malformed reads
 are errors, never interpreted as empty lists. A submitted DELETE is logged
 as a **request**, not as verified final `CANCELLED` status.
 
+## Production validation — 2026-11-06 (Asia/Kolkata)
+
+The operator confirmed the independent user timer ran automatically at a ~20-second
+interval on the `sapphairebot` VM. The repository configuration uses
+`OnUnitInactiveSec=20s` and `AccuracySec=1s`; actual execution times also
+depend on the duration of the previous run and systemd scheduling.
+
+A LIVE manual square-off of an equity position in **TRIDENT** provided an end-to-end
+test of the orphan cleanup. Observed worker logs:
+
+| Time (IST) | Observation |
+| --- | --- |
+| 12:17:17 | Cleaner skipped the OCO: `positive broker position` |
+| 12:17:40 | Independent cleaner logged `Forever cancel REQUESTED` for TRIDENT |
+| 12:17:40 | JSON report: one `eligible`, same ID under `cancel_requested`, no errors |
+| 12:18:01 | Next broker snapshot: previously active OCO `absent from broker book` |
+
+The operator subsequently reported the automatic cancellation worked. The logs
+demonstrate a broker-acknowledged cancellation request and disappearance from
+the next Forever book snapshot; by themselves they do **not** prove a terminal
+`CANCELLED` status in full Dhan order history. Check that history when
+investigating disputes or delayed broker responses.
+
+**Production safety conclusion:** Live detection, exposure gate, scheduled
+execution and cancellation request have been exercised once successfully.
+This is not a guarantee of timing or availability during broker outages;
+failed or ambiguous reads must remain fail-closed. No changes to the trading
+listener are needed to run this separate timer.
+
 ## Install files on VM and run read-only preview first
 
 From the usual VM browser SSH terminal:
@@ -60,6 +89,30 @@ Runs as the VM user in `%h/uditbot`, using `venv/bin/python3` without
 restarting or attaching to `trading_bot.service`. For 24/7 execution
 while logged out, a working systemd user manager with lingering enabled is
 required, which must be configured separately by the VM operator.
+
+## Current timer and operational verification
+
+Timer config is checked into
+`deploy/user-services/uditbot-orphan-oco-cleanup.timer`:
+`OnUnitInactiveSec=20s`, `AccuracySec=1s` (initial boot trigger
+`OnBootSec=120s`). The timeout is measured **after the previous cleanup
+service has become inactive**, not from when a trade is squared off.
+
+After an update to the checked-in timer, explicitly install it into
+`~/.config/systemd/user/`, reload systemd user units, and restart the
+timer. No restart of `trading_bot.service` is required.
+
+```bash
+systemctl --user is-active uditbot-orphan-oco-cleanup.timer
+systemctl --user list-timers --all --no-pager | grep uditbot-orphan
+journalctl --user -u uditbot-orphan-oco-cleanup.service -n 80 --no-pager
+```
+
+Log fields: `eligible` means a candidate passed the initial snapshot,
+`cancel_requested` means Dhan acknowledged a DELETE request, `skipped`
+explains a fail-closed decision, and `failed`/`error` indicate problems.
+Never mistake absence from the active Forever order book for a conclusive
+final broker order status.
 
 ## Disable/remove without touching the trading bot
 
