@@ -65,7 +65,7 @@ printf '4/6 — Configuring new credentials (TEST mode only)...\n'
 "$ROOT/venv/bin/python" "$ROOT/deploy/fresh_config.py" --repo "$ROOT" --home "$HOME"
 
 printf '5/6 — Installing bot services without starting trading...\n'
-bash "$ROOT/deploy/install_vm_services.sh" --install
+AUDITBOT_SKIP_TOKEN_TIMER_START=1 bash "$ROOT/deploy/install_vm_services.sh" --install
 
 # Optional OCO cleanup can cancel broker instructions.
 # Stage the units, but NEVER start or enable the timer here.
