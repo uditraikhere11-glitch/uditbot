@@ -207,8 +207,26 @@ def _cancel_forever(broker: Any, order_id: str) -> Tuple[bool, str]:
         )
         if response.status_code not in (200, 202):
             return False, f"Forever cancel HTTP {response.status_code}"
-        # An acknowledgement is not the same as final broker cancellation.
-        return True, f"Forever cancel requested (HTTP {response.status_code}); verify broker book"
+        # Do not accept a contradictory broker response merely because HTTP
+        # returned success. Treat missing/lagged status as request-only.
+        try:
+            body = response.json()
+        except (ValueError, AttributeError):
+            body = {}
+        if not isinstance(body, dict):
+            return False, "Forever cancel returned malformed broker payload"
+        reported_id = str(body.get("orderId") or "").strip()
+        if reported_id and reported_id != order_id:
+            return False, "Forever cancel response orderId mismatch"
+        state = str(body.get("orderStatus") or "").strip().upper()
+        if state in ("REJECTED", "EXPIRED", "TRADED", "TRIGGERED"):
+            return False, f"Forever cancel not accepted: broker status {state}"
+        if state and state not in ("CANCELLED", "PENDING", "TRANSIT", "CONFIRM", "OPEN", "ACTIVE"):
+            return False, f"Unrecognized Forever cancel status {state}"
+        return True, (
+            f"Forever cancel broker-confirmed for {order_id}" if state == "CANCELLED"
+            else f"Forever cancel requested (HTTP {response.status_code}); verify broker book"
+        )
     except Exception as exc:
         return False, f"Forever cancel outcome UNKNOWN: {type(exc).__name__}: {exc}"
 
