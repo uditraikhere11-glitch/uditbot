@@ -1,0 +1,41 @@
+name: Combined release regression
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  combined-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Integrate pinned reviewed runner and designer candidates
+        env:
+          RUNNER_SHA: fd570eab502257abb59b498c62a2a5ca4dcd3780
+          DESIGNER_SHA: 63d3cc927709c97c85e4c2dc0cb7bc31b4c49b82
+        run: |
+          git config user.name "AuditBot integration check"
+          git config user.email "auditbot-ci@users.noreply.github.com"
+          git fetch origin "$RUNNER_SHA" "$DESIGNER_SHA"
+          git merge --no-edit "$RUNNER_SHA"
+          git merge --no-edit "$DESIGNER_SHA"
+      - name: Install real runtime dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Compile integrated tree
+        run: python -B -m compileall -q run.py src tests
+      - name: Mandatory release gates
+        run: |
+          python -m unittest -v tests.test_equity_amo tests.test_pr44_merge_resolution
+          python -m unittest -v tests.test_dhan_amo_ack_response tests.test_dhan_final_response_group tests.test_run_entrypoint_dhan_response
+          python -m unittest -v tests.test_fno_positional_premium tests.test_verified_stop_account_sync
+          python -m unittest -v tests.test_auditbot_v14_release_blockers tests.test_v14_protection_notify_final tests.test_ab_v14_merge_gate_extra
+          python -m unittest -v tests.test_python314_runner_loop
+      - name: Full combined offline suite
+        run: python -W error::ResourceWarning -m unittest discover -s tests -p "test_*.py"

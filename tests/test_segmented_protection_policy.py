@@ -126,7 +126,7 @@ class TestIndependentSegmentProtection(unittest.TestCase):
             watcher.track(
                 order_id="DRY-FO-1", symbol="HAL", security_id="4567",
                 segment="NSE_FNO", product_type="MARGIN",
-                qty=75, dry_price=100.0,
+                qty=75, dry_price=100.0, is_super_order=True,
             )
             with patch(
                 "src.engine.protection_watcher.calculate_protection_levels",
@@ -175,6 +175,21 @@ class TestIndependentSegmentProtection(unittest.TestCase):
                 with self.subTest(key=key, value=value):
                     valid, _ = tracker.validate_inputs({key: value})
                     self.assertFalse(valid)
+
+    def test_explicit_equity_super_uses_segment_specific_risk_percentages(self):
+        """Initial Super Order protection must use Equity SL/target, not legacy shared values."""
+        from src.main import TradingBotPipeline
+        source = inspect.getsource(TradingBotPipeline._handle_equity_signal)
+        start = source.index("eq_init_levels = calculate_protection_levels(")
+        end = source.index("if eq_is_super:", start)
+        initial = source[start:end]
+        self.assertIn("sl_pct=self.cfg.equity_sl_pct", initial)
+        self.assertIn("target_pct=self.cfg.equity_target_pct", initial)
+        self.assertNotIn("sl_pct=self.cfg.sl_pct", initial)
+        self.assertNotIn("target_pct=self.cfg.target_pct", initial)
+        cfg = AppConfig.from_env(env={"SL_PCT": "8", "TARGET_PCT": "15"}, env_file="")
+        self.assertEqual(cfg.equity_protection_route, "FOREVER_OCO")
+        self.assertEqual((cfg.equity_sl_pct, cfg.equity_target_pct), (1.0, 1.0))
 
     def test_provider_targets_not_used_by_live_fno_sizer(self):
         # A change-detection guard for the executor wiring without broker calls.

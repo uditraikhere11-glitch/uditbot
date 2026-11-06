@@ -556,7 +556,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
 
     def test_c03_followup_actual_single_retry_integration(self):
         """Follow-up 4: execute_retry places single retry order, tracks it, and enforces 1-retry cap."""
-        cfg = AppConfig.from_env()
+        cfg = AppConfig.from_env(env={}, env_file="")
+        cfg.data_dir = self.temp_dir.name
         cfg.trading_mode = TradingMode.TEST
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "retry_stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")

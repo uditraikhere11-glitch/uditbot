@@ -55,6 +55,16 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         self.pending_path = os.path.join(self.tmp.name, "pending_protection.json")
 
     def _make_watcher(self, broker, clock_fn=None, **kwargs):
+        if isinstance(broker, DhanClient) and "get" not in getattr(broker.session, "__dict__", {}):
+            def _default_session_get(url, *args, **kw):
+                if "/fundlimit" in str(url):
+                    return SimpleNamespace(
+                        status_code=200,
+                        text='{"availabelBalance": 1000000.0}',
+                        json=lambda: {"availabelBalance": 1000000.0},
+                    )
+                return SimpleNamespace(status_code=200, text="[]", json=lambda: [])
+            broker.session.get = _default_session_get
         return ProtectionWatcher(
             broker=broker,
             sl_pct=3.0,

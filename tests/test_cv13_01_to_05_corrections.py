@@ -43,6 +43,10 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         self.pending_path = os.path.join(self.tmp.name, "pending_protection.json")
 
     def _make_watcher(self, broker, clock_fn=None, **kwargs):
+        if isinstance(broker, DhanClient) and "get" not in getattr(broker.session, "__dict__", {}):
+            broker.session.get = Mock(
+                return_value= type("Resp", (), {"status_code": 200, "text": "[]", "json": staticmethod(lambda: [])})()
+            )
         return ProtectionWatcher(
             broker=broker,
             sl_pct=3.0,
