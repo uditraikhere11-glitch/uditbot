@@ -95,6 +95,11 @@ if systemctl is-active --quiet trading_bot.service; then
     sudo systemctl stop trading_bot.service || true
     exit 3
 fi
+sleep 1
+if ! systemctl is-active --quiet auditbot-web.service; then
+    fail 'WebUI did not start. Inspect: journalctl -u auditbot-web.service -n 50'
+    exit 3
+fi
 
 printf '\n========================================================\n'
 printf 'AUDITBOT SOFTWARE INSTALLED: NEW, PRIVATE, TEST MODE\n'
