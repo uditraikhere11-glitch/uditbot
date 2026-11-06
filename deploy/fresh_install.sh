@@ -86,7 +86,7 @@ printf '6/6 — Running safe installation checks...\n'
 "$ROOT/venv/bin/python" -m py_compile \
     "$ROOT/run.py" "$ROOT/src/setup_app.py" "$ROOT/src/config.py"
 cd "$ROOT"
-"$ROOT/venv/bin/python" -m unittest -q tests.test_vm_rebuild_deployment tests.test_fresh_install
+AUDITBOT_TEST_ISOLATION=1 "$ROOT/venv/bin/python" -m unittest -q tests.test_vm_rebuild_deployment tests.test_fresh_install
 [[ "$(grep '^TRADING_MODE=' "$ROOT/.env")" == 'TRADING_MODE=TEST' ]] || {
     fail 'TRADING_MODE must remain TEST'; exit 3;
 }
