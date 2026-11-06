@@ -71,7 +71,7 @@ PHRASE_STOP_WORDS = frozenset({
 
 # Common English filler words that are NOT stock symbols (adopted from darvas_script/services/regex_service.py)
 NOISE_WORDS = frozenset({
-    "THEM", "IT", "THIS", "THE", "SOME", "SOMETHING", "NOW", "TODAY", "MORE", "ALL",
+    "THEM", "IT", "THIS", "THE", "SOME", "SOMETHING", "NOW", "TODAY", "MORE", "ONE", "STOCK", "COUNTER", "SHARE", "LETS", "LET'S", "SIGNAL", "RECEIVED", "ALLOCATION", "ONLY", "ALL",
     "BUY", "SELL", "BOUGHT", "ADDED", "ADD", "IN", "AT", "FOR", "AND", "OR", "WITH",
     "TO", "FROM", "ONLY", "CARE", "GOOD", "SAFE", "FAST", "SLOW", "HIGH", "LOW",
     "BIY", "BOGHT", "BOUGTH", "BOT", "BAUGHT", "ASD", "ADED",
@@ -109,7 +109,7 @@ HASHTAG_PATTERN = re.compile(r'#\s*([a-zA-Z]+)')
 
 # Action + symbol: "buy SBIN", "bought in RELIANCE", "added TATAMOTORS"
 ACTION_SYMBOL_PATTERN = re.compile(
-    r'(?:buy|biy|bought|boght|bougth|bot|baught|add|asd|added|aded)\s+(?:in\s+)?(?:#\s*)?([a-zA-Z]+)',
+    r'(?:buy|biy|bought|boght|bougth|bot|baught|add|asd|added|aded)\s+(?:(?:one|more|stock|counter|share|lets|let\'s|signal|received)\s+)*(?:in\s+)?(?:#\s*)?([a-zA-Z]+)',
     re.IGNORECASE,
 )
 
@@ -130,7 +130,7 @@ CONJUNCTIVE_SYMBOL_PATTERN = re.compile(
 _WORD = r"[A-Za-z&][A-Za-z&.\-]*"
 HASHTAG_PHRASE_PATTERN = re.compile(r'#\s*(' + _WORD + r'(?:[ \t]+' + _WORD + r'){0,5})')
 ACTION_PHRASE_PATTERN = re.compile(
-    r'(?:buy|biy|bought|boght|bougth|bot|baught|add|asd|added|aded)\s+(?:in\s+)?(?:#\s*)?(' + _WORD + r'(?:[ \t]+' + _WORD + r'){0,5})',
+    r'(?:buy|biy|bought|boght|bougth|bot|baught|add|asd|added|aded)\s+(?:(?:one|more|stock|counter|share|lets|let\'s|signal|received)\s+)*(?:in\s+)?(?:#\s*)?(' + _WORD + r'(?:[ \t]+' + _WORD + r'){0,5})',
     re.IGNORECASE,
 )
 
