@@ -227,7 +227,7 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
         """
         db = JournalDB(self.db_path)
         mock_broker = MagicMock()
-        mock_broker.cfg = AppConfig(trading_mode=TradingMode.LIVE, equity_price_markup_pct=0.5)
+        mock_broker.cfg = AppConfig(trading_mode=TradingMode.LIVE, equity_price_markup_pct=0.5, data_dir=self.data_dir)
         mock_broker.stop_manager = MagicMock()
         mock_broker.stop_manager.is_stopped.return_value = False
 

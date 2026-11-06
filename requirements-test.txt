@@ -2,3 +2,6 @@
 -r requirements.txt
 # FastAPI/Starlette TestClient requires httpx.
 httpx>=0.27,<1.0
+
+# Modern Starlette TestClient uses httpx2 on the Python >=3.13 runtime branch.
+httpx2==2.16.0; python_version >= "3.13"

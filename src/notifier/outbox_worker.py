@@ -1,7 +1,9 @@
 """
 Durable Outbox Worker for Asynchronous Log & Signal Notifications.
-Implements STEP 16 (16-A through 16-E) + V12-14 Non-Blocking I/O:
+Implements STEP 16 (16-A through 16-E) + V12-14 Non-Blocking I/O + P0-08 Atomic Claiming:
 - Separates broker order execution from Telegram network latency.
+- Uses atomic cross-process claiming (`claim_pending_outbox`) when supported by `JournalDB` so
+  concurrent workers/processes never send duplicate Telegram notifications.
 - Offloads synchronous SQLite and HTTP dispatch work to `asyncio.to_thread` in `run()` so the
   event loop is never blocked.
 - Bounded retries with exponential backoff and dead-letter escalation on repeated 429/500/timeout (`OUTBOX-01`).
@@ -59,16 +61,22 @@ class OutboxWorker:
 
     def process_pending_events(self, limit: int = 10, now: Optional[float] = None) -> int:
         """
-        Fetches pending outbox events from SQLite whose `next_retry_at <= now`,
+        Atomically claims pending outbox events from SQLite whose `next_retry_at <= now`,
         redacts sensitive tokens, and dispatches to destination.
-        Marks processed atomically upon success, or schedules exponential backoff on failure.
+        Marks processed atomically upon verified delivery, or schedules exponential backoff on failure.
         """
         with self._lock:
             current_ts = now if now is not None else time.time()
-            try:
-                pending = self.db.fetch_pending_outbox(limit=limit, now=current_ts)
-            except TypeError:
-                pending = self.db.fetch_pending_outbox(limit=limit)
+            if hasattr(self.db, "claim_pending_outbox"):
+                try:
+                    pending = self.db.claim_pending_outbox(limit=limit, now=current_ts)
+                except TypeError:
+                    pending = self.db.claim_pending_outbox(limit=limit)
+            else:
+                try:
+                    pending = self.db.fetch_pending_outbox(limit=limit, now=current_ts)
+                except TypeError:
+                    pending = self.db.fetch_pending_outbox(limit=limit)
 
             if not pending:
                 return 0
@@ -83,12 +91,12 @@ class OutboxWorker:
                     safe_text = redact_secrets(msg_text)
 
                     if item.get("event_type") in {"DHAN_FINAL_RESPONSE", "DHAN_RESPONSE_ACK"}:
-                        ok = (
+                        ok = bool(
                             self.dhan_response_dispatch_fn(safe_text)
                             if self.dhan_response_dispatch_fn is not None else False
                         )
                     else:
-                        ok = self.dispatch_fn(safe_text)
+                        ok = bool(self.dispatch_fn(safe_text))
                     if ok:
                         self.db.mark_outbox_processed(out_id)
                         dispatched_count += 1

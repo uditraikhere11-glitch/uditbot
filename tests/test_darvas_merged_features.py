@@ -250,7 +250,8 @@ class TestDarvasMergedFeatures(unittest.TestCase):
             stop_mgr = EmergencyStopManager(stop_file, fail_closed_if_missing=True)
             stop_mgr.provision_initial_clean_state("Udit", "1113731536")
 
-            cfg = AppConfig.from_env()
+            cfg = AppConfig.from_env(env={}, env_file="")
+            cfg.data_dir = tmpdir
             cfg.dhan_client_id = "1113731536"
             cfg.dhan_access_token = "mock_token"
             cfg.trading_mode = TradingMode.LIVE
@@ -319,6 +320,9 @@ class TestDarvasMergedFeatures(unittest.TestCase):
             client.get_super_orders = MagicMock(return_value=[super_rec])
             client.order_status = MagicMock(return_value=super_rec)
             client.trades_avg_price = MagicMock(return_value=100.0)
+            client.session.get = MagicMock(
+                return_value=MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
+            )
 
             watcher.check_once()
             self.assertEqual(mock_put.call_count, 2)

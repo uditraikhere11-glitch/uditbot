@@ -40,6 +40,10 @@ from src.notifier.telegram_notifier import TelegramNotifier
 
 app = FastAPI(title="Audit bot - Setup Dashboard")
 
+# Presentation-only Telegram settings editor; existing Setup routes are unchanged.
+from src.notifier.message_designer_routes import register_routes as register_message_designer_routes
+register_message_designer_routes(app, SETUP_CSRF_TOKEN)
+
 
 def ensure_webui_coordinator_started(
     data_dir: Optional[str] = None,
@@ -641,6 +645,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <!--SYSTEM_STATUS_BAR-->
+    <div class="section-card" style="margin-top:12px; padding:15px 20px">
+      <a href="/setup/telegram-designer" style="font-weight:750; color:#93c5fd; text-decoration:none">🎨 Open Telegram Message Designer →</a>
+      <p class="help-text" style="margin:7px 0 0">Choose notification fields, layout, order, custom titles and emojis; preview and save without restarting trading.</p>
+    </div>
 
     <!--STATUS_BANNER-->
 
