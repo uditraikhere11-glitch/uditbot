@@ -164,7 +164,11 @@ if [[ "$WEB_EXISTED" == 0 ]]; then
     sudo systemctl start auditbot-web.service
 fi
 if [[ "$TIMER_EXISTED" == 0 ]]; then
-    sudo systemctl enable --now dhan-token-refresh.timer
+    if [[ "${AUDITBOT_SKIP_TOKEN_TIMER_START:-0}" != "1" ]]; then
+        sudo systemctl enable --now dhan-token-refresh.timer
+    else
+        echo "STAGED but DISABLED daily token refresh timer (fresh-bot safety)"
+    fi
 fi
 if [[ "$TRADING_EXISTED" == 0 && "$BOOT" == 1 ]]; then
     # Explicit opt-in enables NEXT boot; never starts the trading service now.

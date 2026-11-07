@@ -14,3 +14,9 @@ __pycache__/
 *.py[cod]
 venv/
 /FETCH_HEAD
+
+# Fresh-release runtime and obsolete local artifacts
+/logs/
+/today_bot_logs.txt
+*.bak
+*.backup_*
