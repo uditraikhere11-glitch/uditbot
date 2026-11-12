@@ -113,6 +113,48 @@ class TestSharedAuthFailureCooldown(unittest.TestCase):
         self.assertEqual(read_token(self.path), "expired-token")
 
 
+    def test_new_rejected_token_is_not_blocked_by_old_token_cooldown(self):
+        self.client._perform_totp_http_login = Mock(
+            side_effect=[
+                (False, "", "Old token: auth server unavailable"),
+                (True, "valid-final-token", "OK"),
+            ]
+        )
+        old = self.client.generate_token_with_totp(
+            force=False, rejected_token="expired-token"
+        )
+        self.assertFalse(old[0])
+        # An external process issued a DIFFERENT token, which later gets
+        # rejected. Its recovery must not inherit the previous token's marker.
+        write_token_atomic("new-but-invalid", self.path)
+        self.client.token = "new-but-invalid"
+        ok, tok, _ = self.client.generate_token_with_totp(
+            force=False, rejected_token="new-but-invalid"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(tok, "valid-final-token")
+        self.assertEqual(read_token(self.path), "valid-final-token")
+        self.assertEqual(self.client._perform_totp_http_login.call_count, 2)
+        self.assertFalse(os.path.exists(self.path + ".auth_retry_after"))
+
+    def test_legacy_float_only_marker_is_honored_to_avoid_upgrade_stampede(self):
+        import time
+        marker = self.path + ".auth_retry_after"
+        with open(marker, "w", encoding="ascii") as f:
+            f.write(str(time.time() + 60))
+        os.chmod(marker, 0o600)
+        self.client._perform_totp_http_login = Mock(
+            side_effect=AssertionError("login must respect legacy marker")
+        )
+        ok, token, reason = self.client.generate_token_with_totp(
+            force=False, rejected_token="expired-token"
+        )
+        self.assertFalse(ok)
+        self.assertEqual(token, "")
+        self.assertIn("cooldown", reason)
+        self.client._perform_totp_http_login.assert_not_called()
+
+
 class TestAtomicTokenFileAdoption(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -126,8 +168,6 @@ class TestAtomicTokenFileAdoption(unittest.TestCase):
         self.old_stamp = old_stat
         self.client._token_mtime = old_stat.st_mtime
         self.client._token_file_signature = DhanClient._token_stat_signature(old_stat)
-        self.client._auth_read_pause_token = "expired"
-        self.client._auth_read_pause_until = 1e30
 
     def test_atomic_replace_adopted_even_if_mtime_goes_backwards(self):
         write_token_atomic("fresh", self.path)
@@ -136,8 +176,10 @@ class TestAtomicTokenFileAdoption(unittest.TestCase):
         self.assertLess(os.stat(self.path).st_mtime_ns, self.old_stamp.st_mtime_ns)
         self.client._sync_shared_token_from_disk()
         self.assertEqual(self.client.token, "fresh")
-        self.assertEqual(self.client._auth_read_pause_until, 0.0)
-        self.assertEqual(self.client._auth_read_pause_token, "")
+        self.assertEqual(
+            self.client._token_file_signature,
+            self.client._token_stat_signature(os.stat(self.path)),
+        )
 
     def test_unchanged_file_does_not_reopen_or_overwrite_memory(self):
         with patch("src.broker.dhan_client.read_token",
@@ -146,7 +188,7 @@ class TestAtomicTokenFileAdoption(unittest.TestCase):
         self.assertEqual(self.client.token, "expired")
 
 
-class TestReadCircuitAndFailClosed(unittest.TestCase):
+class TestReadContinuityAndFailClosed(unittest.TestCase):
     def setUp(self):
         self.client = object.__new__(DhanClient)
         self.client.cfg = SimpleNamespace(
@@ -166,24 +208,23 @@ class TestReadCircuitAndFailClosed(unittest.TestCase):
         self.client.session = Mock()
         self.client._auth_log_at = {}
 
-    def test_outage_skips_repeated_broker_reads_but_returns_failure(self):
+    def test_outage_keeps_read_probes_active_but_throttles_duplicate_logs(self):
+        # Failed authentication must not make the protection watcher blind for
+        # 15 seconds. The shared token-file cooldown prevents repeated LOGIN,
+        # while read-only order status checks continue every watcher cycle.
         self.client.session.get.return_value = response(
             401, '{"errorCode":"DH-901"}'
         )
         with patch("src.broker.dhan_client.logger.error") as log_error:
-            first = self.client.get_order_book()
-            second = self.client.get_order_book()
-            third = self.client.get_order_book()
-        self.assertIsInstance(first, BrokerReadFailure)
-        self.assertIsInstance(second, BrokerReadFailure)
-        self.assertIsInstance(third, BrokerReadFailure)
-        self.assertEqual(first.status_code, 401)
-        self.assertEqual(second.status_code, 401)
-        self.assertEqual(self.client.session.get.call_count, 1)
-        self.client.generate_token_with_totp.assert_called_once()
+            outcomes = [self.client.get_order_book() for _ in range(3)]
+        for result in outcomes:
+            self.assertIsInstance(result, BrokerReadFailure)
+            self.assertEqual(result.status_code, 401)
+            self.assertNotEqual(result, [])
+        self.assertEqual(self.client.session.get.call_count, 3)
         self.assertEqual(log_error.call_count, 1)
 
-    def test_new_token_bypasses_pause_and_resumes_broker_reads_immediately(self):
+    def test_new_token_is_used_on_next_broker_read(self):
         self.client.session.get.side_effect = [
             response(401, '{"errorCode":"DH-901"}'),
             response(200, "", [{"orderId": "123"}]),
@@ -196,7 +237,7 @@ class TestReadCircuitAndFailClosed(unittest.TestCase):
         self.assertEqual(good[0]["orderId"], "123")
         self.assertEqual(self.client.session.get.call_count, 2)
 
-    def test_new_token_rejected_twice_is_not_refreshed_in_a_tight_loop(self):
+    def test_two_rejected_tokens_trigger_only_one_login_in_a_single_read(self):
         def renew(*, force, rejected_token):
             self.client.token = "new-but-rejected"
             return True, "new-but-rejected", "OK"
@@ -205,12 +246,25 @@ class TestReadCircuitAndFailClosed(unittest.TestCase):
             response(401, "DH-901"),
             response(401, "DH-901"),
         ]
-        first = self.client.get_positions()
-        self.assertIsInstance(first, BrokerReadFailure)
-        second = self.client.get_positions()
-        self.assertIsInstance(second, BrokerReadFailure)
+        result = self.client.get_positions()
+        self.assertIsInstance(result, BrokerReadFailure)
+        self.assertEqual(result.status_code, 401)
         self.assertEqual(self.client.session.get.call_count, 2)
         self.client.generate_token_with_totp.assert_called_once()
+
+    def test_next_read_recovers_immediately_after_transient_401(self):
+        # No token-file modification is needed when a broker-side temporary
+        # authentication rejection clears. PR #74's 15s block failed this.
+        self.client.session.get.side_effect = [
+            response(401, "DH-901"),
+            response(200, "", [{"orderId": "OK-NOW"}]),
+        ]
+        first = self.client.get_order_book()
+        second = self.client.get_order_book()
+        self.assertIsInstance(first, BrokerReadFailure)
+        self.assertIsInstance(second, BrokerReadList)
+        self.assertEqual(second[0]["orderId"], "OK-NOW")
+        self.assertEqual(self.client.session.get.call_count, 2)
 
     def test_non_auth_service_unavailable_still_reaches_broker_again(self):
         self.client.session.get.return_value = response(503, "Unavailable")
