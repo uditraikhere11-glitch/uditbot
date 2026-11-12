@@ -152,6 +152,53 @@ class TestDhanReadAuthRecovery(unittest.TestCase):
         )
 
 
+    def test_live_funds_401_then_200_recovers_once(self):
+        self.client.session.get.side_effect = [
+            _response(401, text='{"errorCode":"DH-901"}'),
+            _response(200, {"availabelBalance": 775.50}),
+        ]
+        ok, balance, _ = self.client.get_fund_limits()
+        self.assertTrue(ok)
+        self.assertEqual(balance, 775.50)
+        self.assertEqual(self.client.session.get.call_count, 2)
+        self.client.generate_token_with_totp.assert_called_once()
+
+    def test_live_funds_repeated_401_remains_auth_error(self):
+        self.client.session.get.side_effect = [
+            _response(401, text="DH-901"), _response(401, text="DH-901")
+        ]
+        ok, balance, message = self.client.get_fund_limits()
+        self.assertFalse(ok)
+        self.assertEqual(balance, 0.0)
+        self.assertIn("auth error", message)
+        self.assertEqual(self.client.session.get.call_count, 2)
+        self.client.generate_token_with_totp.assert_called_once()
+
+    def test_token_verification_funds_retry_false_never_rotates(self):
+        self.client.session.get.return_value = _response(401, text="DH-901")
+        ok, _, _ = self.client.get_fund_limits(retry=False)
+        self.assertFalse(ok)
+        self.client.generate_token_with_totp.assert_not_called()
+        self.assertEqual(self.client.session.get.call_count, 1)
+
+
+class TestDhanTokenAccountIsolation(unittest.TestCase):
+    def test_separate_account_token_paths_never_cross(self):
+        from src.broker.dhan_token import fresh_token, read_token
+        with tempfile.TemporaryDirectory() as directory:
+            udit = os.path.join(directory, "udit-account.token")
+            aman = os.path.join(directory, "aman-account.token")
+            self.assertEqual(fresh_token("", lambda: "udit-token", path=udit), "udit-token")
+            self.assertEqual(fresh_token("", lambda: "aman-token", path=aman), "aman-token")
+            self.assertEqual(read_token(udit), "udit-token")
+            self.assertEqual(read_token(aman), "aman-token")
+            wrong_login = Mock(side_effect=AssertionError("must adopt existing token"))
+            self.assertEqual(
+                fresh_token("expired-token", wrong_login, path=udit), "udit-token"
+            )
+            wrong_login.assert_not_called()
+
+
 class TestScheduledTokenVerification(unittest.TestCase):
     def _cfg(self, path):
         return SimpleNamespace(
