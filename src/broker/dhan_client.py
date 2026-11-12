@@ -1726,6 +1726,43 @@ class DhanClient:
     # SAFETY CORRECTION C.A: Structured Broker Collection Reads
     # =========================================================================
 
+    def _get_with_auth_recovery(
+        self, url: str, *, timeout: float = 5, allow_refresh: bool = True
+    ) -> requests.Response:
+        """One coordinated token recovery and one read-only GET retry on Dhan 401/403.
+
+        The rejected token is the token actually sent, not an in-memory token which
+        may have changed while another process was refreshing it. This method
+        never retries POST/PUT/DELETE or any order submission.
+        """
+        headers = self._headers()
+        response = self.session.get(url, headers=headers, timeout=timeout)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if not allow_refresh or status not in (401, 403) or not self.is_token_error(
+            status, str(getattr(response, "text", "") or "")
+        ):
+            return response
+
+        rejected = headers.get("access-token", "")
+        self._sync_shared_token_from_disk()
+        if self.token and self.token != rejected:
+            logger.warning("Dhan read auth rejected; adopting updated shared token.")
+        elif self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+            logger.warning("Dhan read auth rejected; attempting one coordinated TOTP recovery.")
+            ok, _, _ = self.generate_token_with_totp(
+                force=False, rejected_token=rejected
+            )
+            if not ok:
+                return response
+        else:
+            logger.warning("Dhan read auth rejected; TOTP recovery is not configured.")
+            return response
+
+        retry_headers = self._headers()
+        if not retry_headers.get("access-token") or retry_headers["access-token"] == rejected:
+            return response
+        return self.session.get(url, headers=retry_headers, timeout=timeout)
+
     def _read_collection(
         self,
         path_suffix: str,
@@ -1743,7 +1780,7 @@ class DhanClient:
 
         url = f"{BASE_URL}{path_suffix}"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             status_code = int(getattr(resp, "status_code", 0) or 0)
             if status_code == 200:
                 try:
@@ -2553,7 +2590,7 @@ class DhanClient:
         url = f"{BASE_URL}/orders/{requested_id}"
 
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             if resp.status_code == 200:
                 data = resp.json()
                 candidates = [data] if isinstance(data, dict) else (
@@ -2572,6 +2609,12 @@ class DhanClient:
                     "Dhan single-order read failed: %s HTTP %s",
                     requested_id, resp.status_code
                 )
+                if int(resp.status_code) in (401, 403) and self.is_token_error(
+                    int(resp.status_code), str(getattr(resp, "text", "") or "")
+                ):
+                    # A failed auth recovery is UNKNOWN, not a cancelled/empty order.
+                    # Avoid a second TOTP refresh via the order-book fallback.
+                    return None
         except Exception as exc:
             logger.warning(
                 "Dhan single-order read exception for %s: %s",
