@@ -82,7 +82,57 @@ class TestSharedAuthFailureCooldown(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(tok, "fresh-token")
         self.assertEqual(read_token(self.path), "fresh-token")
-        self.assertFalse(os.path.exists(self.path + ".auth_retry_after"))
+        # A fresh token gets a brief propagation grace marker rather than
+        # having its old failed-login marker removed unconditionally.
+        import hashlib
+        with open(self.path + ".auth_retry_after", encoding="ascii") as f:
+            marker = f.read().split()
+        self.assertEqual(len(marker), 2)
+        self.assertEqual(
+            marker[1], hashlib.sha256(b"fresh-token").hexdigest()
+        )
+        self.assertEqual(self.client._perform_totp_http_login.call_count, 2)
+
+    def test_newly_issued_token_401_does_not_cause_instant_relogin(self):
+        import hashlib
+        from src.broker.dhan_client import NEW_TOKEN_PROPAGATION_GRACE_SEC
+        self.client._perform_totp_http_login = Mock(
+            side_effect=[
+                (True, "just-issued-token", "OK"),
+                (True, "later-token", "OK"),
+            ]
+        )
+        ok, token, _ = self.client.generate_token_with_totp(force=True)
+        self.assertTrue(ok)
+        self.assertEqual(token, "just-issued-token")
+        # Dhan can briefly respond DH-901 while API nodes propagate a newly
+        # issued token. Continue broker reads; do NOT issue a fresh login yet.
+        for _ in range(3):
+            ok2, new_tok, reason = self.client.generate_token_with_totp(
+                force=False, rejected_token="just-issued-token"
+            )
+            self.assertFalse(ok2)
+            self.assertEqual(new_tok, "")
+            self.assertIn("cooldown", reason)
+        self.client._perform_totp_http_login.assert_called_once()
+        with open(self.path + ".auth_retry_after", encoding="ascii") as f:
+            marker = f.read().split()
+        self.assertEqual(
+            marker[1], hashlib.sha256(b"just-issued-token").hexdigest()
+        )
+        # The grace is shorter than a failed-auth cooldown.
+        until = float(marker[0])
+        self.assertGreater(until, 0)
+
+        # Once that short grace expires, a still-rejected token may be
+        # regenerated once through the normal shared-file coordinator.
+        with open(self.path + ".auth_retry_after", "w", encoding="ascii") as f:
+            f.write(f"0 {marker[1]}")
+        ok3, final, _ = self.client.generate_token_with_totp(
+            force=False, rejected_token="just-issued-token"
+        )
+        self.assertTrue(ok3)
+        self.assertEqual(final, "later-token")
         self.assertEqual(self.client._perform_totp_http_login.call_count, 2)
 
     def test_shared_backoff_respects_distinct_account_token_paths(self):
