@@ -1856,6 +1856,26 @@ class DhanClient:
             '"errorcode": "807"', '"errorcode": "808"', '"errorcode": "809"',
         ))
 
+    def _pause_failed_auth_reads(self, token: str) -> None:
+        """Short, token-specific pause to avoid thousands of rejected reads."""
+        self._auth_read_pause_token = str(token or "")
+        self._auth_read_pause_until = (
+            time.monotonic() + BROKER_AUTH_READ_PAUSE_SEC
+        )
+
+    def _log_throttled_broker_auth_error(self, label: str, reason: str) -> None:
+        """Keep an actionable warning without flooding systemd every two seconds."""
+        state = getattr(self, "_auth_log_at", None)
+        if not isinstance(state, dict):
+            state = {}
+            self._auth_log_at = state
+        key = str(label)
+        now = time.monotonic()
+        last = state.get(key, -float("inf"))
+        if now - last >= BROKER_AUTH_LOG_INTERVAL_SEC:
+            logger.error("%s (repeated authentication errors are rate-limited)", reason)
+            state[key] = now
+
     def _get_with_auth_recovery(
         self, url: str, *, timeout: float = 5, allow_refresh: bool = True
     ) -> requests.Response:
@@ -1865,32 +1885,57 @@ class DhanClient:
         may have changed while another process was refreshing it. This method
         never retries POST/PUT/DELETE or any order submission.
         """
+        # _headers() first adopts a rotated token from the shared file. An
+        # external successful refresh therefore immediately bypasses this
+        # token-specific pause without waiting for the cooldown.
         headers = self._headers()
+        sent_token = headers.get("access-token", "")
+        if (
+            allow_refresh and sent_token
+            and sent_token == getattr(self, "_auth_read_pause_token", "")
+            and time.monotonic() < getattr(self, "_auth_read_pause_until", 0.0)
+        ):
+            raise DhanAuthReadBackoff(
+                "Dhan access token remains unverified; next read probe is delayed"
+            )
         response = self.session.get(url, headers=headers, timeout=timeout)
         status = int(getattr(response, "status_code", 0) or 0)
         error_text = str(getattr(response, "text", "") or "")
+        if status == 200:
+            self._auth_read_pause_token = ""
+            self._auth_read_pause_until = 0.0
         if not allow_refresh or not self._requires_token_refresh(status, error_text):
             return response
 
-        rejected = headers.get("access-token", "")
+        rejected = sent_token
         self._sync_shared_token_from_disk()
         if self.token and self.token != rejected:
             logger.warning("Dhan read auth rejected; adopting updated shared token.")
         elif self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
-            logger.warning("Dhan read auth rejected; attempting one coordinated TOTP recovery.")
             ok, _, _ = self.generate_token_with_totp(
                 force=False, rejected_token=rejected
             )
             if not ok:
+                self._pause_failed_auth_reads(rejected)
                 return response
         else:
-            logger.warning("Dhan read auth rejected; TOTP recovery is not configured.")
+            self._pause_failed_auth_reads(rejected)
             return response
 
         retry_headers = self._headers()
-        if not retry_headers.get("access-token") or retry_headers["access-token"] == rejected:
+        retry_token = retry_headers.get("access-token", "")
+        if not retry_token or retry_token == rejected:
+            self._pause_failed_auth_reads(rejected)
             return response
-        return self.session.get(url, headers=retry_headers, timeout=timeout)
+        retry_response = self.session.get(url, headers=retry_headers, timeout=timeout)
+        retry_status = int(getattr(retry_response, "status_code", 0) or 0)
+        retry_text = str(getattr(retry_response, "text", "") or "")
+        if self._requires_token_refresh(retry_status, retry_text):
+            self._pause_failed_auth_reads(retry_token)
+        elif retry_status == 200:
+            self._auth_read_pause_token = ""
+            self._auth_read_pause_until = 0.0
+        return retry_response
 
     def _read_collection(
         self,
@@ -1932,8 +1977,18 @@ class DhanClient:
 
             err_text = str(getattr(resp, "text", "") or "")
             err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}"
-            logger.error(err)
+            if self._requires_token_refresh(status_code, err_text):
+                self._log_throttled_broker_auth_error(label, err)
+            else:
+                logger.error(err)
             return BrokerReadFailure(status=BrokerReadStatus.FAILED.value, error=err, status_code=status_code)
+        except DhanAuthReadBackoff as e:
+            err = f"Dhan {label} read unavailable: {e}"
+            self._log_throttled_broker_auth_error(label, err)
+            # Fail closed: a skipped unverified read is NOT an empty book.
+            return BrokerReadFailure(
+                status=BrokerReadStatus.FAILED.value, error=err, status_code=401
+            )
         except Exception as e:
             err = f"HTTP exception fetching {label}: {e}"
             logger.error(err)
