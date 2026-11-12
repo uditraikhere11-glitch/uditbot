@@ -611,9 +611,8 @@ class TestCV1306And07Consolidated(unittest.TestCase):
 
     def test_11_p1_totp_recovery_requires_verified_broker_auth(self):
         """
-        P1 Verification:
-        - Do not assume restoring an earlier token makes it valid after a new token has been generated.
-        - Require verified broker authentication (/fundlimit HTTP 200) before claiming recovery.
+        P1 Verification: A failed newly generated token is NOT verified and
+        must NOT trigger restoration of a potentially expired previous token.
         """
         cfg = AppConfig(
             trading_mode=TradingMode.TEST,
@@ -624,38 +623,49 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             data_dir=self.data_dir,
             journal_db_path=self.db_path,
         )
-        stop_mgr = EmergencyStopManager(os.path.join(self.data_dir, "emergency_stop.json"), expected_account_id="1113731536")
+        stop_mgr = EmergencyStopManager(
+            os.path.join(self.data_dir, "emergency_stop.json"),
+            expected_account_id="1113731536",
+        )
         stop_mgr.provision_initial_clean_state("Udit", "1113731536")
 
-        # Case 1: New token fails /fundlimit (401), AND previous token was invalidated by Dhan on TOTP generation (also 401)
         totp_ok = MagicMock(status_code=200)
-        totp_ok.json.return_value = {"dhanClientId": "1113731536", "accessToken": "NEW_BROKEN_TOKEN"}
-        funds_401 = MagicMock(status_code=401, text='{"errorCode":"DH-901","errorMessage":"Token Invalidated"}')
+        totp_ok.json.return_value = {
+            "dhanClientId": "1113731536", "accessToken": "NEW_BROKEN_TOKEN"
+        }
+        funds_401 = MagicMock(
+            status_code=401,
+            text='{"errorCode":"DH-901","errorMessage":"Token Invalidated"}',
+        )
 
+        # Repeated DH-901: broker authentication remains unverified, even
+        # after bounded propagation checks. No old token should be restored.
         with patch("requests.Session.post", return_value=totp_ok), \
-             patch("requests.Session.get", return_value=funds_401):
+             patch("requests.Session.get", return_value=funds_401), \
+             patch("src.cli.time.sleep"):
             buf1 = io.StringIO()
             with redirect_stdout(buf1):
                 res1 = cmd_refresh_token(cfg, stop_mgr)
-            out1 = buf1.getvalue()
             self.assertFalse(res1)
-            self.assertIn("RECOVERY_UNVERIFIED", out1)
-            self.assertNotIn("RECOVERY_VERIFIED", out1)
+            self.assertIn("no unsafe rollback", buf1.getvalue())
+            self.assertNotIn("RECOVERY_VERIFIED", buf1.getvalue())
+            self.assertEqual(read_token(self.tok_path), "NEW_BROKEN_TOKEN")
 
-        # Case 2: New token fails /fundlimit (500), but previous token passes /fundlimit (200) -> RECOVERY_VERIFIED
+        # Non-auth 500: do not retry TOTP, do not accept an unverified old
+        # token, and do not claim broker recovery.
         write_token_atomic("PREV_STILL_VALID_TOKEN", self.tok_path)
         funds_500 = MagicMock(status_code=500, text="Gateway error")
-        funds_200 = MagicMock(status_code=200)
-        funds_200.json.return_value = {"availabelBalance": 75000.0}
-
         with patch("requests.Session.post", return_value=totp_ok), \
-             patch("requests.Session.get", side_effect=[funds_500, funds_200]):
+             patch("requests.Session.get", return_value=funds_500), \
+             patch("src.cli.time.sleep") as sleeper:
             buf2 = io.StringIO()
             with redirect_stdout(buf2):
                 res2 = cmd_refresh_token(cfg, stop_mgr)
-            out2 = buf2.getvalue()
             self.assertFalse(res2)
-            self.assertIn("RECOVERY_VERIFIED", out2)
+            self.assertIn("Post-refresh broker verification failed", buf2.getvalue())
+            self.assertNotIn("RECOVERY_VERIFIED", buf2.getvalue())
+            self.assertEqual(read_token(self.tok_path), "NEW_BROKEN_TOKEN")
+            sleeper.assert_not_called()
 
     def test_12_p1_strict_regression_test_isolation_proof(self):
         """
