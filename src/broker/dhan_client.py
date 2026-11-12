@@ -1739,9 +1739,12 @@ class DhanClient:
         headers = self._headers()
         response = self.session.get(url, headers=headers, timeout=timeout)
         status = int(getattr(response, "status_code", 0) or 0)
-        if not allow_refresh or status not in (401, 403) or not self.is_token_error(
-            status, str(getattr(response, "text", "") or "")
-        ):
+        error_text = str(getattr(response, "text", "") or "")
+        # A generic 403 may be an authorization/permission denial rather than
+        # an expired token; rotate only for the explicit Dhan DH-901 code.
+        if (not allow_refresh or status not in (401, 403)
+                or (status == 403 and "DH-901" not in error_text.upper())
+                or not self.is_token_error(status, error_text)):
             return response
 
         rejected = headers.get("access-token", "")
