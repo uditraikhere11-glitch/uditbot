@@ -823,7 +823,36 @@ class DhanClient:
                 "pin": self.cfg.dhan_pin,
                 "totp": totp_code,
             }
-            resp = self.session.post(AUTH_URL, params=params, timeout=10)
+            # Dhan's TOTP authentication endpoint may respond slower during
+            # morning refresh. A 10-second read timeout falsely caused the
+            # 08:00 job to fail even with valid credentials (12 Nov 2026).
+            #
+            # A timed-out POST has an uncertain broker-side outcome. Retry at
+            # most ONCE with a newly computed TOTP; save only the token returned
+            # by the final verified response. This is strictly an auth request,
+            # never an order POST. Do not repeat on broker 4xx rejections.
+            for attempt in range(2):
+                try:
+                    resp = self.session.post(AUTH_URL, params=params, timeout=(5, 25))
+                    break
+                except (requests.exceptions.ConnectTimeout,
+                        requests.exceptions.ReadTimeout,
+                        requests.exceptions.ConnectionError) as exc:
+                    if isinstance(exc, requests.exceptions.SSLError):
+                        return False, "", "Dhan TOTP HTTPS/TLS verification failed"
+                    if attempt:
+                        return False, "", (
+                            "Dhan TOTP authentication endpoint unavailable after "
+                            f"two bounded attempts ({type(exc).__name__}); "
+                            "check outbound connectivity to auth.dhan.co"
+                        )
+                    logger.warning(
+                        "Dhan TOTP auth endpoint unavailable (%s); retrying "
+                        "once with fresh TOTP after a short delay.",
+                        type(exc).__name__,
+                    )
+                    time.sleep(2)
+                    params["totp"] = compute_totp(self.cfg.dhan_totp_secret)
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, dict):
