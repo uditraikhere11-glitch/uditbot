@@ -69,6 +69,19 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.dhan.co/v2"
 AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
+
+# A failing Dhan authentication endpoint must not be called again on every
+# two-second Protection Watcher poll. These bound retries without changing
+# order submission, reconciliation policy, or emergency STOP.
+ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC = 120.0
+BROKER_AUTH_READ_PAUSE_SEC = 15.0
+BROKER_AUTH_LOG_INTERVAL_SEC = 60.0
+
+
+class DhanAuthReadBackoff(RuntimeError):
+    """Read-only broker access is temporarily unverified after repeated DH-901."""
+
+
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
 
 VALID_NSE_EXCHANGES = frozenset({"NSI", "NSE", "NATIONAL STOCK EXCHANGE OF INDIA"})
@@ -795,6 +808,10 @@ class DhanClient:
         )
         self.reconciliation_gate = reconciliation_gate
         self._token_mtime: float = 0.0
+        self._token_file_signature = None
+        self._auth_read_pause_token = ""
+        self._auth_read_pause_until = 0.0
+        self._auth_log_at = {}
         self.token = self._load_token()
         self._quote_cache: Dict[Tuple[str, str], QuoteResult] = {}
         self._yahoo_quote_local = threading.local()
@@ -883,12 +900,44 @@ class DhanClient:
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
         last_err = ["Token generation failed"]
 
+        # Called INSIDE fresh_token()/force_login()'s existing per-file flock.
+        # Store no credentials in the sibling marker: only a next-attempt time.
+        retry_marker = token_path + ".auth_retry_after"
+
         def _login_cb() -> Optional[str]:
+            now = time.time()
+            if not force:
+                try:
+                    with open(retry_marker, "r", encoding="ascii") as f:
+                        retry_after = float(f.read().strip())
+                    if now < retry_after <= now + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC:
+                        last_err[0] = "Dhan TOTP endpoint recovery cooldown active"
+                        return None
+                except (FileNotFoundError, ValueError, OSError):
+                    pass
+
             ok, tok, msg = self._perform_totp_http_login()
-            if ok and tok:
-                last_err[0] = msg
-                return tok
             last_err[0] = msg
+            if ok and tok:
+                try:
+                    os.unlink(retry_marker)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning("Could not clear Dhan authentication retry marker.")
+                return tok
+
+            # A scheduled failed refresh also engages the shared cooldown, but
+            # the next day's scheduled force login still runs independently.
+            try:
+                fd = os.open(
+                    retry_marker, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fd, "w", encoding="ascii") as f:
+                    f.write(str(now + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC))
+                os.chmod(retry_marker, 0o600)
+            except OSError:
+                logger.warning("Unable to record Dhan authentication retry cooldown.")
             return None
 
         try:
@@ -911,20 +960,52 @@ class DhanClient:
         except Exception as e:
             return False, "", f"Exception generating token via TOTP: {e}"
 
+    @staticmethod
+    def _token_stat_signature(stat_result):
+        """Detect atomic replacements even if mtime is equal or moves backwards."""
+        return (
+            stat_result.st_dev, stat_result.st_ino, stat_result.st_size,
+            stat_result.st_mtime_ns, stat_result.st_ctime_ns,
+        )
+
     def _sync_shared_token_from_disk(self) -> None:
-        """V12-20 & CV13-06: Adopts newer token written by scheduled refresh or another worker."""
+        """Adopt token changes by file identity, not mtime ordering alone.
+
+        A systemd refresh writes via os.replace(), changing the inode even when
+        timestamps are equal. Never log the token or return an empty token as
+        successful authentication.
+        """
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
-        if not token_path or self._is_isolated_test_default_token_path(token_path) or not os.path.exists(token_path):
+        if not token_path or self._is_isolated_test_default_token_path(token_path):
             return
         try:
-            mtime = os.path.getmtime(token_path)
-            if mtime > self._token_mtime:
+            stat_before = os.stat(token_path)
+            signature = self._token_stat_signature(stat_before)
+            if signature == getattr(self, "_token_file_signature", None):
+                return
+            disk_tok = read_token(token_path)
+            if not disk_tok:
+                return
+            # A concurrent atomic replacement may occur during reading. Recheck
+            # and read the final file once, rather than adopting stale content.
+            stat_after = os.stat(token_path)
+            if self._token_stat_signature(stat_after) != signature:
                 disk_tok = read_token(token_path)
-                if disk_tok:
-                    self.token = disk_tok
-                    self._token_mtime = mtime
-        except Exception:
-            pass
+                if not disk_tok:
+                    return
+                stat_after = os.stat(token_path)
+                signature = self._token_stat_signature(stat_after)
+            if disk_tok != getattr(self, "token", ""):
+                self.token = disk_tok
+                self._auth_read_pause_token = ""
+                self._auth_read_pause_until = 0.0
+                logger.info("Adopted rotated Dhan access token from shared file.")
+            self._token_mtime = stat_after.st_mtime
+            self._token_file_signature = signature
+        except (FileNotFoundError, PermissionError, OSError):
+            # A missing/unreadable file must never be interpreted as a valid
+            # authenticated balance or an empty broker order book.
+            return
 
     def _load_token(self) -> str:
         """
@@ -939,8 +1020,10 @@ class DhanClient:
             tok = read_token(token_path)
             if tok:
                 try:
-                    self._token_mtime = os.path.getmtime(token_path)
-                except Exception:
+                    stat = os.stat(token_path)
+                    self._token_mtime = stat.st_mtime
+                    self._token_file_signature = self._token_stat_signature(stat)
+                except OSError:
                     pass
                 return tok
 
