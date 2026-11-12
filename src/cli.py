@@ -196,10 +196,6 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         print("Please ensure DHAN_CLIENT_ID, DHAN_PIN, and DHAN_TOTP_SECRET are set.")
         return False
 
-    from src.broker.dhan_token import read_token, write_token_atomic
-    token_path = os.path.expanduser(cfg.dhan_token_file)
-    prev_token = read_token(token_path) if os.path.exists(token_path) else ""
-
     client = DhanClient(cfg, stop_manager=stop_mgr)
     ok, token, msg = client.generate_token_with_totp(force=True)
     if ok and token:
@@ -222,26 +218,6 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         if not ok_f:
             print(f"\n❌ Post-refresh broker verification failed: {msg_f}")
             print("[!] The newly generated token is retained for later verification; no unsafe rollback or extra login was attempted.")
-            if prev_token and prev_token != token:
-                write_token_atomic(prev_token, token_path)
-                client.token = prev_token
-                try:
-                    client._token_mtime = os.path.getmtime(token_path)
-                except Exception:
-                    pass
-                ok_prev, bal_prev, msg_prev = client.verify_token_authenticated()
-                if ok_prev:
-                    print(
-                        f"[*] RECOVERY_VERIFIED: Restored previous token and confirmed broker authentication "
-                        f"(Balance: INR {bal_prev:,.2f})."
-                    )
-                else:
-                    print(
-                        f"[!] RECOVERY_UNVERIFIED: Previous token is no longer valid after new TOTP attempt "
-                        f"({msg_prev}). Broker authentication remains UNVERIFIED!"
-                    )
-            else:
-                print("[!] No distinct previous token available for recovery; broker authentication remains UNVERIFIED.")
             print("=======================================================")
             return False
 
