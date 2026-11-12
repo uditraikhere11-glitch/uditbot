@@ -475,6 +475,33 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
         self.assertIn("QUEUED", msg)
         self.assertEqual(len(self.db.fetch_pending_outbox()), 1)
 
+    def test_failed_auth_still_sends_truthful_morning_alert(self):
+        from src.cli import cmd_daily_health_check
+        broker = Mock()
+        broker.get_fund_limits.return_value = (
+            False, 0.0, "Dhan auth error (401): DH-901",
+        )
+        broker.last_funds_is_fallback = False
+        stop_mgr = Mock()
+        stop_mgr.get_state.return_value = {"is_stopped": True}
+        cards = []
+        with patch("src.cli.cmd_refresh_token", return_value=False), patch(
+            "src.broker.dhan_client.DhanClient", return_value=broker
+        ), patch(
+            "src.instruments.resolver.InstrumentResolver.load_dhan_master",
+            return_value=False
+        ), patch(
+            "src.notifier.telegram_notifier.TelegramNotifier.send_log_message",
+            side_effect=lambda body: cards.append(body) or True
+        ):
+            rc = cmd_daily_health_check(self.cfg, self.db, stop_mgr)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(cards), 1)
+        self.assertIn("Dhan authentication: ❌ NOT VERIFIED", cards[0])
+        self.assertIn("Emergency STOP: 🛑 ACTIVE", cards[0])
+        self.assertIn("REVIEW REQUIRED", cards[0])
+        broker.generate_token_with_totp.assert_not_called()
+
     def test_unconfigured_log_group_never_claims_delivered(self):
         from src.cli import dispatch_morning_health_report_once
         self.cfg.log_group_id = 0
