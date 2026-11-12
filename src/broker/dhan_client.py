@@ -833,7 +833,7 @@ class DhanClient:
             # never an order POST. Do not repeat on broker 4xx rejections.
             for attempt in range(2):
                 try:
-                    resp = self.session.post(AUTH_URL, params=params, timeout=(5, 25))
+                    resp = self.session.post(AUTH_URL, params=dict(params), timeout=(5, 25))
                     break
                 except (requests.exceptions.ConnectTimeout,
                         requests.exceptions.ReadTimeout,
