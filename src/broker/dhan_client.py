@@ -1000,19 +1000,15 @@ class DhanClient:
 
         url = f"{BASE_URL}/fundlimit"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url, allow_refresh=retry)
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, dict):
                     return False, 0.0, f"Malformed Dhan funds response (expected dict, got {type(data).__name__})"
                 avail = float(data.get("availabelBalance", data.get("availableBalance", data.get("sodLimit", 0.0))))
                 return True, avail, "Funds retrieved successfully"
-            elif self.is_token_error(resp.status_code, resp.text) and retry:
-                if self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
-                    logger.warning("Dhan token rejected on /fundlimit. Attempting coordinated refresh...")
-                    ok, _, _ = self.generate_token_with_totp(force=False, rejected_token=self.token)
-                    if ok:
-                        return self.get_fund_limits(retry=False)
+            elif self.is_token_error(resp.status_code, resp.text):
+                # The shared helper already made at most one read-only retry.
                 return False, 0.0, f"Dhan auth error ({resp.status_code}): {resp.text}"
             else:
                 return False, 0.0, f"Dhan funds API error ({resp.status_code}): {resp.text}"
