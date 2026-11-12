@@ -945,9 +945,7 @@ class DhanClient:
         if self.cfg.trading_mode == TradingMode.TEST:
             return None
         try:
-            resp = self.session.get(
-                f"{BASE_URL}/profile", headers=self._headers(), timeout=5
-            )
+            resp = self._get_with_auth_recovery(f"{BASE_URL}/profile")
             if resp.status_code != 200:
                 logger.warning("Dhan profile identity check returned HTTP %s", resp.status_code)
                 return None
@@ -985,7 +983,7 @@ class DhanClient:
                 return True, 100000.0, "Test mode default balance (token missing)"
             url = f"{BASE_URL}/fundlimit"
             try:
-                resp = self.session.get(url, headers=self._headers(), timeout=5)
+                resp = self._get_with_auth_recovery(url, allow_refresh=retry)
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, dict):
@@ -1712,7 +1710,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/orders/external/{correlation_id}"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
@@ -1740,10 +1738,21 @@ class DhanClient:
         response = self.session.get(url, headers=headers, timeout=timeout)
         status = int(getattr(response, "status_code", 0) or 0)
         error_text = str(getattr(response, "text", "") or "")
-        # A generic 403 may be an authorization/permission denial rather than
-        # an expired token; rotate only for the explicit Dhan DH-901 code.
+        # HTTP 403 can mean either invalid authentication or insufficient API
+        # permission. Refresh only when Dhan explicitly identifies token/session
+        # authentication as the issue; generic "Forbidden" must not rotate
+        # the token shared by both the listener and protection watcher.
+        auth_text = error_text.lower()
+        is_403_token_rejection = any(marker in auth_text for marker in (
+            "dh-901", "invalid_authentication", "invalid authentication",
+            "invalid token", "token invalid", "token expired", "token is expired",
+            "expired token", "access token expired", "access token is invalid",
+            "jwt expired", "jwt invalid", "session expired",
+            '"errorcode":"807"', '"errorcode":"808"', '"errorcode":"809"',
+            '"errorcode": "807"', '"errorcode": "808"', '"errorcode": "809"',
+        ))
         if (not allow_refresh or status not in (401, 403)
-                or (status == 403 and "DH-901" not in error_text.upper())
+                or (status == 403 and not is_403_token_rejection)
                 or not self.is_token_error(status, error_text)):
             return response
 
@@ -2763,7 +2772,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/trades/{order_id}"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             status_code = int(getattr(resp, "status_code", 0) or 0)
             if status_code == 200:
                 try:
