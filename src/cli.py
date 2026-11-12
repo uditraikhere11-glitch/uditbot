@@ -196,7 +196,7 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         print("Please ensure DHAN_CLIENT_ID, DHAN_PIN, and DHAN_TOTP_SECRET are set.")
         return False
 
-    client = DhanClient(cfg, stop_manager=stop_mgr)
+    client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
     ok, token, msg = client.generate_token_with_totp(force=True)
     if ok and token:
         # Allow a newly issued access token to become usable before reporting
