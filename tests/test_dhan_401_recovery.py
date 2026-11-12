@@ -18,6 +18,91 @@ def _response(status, payload=None, text=""):
     return r
 
 
+class TestDhanTotpTimeoutRecovery(unittest.TestCase):
+    def setUp(self):
+        import requests
+        self.requests = requests
+        self.client = object.__new__(DhanClient)
+        self.client.cfg = SimpleNamespace(
+            dhan_client_id="test-account-1",
+            dhan_pin="test-pin",
+            dhan_totp_secret="test-secret",
+        )
+        self.client.session = Mock()
+
+    def test_read_timeout_one_retry_then_success_no_order_post(self):
+        from src.broker.dhan_client import AUTH_URL
+        self.client.session.post.side_effect = [
+            self.requests.exceptions.ReadTimeout("Dhan auth read timed out"),
+            _response(200, {
+                "dhanClientId": "test-account-1",
+                "accessToken": "verified-token",
+            }),
+        ]
+        with patch("src.broker.dhan_client.compute_totp",
+                   side_effect=["111111", "222222"]) as totp, patch(
+            "src.broker.dhan_client.time.sleep"
+        ) as sleep:
+            ok, token, message = self.client._perform_totp_http_login()
+        self.assertTrue(ok, message)
+        self.assertEqual(token, "verified-token")
+        self.assertEqual(self.client.session.post.call_count, 2)
+        for call_args in self.client.session.post.call_args_list:
+            self.assertEqual(call_args.args[0], AUTH_URL)
+            self.assertEqual(call_args.kwargs["timeout"], (5, 25))
+        self.assertEqual(
+            [call_args.kwargs["params"]["totp"]
+             for call_args in self.client.session.post.call_args_list],
+            ["111111", "222222"],
+        )
+        self.assertEqual(totp.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_second_timeout_is_failure_with_at_most_two_calls(self):
+        self.client.session.post.side_effect = [
+            self.requests.exceptions.ReadTimeout("attempt one"),
+            self.requests.exceptions.ReadTimeout("attempt two"),
+        ]
+        with patch("src.broker.dhan_client.compute_totp",
+                   side_effect=["111111", "222222"]), patch(
+            "src.broker.dhan_client.time.sleep"
+        ):
+            ok, token, message = self.client._perform_totp_http_login()
+        self.assertFalse(ok)
+        self.assertEqual(token, "")
+        self.assertIn("unavailable", message)
+        self.assertNotIn("test-pin", message)
+        self.assertEqual(self.client.session.post.call_count, 2)
+
+    def test_wrong_pin_http_403_does_not_generate_another_totp(self):
+        self.client.session.post.return_value = _response(
+            403, text='{"errorMessage":"Incorrect PIN"}'
+        )
+        with patch("src.broker.dhan_client.compute_totp", return_value="111111"), patch(
+            "src.broker.dhan_client.time.sleep"
+        ) as sleep:
+            ok, token, message = self.client._perform_totp_http_login()
+        self.assertFalse(ok)
+        self.assertEqual(token, "")
+        self.assertIn("403", message)
+        self.assertEqual(self.client.session.post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_tls_certificate_error_is_not_retried(self):
+        self.client.session.post.side_effect = self.requests.exceptions.SSLError(
+            "certificate verify failed"
+        )
+        with patch("src.broker.dhan_client.compute_totp", return_value="111111"), patch(
+            "src.broker.dhan_client.time.sleep"
+        ) as sleep:
+            ok, token, message = self.client._perform_totp_http_login()
+        self.assertFalse(ok)
+        self.assertEqual(token, "")
+        self.assertIn("TLS", message)
+        self.assertEqual(self.client.session.post.call_count, 1)
+        sleep.assert_not_called()
+
+
 class TestDhanReadAuthRecovery(unittest.TestCase):
     def setUp(self):
         # No broker session, token file, or network is created by these tests.
