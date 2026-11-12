@@ -347,5 +347,114 @@ class TestScheduledTokenVerification(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class TestDailyTelegramHealthReport(unittest.TestCase):
+    def setUp(self):
+        from src.config import AppConfig
+        from src.journal.db import JournalDB
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.cfg = AppConfig(
+            trading_mode=TradingMode.LIVE,
+            dhan_client_id="1234567890",
+            data_dir=self.tempdir.name,
+            tg_bot_token="123456:OFFLINE_DUMMY",
+            log_group_id=-100987654321,
+            instance_name="AuditBot Udit",
+        )
+        self.db = JournalDB(
+            os.path.join(self.tempdir.name, "journal.db"),
+            account_id=self.cfg.dhan_client_id,
+        )
+        # Fixed time is representative of the 08:00 IST daily systemd job.
+        self.fixed_ts = 1794450605.0
+
+    def test_healthy_report_includes_account_mode_timestamp_and_real_funds(self):
+        from src.cli import format_morning_health_report
+        card = format_morning_health_report(
+            self.cfg, now_ts=self.fixed_ts, token_verified=True,
+            funds_verified=True, fallback_funds=False,
+            available_balance=1200.5, master_loaded=True, is_stopped=False,
+        )
+        self.assertIn("Morning Dhan Health", card)
+        self.assertIn("08:00:", card)
+        self.assertIn("***7890", card)
+        self.assertIn("LIVE", card)
+        self.assertIn("₹1,200.50", card)
+        self.assertIn("CHECKS PASSED", card)
+        self.assertNotIn("1234567890", card)
+
+    def test_stop_master_warning_and_paper_balance_never_claim_ready(self):
+        from src.cli import format_morning_health_report
+        for stop, master, paper in (
+            (True, True, False), (False, False, False), (False, True, True)
+        ):
+            card = format_morning_health_report(
+                self.cfg, now_ts=self.fixed_ts, token_verified=True,
+                funds_verified=not paper, fallback_funds=paper,
+                available_balance=100000.0, master_loaded=master, is_stopped=stop,
+            )
+            self.assertIn("REVIEW REQUIRED", card)
+            self.assertNotIn("CHECKS PASSED", card)
+        self.assertIn("TEST FALLBACK", card)
+
+    def test_direct_bot_api_sends_only_once_per_ist_day(self):
+        from src.cli import dispatch_morning_health_report_once
+        with patch(
+            "src.notifier.telegram_notifier.TelegramNotifier.send_log_message",
+            return_value=True,
+        ) as sender:
+            a = dispatch_morning_health_report_once(
+                self.cfg, self.db, "<b>morning report</b>", now_ts=self.fixed_ts
+            )
+            b = dispatch_morning_health_report_once(
+                self.cfg, self.db, "<b>morning report</b>", now_ts=self.fixed_ts + 60
+            )
+        self.assertIn("DELIVERED", a)
+        self.assertIn("ALREADY", b)
+        sender.assert_called_once()
+        self.assertEqual(self.db.fetch_pending_outbox(), [])
+
+    def test_bot_api_failure_is_queued_once_and_not_claimed_delivered(self):
+        from src.cli import dispatch_morning_health_report_once
+        with patch(
+            "src.notifier.telegram_notifier.TelegramNotifier.send_log_message",
+            return_value=False,
+        ) as sender:
+            a = dispatch_morning_health_report_once(
+                self.cfg, self.db, "Health report", now_ts=self.fixed_ts
+            )
+            b = dispatch_morning_health_report_once(
+                self.cfg, self.db, "Health report", now_ts=self.fixed_ts + 10
+            )
+        self.assertIn("QUEUED", a)
+        self.assertIn("ALREADY", b)
+        sender.assert_called_once()
+        messages = self.db.fetch_pending_outbox()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["event_type"], "ORDER_STATUS_UPDATE")
+
+    def test_without_bot_token_queues_for_running_telethon_worker(self):
+        from src.cli import dispatch_morning_health_report_once
+        self.cfg.tg_bot_token = ""
+        with patch(
+            "src.notifier.telegram_notifier.TelegramNotifier.send_log_message",
+            side_effect=AssertionError("Bot API must not be contacted"),
+        ):
+            msg = dispatch_morning_health_report_once(
+                self.cfg, self.db, "morning", now_ts=self.fixed_ts
+            )
+        self.assertIn("QUEUED", msg)
+        self.assertEqual(len(self.db.fetch_pending_outbox()), 1)
+
+    def test_unconfigured_log_group_never_claims_delivered(self):
+        from src.cli import dispatch_morning_health_report_once
+        self.cfg.log_group_id = 0
+        status = dispatch_morning_health_report_once(
+            self.cfg, self.db, "morning", now_ts=self.fixed_ts
+        )
+        self.assertIn("NOT_CONFIGURED", status)
+        self.assertEqual(self.db.fetch_pending_outbox(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
