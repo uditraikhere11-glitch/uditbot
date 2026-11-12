@@ -185,7 +185,12 @@ class TestSharedAuthFailureCooldown(unittest.TestCase):
         self.assertEqual(tok, "valid-final-token")
         self.assertEqual(read_token(self.path), "valid-final-token")
         self.assertEqual(self.client._perform_totp_http_login.call_count, 2)
-        self.assertFalse(os.path.exists(self.path + ".auth_retry_after"))
+        # The old rejected token no longer owns the marker: the newly issued
+        # token gets its own short grace marker.
+        import hashlib
+        with open(self.path + ".auth_retry_after", encoding="ascii") as f:
+            marker = f.read().split()
+        self.assertEqual(marker[1], hashlib.sha256(b"valid-final-token").hexdigest())
 
     def test_legacy_float_only_marker_is_honored_to_avoid_upgrade_stampede(self):
         import time
