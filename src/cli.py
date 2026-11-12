@@ -253,8 +253,9 @@ def format_morning_health_report(
         now_ts, tz=zoneinfo.ZoneInfo("Asia/Kolkata")
     )
     name = html.escape(str(getattr(cfg, "instance_name", "AuditBot") or "AuditBot"))
-    account = html.escape(_mask_account_id(str(cfg.dhan_client_id or "")))
-    mode = html.escape(str(getattr(cfg.trading_mode, "value", cfg.trading_mode)))
+    account = html.escape(_mask_account_id(str(getattr(cfg, "dhan_client_id", "") or "")))
+    configured_mode = getattr(cfg, "trading_mode", "UNKNOWN")
+    mode = html.escape(str(getattr(configured_mode, "value", configured_mode)))
     ready = bool(token_verified and funds_verified and master_loaded and not is_stopped)
     token_line = "✅ VERIFIED" if token_verified else "❌ NOT VERIFIED"
     if funds_verified:
@@ -360,7 +361,11 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         or "test mode default" in str(funds_msg).lower()
     )
     funds_verified = bool(ok_funds and not fallback_funds)
-    stop_state = stop_mgr.get_state() if stop_mgr is not None else {"is_stopped": True}
+    stop_state = (
+        stop_mgr.get_state()
+        if callable(getattr(stop_mgr, "get_state", None))
+        else {"is_stopped": True}
+    )
     is_stopped = bool(stop_state.get("is_stopped", True))
     report_now = time.time()
     report = format_morning_health_report(
