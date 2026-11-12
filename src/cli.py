@@ -344,7 +344,9 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     print("=======================================================")
 
     tok_ok = cmd_refresh_token(cfg, stop_mgr)
-    client = DhanClient(cfg, stop_manager=stop_mgr)
+    # The scheduled refresh already attempted the single intended TOTP login.
+    # Do not implicitly generate another token while gathering the report.
+    client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
     ok_funds, avail_bal, funds_msg = client.get_fund_limits(retry=False)
 
     scrip_path = os.path.join(cfg.data_dir, "scrip_master.csv")
