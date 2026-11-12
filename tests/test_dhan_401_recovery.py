@@ -245,6 +245,35 @@ class TestDhanReadAuthRecovery(unittest.TestCase):
         self.assertFalse(self.client.last_funds_is_fallback)
 
 
+    def test_read_only_marketfeed_post_403_token_expired_recovers_once(self):
+        self.client.session.post.side_effect = [
+            _response(403, text="Access token expired"),
+            _response(200, {
+                "data": {"NSE_FNO": {"777": {"last_price": 28.5}}}
+            }),
+        ]
+        ok, ltp, msg = self.client.get_ltp(
+            "NSE_FNO", "777", symbol=None,
+        )
+        self.assertTrue(ok, msg)
+        self.assertEqual(ltp, 28.5)
+        self.assertEqual(self.client.session.post.call_count, 2)
+        used = [
+            call.kwargs["headers"]["access-token"]
+            for call in self.client.session.post.call_args_list
+        ]
+        self.assertEqual(used, ["expired", "fresh"])
+        self.client.generate_token_with_totp.assert_called_once()
+
+    def test_read_only_marketfeed_post_permission_403_does_not_rotate(self):
+        self.client.session.post.return_value = _response(403, text="Permission denied")
+        ok, ltp, _ = self.client.get_ltp("NSE_FNO", "777", symbol=None)
+        self.assertFalse(ok)
+        self.assertEqual(ltp, 0.0)
+        self.assertEqual(self.client.session.post.call_count, 1)
+        self.client.generate_token_with_totp.assert_not_called()
+
+
 class TestDhanTokenAccountIsolation(unittest.TestCase):
     def test_separate_account_token_paths_never_cross(self):
         from src.broker.dhan_token import fresh_token, read_token
