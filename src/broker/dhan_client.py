@@ -74,6 +74,8 @@ AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
 # two-second Protection Watcher poll. These bound retries without changing
 # order submission, reconciliation policy, or emergency STOP.
 ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC = 120.0
+# Keep the freshly issued token for a short broker-side propagation window.
+NEW_TOKEN_PROPAGATION_GRACE_SEC = 20.0
 BROKER_AUTH_LOG_INTERVAL_SEC = 60.0
 
 
@@ -902,9 +904,22 @@ class DhanClient:
         rejected_for_cooldown = str(
             rejected_token if rejected_token is not None else self.token
         )
-        rejected_digest = hashlib.sha256(
-            rejected_for_cooldown.encode("utf-8")
-        ).hexdigest()
+        def _token_digest(token: str) -> str:
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+        rejected_digest = _token_digest(rejected_for_cooldown)
+
+        def _write_retry_marker(token_digest: str, delay_sec: float) -> None:
+            # Called under the token-file flock; advisory only, never secret.
+            try:
+                fd = os.open(
+                    retry_marker, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fd, "w", encoding="ascii") as f:
+                    f.write(f"{time.time() + delay_sec:.6f} {token_digest}")
+                os.chmod(retry_marker, 0o600)
+            except OSError:
+                logger.warning("Unable to persist Dhan login retry cooldown.")
 
         def _login_cb() -> Optional[str]:
             now = time.time()
@@ -927,28 +942,20 @@ class DhanClient:
             ok, tok, msg = self._perform_totp_http_login()
             last_err[0] = msg
             if ok and tok:
-                try:
-                    os.unlink(retry_marker)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    logger.warning("Could not clear Dhan authentication retry marker.")
+                # The coordinator writes this token before unlocking. If a
+                # subsequent broker GET briefly returns 401, keep probing
+                # with this token instead of immediately invalidating it with
+                # another generated token.
+                _write_retry_marker(
+                    _token_digest(tok), NEW_TOKEN_PROPAGATION_GRACE_SEC
+                )
                 return tok
 
-            # A scheduled failed refresh also engages the shared cooldown, but
-            # the next day's scheduled force login still runs independently.
-            try:
-                fd = os.open(
-                    retry_marker, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600
-                )
-                with os.fdopen(fd, "w", encoding="ascii") as f:
-                    f.write(
-                        f"{time.time() + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC:.6f} "
-                        f"{rejected_digest}"
-                    )
-                os.chmod(retry_marker, 0o600)
-            except OSError:
-                logger.warning("Unable to record Dhan authentication retry cooldown.")
+            # Failed logins get a longer 120-second per-rejected-token cooldown.
+            # Force login still bypasses it on the next scheduled refresh.
+            _write_retry_marker(
+                rejected_digest, ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC
+            )
             return None
 
         try:
