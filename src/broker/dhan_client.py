@@ -74,12 +74,7 @@ AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
 # two-second Protection Watcher poll. These bound retries without changing
 # order submission, reconciliation policy, or emergency STOP.
 ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC = 120.0
-BROKER_AUTH_READ_PAUSE_SEC = 15.0
 BROKER_AUTH_LOG_INTERVAL_SEC = 60.0
-
-
-class DhanAuthReadBackoff(RuntimeError):
-    """Read-only broker access is temporarily unverified after repeated DH-901."""
 
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
@@ -809,8 +804,6 @@ class DhanClient:
         self.reconciliation_gate = reconciliation_gate
         self._token_mtime: float = 0.0
         self._token_file_signature = None
-        self._auth_read_pause_token = ""
-        self._auth_read_pause_until = 0.0
         self._auth_log_at = {}
         self.token = self._load_token()
         self._quote_cache: Dict[Tuple[str, str], QuoteResult] = {}
@@ -900,20 +893,35 @@ class DhanClient:
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
         last_err = ["Token generation failed"]
 
-        # Called INSIDE fresh_token()/force_login()'s existing per-file flock.
-        # Store no credentials in the sibling marker: only a next-attempt time.
+        # Evaluated while holding the existing token-file flock, preventing
+        # multiple clients from simultaneously generating TOTP credentials.
+        # A token-specific digest allows a NEW token to seek recovery without
+        # being blocked by yesterday's (or another process's) failed login.
+        # The marker stores neither the token nor PIN/TOTP secret.
         retry_marker = token_path + ".auth_retry_after"
+        rejected_for_cooldown = str(
+            rejected_token if rejected_token is not None else self.token
+        )
+        rejected_digest = hashlib.sha256(
+            rejected_for_cooldown.encode("utf-8")
+        ).hexdigest()
 
         def _login_cb() -> Optional[str]:
             now = time.time()
             if not force:
                 try:
                     with open(retry_marker, "r", encoding="ascii") as f:
-                        retry_after = float(f.read().strip())
-                    if now < retry_after <= now + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC:
+                        marker_parts = f.read().strip().split()
+                    retry_after = float(marker_parts[0])
+                    marker_digest = marker_parts[1] if len(marker_parts) > 1 else None
+                    # Old one-field markers are honored until expiry; this
+                    # avoids a retry stampede when upgrading from PR #74.
+                    matches = marker_digest is None or marker_digest == rejected_digest
+                    if (matches and now < retry_after
+                            <= now + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC):
                         last_err[0] = "Dhan TOTP endpoint recovery cooldown active"
                         return None
-                except (FileNotFoundError, ValueError, OSError):
+                except (FileNotFoundError, ValueError, OSError, IndexError):
                     pass
 
             ok, tok, msg = self._perform_totp_http_login()
@@ -934,7 +942,10 @@ class DhanClient:
                     retry_marker, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600
                 )
                 with os.fdopen(fd, "w", encoding="ascii") as f:
-                    f.write(str(now + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC))
+                    f.write(
+                        f"{time.time() + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC:.6f} "
+                        f"{rejected_digest}"
+                    )
                 os.chmod(retry_marker, 0o600)
             except OSError:
                 logger.warning("Unable to record Dhan authentication retry cooldown.")
@@ -997,8 +1008,6 @@ class DhanClient:
                 signature = self._token_stat_signature(stat_after)
             if disk_tok != getattr(self, "token", ""):
                 self.token = disk_tok
-                self._auth_read_pause_token = ""
-                self._auth_read_pause_until = 0.0
                 logger.info("Adopted rotated Dhan access token from shared file.")
             self._token_mtime = stat_after.st_mtime
             self._token_file_signature = signature
@@ -1856,13 +1865,6 @@ class DhanClient:
             '"errorcode": "807"', '"errorcode": "808"', '"errorcode": "809"',
         ))
 
-    def _pause_failed_auth_reads(self, token: str) -> None:
-        """Short, token-specific pause to avoid thousands of rejected reads."""
-        self._auth_read_pause_token = str(token or "")
-        self._auth_read_pause_until = (
-            time.monotonic() + BROKER_AUTH_READ_PAUSE_SEC
-        )
-
     def _log_throttled_broker_auth_error(self, label: str, reason: str) -> None:
         """Keep an actionable warning without flooding systemd every two seconds."""
         state = getattr(self, "_auth_log_at", None)
@@ -1885,25 +1887,14 @@ class DhanClient:
         may have changed while another process was refreshing it. This method
         never retries POST/PUT/DELETE or any order submission.
         """
-        # _headers() first adopts a rotated token from the shared file. An
-        # external successful refresh therefore immediately bypasses this
-        # token-specific pause without waiting for the cooldown.
+        # NEVER suspend broker reads to save authentication requests:
+        # order/position/protective-leg checks must remain responsive.
+        # The shared *TOTP-login* cooldown below controls retry storms.
         headers = self._headers()
         sent_token = headers.get("access-token", "")
-        if (
-            allow_refresh and sent_token
-            and sent_token == getattr(self, "_auth_read_pause_token", "")
-            and time.monotonic() < getattr(self, "_auth_read_pause_until", 0.0)
-        ):
-            raise DhanAuthReadBackoff(
-                "Dhan access token remains unverified; next read probe is delayed"
-            )
         response = self.session.get(url, headers=headers, timeout=timeout)
         status = int(getattr(response, "status_code", 0) or 0)
         error_text = str(getattr(response, "text", "") or "")
-        if status == 200:
-            self._auth_read_pause_token = ""
-            self._auth_read_pause_until = 0.0
         if not allow_refresh or not self._requires_token_refresh(status, error_text):
             return response
 
@@ -1916,26 +1907,17 @@ class DhanClient:
                 force=False, rejected_token=rejected
             )
             if not ok:
-                self._pause_failed_auth_reads(rejected)
                 return response
         else:
-            self._pause_failed_auth_reads(rejected)
             return response
 
         retry_headers = self._headers()
         retry_token = retry_headers.get("access-token", "")
         if not retry_token or retry_token == rejected:
-            self._pause_failed_auth_reads(rejected)
             return response
-        retry_response = self.session.get(url, headers=retry_headers, timeout=timeout)
-        retry_status = int(getattr(retry_response, "status_code", 0) or 0)
-        retry_text = str(getattr(retry_response, "text", "") or "")
-        if self._requires_token_refresh(retry_status, retry_text):
-            self._pause_failed_auth_reads(retry_token)
-        elif retry_status == 200:
-            self._auth_read_pause_token = ""
-            self._auth_read_pause_until = 0.0
-        return retry_response
+        # A successful/failed second GET is terminal for this call. It must
+        # never trigger a second token generation or a trading order replay.
+        return self.session.get(url, headers=retry_headers, timeout=timeout)
 
     def _read_collection(
         self,
@@ -1982,13 +1964,6 @@ class DhanClient:
             else:
                 logger.error(err)
             return BrokerReadFailure(status=BrokerReadStatus.FAILED.value, error=err, status_code=status_code)
-        except DhanAuthReadBackoff as e:
-            err = f"Dhan {label} read unavailable: {e}"
-            self._log_throttled_broker_auth_error(label, err)
-            # Fail closed: a skipped unverified read is NOT an empty book.
-            return BrokerReadFailure(
-                status=BrokerReadStatus.FAILED.value, error=err, status_code=401
-            )
         except Exception as e:
             err = f"HTTP exception fetching {label}: {e}"
             logger.error(err)
