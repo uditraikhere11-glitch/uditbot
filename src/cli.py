@@ -235,6 +235,101 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         return False
 
 
+def format_morning_health_report(
+    cfg: AppConfig,
+    *,
+    now_ts: float,
+    token_verified: bool,
+    funds_verified: bool,
+    fallback_funds: bool,
+    available_balance: float,
+    master_loaded: bool,
+    is_stopped: bool,
+) -> str:
+    """Report measured status, never a paper balance or STOP state as LIVE-ready."""
+    import html
+
+    ist = datetime.datetime.fromtimestamp(
+        now_ts, tz=zoneinfo.ZoneInfo("Asia/Kolkata")
+    )
+    name = html.escape(str(getattr(cfg, "instance_name", "AuditBot") or "AuditBot"))
+    account = html.escape(_mask_account_id(str(cfg.dhan_client_id or "")))
+    mode = html.escape(str(getattr(cfg.trading_mode, "value", cfg.trading_mode)))
+    ready = bool(token_verified and funds_verified and master_loaded and not is_stopped)
+    token_line = "✅ VERIFIED" if token_verified else "❌ NOT VERIFIED"
+    if funds_verified:
+        funds_line = f"✅ VERIFIED — ₹{available_balance:,.2f}"
+    elif fallback_funds:
+        funds_line = "⚠️ TEST FALLBACK — NOT VERIFIED WITH DHAN"
+    else:
+        funds_line = "❌ NOT VERIFIED"
+    master_line = "✅ AVAILABLE" if master_loaded else "⚠️ UNAVAILABLE / STALE"
+    stop_line = "🛑 ACTIVE — NEW ENTRIES BLOCKED" if is_stopped else "✅ INACTIVE"
+    result = "✅ CHECKS PASSED" if ready else "⚠️ REVIEW REQUIRED"
+    return "\n".join((
+        f"☀️ <b>{name} — Morning Dhan Health</b>",
+        f"🕗 {ist:%d %b %Y, %H:%M:%S} IST",
+        f"🪪 Dhan account: <code>{account}</code>",
+        f"⚙️ Trading mode: <b>{mode}</b>",
+        f"🔑 Dhan authentication: {token_line}",
+        f"💰 Broker funds: {funds_line}",
+        f"📚 Scrip master: {master_line}",
+        f"🛡️ Emergency STOP: {stop_line}",
+        f"📊 <b>Overall: {result}</b>",
+    ))
+
+
+def dispatch_morning_health_report_once(
+    cfg: AppConfig, db: JournalDB, report: str, *, now_ts: float
+) -> str:
+    """Send once per account/IST date to the configured Telegram log group.
+
+    Direct Bot API delivery works even when the trading service is stopped.
+    Without a Bot API destination, or after delivery failure, atomically queue
+    a durable outbox notice for the existing Telethon/Telegram notifier worker.
+    Never label a queued notification as delivered.
+    """
+    if not getattr(cfg, "log_group_id", 0):
+        return "NOT_CONFIGURED (LOG_GROUP_ID is missing)"
+    from src.broker.dhan_token import locked_token_file
+    from src.notifier.telegram_notifier import TelegramNotifier
+
+    ist_date = datetime.datetime.fromtimestamp(
+        now_ts, tz=zoneinfo.ZoneInfo("Asia/Kolkata")
+    ).strftime("%Y-%m-%d")
+    identity = f"DAILY_HEALTH:{ist_date}:{cfg.dhan_client_id}:{getattr(cfg, 'instance_name', 'AuditBot')}"
+    event_key = "MORNING_REPORT"
+    # Separate lock from the Dhan token lock; never hold the token lock across
+    # Telegram network I/O. The DB claim is unique across service restarts.
+    lock_path = os.path.join(cfg.data_dir, ".morning_health_report")
+    try:
+        with locked_token_file(lock_path):
+            with db._get_conn() as conn:
+                existing = conn.execute(
+                    "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
+                    (identity, event_key),
+                ).fetchone()
+            if existing:
+                return "ALREADY SENT OR QUEUED"
+
+            notifier = TelegramNotifier(cfg)
+            if notifier.enabled and notifier.send_log_message(report):
+                with db._get_conn() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO order_notification_events (order_id, event_key, created_at) VALUES (?, ?, ?)",
+                        (identity, event_key, float(now_ts)),
+                    )
+                return "DELIVERED VIA TELEGRAM BOT API"
+
+            # Existing outbox worker delivers using Telegram Bot API or, if the
+            # bot token is absent, its Telegram user session (when running).
+            queued = db.enqueue_order_notification_once(identity, event_key, report)
+            return "QUEUED FOR TELEGRAM RETRY" if queued else "ALREADY QUEUED"
+    except Exception as exc:
+        # Notification failure must never change token validation or trading mode.
+        return f"NOTIFICATION ERROR ({type(exc).__name__})"
+
+
 def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager) -> int:
     """
     V12-24: Executes the scheduled 08:00 IST daily token refresh and health probe invoked by
@@ -259,12 +354,35 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         allow_network_download=True,
     )
 
-    funds_verified = bool(ok_funds and not getattr(client, "last_funds_is_fallback", False))
+    fallback_funds = bool(
+        getattr(client, "last_funds_is_fallback", False)
+        or "fallback" in str(funds_msg).lower()
+        or "test mode default" in str(funds_msg).lower()
+    )
+    funds_verified = bool(ok_funds and not fallback_funds)
+    stop_state = stop_mgr.get_state() if stop_mgr is not None else {"is_stopped": True}
+    is_stopped = bool(stop_state.get("is_stopped", True))
+    report_now = time.time()
+    report = format_morning_health_report(
+        cfg,
+        now_ts=report_now,
+        token_verified=tok_ok,
+        funds_verified=funds_verified,
+        fallback_funds=fallback_funds,
+        available_balance=avail_bal,
+        master_loaded=master_ok,
+        is_stopped=is_stopped,
+    )
+    notify_status = dispatch_morning_health_report_once(
+        cfg, db, report, now_ts=report_now
+    )
     overall_ok = bool(tok_ok and funds_verified)
     summary = (
         f"token_refresh={'OK' if tok_ok else 'FAIL'}, "
         f"funds={'OK' if funds_verified else 'UNVERIFIED'} ({avail_bal:,.2f} INR: {funds_msg}), "
-        f"scrip_master={'OK' if master_ok else 'WARN'}"
+        f"scrip_master={'OK' if master_ok else 'WARN'}, "
+        f"emergency_stop={'ACTIVE' if is_stopped else 'INACTIVE'}, "
+        f"telegram_report={notify_status}"
     )
     db.record_system_event("DAILY_HEALTH_CHECK", summary)
     if overall_ok:
