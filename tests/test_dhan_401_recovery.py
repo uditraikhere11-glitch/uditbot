@@ -188,6 +188,63 @@ class TestDhanReadAuthRecovery(unittest.TestCase):
         self.assertEqual(self.client.session.get.call_count, 1)
 
 
+    def test_explicit_403_invalid_authentication_recovers(self):
+        self.client.session.get.side_effect = [
+            _response(403, text='{"errorCode":"DH-901","errorMessage":"Invalid_Authentication"}'),
+            _response(200, [{"orderId": "A", "orderStatus": "PENDING"}]),
+        ]
+        self.assertEqual(len(self.client.get_order_book()), 1)
+        self.assertEqual(self.client.session.get.call_count, 2)
+        self.client.generate_token_with_totp.assert_called_once()
+
+    def test_403_expired_access_token_recovers_without_dh901_code(self):
+        self.client.session.get.side_effect = [
+            _response(403, text="Access token expired"),
+            _response(200, []),
+        ]
+        self.assertIsInstance(self.client.get_order_book(), BrokerReadList)
+        self.client.generate_token_with_totp.assert_called_once()
+
+    def test_correlation_id_read_uses_one_recovery(self):
+        self.client.session.get.side_effect = [
+            _response(401, text="DH-901"),
+            _response(200, {"orderId": "OID-1", "correlationId": "C-1"}),
+        ]
+        self.assertEqual(
+            self.client.get_order_by_correlation_id("C-1")["orderId"], "OID-1"
+        )
+        self.assertEqual(self.client.session.get.call_count, 2)
+
+    def test_trade_fill_read_401_then_valid_empty_book(self):
+        self.client.session.get.side_effect = [
+            _response(401, text="DH-901"), _response(200, []),
+        ]
+        result = self.client.get_trades_for_order("OID-1")
+        self.assertIsInstance(result, BrokerReadList)
+        self.assertEqual(len(result), 0)
+        self.client.generate_token_with_totp.assert_called_once()
+
+    def test_account_profile_403_token_expired_uses_recovery(self):
+        self.client.cfg.dhan_client_id = "1234567"
+        self.client.session.get.side_effect = [
+            _response(403, text="invalid token"),
+            _response(200, {"dhanClientId": "1234567"}),
+        ]
+        self.assertEqual(self.client.get_authenticated_profile_id(), "1234567")
+        self.assertEqual(self.client.session.get.call_count, 2)
+
+    def test_test_mode_funds_auth_recovery_is_not_paper_fallback(self):
+        self.client.cfg.trading_mode = TradingMode.TEST
+        self.client.session.get.side_effect = [
+            _response(403, text="token expired"),
+            _response(200, {"availabelBalance": 135.25}),
+        ]
+        ok, bal, _ = self.client.get_fund_limits()
+        self.assertTrue(ok)
+        self.assertEqual(bal, 135.25)
+        self.assertFalse(self.client.last_funds_is_fallback)
+
+
 class TestDhanTokenAccountIsolation(unittest.TestCase):
     def test_separate_account_token_paths_never_cross(self):
         from src.broker.dhan_token import fresh_token, read_token
