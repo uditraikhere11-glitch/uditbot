@@ -259,10 +259,11 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         allow_network_download=True,
     )
 
-    overall_ok = bool(tok_ok and ok_funds and not getattr(client, "last_funds_is_fallback", False))
+    funds_verified = bool(ok_funds and not getattr(client, "last_funds_is_fallback", False))
+    overall_ok = bool(tok_ok and funds_verified)
     summary = (
         f"token_refresh={'OK' if tok_ok else 'FAIL'}, "
-        f"funds={'OK' if ok_funds else 'FAIL'} ({avail_bal:,.2f} INR: {funds_msg}), "
+        f"funds={'OK' if funds_verified else 'UNVERIFIED'} ({avail_bal:,.2f} INR: {funds_msg}), "
         f"scrip_master={'OK' if master_ok else 'WARN'}"
     )
     db.record_system_event("DAILY_HEALTH_CHECK", summary)
