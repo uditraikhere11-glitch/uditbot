@@ -1646,7 +1646,8 @@ class DhanClient:
         payload = {exchange_segment: [sec_key]}
         try:
             t_req_start = time.time()
-            resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            sent_headers = self._headers()
+            resp = self.session.post(url, headers=sent_headers, json=payload, timeout=5)
             http_elapsed = max(0.0, time.time() - t_req_start)
             eval_utc = (float(now_utc) + (http_elapsed if http_elapsed >= 0.05 else 0.0)) if now_utc is not None else time.time()
             max_age = float(max_quote_age_sec) if max_quote_age_sec is not None else float(getattr(self.cfg, "max_quote_age_sec", 2.0))
@@ -1687,9 +1688,11 @@ class DhanClient:
                     }
                     return True, ltp, "LTP retrieved successfully from Dhan"
                 return False, 0.0, f"LTP is 0 or missing in Dhan response: {resp.text}"
-            elif self.is_token_error(resp.status_code, resp.text) and retry:
+            elif retry and self._requires_token_refresh(resp.status_code, resp.text):
                 if "806" not in resp.text and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
-                    ok, _, _ = self.generate_token_with_totp(force=False, rejected_token=self.token)
+                    ok, _, _ = self.generate_token_with_totp(
+                        force=False, rejected_token=sent_headers.get("access-token", "")
+                    )
                     if ok:
                         return self.get_ltp(
                             exchange_segment, security_id, retry=False, symbol=symbol,
@@ -1725,6 +1728,22 @@ class DhanClient:
     # SAFETY CORRECTION C.A: Structured Broker Collection Reads
     # =========================================================================
 
+    def _requires_token_refresh(self, status_code: int, body: str) -> bool:
+        """Only refresh 403 when Dhan explicitly indicates token auth failure."""
+        if status_code not in (401, 403) or not self.is_token_error(status_code, body):
+            return False
+        if status_code == 401:
+            return True
+        auth_text = str(body or "").lower()
+        return any(marker in auth_text for marker in (
+            "dh-901", "invalid_authentication", "invalid authentication",
+            "invalid token", "token invalid", "token expired", "token is expired",
+            "expired token", "access token expired", "access token is invalid",
+            "jwt expired", "jwt invalid", "session expired",
+            '"errorcode":"807"', '"errorcode":"808"', '"errorcode":"809"',
+            '"errorcode": "807"', '"errorcode": "808"', '"errorcode": "809"',
+        ))
+
     def _get_with_auth_recovery(
         self, url: str, *, timeout: float = 5, allow_refresh: bool = True
     ) -> requests.Response:
@@ -1738,22 +1757,7 @@ class DhanClient:
         response = self.session.get(url, headers=headers, timeout=timeout)
         status = int(getattr(response, "status_code", 0) or 0)
         error_text = str(getattr(response, "text", "") or "")
-        # HTTP 403 can mean either invalid authentication or insufficient API
-        # permission. Refresh only when Dhan explicitly identifies token/session
-        # authentication as the issue; generic "Forbidden" must not rotate
-        # the token shared by both the listener and protection watcher.
-        auth_text = error_text.lower()
-        is_403_token_rejection = any(marker in auth_text for marker in (
-            "dh-901", "invalid_authentication", "invalid authentication",
-            "invalid token", "token invalid", "token expired", "token is expired",
-            "expired token", "access token expired", "access token is invalid",
-            "jwt expired", "jwt invalid", "session expired",
-            '"errorcode":"807"', '"errorcode":"808"', '"errorcode":"809"',
-            '"errorcode": "807"', '"errorcode": "808"', '"errorcode": "809"',
-        ))
-        if (not allow_refresh or status not in (401, 403)
-                or (status == 403 and not is_403_token_rejection)
-                or not self.is_token_error(status, error_text)):
+        if not allow_refresh or not self._requires_token_refresh(status, error_text):
             return response
 
         rejected = headers.get("access-token", "")
