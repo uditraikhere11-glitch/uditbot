@@ -199,6 +199,9 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
     client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
     ok, token, msg = client.generate_token_with_totp(force=True)
     if ok and token:
+        # Bind the authenticated candidate returned by the coordinator, even
+        # when a test double or alternative implementation does not mutate it.
+        client.token = token
         # Allow a newly issued access token to become usable before reporting
         # failure. Never generate additional TOTP tokens or restore a stale one.
         # Only retry broker authentication errors, not incorrect credentials,
