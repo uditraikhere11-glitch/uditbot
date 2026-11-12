@@ -783,8 +783,12 @@ class DhanClient:
         config: AppConfig,
         stop_manager: Optional[EmergencyStopManager] = None,
         reconciliation_gate: Optional[Any] = None,
+        auto_generate_token: bool = True,
     ):
         self.cfg = config
+        # The scheduled force-refresh must not perform a first implicit TOTP
+        # login just because the token file is missing.
+        self._auto_generate_token = auto_generate_token
         self.session = configure_yahoo_http(requests.Session())
         self.stop_manager = stop_manager or EmergencyStopManager(
             state_file=os.path.join(config.data_dir, "emergency_stop.json")
@@ -914,7 +918,8 @@ class DhanClient:
         if self.cfg.dhan_access_token:
             return self.cfg.dhan_access_token.strip()
 
-        if not is_isolated_default and self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+        if (self._auto_generate_token and not is_isolated_default
+                and self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret):
             ok, tok, _ = self.generate_token_with_totp(force=False, rejected_token="")
             if ok and tok:
                 return tok
