@@ -107,6 +107,12 @@ class TestDhanReadAuthRecovery(unittest.TestCase):
         self.assertEqual(self.client.session.get.call_count, 1)
         self.client.generate_token_with_totp.assert_not_called()
 
+    def test_unrelated_403_permission_denial_never_rotates_token(self):
+        self.client.session.get.return_value = _response(403, text="Permission denied")
+        self.assertIsInstance(self.client.get_order_book(), BrokerReadFailure)
+        self.assertEqual(self.client.session.get.call_count, 1)
+        self.client.generate_token_with_totp.assert_not_called()
+
     def test_single_order_401_then_200_requires_exact_order_id(self):
         self.client.session.get.side_effect = [
             _response(401, text="DH-901"),
