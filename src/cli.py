@@ -203,9 +203,25 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
     client = DhanClient(cfg, stop_manager=stop_mgr)
     ok, token, msg = client.generate_token_with_totp(force=True)
     if ok and token:
-        ok_f, bal, msg_f = client.verify_token_authenticated()
+        # Allow a newly issued access token to become usable before reporting
+        # failure. Never generate additional TOTP tokens or restore a stale one.
+        # Only retry broker authentication errors, not incorrect credentials,
+        # account-binding failures, rate limits or network failures.
+        ok_f, bal, msg_f = False, 0.0, "Not verified"
+        for delay in (0, 2, 3, 4):
+            if delay:
+                time.sleep(delay)
+            ok_f, bal, msg_f = client.verify_token_authenticated()
+            if ok_f:
+                break
+            auth_error = str(msg_f or "").lower()
+            if not any(marker in auth_error for marker in (
+                "dh-901", "auth error", "401", "invalid authentication",
+            )):
+                break
         if not ok_f:
             print(f"\n❌ Post-refresh broker verification failed: {msg_f}")
+            print("[!] The newly generated token is retained for later verification; no unsafe rollback or extra login was attempted.")
             if prev_token and prev_token != token:
                 write_token_atomic(prev_token, token_path)
                 client.token = prev_token
@@ -264,7 +280,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         allow_network_download=True,
     )
 
-    overall_ok = bool(tok_ok and ok_funds)
+    overall_ok = bool(tok_ok and ok_funds and not getattr(client, "last_funds_is_fallback", False))
     summary = (
         f"token_refresh={'OK' if tok_ok else 'FAIL'}, "
         f"funds={'OK' if ok_funds else 'FAIL'} ({avail_bal:,.2f} INR: {funds_msg}), "
