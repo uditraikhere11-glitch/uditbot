@@ -199,6 +199,25 @@ class TestDhanTokenAccountIsolation(unittest.TestCase):
             wrong_login.assert_not_called()
 
 
+class TestScheduledRefreshStartup(unittest.TestCase):
+    def test_missing_file_does_not_implicitly_login_before_scheduled_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = SimpleNamespace(
+                dhan_client_id="test-account-1", dhan_pin="123456",
+                dhan_totp_secret="test-secret", dhan_access_token="",
+                dhan_token_file=os.path.join(directory, "nonexistent-token"),
+                data_dir=directory,
+            )
+            with patch.object(
+                DhanClient, "generate_token_with_totp",
+                side_effect=AssertionError("implicit login would rotate token twice"),
+            ):
+                client = DhanClient(
+                    cfg, stop_manager=Mock(), auto_generate_token=False
+                )
+            self.assertEqual(client.token, "")
+
+
 class TestScheduledTokenVerification(unittest.TestCase):
     def _cfg(self, path):
         return SimpleNamespace(
