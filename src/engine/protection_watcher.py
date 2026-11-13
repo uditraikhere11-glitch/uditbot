@@ -260,9 +260,27 @@ class ProtectionWatcher:
         rec.setdefault("cancel_exhausted", False)
         rec.setdefault("cancel_exhausted_alerted", False)
         rec.setdefault("confirmed_protection_ids", [])
-        if not rec.get("protection_route"):
+        if not rec.get("protection_route") or (
+            rec.get("entry_only_amo") is True
+            and str(rec.get("protection_route") or "").strip().upper() == ProtectionRoute.UNKNOWN.value
+        ):
             rec["protection_route"] = infer_record_protection_route(rec)
-        rec.setdefault("position_state", PositionLifecycleState.PROTECTED.value if int(rec.get("protected_qty") or 0) > 0 else PositionLifecycleState.ENTRY.value)
+        default_pos_state = (
+            PositionLifecycleState.UNPROTECTED.value
+            if (rec.get("entry_only_amo") is True or str(rec.get("protection_route") or "").strip().upper() == "ENTRY_ONLY_AMO")
+            and max(0, int(rec.get("filled_qty") or 0) - int(rec.get("exit_filled_qty") or 0)) > 0
+            and bool(is_term)
+            else PositionLifecycleState.PROTECTED.value if int(rec.get("protected_qty") or 0) > 0
+            else PositionLifecycleState.ENTRY.value
+        )
+        rec.setdefault("position_state", default_pos_state)
+        if (
+            bool(is_term)
+            and (rec.get("entry_only_amo") is True or str(rec.get("protection_route") or "").strip().upper() == "ENTRY_ONLY_AMO")
+            and max(0, int(rec.get("filled_qty") or 0) - int(rec.get("exit_filled_qty") or 0)) > 0
+            and rec.get("position_state") in (PositionLifecycleState.ENTRY.value, PositionLifecycleState.POSITION_OPEN.value)
+        ):
+            rec["position_state"] = PositionLifecycleState.UNPROTECTED.value
         rec.setdefault("exit_filled_qty", 0)
         rec.setdefault("exit_vwap", 0.0)
         rec.setdefault("realized_pnl", 0.0)
@@ -377,6 +395,89 @@ class ProtectionWatcher:
                                 rec["pending_oco"] = self._attempt_row_to_pending_dict(row, rec, p_oid, route_val)
                 except Exception as e:
                     logger.warning(f"[Protection] Could not restore protection_attempts from SQLite: {e}")
+
+            # H11: Detect and repair any inconsistent watcher_orders rows (e.g. one-field SQL is_terminal=1
+            # with stale record_json state='PENDING'/filled_qty=0, or verified fills in SQLite not reflected in record_json).
+            if self.journal_db and hasattr(self.journal_db, "get_position_accounting"):
+                needs_migration_save = False
+                all_ids = list(set(list(self.pending.keys()) + list(self.terminal_orders.keys())))
+                for oid in all_ids:
+                    in_term = oid in self.terminal_orders
+                    rec = self.terminal_orders.get(oid) if in_term else self.pending.get(oid)
+                    if not isinstance(rec, dict):
+                        continue
+                    try:
+                        acct = self.journal_db.get_position_accounting(oid)
+                    except Exception:
+                        acct = None
+                    ver_buy_qty = int((acct or {}).get("buy_filled_qty") or 0)
+                    ver_buy_vwap = float((acct or {}).get("buy_vwap") or 0.0)
+                    ver_sell_qty = int((acct or {}).get("sell_filled_qty") or 0)
+                    req_qty = int(rec.get("qty") or ver_buy_qty or 0)
+                    cur_state = str(rec.get("state") or OrderLifecycleState.PENDING.value).upper()
+
+                    if ver_buy_qty > 0:
+                        if int(rec.get("filled_qty") or 0) != ver_buy_qty:
+                            rec["filled_qty"] = ver_buy_qty
+                            needs_migration_save = True
+                        if ver_buy_vwap > 0 and abs(float(rec.get("avg_fill_price") or 0.0) - ver_buy_vwap) > 1e-4:
+                            rec["avg_fill_price"] = ver_buy_vwap
+                            needs_migration_save = True
+                        rec["exit_filled_qty"] = max(int(rec.get("exit_filled_qty") or 0), ver_sell_qty)
+                        open_q = max(0, ver_buy_qty - int(rec.get("exit_filled_qty") or 0))
+                        rec["confirmed_position_open_qty"] = open_q
+
+                        if req_qty > 0 and ver_buy_qty >= req_qty:
+                            if cur_state != OrderLifecycleState.TRADED.value:
+                                rec["state"] = OrderLifecycleState.TRADED.value
+                                rec["terminal_confirmed"] = True
+                                needs_migration_save = True
+                            if not in_term and not rec.get("pending_oco"):
+                                self.pending.pop(oid, None)
+                                self.terminal_orders[oid] = rec
+                                needs_migration_save = True
+                        elif 0 < ver_buy_qty < req_qty:
+                            if cur_state != OrderLifecycleState.PART_FILLED.value:
+                                rec["state"] = OrderLifecycleState.PART_FILLED.value
+                                rec["terminal_confirmed"] = False
+                                needs_migration_save = True
+                            if in_term:
+                                self.terminal_orders.pop(oid, None)
+                                self.pending[oid] = rec
+                                needs_migration_save = True
+
+                        prot_q = int(rec.get("protected_qty") or 0)
+                        is_man_ack = (
+                            hasattr(self.journal_db, "is_manual_risk_acknowledged")
+                            and self.journal_db.is_manual_risk_acknowledged(oid, str(rec.get("correlation_id") or ""))
+                        )
+                        if open_q == 0:
+                            target_pos_state = PositionLifecycleState.POSITION_CLOSED.value
+                        elif prot_q >= open_q:
+                            target_pos_state = PositionLifecycleState.PROTECTED.value
+                        elif is_man_ack:
+                            target_pos_state = "UNPROTECTED_MANUAL_RISK"
+                            rec["manual_risk_acknowledged"] = True
+                        else:
+                            target_pos_state = PositionLifecycleState.UNPROTECTED.value
+
+                        if rec.get("position_state") != target_pos_state:
+                            rec["position_state"] = target_pos_state
+                            needs_migration_save = True
+                        self._sync_position_lifecycle(rec)
+                    elif (
+                        in_term
+                        and int(rec.get("filled_qty") or 0) < max(1, int(rec.get("qty") or 1))
+                        and cur_state in ("PENDING", "PART_FILLED", "ACKED", "TRANSIT", "TRIGGERED")
+                    ):
+                        # H11: Reject one-field SQL shortcut (`is_terminal=1` while JSON state is still PENDING/PART_FILLED with 0 fills)
+                        rec["terminal_confirmed"] = False
+                        self.terminal_orders.pop(oid, None)
+                        self.pending[oid] = rec
+                        needs_migration_save = True
+
+                if needs_migration_save:
+                    self._save()
 
     def _attempt_row_to_pending_dict(self, row: dict, rec: dict, p_oid: str, route_val: str) -> dict:
         return {
@@ -802,6 +903,119 @@ class ProtectionWatcher:
                 pass
         return None
 
+
+    def reconcile_historical_order_fills(
+        self,
+        *,
+        order_id: str,
+        correlation_id: str,
+        symbol: str,
+        security_id: str,
+        segment: str,
+        product_type: str,
+        requested_qty: int,
+        filled_qty: int,
+        avg_fill_price: float,
+        verified_protected_qty: int = 0,
+        verified_closed_qty: int = 0,
+        confirmed_protection_ids: Optional[List[str]] = None,
+        manual_risk_acknowledged: bool = False,
+        is_amo: bool = False,
+        protection_route: str = "",
+        original_market_price: float = 0.0,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        H01, H07, H08, H11, H16: Updates watcher `record_json` and `is_terminal` atomically under lock
+        from verified historical fills without placing any automatic OCO or assuming `TRADED` implies
+        `POSITION_CLOSED` or `PROTECTED`.
+        """
+        ts = float(now if now is not None else self.clock())
+        oid = str(order_id or "").strip()
+        cid = str(correlation_id or oid).strip()
+        req_q = int(requested_qty or 0)
+        fill_q = int(filled_qty or 0)
+        prot_q = max(0, int(verified_protected_qty or 0))
+        closed_q = max(0, int(verified_closed_qty or 0))
+        open_q = max(0, fill_q - closed_q)
+
+        with self._lock:
+            existing = self.pending.get(oid) or self.terminal_orders.get(oid)
+            if isinstance(existing, dict):
+                rec = dict(existing)
+            else:
+                sl_pct, tgt_pct = self._protection_for_segment(segment)
+                rec = {
+                    "order_id": oid,
+                    "root_order_id": oid,
+                    "parent_order_id": None,
+                    "correlation_id": cid,
+                    "symbol": str(symbol),
+                    "trading_symbol": str(symbol),
+                    "security_id": str(security_id),
+                    "segment": str(segment).upper(),
+                    "product_type": str(product_type).upper(),
+                    "is_super_order": (str(protection_route).upper() == "SUPER_ORDER"),
+                    "is_amo": bool(is_amo),
+                    "entry_only_amo": (str(protection_route).upper() == "ENTRY_ONLY_AMO"),
+                    "protection_route": str(protection_route or ("FOREVER_OCO" if str(product_type).upper() in ("CNC", "MTF") else "UNKNOWN")),
+                    "qty": req_q,
+                    "original_market_price": float(original_market_price or avg_fill_price or 0.0),
+                    "sl_pct": sl_pct,
+                    "target_pct": tgt_pct,
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "created_at": ts,
+                }
+                self._hydrate_loaded_record_defaults(rec, is_term=(fill_q >= req_q))
+
+            rec["order_id"] = oid
+            rec["correlation_id"] = cid
+            rec["symbol"] = str(symbol or rec.get("symbol") or "")
+            rec["security_id"] = str(security_id or rec.get("security_id") or "")
+            rec["segment"] = str(segment or rec.get("segment") or "NSE_EQ").upper()
+            rec["product_type"] = str(product_type or rec.get("product_type") or "CNC").upper()
+            rec["qty"] = req_q
+            rec["filled_qty"] = fill_q
+            rec["avg_fill_price"] = float(avg_fill_price or rec.get("avg_fill_price") or 0.0)
+            rec["exit_filled_qty"] = closed_q
+            rec["confirmed_position_open_qty"] = open_q
+            # Never assume entry TRADED implies protected_qty > 0; require verified_protected_qty
+            rec["protected_qty"] = prot_q
+            if confirmed_protection_ids:
+                rec["confirmed_protection_ids"] = sorted(set(list(rec.get("confirmed_protection_ids") or []) + [str(x) for x in confirmed_protection_ids if x]))
+
+            if fill_q >= req_q and req_q > 0:
+                rec["state"] = OrderLifecycleState.TRADED.value
+                rec["terminal_confirmed"] = True
+                rec["finalized_at"] = float(rec.get("finalized_at") or ts)
+            else:
+                rec["state"] = OrderLifecycleState.PART_FILLED.value if fill_q > 0 else OrderLifecycleState.PENDING.value
+                rec["terminal_confirmed"] = False
+
+            if open_q == 0 and fill_q > 0:
+                rec["position_state"] = PositionLifecycleState.POSITION_CLOSED.value
+            elif prot_q >= open_q and open_q > 0:
+                rec["position_state"] = PositionLifecycleState.PROTECTED.value
+            elif manual_risk_acknowledged and open_q > 0:
+                rec["position_state"] = "UNPROTECTED_MANUAL_RISK"
+                rec["manual_risk_acknowledged"] = True
+            elif open_q > 0:
+                rec["position_state"] = PositionLifecycleState.UNPROTECTED.value
+            else:
+                rec["position_state"] = PositionLifecycleState.ENTRY.value
+
+            if rec["terminal_confirmed"] and not rec.get("pending_oco"):
+                self.pending.pop(oid, None)
+                self.terminal_orders[oid] = rec
+            else:
+                self.terminal_orders.pop(oid, None)
+                self.pending[oid] = rec
+
+            self._sync_position_lifecycle(rec)
+            self._save()
+            return dict(rec)
+
     def check_once(self) -> bool:
         with self._pass_lock:
             changed = False
@@ -841,7 +1055,55 @@ class ProtectionWatcher:
                 prev_state = str(rec.get("state") or OrderLifecycleState.PENDING.value)
                 broker_status = str(st.get("orderStatus", "")).upper()
                 prev_filled = int(rec.get("filled_qty") or 0)
-                filled = int(st.get("filledQty") or 0)
+                req_qty = int(rec.get("qty") or 0)
+                raw_filled = st.get("filledQty", 0)
+                if raw_filled is None:
+                    raw_filled = 0
+                malformed_fill_qty = False
+                parsed_filled = 0
+                if isinstance(raw_filled, bool):
+                    malformed_fill_qty = True
+                elif isinstance(raw_filled, int):
+                    parsed_filled = raw_filled
+                elif isinstance(raw_filled, float):
+                    if not math.isfinite(raw_filled) or not raw_filled.is_integer():
+                        malformed_fill_qty = True
+                    else:
+                        parsed_filled = int(raw_filled)
+                elif isinstance(raw_filled, str):
+                    s_fill = raw_filled.strip()
+                    if not s_fill or not s_fill.lstrip("-").isdigit():
+                        malformed_fill_qty = True
+                    else:
+                        parsed_filled = int(s_fill)
+                else:
+                    malformed_fill_qty = True
+
+                if not malformed_fill_qty:
+                    if parsed_filled < 0 or parsed_filled < prev_filled or (req_qty > 0 and parsed_filled > req_qty):
+                        malformed_fill_qty = True
+                    elif rec.get("entry_only_amo") and broker_status in ("TRADED", "CLOSED") and parsed_filled != req_qty:
+                        malformed_fill_qty = True
+
+                if malformed_fill_qty:
+                    rec["filled_qty"] = prev_filled
+                    rec["unreadable_broker_response"] = True
+                    if rec.get("entry_only_amo"):
+                        rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                        rec["reconciliation_required"] = True
+                    if gate is not None and hasattr(gate, "halt_new_entries"):
+                        gate.halt_new_entries(
+                            f"Malformed or inconsistent broker filledQty ({raw_filled!r}) for {rec.get('symbol')} ({order_id})"
+                        )
+                    if self.execution_reporter is not None and rec.get("notification_meta"):
+                        try:
+                            self.execution_reporter.process(rec, st, observed_at=current_time)
+                        except Exception:
+                            pass
+                    changed = True
+                    continue
+
+                filled = parsed_filled
                 rec["filled_qty"] = filled
 
                 # Map broker status to lifecycle state and update separate CV13-03 tracking flags
@@ -909,15 +1171,20 @@ class ProtectionWatcher:
                     rec["confirmed_position_open_qty"] = max(0, filled - int(rec.get("exit_filled_qty") or 0))
                     if rec.get("position_state") in (None, "", PositionLifecycleState.ENTRY.value):
                         rec["position_state"] = PositionLifecycleState.POSITION_OPEN.value
+                fill_persist_failed = False
                 if filled > prev_filled and self.journal_db and hasattr(self.journal_db, "record_fill"):
                     def record_entry_fill(**values):
+                        nonlocal fill_persist_failed
                         try:
                             return self.journal_db.record_fill(**values)
                         except Exception:
+                            fill_persist_failed = True
                             if rec.get("entry_only_amo"):
                                 rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
                                 rec["reconciliation_required"] = True
                                 rec["persistence_uncertain"] = True
+                                rec["filled_qty"] = prev_filled
+                                rec["confirmed_position_open_qty"] = max(0, prev_filled - int(rec.get("exit_filled_qty") or 0))
                                 if gate is not None and hasattr(gate, "halt_new_entries"):
                                     gate.halt_new_entries(f"Entry-only AMO {order_id}: fill persistence failed")
                             raise
@@ -946,7 +1213,7 @@ class ProtectionWatcher:
                                         recorded_real_trades = True
                         except Exception:
                             recorded_real_trades = False
-                    if not recorded_real_trades:
+                    if not recorded_real_trades and not fill_persist_failed:
                         try:
                             avg_p = float(st.get("averageTradedPrice") or 0.0)
                             record_entry_fill(
@@ -965,6 +1232,11 @@ class ProtectionWatcher:
                             )
                         except Exception:
                             pass
+                    if not fill_persist_failed and rec.get("entry_only_amo") and rec.get("persistence_uncertain"):
+                        rec["persistence_uncertain"] = False
+                        rec["reconciliation_required"] = False
+                        if rec.get("position_state") == PositionLifecycleState.RECONCILIATION_REQUIRED.value:
+                            rec["position_state"] = PositionLifecycleState.POSITION_OPEN.value
 
                 # 1. Reconcile any existing unresolved protection attempt (FOREVER_OCO or SUPER_ORDER)
                 #    OR protect newly executed units (P0-02: use explicit protection_route, never product_type == MARGIN).
@@ -1138,7 +1410,7 @@ class ProtectionWatcher:
                 # 4. Check terminal finalization of entry phase (open positions remain supervised in terminal_orders)
                 entry_only_complete = (route_name == "ENTRY_ONLY_AMO"
                                        and not has_unresolved_after
-                                       and not rec.get("persistence_uncertain")
+                                       and not fill_persist_failed
                                        and 0 <= filled <= int(rec["qty"])
                                        and (broker_status != "TRADED" or filled == int(rec["qty"]))
                                        and broker_status in {"TRADED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"})
@@ -1148,7 +1420,13 @@ class ProtectionWatcher:
                         rec["confirmed_position_open_qty"] = 0
                         logger.info(f"[Protection] {rec['symbol']} order {order_id} terminal ({rec['state']}) with 0 fills; closed.")
                     else:
-                        if rec.get("position_state") in (None, "", PositionLifecycleState.ENTRY.value, PositionLifecycleState.POSITION_OPEN.value):
+                        if rec.get("position_state") in (
+                            None,
+                            "",
+                            PositionLifecycleState.ENTRY.value,
+                            PositionLifecycleState.POSITION_OPEN.value,
+                            PositionLifecycleState.RECONCILIATION_REQUIRED.value,
+                        ):
                             rec["position_state"] = (PositionLifecycleState.UNPROTECTED.value if entry_only_complete
                                                      else PositionLifecycleState.PROTECTED.value)
                         rec["confirmed_position_open_qty"] = max(0, filled - int(rec.get("exit_filled_qty") or 0))
@@ -1162,6 +1440,9 @@ class ProtectionWatcher:
                             gate.halt_new_entries(f"Entry-only AMO {order_id}: lifecycle persistence failed")
                         changed = True
                         continue
+                    if entry_only_complete and lifecycle_saved:
+                        rec["persistence_uncertain"] = False
+                        rec["reconciliation_required"] = False
 
                     with self._lock:
                         self.pending.pop(order_id, None)
@@ -1181,7 +1462,24 @@ class ProtectionWatcher:
             # B07: Trading watcher NEVER restarts its own systemd service!
             # When all pending orders in watcher have resolved, record transition readiness only;
             # the WebUI / control coordinator process executes the actual deferred apply/restart or stop.
-            if not self.pending:
+            has_unprotected_or_entry_only_open = any(
+                isinstance(r, dict)
+                and max(0, int(r.get("filled_qty") or 0) - int(r.get("exit_filled_qty") or 0)) > 0
+                and str(r.get("position_state") or "").upper() != PositionLifecycleState.POSITION_CLOSED.value
+                and (
+                    bool(r.get("entry_only_amo"))
+                    or str(r.get("protection_route") or "").upper() == "ENTRY_ONLY_AMO"
+                    or bool(r.get("reconciliation_required"))
+                    or bool(r.get("persistence_uncertain"))
+                    or str(r.get("position_state") or "").upper() in (
+                        PositionLifecycleState.UNPROTECTED.value,
+                        PositionLifecycleState.RECONCILIATION_REQUIRED.value,
+                        PositionLifecycleState.PERSISTENCE_UNCERTAIN.value,
+                    )
+                )
+                for r in self.terminal_orders.values()
+            )
+            if not self.pending and not has_unprotected_or_entry_only_open:
                 try:
                     data_dir = os.path.dirname(os.path.abspath(self.path)) if self.path else "data"
                     from src.engine.config_manager import ConfigChangeTracker

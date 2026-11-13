@@ -313,6 +313,19 @@ class JournalDB:
                 PRIMARY KEY (order_id, event_key)
             );
 
+            CREATE TABLE IF NOT EXISTS manual_risk_acknowledgements (
+                parent_order_id TEXT PRIMARY KEY,
+                correlation_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                security_id TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                acknowledged_by TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'UNPROTECTED_MANUAL_RISK',
+                acknowledged_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
@@ -2320,3 +2333,498 @@ class JournalDB:
             if not str(d.get("approved_by") or "").strip() or not d["eval_summary"].get("passed"):
                 d["state"] = "REJECTED"
         return d
+
+    # --- Historical Fill Reconciliation & Audited Manual-Risk Acknowledgements (H01-H17) ---
+
+    def apply_verified_historical_fills(
+        self,
+        *,
+        correlation_id: str,
+        broker_order_id: str,
+        expected_account_id: str,
+        symbol: str,
+        security_id: str,
+        exchange_segment: str,
+        product_type: str,
+        requested_quantity: int,
+        verified_trades: List[Dict[str, Any]],
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Idempotent, atomic SQLite transaction that persists verified historical broker trade fills:
+        - Requires exact matching `dhanClientId`, `orderId`, `securityId`, `exchangeSegment`, `productType`,
+          `transactionType=BUY`, positive integer `tradedQuantity`, positive finite `tradedPrice`, and a real
+          broker `exchangeTradeId` (rejecting synthetic IDs and cross-order trade ID collisions).
+        - Deduplicates trades by `exchangeTradeId` across pages/runs.
+        - Rejects `total_filled_qty <= 0` or `total_filled_qty > requested_quantity`.
+        - Atomically inserts unique rows into `fills`, updates `order_intents.state` (`TRADED` when
+          `total_filled_qty == requested_quantity`, `PART_FILLED` when `0 < total_filled_qty < requested_quantity`),
+          updates `orders.status` and `orders.filled_quantity`, and records a durable `HISTORICAL_FILL_RECONCILED`
+          audit event in `system_events`.
+        """
+        from src.broker.dhan_client import DhanClient
+
+        ts = float(now if now is not None else time.time())
+        cid = str(correlation_id or "").strip()[:30]
+        boid = str(broker_order_id or "").strip()
+        exp_acct = str(expected_account_id or "").strip()
+        sec_id = str(security_id or "").strip()
+        seg = str(exchange_segment or "").strip().upper()
+        prod = str(product_type or "").strip().upper()
+        req_qty = int(requested_quantity or 0)
+
+        if not cid or not boid or not exp_acct or not sec_id or not seg or not prod or req_qty <= 0:
+            raise ValueError("Missing mandatory order/account/instrument parameters for historical fill application")
+        if self.account_id and str(self.account_id).strip() and exp_acct != str(self.account_id).strip():
+            raise ValueError(
+                f"Account mismatch in apply_verified_historical_fills: expected {self.account_id!r}, got {exp_acct!r}"
+            )
+        if not isinstance(verified_trades, list) or not verified_trades:
+            raise ValueError("verified_trades must be a non-empty list of broker trade records")
+
+        deduped_by_etid: Dict[str, Dict[str, Any]] = {}
+        for idx, raw_tr in enumerate(verified_trades):
+            ok_v, norm_tr, err_v = DhanClient.validate_historical_trade_record(
+                raw_tr,
+                expected_account_id=exp_acct,
+                expected_order_id=boid,
+                expected_security_id=sec_id,
+                expected_exchange_segment=seg,
+                expected_product_type=prod,
+                expected_transaction_type="BUY",
+            )
+            if not ok_v or norm_tr is None:
+                raise ValueError(f"Invalid historical trade record #{idx} for order {boid}: {err_v}")
+            etid = str(norm_tr["exchangeTradeId"])
+            if etid in deduped_by_etid:
+                prev = deduped_by_etid[etid]
+                if (
+                    int(prev["tradedQuantity"]) != int(norm_tr["tradedQuantity"])
+                    or abs(float(prev["tradedPrice"]) - float(norm_tr["tradedPrice"])) > 1e-6
+                ):
+                    raise ValueError(f"Conflicting duplicate exchangeTradeId '{etid}' for order {boid}")
+                continue
+            deduped_by_etid[etid] = norm_tr
+
+        unique_trades = list(deduped_by_etid.values())
+        batch_qty = sum(int(t["tradedQuantity"]) for t in unique_trades)
+        if batch_qty <= 0 or batch_qty > req_qty:
+            raise ValueError(
+                f"Historical fill quantity ({batch_qty}) out of bounds for requested quantity ({req_qty}) on order {boid}"
+            )
+
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            intent_row = conn.execute(
+                "SELECT * FROM order_intents WHERE correlation_id = ? LIMIT 1",
+                (cid,),
+            ).fetchone()
+            if intent_row is None:
+                raise ValueError(f"Order intent {cid!r} not found in order_intents")
+            intent_acct = str(intent_row["account_id"] or "").strip()
+            if intent_acct and intent_acct != exp_acct:
+                raise ValueError(
+                    f"Order intent {cid} belongs to account {intent_acct!r}, cannot apply fills from {exp_acct!r}"
+                )
+            intent_boid = str(intent_row["broker_order_id"] or "").strip()
+            if intent_boid and intent_boid != boid:
+                raise ValueError(
+                    f"Order intent {cid} bound to broker_order_id {intent_boid!r}, cannot apply fills for {boid!r}"
+                )
+
+            # Remove any synthetic unverified placeholders for this broker_order_id before inserting verified trades
+            conn.execute(
+                "DELETE FROM fills WHERE broker_order_id = ? AND is_verified_trade = 0",
+                (boid,),
+            )
+
+            newly_inserted = 0
+            for tr in unique_trades:
+                etid = str(tr["exchangeTradeId"])
+                existing_fill = conn.execute(
+                    "SELECT broker_order_id, traded_quantity, traded_price, security_id, exchange_segment, product_type, transaction_type, is_verified_trade "
+                    "FROM fills WHERE exchange_trade_id = ? LIMIT 1",
+                    (etid,),
+                ).fetchone()
+                if existing_fill is not None:
+                    ex_boid = str(existing_fill["broker_order_id"] or "").strip()
+                    if ex_boid != boid:
+                        raise ValueError(
+                            f"exchangeTradeId {etid!r} already attributed to different broker_order_id {ex_boid!r} (!= {boid!r})"
+                        )
+                    # Replayed proof must match the FULL previously verified
+                    # exchange execution. Do not silently trust corrupt/stale rows.
+                    if (
+                        int(existing_fill["traded_quantity"] or 0) != int(tr["tradedQuantity"])
+                        or abs(float(existing_fill["traded_price"] or 0) - float(tr["tradedPrice"])) > 1e-6
+                        or str(existing_fill["security_id"] or "") != sec_id
+                        or str(existing_fill["exchange_segment"] or "").upper() != seg
+                        or str(existing_fill["product_type"] or "").upper() != prod
+                        or str(existing_fill["transaction_type"] or "").upper() != "BUY"
+                        or int(existing_fill["is_verified_trade"] or 0) != 1
+                    ):
+                        raise ValueError(f"Conflicting stored execution evidence for exchangeTradeId {etid!r}")
+                    continue
+
+                cur = conn.execute(
+                    """
+                    INSERT INTO fills (
+                        broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity,
+                        traded_at, transaction_type, security_id, exchange_segment, product_type,
+                        parent_order_id, is_verified_trade
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, 1)
+                    """,
+                    (
+                        boid,
+                        etid,
+                        str(symbol or intent_row["symbol"] or ""),
+                        float(tr["tradedPrice"]),
+                        int(tr["tradedQuantity"]),
+                        float(tr.get("traded_at") or ts),
+                        sec_id,
+                        seg,
+                        prod,
+                        boid,
+                    ),
+                )
+                if cur.rowcount == 1:
+                    newly_inserted += 1
+
+            # Recompute total verified BUY fills for this broker_order_id from the authoritative fills table
+            persisted_rows = conn.execute(
+                """
+                SELECT exchange_trade_id, traded_quantity, traded_price
+                FROM fills
+                WHERE broker_order_id = ? AND UPPER(COALESCE(transaction_type, 'BUY')) = 'BUY' AND is_verified_trade = 1
+                ORDER BY id ASC
+                """,
+                (boid,),
+            ).fetchall()
+            total_filled_qty = sum(int(r["traded_quantity"] or 0) for r in persisted_rows)
+            if total_filled_qty <= 0 or total_filled_qty > req_qty:
+                raise ValueError(
+                    f"Persisted verified fill total ({total_filled_qty}) invalid for requested quantity ({req_qty}) on order {boid}"
+                )
+            total_val = sum(int(r["traded_quantity"] or 0) * float(r["traded_price"] or 0.0) for r in persisted_rows)
+            vwap = round(total_val / total_filled_qty, 4)
+            resolved_state = "TRADED" if total_filled_qty == req_qty else "PART_FILLED"
+
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = ?, broker_order_id = ?, updated_at = ?
+                WHERE correlation_id = ?
+                """,
+                (resolved_state, boid, ts, cid),
+            )
+            conn.execute(
+                """
+                UPDATE orders
+                SET status = ?,
+                    broker_order_id = COALESCE(NULLIF(broker_order_id, ''), ?),
+                    filled_quantity = ?,
+                    updated_at = ?
+                WHERE correlation_id = ? OR broker_order_id = ?
+                """,
+                (resolved_state, boid, int(total_filled_qty), ts, cid, boid),
+            )
+
+            etids_sorted = sorted(str(r["exchange_trade_id"]) for r in persisted_rows)
+            event_payload = json.dumps(
+                {
+                    "correlation_id": cid,
+                    "broker_order_id": boid,
+                    "account_id": exp_acct,
+                    "symbol": str(symbol or intent_row["symbol"] or ""),
+                    "security_id": sec_id,
+                    "exchange_segment": seg,
+                    "product_type": prod,
+                    "requested_quantity": req_qty,
+                    "filled_quantity": total_filled_qty,
+                    "vwap": vwap,
+                    "resolved_state": resolved_state,
+                    "exchange_trade_ids": etids_sorted,
+                },
+                sort_keys=True,
+            )
+            existing_ev = conn.execute(
+                "SELECT 1 FROM system_events WHERE event_type = 'HISTORICAL_FILL_RECONCILED' AND payload = ? LIMIT 1",
+                (event_payload,),
+            ).fetchone()
+            if existing_ev is None:
+                conn.execute(
+                    "INSERT INTO system_events (event_type, description, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        "HISTORICAL_FILL_RECONCILED",
+                        (
+                            f"Reconciled historical fills for {symbol} (orderId={boid}, corrId={cid}): "
+                            f"{total_filled_qty}/{req_qty} @ VWAP {vwap:.4f} -> {resolved_state}"
+                        ),
+                        event_payload,
+                        ts,
+                    ),
+                )
+
+        return {
+            "correlation_id": cid,
+            "broker_order_id": boid,
+            "requested_quantity": req_qty,
+            "filled_quantity": total_filled_qty,
+            "vwap": vwap,
+            "resolved_state": resolved_state,
+            "newly_inserted_fills": newly_inserted,
+            "exchange_trade_ids": etids_sorted,
+        }
+
+    def repair_interrupted_fill_states(self, now: Optional[float] = None) -> int:
+        """
+        H09: Idempotently repairs any interrupted state where verified real fills exist in `fills`
+        for a non-terminal `order_intents` / `orders` row (e.g. after an unexpected crash or power loss).
+        """
+        ts = float(now if now is not None else time.time())
+        repaired = 0
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            intents = conn.execute(
+                "SELECT * FROM order_intents WHERE broker_order_id IS NOT NULL AND TRIM(broker_order_id) != ''"
+            ).fetchall()
+            for intent in intents:
+                cid = str(intent["correlation_id"])
+                boid = str(intent["broker_order_id"]).strip()
+                req_qty = int(intent["quantity"] or 0)
+                if req_qty <= 0:
+                    continue
+                fill_rows = conn.execute(
+                    """
+                    SELECT traded_quantity, traded_price
+                    FROM fills
+                    WHERE broker_order_id = ? AND UPPER(COALESCE(transaction_type, 'BUY')) = 'BUY' AND is_verified_trade = 1
+                    """,
+                    (boid,),
+                ).fetchall()
+                if not fill_rows:
+                    continue
+                total_filled = sum(int(r["traded_quantity"] or 0) for r in fill_rows)
+                if total_filled <= 0 or total_filled > req_qty:
+                    continue
+                target_state = "TRADED" if total_filled == req_qty else "PART_FILLED"
+                cur_state = str(intent["state"] or "").upper()
+                order_row = conn.execute(
+                    "SELECT status, filled_quantity FROM orders WHERE correlation_id = ? OR broker_order_id = ? LIMIT 1",
+                    (cid, boid),
+                ).fetchone()
+                order_needs_fix = (
+                    order_row is not None
+                    and (
+                        str(order_row["status"] or "").upper() != target_state
+                        or int(order_row["filled_quantity"] or 0) != total_filled
+                    )
+                )
+                if cur_state != target_state or order_needs_fix:
+                    conn.execute(
+                        "UPDATE order_intents SET state = ?, updated_at = ? WHERE correlation_id = ?",
+                        (target_state, ts, cid),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE orders
+                        SET status = ?, filled_quantity = ?, broker_order_id = COALESCE(NULLIF(broker_order_id, ''), ?), updated_at = ?
+                        WHERE correlation_id = ? OR broker_order_id = ?
+                        """,
+                        (target_state, total_filled, boid, ts, cid, boid),
+                    )
+                    repaired += 1
+        return repaired
+
+    def acknowledge_manual_risk_holding(
+        self,
+        *,
+        parent_order_id: str,
+        correlation_id: str = "",
+        account_id: str = "",
+        symbol: str = "",
+        security_id: str = "",
+        quantity: int = 0,
+        acknowledged_by: str,
+        reason: str,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        H16: Records a tightly scoped, audited manual-risk designation (`UNPROTECTED_MANUAL_RISK`)
+        for an explicitly owner-acknowledged controlled LIVE test holding.
+        - Never marks the position `PROTECTED` or `POSITION_CLOSED`.
+        - Never creates a global protection bypass for any other order or quantity.
+        """
+        ts = float(now if now is not None else time.time())
+        p_oid = str(parent_order_id or "").strip()
+        actor = str(acknowledged_by or "").strip()
+        reas = str(reason or "").strip()
+        if not p_oid or not actor or not reas:
+            raise ValueError("parent_order_id, acknowledged_by, and reason are required for manual-risk acknowledgement")
+
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            intent_row = conn.execute(
+                "SELECT * FROM order_intents WHERE broker_order_id = ? OR correlation_id = ? LIMIT 1",
+                (p_oid, str(correlation_id or p_oid)[:30]),
+            ).fetchone()
+            eff_cid = str(correlation_id or (intent_row["correlation_id"] if intent_row else p_oid)).strip()[:30]
+            eff_acct = str(account_id or (intent_row["account_id"] if intent_row else "") or self.account_id).strip()
+            eff_sym = str(symbol or (intent_row["symbol"] if intent_row else "")).strip()
+            eff_sec = str(security_id or (intent_row["security_id"] if intent_row else "")).strip()
+            eff_qty = int(quantity or (intent_row["quantity"] if intent_row else 0))
+            if not eff_acct or not eff_sym or not eff_sec or eff_qty <= 0:
+                raise ValueError(f"Cannot acknowledge manual risk for {p_oid}: missing verified account/symbol/security_id/quantity")
+
+            conn.execute(
+                """
+                INSERT INTO manual_risk_acknowledgements (
+                    parent_order_id, correlation_id, account_id, symbol, security_id,
+                    quantity, acknowledged_by, reason, status, acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'UNPROTECTED_MANUAL_RISK', ?)
+                ON CONFLICT(parent_order_id) DO UPDATE SET
+                    correlation_id = excluded.correlation_id,
+                    account_id = excluded.account_id,
+                    symbol = excluded.symbol,
+                    security_id = excluded.security_id,
+                    quantity = excluded.quantity,
+                    acknowledged_by = excluded.acknowledged_by,
+                    reason = excluded.reason,
+                    status = 'UNPROTECTED_MANUAL_RISK',
+                    acknowledged_at = excluded.acknowledged_at
+                """,
+                (p_oid, eff_cid, eff_acct, eff_sym, eff_sec, eff_qty, actor, reas, ts),
+            )
+
+            # Update positions_lifecycle if present to UNPROTECTED_MANUAL_RISK (never PROTECTED or POSITION_CLOSED)
+            conn.execute(
+                """
+                UPDATE positions_lifecycle
+                SET position_state = 'UNPROTECTED_MANUAL_RISK', updated_at = ?
+                WHERE parent_order_id = ?
+                """,
+                (ts, p_oid),
+            )
+            # Update watcher_orders record_json if present
+            w_row = conn.execute(
+                "SELECT is_terminal, record_json FROM watcher_orders WHERE order_id = ? LIMIT 1",
+                (p_oid,),
+            ).fetchone()
+            if w_row is not None:
+                try:
+                    w_data = json.loads(w_row["record_json"])
+                    if isinstance(w_data, dict):
+                        w_data["position_state"] = "UNPROTECTED_MANUAL_RISK"
+                        w_data["manual_risk_acknowledged"] = True
+                        w_data["manual_risk_acknowledged_by"] = actor
+                        w_data["manual_risk_reason"] = reas
+                        conn.execute(
+                            "UPDATE watcher_orders SET record_json = ?, updated_at = ? WHERE order_id = ?",
+                            (json.dumps(w_data), ts, p_oid),
+                        )
+                except Exception:
+                    pass
+
+            # Mark any UNPROTECTED row in protection_orders for this specific parent_order_id as UNPROTECTED_MANUAL_RISK
+            conn.execute(
+                """
+                UPDATE protection_orders
+                SET status = 'UNPROTECTED_MANUAL_RISK'
+                WHERE parent_order_id IN (?, ?) AND status IN ('UNPROTECTED', 'UNVERIFIED')
+                """,
+                (p_oid, eff_cid),
+            )
+
+            payload = json.dumps(
+                {
+                    "parent_order_id": p_oid,
+                    "correlation_id": eff_cid,
+                    "account_id": eff_acct,
+                    "symbol": eff_sym,
+                    "security_id": eff_sec,
+                    "quantity": eff_qty,
+                    "acknowledged_by": actor,
+                    "reason": reas,
+                    "status": "UNPROTECTED_MANUAL_RISK",
+                },
+                sort_keys=True,
+            )
+            conn.execute(
+                "INSERT INTO system_events (event_type, description, payload, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "MANUAL_RISK_ACKNOWLEDGED",
+                    f"Owner {actor} acknowledged UNPROTECTED_MANUAL_RISK for {eff_sym} (orderId={p_oid}, qty={eff_qty}): {reas}",
+                    payload,
+                    ts,
+                ),
+            )
+
+        return {
+            "parent_order_id": p_oid,
+            "correlation_id": eff_cid,
+            "account_id": eff_acct,
+            "symbol": eff_sym,
+            "security_id": eff_sec,
+            "quantity": eff_qty,
+            "acknowledged_by": actor,
+            "reason": reas,
+            "status": "UNPROTECTED_MANUAL_RISK",
+        }
+
+    def get_manual_risk_acknowledgement(
+        self,
+        parent_order_id: str,
+        correlation_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        p_oid = str(parent_order_id or "").strip()
+        cid = str(correlation_id or "").strip()
+        with self._get_conn() as conn:
+            if p_oid and cid:
+                row = conn.execute(
+                    "SELECT * FROM manual_risk_acknowledgements WHERE parent_order_id = ? OR correlation_id = ? LIMIT 1",
+                    (p_oid, cid),
+                ).fetchone()
+            elif p_oid:
+                row = conn.execute(
+                    "SELECT * FROM manual_risk_acknowledgements WHERE parent_order_id = ? OR correlation_id = ? LIMIT 1",
+                    (p_oid, p_oid),
+                ).fetchone()
+            elif cid:
+                row = conn.execute(
+                    "SELECT * FROM manual_risk_acknowledgements WHERE correlation_id = ? LIMIT 1",
+                    (cid,),
+                ).fetchone()
+            else:
+                return None
+            return dict(row) if row is not None else None
+
+    def is_manual_risk_acknowledged(
+        self,
+        parent_order_id: str,
+        correlation_id: str = "",
+        expected_account_id: str = "",
+        expected_security_id: str = "",
+        required_qty: Optional[int] = None,
+    ) -> bool:
+        ack = self.get_manual_risk_acknowledgement(parent_order_id, correlation_id)
+        if not isinstance(ack, dict):
+            return False
+        if str(ack.get("status") or "").upper() != "UNPROTECTED_MANUAL_RISK":
+            return False
+        exp_acct = str(expected_account_id or self.account_id or "").strip()
+        if exp_acct and str(ack.get("account_id") or "").strip() != exp_acct:
+            return False
+        exp_sec = str(expected_security_id or "").strip()
+        if exp_sec and str(ack.get("security_id") or "").strip() != exp_sec:
+            return False
+        if required_qty is not None and int(ack.get("quantity") or 0) < int(required_qty):
+            return False
+        return True
+
+    def list_manual_risk_acknowledgements(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM manual_risk_acknowledgements ORDER BY acknowledged_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+

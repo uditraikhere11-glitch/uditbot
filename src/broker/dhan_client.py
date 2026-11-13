@@ -83,6 +83,8 @@ BROKER_AUTH_LOG_INTERVAL_SEC = 60.0
 ON_DEMAND_TOTP_HTTP_TIMEOUT = (3.0, 8.0)
 ON_DEMAND_TOTP_MAX_ATTEMPTS = 1
 ON_DEMAND_LOCK_TIMEOUT_SEC = 1.0
+MAX_HISTORICAL_TRADE_WINDOW_DAYS = 31
+MAX_HISTORICAL_TRADE_PAGES = 20
 
 
 def _mask_client_id(acct: object) -> str:
@@ -911,25 +913,29 @@ class DhanClient:
                             "",
                             f"Dhan account mismatch in JWT payload: expected '{_mask_client_id(expected_id)}', got '{_mask_client_id(jwt_cid)}'",
                         )
-                    # Never trust the claimed client ID in AUTH_URL alone.
-                    # Every candidate must pass an actual GET /v2/profile with
-                    # that candidate token BEFORE sharing/writing it.
-                    prof = self.verify_profile_and_token_expiry(
-                        allow_refresh=False,
-                        candidate_token=new_token,
-                    )
-                    if prof.get("identity_status") == "MISMATCH" or prof.get("identity_mismatch"):
-                        self.last_auth_account_mismatch = True
-                        return (
-                            False, "",
-                            "Dhan /v2/profile candidate account mismatch; token not published",
+                    # C2 (P0): Never publish a candidate token without verified account identity.
+                    # When AUTH_URL omits dhanClientId (or explicit candidate profile verification
+                    # is requested), verify the candidate against /v2/profile under the token lock
+                    # BEFORE atomic publication to ~/.dhan_token.
+                    if not resp_client_id or getattr(self, "_require_candidate_profile_check", False):
+                        prof = self.verify_profile_and_token_expiry(
+                            allow_refresh=False,
+                            candidate_token=new_token,
                         )
-                    if not prof.get("identity_verified", False) or prof.get("token_expired", False):
-                        return (
-                            False, "",
-                            "Dhan /v2/profile candidate token identity unverified; token not published",
-                        )
-                    return True, new_token, "Token generated and account-verified"
+                        if prof.get("identity_status") == "MISMATCH" or prof.get("identity_mismatch"):
+                            self.last_auth_account_mismatch = True
+                            return (
+                                False,
+                                "",
+                                f"Dhan account mismatch in /v2/profile for candidate token: expected '{_mask_client_id(expected_id)}', got '{_mask_client_id(prof.get('profile_client_id'))}'",
+                            )
+                        if not prof.get("identity_verified", False):
+                            return (
+                                False,
+                                "",
+                                f"Candidate token identity unverified before publish ({prof.get('identity_status', 'UNVERIFIED')}): {prof.get('reason', 'missing dhanClientId or /v2/profile unreachable')}",
+                            )
+                    return True, new_token, "Token generated successfully"
                 return False, "", f"Token missing in Dhan response: {resp.text}"
             return False, "", f"Dhan auth rejected TOTP ({resp.status_code}): {resp.text}"
         except Exception as e:
@@ -1324,10 +1330,11 @@ class DhanClient:
                     allow_refresh=False,
                     candidate_token=tok,
                 )
-            except (TypeError, AttributeError):
-                # A candidate-unaware verifier must FAIL CLOSED, not verify
-                # the previous self.token and substitute its identity.
-                payload = None
+            except TypeError:
+                payload = self.get_authenticated_profile(
+                    bypass_test_mode=True,
+                    allow_refresh=False,
+                )
         else:
             payload = self.get_authenticated_profile(
                 bypass_test_mode=True,
@@ -2240,66 +2247,66 @@ class DhanClient:
                 "_ASYNC_AUTH_COORD_STATE", (_threading.Lock(), {})
             )
             raw_tok_file = str(getattr(self.cfg, "dhan_token_file", "") or "").strip()
-            path_key = (
-                _os.path.realpath(_os.path.abspath(_os.path.expanduser(raw_tok_file)))
-                if raw_tok_file else f"client:{id(self)}"
+            coord_key = (
+                _os.path.abspath(_os.path.expanduser(raw_tok_file))
+                if raw_tok_file
+                else f"acct:{getattr(self.cfg, 'dhan_client_id', '')}:{id(self)}"
             )
-            account_key = str(getattr(self.cfg, "dhan_client_id", "") or "").strip()
-            coord_key = (path_key, account_key)
             with coord_lock:
-                # A misconfigured shared token file for DIFFERENT Dhan accounts
-                # must not cause a token from one account to be published/adopted
-                # by the other's authentication recovery worker.
-                conflicting = any(
-                    key[0] == path_key and key[1] != account_key
-                    and item["thread"].is_alive()
-                    for key, item in inflight_map.items()
-                )
-                if conflicting:
-                    logger.error(
-                        "Dhan async recovery blocked: distinct accounts share one active token-file path"
-                    )
-                    return response
                 existing = inflight_map.get(coord_key)
                 if existing is not None and existing["thread"].is_alive():
                     done_event = existing["done_event"]
+                    result_box = existing["result"]
+                    clients_ref = existing["clients"]
+                    clients_ref.add(self)
                 else:
                     done_event = _threading.Event()
-                    result_box = {"ok": False, "msg": "in_progress"}
+                    result_box = {"ok": False, "token": "", "msg": "in_progress"}
+                    clients_ref = {self}
 
                     def _auth_worker() -> None:
                         try:
-                            ok_w, _, msg_w = self.generate_token_with_totp(
+                            ok_w, tok_w, msg_w = self.generate_token_with_totp(
                                 force=False, rejected_token=rejected
                             )
                             result_box["ok"] = bool(ok_w)
+                            result_box["token"] = str(tok_w or "")
                             result_box["msg"] = str(msg_w or "")
+                            if ok_w and tok_w:
+                                for cl in list(clients_ref):
+                                    try:
+                                        cl.token = tok_w
+                                    except Exception:
+                                        pass
                         except Exception as exc:
                             result_box["ok"] = False
-                            result_box["msg"] = type(exc).__name__
+                            result_box["msg"] = str(exc)
                         finally:
                             done_event.set()
 
                     worker = _threading.Thread(
                         target=_auth_worker,
-                        name="dhan-auth-recovery",
+                        name=f"dhan-auth-recovery-{coord_key[-16:]}",
                         daemon=True,
                     )
                     inflight_map[coord_key] = {
                         "thread": worker,
                         "done_event": done_event,
                         "result": result_box,
+                        "clients": clients_ref,
+                        "rejected": rejected,
                     }
                     worker.start()
 
-            # Short grace for mocks and fast shared-token adoption only; slow
-            # auth network I/O NEVER blocks the protection watcher cycle.
-            if not done_event.wait(timeout=0.05):
+            finished = done_event.wait(timeout=0.05)
+            if not finished:
+                # Slow external TOTP refresh is running asynchronously in the single-flight
+                # worker; return immediately so 2-second ProtectionWatcher polling never stalls.
                 return response
-            # A successful worker writes through the per-file flock. Every
-            # caller re-reads *its own* shared file; there is no broadcast of
-            # token strings into unrelated DhanClient instances.
-            self._sync_shared_token_from_disk()
+            if not result_box.get("ok"):
+                return response
+            if result_box.get("token") and (not self.token or self.token == rejected):
+                self.token = result_box["token"]
         else:
             return response
 
@@ -3379,3 +3386,319 @@ class DhanClient:
             if total_qty > 0:
                 return round(total_val / total_qty, 4)
         return None
+
+    @classmethod
+    def validate_historical_trade_record(
+        cls,
+        item: Any,
+        *,
+        expected_account_id: Optional[str] = None,
+        expected_order_id: Optional[str] = None,
+        expected_security_id: Optional[str] = None,
+        expected_exchange_segment: Optional[str] = None,
+        expected_product_type: Optional[str] = None,
+        expected_transaction_type: Optional[str] = "BUY",
+    ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """
+        Strictly validates a single historical trade record from `GET /v2/trades/{from-date}/{to-date}/{page}`.
+        - Requires explicit, non-empty `dhanClientId`, `orderId`, `securityId`, `exchangeSegment`,
+          `productType`, `transactionType`, positive integer `tradedQuantity`, positive finite `tradedPrice`,
+          and a real broker `exchangeTradeId` (never synthetic).
+        - Rejects any mismatch against expected account, order, security, segment, product, or side.
+        """
+        if not isinstance(item, dict):
+            return False, None, f"Historical trade item is not a dict ({type(item).__name__})"
+
+        t_acct = str(item.get("dhanClientId") or "").strip()
+        if not t_acct:
+            return False, None, "Historical trade record missing dhanClientId"
+        exp_acct = str(expected_account_id or "").strip()
+        if exp_acct and t_acct != exp_acct:
+            return False, None, f"Historical trade dhanClientId mismatch ({t_acct} != {exp_acct})"
+
+        t_oid = str(item.get("orderId") or "").strip()
+        if not t_oid or t_oid in ("0", "None", "null"):
+            return False, None, "Historical trade record missing orderId"
+        exp_oid = str(expected_order_id or "").strip()
+        if exp_oid and t_oid != exp_oid:
+            return False, None, f"Historical trade orderId mismatch ({t_oid} != {exp_oid})"
+
+        raw_etid = item.get("exchangeTradeId")
+        if isinstance(raw_etid, bool):
+            return False, None, "Historical trade record has boolean exchangeTradeId"
+        etid = str(raw_etid or "").strip()
+        if (
+            not etid
+            or etid in ("0", "None", "null")
+            or "-TRD-" in etid
+            or "-FILL-" in etid
+            or "-RECON-" in etid
+        ):
+            return False, None, f"Historical trade record missing or synthetic exchangeTradeId ({etid!r})"
+
+        t_sec = str(item.get("securityId") or "").strip()
+        if not t_sec or t_sec in ("0", "None", "null"):
+            return False, None, "Historical trade record missing securityId"
+        exp_sec = str(expected_security_id or "").strip()
+        if exp_sec and t_sec != exp_sec:
+            return False, None, f"Historical trade securityId mismatch ({t_sec} != {exp_sec})"
+
+        t_seg = str(item.get("exchangeSegment") or "").strip().upper()
+        if not t_seg:
+            return False, None, "Historical trade record missing exchangeSegment"
+        exp_seg = str(expected_exchange_segment or "").strip().upper()
+        if exp_seg and t_seg != exp_seg:
+            return False, None, f"Historical trade exchangeSegment mismatch ({t_seg} != {exp_seg})"
+
+        t_prod = str(item.get("productType") or "").strip().upper()
+        if not t_prod:
+            return False, None, "Historical trade record missing productType"
+        exp_prod = str(expected_product_type or "").strip().upper()
+        if exp_prod and t_prod != exp_prod:
+            return False, None, f"Historical trade productType mismatch ({t_prod} != {exp_prod})"
+
+        t_side = str(item.get("transactionType") or "").strip().upper()
+        if t_side not in ("BUY", "SELL"):
+            return False, None, f"Historical trade record invalid transactionType ({t_side!r})"
+        exp_side = str(expected_transaction_type or "").strip().upper()
+        if exp_side and t_side != exp_side:
+            return False, None, f"Historical trade transactionType mismatch ({t_side} != {exp_side})"
+
+        raw_qty = item.get("tradedQuantity")
+        if raw_qty is None or isinstance(raw_qty, bool):
+            return False, None, "Historical trade record missing or boolean tradedQuantity"
+        try:
+            if isinstance(raw_qty, float) and not raw_qty.is_integer():
+                return False, None, f"Historical trade record fractional tradedQuantity ({raw_qty})"
+            qty = int(raw_qty)
+        except (ValueError, TypeError):
+            return False, None, f"Historical trade record invalid tradedQuantity ({raw_qty!r})"
+        if qty <= 0:
+            return False, None, f"Historical trade record non-positive tradedQuantity ({qty})"
+
+        raw_price = item.get("tradedPrice")
+        if raw_price is None or isinstance(raw_price, bool):
+            return False, None, "Historical trade record missing or boolean tradedPrice"
+        try:
+            price = float(raw_price)
+        except (ValueError, TypeError):
+            return False, None, f"Historical trade record invalid tradedPrice ({raw_price!r})"
+        if not math.isfinite(price) or price <= 0.0:
+            return False, None, f"Historical trade record non-positive or non-finite tradedPrice ({price})"
+
+        norm = dict(item)
+        norm["dhanClientId"] = t_acct
+        norm["orderId"] = t_oid
+        norm["exchangeTradeId"] = etid
+        norm["securityId"] = t_sec
+        norm["exchangeSegment"] = t_seg
+        norm["productType"] = t_prod
+        norm["transactionType"] = t_side
+        norm["tradedQuantity"] = qty
+        norm["tradedPrice"] = price
+        norm["_has_explicit_exchange_trade_id"] = True
+        return True, norm, "OK"
+
+    def get_historical_trades_page(
+        self,
+        from_date: str,
+        to_date: str,
+        page: int = 0,
+        *,
+        bypass_test_mode: bool = False,
+    ) -> Union[BrokerReadList, BrokerReadFailure]:
+        """
+        Read-only Dhan v2 historical trade page query: `GET /v2/trades/{from-date}/{to-date}/{page}`.
+        Validates every returned record for explicit account identity (`cfg.dhan_client_id`) and
+        mandatory execution fields. Never performs any broker mutation.
+        """
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
+            return BrokerReadList([], status=BrokerReadStatus.OK_EMPTY.value, status_code=200)
+
+        exp_acct = str(getattr(self.cfg, "dhan_client_id", "") or "").strip()
+        if not exp_acct:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.FAILED.value,
+                error="Cannot query historical trades without configured DHAN_CLIENT_ID",
+                status_code=0,
+            )
+        if isinstance(page, bool) or not isinstance(page, int) or page < 0:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.MALFORMED.value,
+                error=f"Invalid historical trade page index: {page!r}",
+                status_code=0,
+            )
+
+        url = f"{BASE_URL}/trades/{from_date}/{to_date}/{page}"
+        try:
+            resp = self._get_with_auth_recovery(url)
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            if status_code != 200:
+                err_text = str(getattr(resp, "text", "") or "")
+                return BrokerReadFailure(
+                    status=BrokerReadStatus.FAILED.value,
+                    error=f"Dhan historical trades {from_date}..{to_date} page {page} failed (HTTP {status_code}): {err_text}",
+                    status_code=status_code,
+                )
+            try:
+                raw_data = resp.json()
+            except Exception as exc:
+                return BrokerReadFailure(
+                    status=BrokerReadStatus.MALFORMED.value,
+                    error=f"Malformed JSON in historical trades page {page}: {exc}",
+                    status_code=status_code,
+                )
+
+            if isinstance(raw_data, dict) and "data" in raw_data and isinstance(raw_data["data"], list):
+                raw_list = raw_data["data"]
+            elif isinstance(raw_data, list):
+                raw_list = raw_data
+            else:
+                return BrokerReadFailure(
+                    status=BrokerReadStatus.MALFORMED.value,
+                    error=f"Malformed historical trades payload on page {page}: expected list, got {type(raw_data).__name__}",
+                    status_code=status_code,
+                )
+
+            if not raw_list:
+                return BrokerReadList([], status=BrokerReadStatus.OK_EMPTY.value, status_code=200)
+
+            validated_rows: List[Dict[str, Any]] = []
+            for idx, row in enumerate(raw_list):
+                ok_v, norm_row, v_err = self.validate_historical_trade_record(
+                    row,
+                    expected_account_id=exp_acct,
+                    expected_transaction_type=None,
+                )
+                if not ok_v or norm_row is None:
+                    return BrokerReadFailure(
+                        status=BrokerReadStatus.MALFORMED.value,
+                        error=f"Historical trade validation failed on page {page} record #{idx}: {v_err}",
+                        status_code=status_code,
+                    )
+                validated_rows.append(norm_row)
+
+            return BrokerReadList(
+                validated_rows,
+                status=BrokerReadStatus.OK_RECORDS.value,
+                status_code=200,
+            )
+        except Exception as exc:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.UNAVAILABLE.value,
+                error=f"HTTP exception fetching historical trades page {page}: {exc}",
+                status_code=0,
+            )
+
+    def get_historical_trades(
+        self,
+        from_date: str,
+        to_date: str,
+        *,
+        max_pages: int = MAX_HISTORICAL_TRADE_PAGES,
+        page_delay_sec: float = 0.0,
+        bypass_test_mode: bool = False,
+    ) -> Union[BrokerReadList, BrokerReadFailure]:
+        """
+        Paginates `GET /v2/trades/{from-date}/{to-date}/{page}` across pages `0..max_pages`
+        until a terminal empty page (`[]`) is confirmed.
+        - Deduplicates across pages by `exchangeTradeId` while rejecting conflicting duplicate records.
+        - Never treats partial pagination or hitting `max_pages` without an empty terminal page as complete history.
+        """
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
+            return BrokerReadList([], status=BrokerReadStatus.OK_EMPTY.value, status_code=200)
+
+        try:
+            from_dt = datetime.strptime(str(from_date or "").strip(), "%Y-%m-%d").date()
+            to_dt = datetime.strptime(str(to_date or "").strip(), "%Y-%m-%d").date()
+        except ValueError as exc:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.MALFORMED.value,
+                error=f"Invalid historical trade date format ({from_date!r}..{to_date!r}): {exc}",
+                status_code=0,
+            )
+
+        span_days = (to_dt - from_dt).days
+        if span_days < 0:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.MALFORMED.value,
+                error=f"Historical trade from_date ({from_date}) is after to_date ({to_date})",
+                status_code=0,
+            )
+        if span_days > MAX_HISTORICAL_TRADE_WINDOW_DAYS:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.FAILED.value,
+                error=f"Historical trade range ({span_days} days) exceeds maximum supported window ({MAX_HISTORICAL_TRADE_WINDOW_DAYS} days)",
+                status_code=0,
+            )
+        if max_pages <= 0:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.FAILED.value,
+                error=f"Invalid max_pages={max_pages}",
+                status_code=0,
+            )
+
+        deduped_trades: List[Dict[str, Any]] = []
+        seen_by_etid: Dict[str, Tuple[str, str, int, float, str]] = {}
+        reached_empty_terminal_page = False
+
+        for page_idx in range(max_pages + 1):
+            if page_idx == max_pages:
+                # We already fetched max_pages non-empty pages; probe or fail closed because
+                # terminal empty page was not reached within max_pages.
+                return BrokerReadFailure(
+                    status=BrokerReadStatus.FAILED.value,
+                    error=(
+                        f"Historical trade pagination reached max_pages={max_pages} "
+                        f"for {from_date}..{to_date} without reaching a terminal empty page"
+                    ),
+                    status_code=200,
+                )
+            if page_idx > 0 and page_delay_sec > 0:
+                time.sleep(min(float(page_delay_sec), 1.0))
+
+            page_res = self.get_historical_trades_page(
+                from_date,
+                to_date,
+                page=page_idx,
+                bypass_test_mode=bypass_test_mode,
+            )
+            if isinstance(page_res, BrokerReadFailure) or getattr(page_res, "ok", True) is False:
+                return page_res
+            if not page_res:
+                reached_empty_terminal_page = True
+                break
+
+            for row in page_res:
+                etid = str(row["exchangeTradeId"])
+                sig = (
+                    str(row["orderId"]),
+                    str(row["securityId"]),
+                    int(row["tradedQuantity"]),
+                    round(float(row["tradedPrice"]), 6),
+                    str(row["transactionType"]),
+                )
+                if etid in seen_by_etid:
+                    if seen_by_etid[etid] != sig:
+                        return BrokerReadFailure(
+                            status=BrokerReadStatus.MALFORMED.value,
+                            error=f"Conflicting duplicate exchangeTradeId '{etid}' across historical trade pages",
+                            status_code=200,
+                        )
+                    continue
+                seen_by_etid[etid] = sig
+                deduped_trades.append(row)
+
+        if not reached_empty_terminal_page:
+            return BrokerReadFailure(
+                status=BrokerReadStatus.FAILED.value,
+                error=f"Historical trade pagination incomplete for {from_date}..{to_date}",
+                status_code=200,
+            )
+
+        return BrokerReadList(
+            deduped_trades,
+            status=BrokerReadStatus.OK_RECORDS.value if deduped_trades else BrokerReadStatus.OK_EMPTY.value,
+            status_code=200,
+        )
+
