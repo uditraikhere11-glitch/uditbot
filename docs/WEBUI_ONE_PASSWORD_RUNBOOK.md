@@ -11,16 +11,33 @@ Source baseline: `6ac2d99a3746a7cc5ae833fed839c95659539d37` (2026-11-13). Revali
 - New installations use `src.control_center_entry` on loopback only. Existing installed service units are **not overwritten** by the installer.
 - No trading service, Dhan order, journal, budget, parser, or AMO execution logic is changed.
 
-## Important ingress restriction
+## Ingress and explicitly insecure public HTTP opt-in
 
-**No password is safe over publicly reachable, plaintext HTTP.** A known public IP plus a password is not a sufficient confidentiality boundary for trading controls. Never directly expose this app's `--host 0.0.0.0` HTTP port to the Internet. The login is accepted only when the actual socket peer is a loopback client. `X-Forwarded-*`, fabricated IAP headers and the Host header do not bypass this check.
+**Public HTTP does not encrypt passwords or session cookies.** A person who can intercept the network connection can take over the administrative WebUI even after a strong password is configured. The recommended default is loopback or encrypted private ingress. The owner has explicitly requested an alternative direct public-IP HTTP mode; it is available only after an operator sets a long, exact acknowledgement string on the WebUI process. It is not a secure mode and must never be presented as such. `X-Forwarded-*`, fabricated IAP headers and the Host header do not bypass the default private access checks.
 
-Two supported access choices:
+The recommended access choices:
 
 1. Existing HTTP port 80, **through SSH local forwarding or a verified encrypted private VPN/tunnel**, with app bound to `127.0.0.1`. For an iPhone, arrange an SSH-forwarding client, or use a separately verified private TLS ingress.
 2. Keep a bookmarked public-facing URL with **HTTPS** using a managed TLS front door / reverse proxy that connects locally to the app. Proxy access and TLS setup are a deployment prerequisite, not supplied by this code.
 
-The application itself can keep serving localhost HTTP in either case. This PR does not provision a hostname, cloud IAP, firewall, or certificate, and does not authorize a public HTTP login.
+The application itself can keep serving localhost HTTP in either case. This PR does not provision a hostname, cloud IAP, firewall, or certificate.
+
+### Operator-requested direct public-IP HTTP (insecure, explicit opt-in)
+
+Only after independent PR approval, on the WebUI process **alone**, set:
+
+```ini
+[Service]
+Environment=UDITBOT_WEBUI_ALLOW_INSECURE_PUBLIC_HTTP=I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK
+ExecStart=
+ExecStart=/home/<actual-VM-username>/uditbot/venv/bin/python3 -m src.control_center_entry --host 0.0.0.0 --port 80
+```
+
+This is an example systemd drop-in, **not** a command to paste unchanged. Replace the exact Python path after verifying it on that VM, back up all existing systemd WebUI unit/drop-ins, and do not overwrite unrelated overrides. This setting must be present in the **WebUI process environment**, not just in `.env`. The default installer deliberately remains loopback-bound, so enabling public HTTP always requires an explicit operator action. Do not set this flag on the trading service.
+
+After the WebUI-only service restart, the existing `http://<VM-public-IP>/login` URL can serve the one-password form on port 80. The form visibly warns that the entered password and session are unencrypted. The setting disables the browser's `Secure` cookie attribute only for explicit HTTP mode (necessary for login to work over public HTTP). `HttpOnly`, `SameSite=Strict`, the password verifier, login throttling, and the single shared authorization boundary remain active, but **none prevents network interception or session theft**. Disable by removing the environment override and returning to a loopback or encrypted entrypoint.
+
+Never restart `trading_bot.service` to change WebUI access. Do not interpret this opt-in as a production security endorsement.
 
 ## Local provisioning (no trade service impact)
 
