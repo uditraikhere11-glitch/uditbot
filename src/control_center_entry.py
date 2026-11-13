@@ -1,8 +1,7 @@
-"""Password-only, loopback-gated Control Center around unchanged AuditBot Setup.
+"""Password-only Control Center with optional explicitly insecure public HTTP.
 
-The original Setup application and trading service are not rewritten.
-Do not bind to public HTTP; deploy via a private encrypted tunnel or local
-TLS-terminating proxy after operator approval.
+The original Setup application and trading service are not rewritten. Public
+plaintext HTTP is opt-in, exposes passwords/sessions, and is NOT secure access.
 """
 from __future__ import annotations
 
@@ -30,7 +29,7 @@ async def require_operator_login(request: Request, call_next):
     """Single outer gate for the Control Center and ALL mounted Setup routes."""
     if not auth.permitted_transport(request):
         return PlainTextResponse(
-            "Private tunnel or verified local TLS proxy required", status_code=403,
+            "Private access required (public HTTP is disabled unless explicitly opted in)", status_code=403,
             headers={"Cache-Control": "no-store"},
         )
     if not auth.password_configured():
@@ -63,21 +62,31 @@ input{background:#0b0f19;color:#fff;border:1px solid #64748b;padding:12px}
 button{background:#047857;color:#fff;border:0;margin-top:18px;font-weight:700;cursor:pointer}
 .notice{color:#fda4af;min-height:1.3em;font-size:14px}</style></head><body>
 <main><h1>🔒 UDITBOT</h1><p>One password for Control Center and Setup</p>
-<p class="notice">__MESSAGE__</p><form method="post" action="/login">
+<p class="notice">__MESSAGE__</p><p class="notice">__RISK_WARNING__</p><form method="post" action="/login">
 <label for="password">WebUI password</label><input id="password" type="password" name="password" autocomplete="current-password" required autofocus>
 <button type="submit">Unlock Control Center</button></form></main></body></html>"""
 
 
+def _login_html(message: str = "") -> str:
+    # Only caller-owned constant strings are accepted; never reflect user input.
+    warning = (
+        "WARNING: Public HTTP does not encrypt your password or login session. "
+        "Network intermediaries may intercept either."
+        if auth.public_http_explicitly_enabled() else ""
+    )
+    return _LOGIN_PAGE.replace("__MESSAGE__", message).replace("__RISK_WARNING__", warning)
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
-    return HTMLResponse(_LOGIN_PAGE.replace("__MESSAGE__", ""))
+    return HTMLResponse(_login_html())
 
 
 @app.post("/login")
 async def login_submit(request: Request):
     ip = request.client.host if request.client else "unknown"
     if auth.blocked(ip):
-        return HTMLResponse(_LOGIN_PAGE.replace("__MESSAGE__", "Too many attempts. Try later."), status_code=429)
+        return HTMLResponse(_login_html("Too many attempts. Try later."), status_code=429)
     if "application/x-www-form-urlencoded" not in request.headers.get("content-type", ""):
         return PlainTextResponse("Form encoded password required", status_code=415)
     if len(await request.body()) > 2048:
@@ -85,7 +94,7 @@ async def login_submit(request: Request):
     form = await request.form()
     password = form.get("password")
     if not isinstance(password, str) or not auth.authenticate(password, ip):
-        return HTMLResponse(_LOGIN_PAGE.replace("__MESSAGE__", "Invalid password"), status_code=401)
+        return HTMLResponse(_login_html("Invalid password"), status_code=401)
     token = auth.start_session()
     response = RedirectResponse("/", status_code=303)
     response.set_cookie(auth.cookie_name(), token, max_age=8*3600, httponly=True,
@@ -143,5 +152,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=80)
     args = parser.parse_args()
     if args.host not in ("127.0.0.1", "::1", "localhost"):
-        parser.error("Control Center binds to loopback only; use a private tunnel or local HTTPS proxy")
+        if args.host != "0.0.0.0" or not auth.public_http_explicitly_enabled():
+            parser.error(
+                "Public binding requires UDITBOT_WEBUI_ALLOW_INSECURE_PUBLIC_HTTP="
+                "I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK"
+            )
+        print("WARNING: PUBLIC HTTP MODE ENABLED: PASSWORDS AND SESSION COOKIES ARE UNENCRYPTED", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, proxy_headers=False)
