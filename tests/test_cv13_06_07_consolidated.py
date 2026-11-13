@@ -653,7 +653,7 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             self.assertFalse(res1)
             self.assertIn("no unsafe rollback", out1)
             self.assertNotIn("RECOVERY_VERIFIED", out1)
-            self.assertEqual(read_token(self.tok_path), "NEW_BROKEN_TOKEN")
+            self.assertEqual(read_token(self.tok_path), "VALID_SHARED_JWT_TOKEN_304_CHARS")
 
         # Non-auth 500: do not retry TOTP, do not accept an unverified old
         # token, and do not claim broker recovery.
@@ -668,9 +668,9 @@ class TestCV1306And07Consolidated(unittest.TestCase):
                 res2 = cmd_refresh_token(cfg, stop_mgr)
             out2 = buf2.getvalue()
             self.assertFalse(res2)
-            self.assertIn("Post-refresh broker verification failed", out2)
+            self.assertIn("candidate token identity unverified", out2.lower())
             self.assertNotIn("RECOVERY_VERIFIED", out2)
-            self.assertEqual(read_token(self.tok_path), "NEW_BROKEN_TOKEN")
+            self.assertEqual(read_token(self.tok_path), "PREV_STILL_VALID_TOKEN")
             sleeper.assert_not_called()
 
     def test_12_p1_strict_regression_test_isolation_proof(self):

@@ -196,7 +196,12 @@ class TestHardenedReproductionGates(unittest.TestCase):
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
 
         client = DhanClient(cfg, stop_manager=stop_mgr)
-        ok, tok, msg = client.generate_token_with_totp()
+        # H-11 verifies 0600 permissions; the mandatory broker identity
+        # handshake is mocked here and covered by separate P0 tests.
+        with patch.object(client, "verify_profile_and_token_expiry", return_value={
+            "identity_verified": True, "identity_status": "VERIFIED", "token_expired": False,
+        }):
+            ok, tok, msg = client.generate_token_with_totp()
 
         self.assertTrue(ok)
         self.assertTrue(os.path.exists(token_path))

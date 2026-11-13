@@ -33,6 +33,10 @@ class FakeJournal:
     def enqueue_order_notification_once(self, identity, event_key, report):
         if (identity, event_key) not in [(x[0], x[1]) for x in self.queued]:
             self.queued.append((identity, event_key, report))
+            self.db.execute(
+                "INSERT OR IGNORE INTO order_notification_events (order_id, event_key, created_at) VALUES (?, ?, ?)",
+                (identity, event_key, time.time()),
+            )
             return True
         return False
 
@@ -70,7 +74,7 @@ class TestAfterMarketSafety(unittest.TestCase):
         with patch("src.engine.market.load_holidays_verified", side_effect=loader):
             card = self.report(now, now+86400*5)
         self.assertIn("Overall result: ❌ ACTION REQUIRED", card)
-        self.assertIn("Holiday calendar UNVERIFIED", card)
+        self.assertIn("Holiday calendar unverified", card)
     def test_verified_new_year_holiday_skipped(self):
         now = dt.datetime(2026, 12, 31, 17, 0, tzinfo=IST).timestamp()
         def loader(*, required_year=None):

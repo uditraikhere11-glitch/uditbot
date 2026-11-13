@@ -231,6 +231,7 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         return True
     else:
         print(f"\n❌ Failed to generate token: {msg}")
+        print("[!] Unverified candidate token was not published; no unsafe rollback was performed.")
         print("=======================================================")
         return False
 
@@ -380,7 +381,7 @@ def format_morning_health_report(
     elif not auth_ok or not clean_exp or clean_exp.upper() == "UNVERIFIED" or parsed_exp_ts is None:
         expiry_line = "⚠️ UNVERIFIED"
     elif not cal_ok:
-        expiry_line = f"⚠️ <code>{html.escape(clean_exp)}</code> (Holiday calendar UNVERIFIED)"
+        expiry_line = f"⚠️ <code>{html.escape(clean_exp)}</code> (Holiday calendar unverified)"
     elif parsed_exp_ts < next_open_ts:
         expiry_line = (
             f"⚠️ <code>{html.escape(clean_exp)}</code> "
@@ -468,6 +469,7 @@ def dispatch_morning_health_report_once(
     is_ready_report = (
         "OVERALL RESULT: ✅ SUCCESS" in text_up
         or "✅ CHECKS PASSED" in text_up
+        or ("<B>RECOVERED</B>" in text_up and "FAILED" not in text_up)
     ) and not any(marker in text_up for marker in (
         "OVERALL RESULT: ❌", "NEXT TRADING SESSION READINESS: ⚠️",
         "OVERALL RESULT: ⚠️",

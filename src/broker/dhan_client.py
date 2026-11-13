@@ -927,7 +927,7 @@ class DhanClient:
                     if not prof.get("identity_verified", False) or prof.get("token_expired", False):
                         return (
                             False, "",
-                            "Dhan /v2/profile did not verify candidate token identity; token not published",
+                            "Dhan /v2/profile candidate token identity unverified; token not published",
                         )
                     return True, new_token, "Token generated and account-verified"
                 return False, "", f"Token missing in Dhan response: {resp.text}"

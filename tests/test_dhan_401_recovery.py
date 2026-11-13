@@ -42,10 +42,15 @@ class TestDhanTotpTimeoutRecovery(unittest.TestCase):
         with patch("src.broker.dhan_client.compute_totp",
             side_effect=["111111", "222222"]) as totp, patch(
             "src.broker.dhan_client.time.sleep"
-        ) as sleep:
+        ) as sleep, patch.object(
+            self.client, "verify_profile_and_token_expiry",
+            return_value={"identity_verified": True, "identity_status": "VERIFIED", "token_expired": False},
+        ) as verified_profile:
             ok, token, message = self.client._perform_totp_http_login()
             self.assertTrue(ok, message)
             self.assertEqual(token, "verified-token")
+            verified_profile.assert_called_once()
+            self.assertEqual(verified_profile.call_args.kwargs["candidate_token"], "verified-token")
             self.assertEqual(self.client.session.post.call_count, 2)
             for call_args in self.client.session.post.call_args_list:
                 self.assertEqual(call_args.args[0], AUTH_URL)

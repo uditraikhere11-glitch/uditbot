@@ -61,7 +61,17 @@ class TestDhanAuthAndFunds(unittest.TestCase):
         cfg.dhan_token_file = "/tmp/test_dhan_token.txt"
 
         client = DhanClient(cfg)
-        ok, tok, msg = client.generate_token_with_totp()
+        # The authentication reply alone must not authorize publication of a
+        # token. This test isolates successful TOTP+profile authentication;
+        # wrong/missing identity is tested in the PR76 safety regressions.
+        with patch.object(client, "verify_profile_and_token_expiry", return_value={
+            "identity_status": "VERIFIED",
+            "identity_verified": True,
+            "token_expired": False,
+        }) as verified_profile:
+            ok, tok, msg = client.generate_token_with_totp()
+        verified_profile.assert_called_once()
+        self.assertEqual(verified_profile.call_args.kwargs["candidate_token"], "eyJmock_new_access_token")
         self.assertTrue(ok)
         self.assertEqual(tok, "eyJmock_new_access_token")
         self.assertEqual(client.token, "eyJmock_new_access_token")
