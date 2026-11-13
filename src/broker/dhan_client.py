@@ -3511,7 +3511,7 @@ class DhanClient:
         norm["transactionType"] = t_side
         norm["tradedQuantity"] = qty
         norm["tradedPrice"] = price
-        norm["_has_explicit_exchange_trade_id"] = True
+        norm["_has_explicit_exchange_trade_id"] = not missing_exchange_trade_id
         return True, norm, "OK"
 
     def get_historical_trades_page(
