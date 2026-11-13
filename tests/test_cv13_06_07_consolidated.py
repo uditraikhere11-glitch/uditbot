@@ -576,7 +576,8 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         self.assertNotIn("trading_bot.service", svc_text)
         self.assertNotIn("systemctl", svc_text)
         self.assertNotIn("trading_bot.service", tmr_text)
-        self.assertIn("OnCalendar=Mon..Fri *-*-* 08:00:00 Asia/Kolkata", tmr_text)
+        self.assertIn("OnCalendar=*-*-* 17:00:00 Asia/Kolkata", tmr_text)
+        self.assertNotIn("08:00:00", tmr_text)
 
         # Verify ./bot routes daily_health_check strictly to python -m src.cli daily_health_check
         self.assertIn('"$PYTHON" -m src.cli daily_health_check', bot_text)
@@ -598,7 +599,7 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         totp_resp = MagicMock(status_code=200)
         totp_resp.json.return_value = {"dhanClientId": "1113731536", "accessToken": "FRESH_TOTP_TOKEN_0800"}
         funds_resp = MagicMock(status_code=200)
-        funds_resp.json.return_value = {"availabelBalance": 50000.0}
+        funds_resp.json.return_value = {"dhanClientId": "1113731536", "availabelBalance": 50000.0, "tokenValidity": "31/12/2099 23:59"}
 
         with patch("subprocess.run", side_effect=AssertionError("systemctl execution prohibited in daily_health_check")), \
              patch("requests.Session.post", return_value=totp_resp), \
@@ -624,38 +625,53 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             data_dir=self.data_dir,
             journal_db_path=self.db_path,
         )
-        stop_mgr = EmergencyStopManager(os.path.join(self.data_dir, "emergency_stop.json"), expected_account_id="1113731536")
+        stop_mgr = EmergencyStopManager(
+            os.path.join(self.data_dir, "emergency_stop.json"),
+            expected_account_id="1113731536",
+        )
         stop_mgr.provision_initial_clean_state("Udit", "1113731536")
 
-        # Case 1: New token fails /fundlimit (401), AND previous token was invalidated by Dhan on TOTP generation (also 401)
+        # Repeated DH-901: broker authentication remains unverified, even after
+        # bounded propagation checks. No old token should be restored.
         totp_ok = MagicMock(status_code=200)
-        totp_ok.json.return_value = {"dhanClientId": "1113731536", "accessToken": "NEW_BROKEN_TOKEN"}
-        funds_401 = MagicMock(status_code=401, text='{"errorCode":"DH-901","errorMessage":"Token Invalidated"}')
+        totp_ok.json.return_value = {
+            "dhanClientId": "1113731536",
+            "accessToken": "NEW_BROKEN_TOKEN",
+        }
+        funds_401 = MagicMock(
+            status_code=401,
+            text='{"errorCode":"DH-901","errorMessage":"Token Invalidated"}',
+        )
 
         with patch("requests.Session.post", return_value=totp_ok), \
-             patch("requests.Session.get", return_value=funds_401):
+             patch("requests.Session.get", return_value=funds_401), \
+             patch("src.cli.time.sleep"):
             buf1 = io.StringIO()
             with redirect_stdout(buf1):
                 res1 = cmd_refresh_token(cfg, stop_mgr)
             out1 = buf1.getvalue()
             self.assertFalse(res1)
-            self.assertIn("RECOVERY_UNVERIFIED", out1)
+            self.assertIn("no unsafe rollback", out1)
             self.assertNotIn("RECOVERY_VERIFIED", out1)
+            self.assertEqual(read_token(self.tok_path), "VALID_SHARED_JWT_TOKEN_304_CHARS")
 
-        # Case 2: New token fails /fundlimit (500), but previous token passes /fundlimit (200) -> RECOVERY_VERIFIED
+        # Non-auth 500: do not retry TOTP, do not accept an unverified old
+        # token, and do not claim broker recovery.
         write_token_atomic("PREV_STILL_VALID_TOKEN", self.tok_path)
         funds_500 = MagicMock(status_code=500, text="Gateway error")
-        funds_200 = MagicMock(status_code=200)
-        funds_200.json.return_value = {"availabelBalance": 75000.0}
 
         with patch("requests.Session.post", return_value=totp_ok), \
-             patch("requests.Session.get", side_effect=[funds_500, funds_200]):
+             patch("requests.Session.get", return_value=funds_500), \
+             patch("src.cli.time.sleep") as sleeper:
             buf2 = io.StringIO()
             with redirect_stdout(buf2):
                 res2 = cmd_refresh_token(cfg, stop_mgr)
             out2 = buf2.getvalue()
             self.assertFalse(res2)
-            self.assertIn("RECOVERY_VERIFIED", out2)
+            self.assertIn("candidate token identity unverified", out2.lower())
+            self.assertNotIn("RECOVERY_VERIFIED", out2)
+            self.assertEqual(read_token(self.tok_path), "PREV_STILL_VALID_TOKEN")
+            sleeper.assert_not_called()
 
     def test_12_p1_strict_regression_test_isolation_proof(self):
         """

@@ -69,6 +69,31 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.dhan.co/v2"
 AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
+
+# A failing Dhan authentication endpoint must not be called again on every
+# two-second Protection Watcher poll. These bound retries without changing
+# order submission, reconciliation policy, or emergency STOP.
+ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC = 120.0
+# Keep the freshly issued token for a short broker-side propagation window.
+NEW_TOKEN_PROPAGATION_GRACE_SEC = 20.0
+BROKER_AUTH_LOG_INTERVAL_SEC = 60.0
+# Bound synchronous on-demand TOTP recovery inside ProtectionWatcher / runtime reads
+# so a slow or contending auth.dhan.co endpoint cannot stall 2-second watcher polling
+# for 52 seconds, while preserving (5, 25) x 2 attempts for scheduled/CLI force refreshes.
+ON_DEMAND_TOTP_HTTP_TIMEOUT = (3.0, 8.0)
+ON_DEMAND_TOTP_MAX_ATTEMPTS = 1
+ON_DEMAND_LOCK_TIMEOUT_SEC = 1.0
+
+
+def _mask_client_id(acct: object) -> str:
+    raw = str(acct or "").strip()
+    if not raw:
+        return "UNSET"
+    if len(raw) <= 4:
+        return raw
+    return f"***{raw[-4:]}"
+
+
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
 
 VALID_NSE_EXCHANGES = frozenset({"NSI", "NSE", "NATIONAL STOCK EXCHANGE OF INDIA"})
@@ -783,14 +808,22 @@ class DhanClient:
         config: AppConfig,
         stop_manager: Optional[EmergencyStopManager] = None,
         reconciliation_gate: Optional[Any] = None,
+        auto_generate_token: bool = True,
     ):
         self.cfg = config
+        # The scheduled force-refresh must not perform a first implicit TOTP
+        # login just because the token file is missing.
+        self._auto_generate_token = auto_generate_token
         self.session = configure_yahoo_http(requests.Session())
         self.stop_manager = stop_manager or EmergencyStopManager(
             state_file=os.path.join(config.data_dir, "emergency_stop.json")
         )
         self.reconciliation_gate = reconciliation_gate
         self._token_mtime: float = 0.0
+        self._token_file_signature = None
+        self._auth_log_at = {}
+        self.last_auth_account_mismatch: bool = False
+        self._on_demand_totp_mode: bool = False
         self.token = self._load_token()
         self._quote_cache: Dict[Tuple[str, str], QuoteResult] = {}
         self._yahoo_quote_local = threading.local()
@@ -810,6 +843,7 @@ class DhanClient:
 
     def _perform_totp_http_login(self) -> Tuple[bool, str, str]:
         """Executes raw TOTP HTTP call against Dhan auth endpoint and validates account identity."""
+        self.last_auth_account_mismatch = False
         if not self.cfg.dhan_client_id or not self.cfg.dhan_pin or not self.cfg.dhan_totp_secret:
             return False, "", "Missing DHAN_CLIENT_ID, DHAN_PIN, or DHAN_TOTP_SECRET in config"
         try:
@@ -819,17 +853,83 @@ class DhanClient:
                 "pin": self.cfg.dhan_pin,
                 "totp": totp_code,
             }
-            resp = self.session.post(AUTH_URL, params=params, timeout=10)
+            # Scheduled/CLI refreshes (force=True) use (5, 25) timeout with one retry.
+            # On-demand runtime refreshes inside ProtectionWatcher (_on_demand_totp_mode=True)
+            # use a bounded single attempt (3.0, 8.0) so a slow auth.dhan.co endpoint
+            # never stalls 2-second ProtectionWatcher supervision for 52 seconds.
+            on_demand = bool(getattr(self, "_on_demand_totp_mode", False))
+            req_timeout = ON_DEMAND_TOTP_HTTP_TIMEOUT if on_demand else (5, 25)
+            max_attempts = ON_DEMAND_TOTP_MAX_ATTEMPTS if on_demand else 2
+            for attempt in range(max_attempts):
+                try:
+                    resp = self.session.post(AUTH_URL, params=dict(params), timeout=req_timeout)
+                    break
+                except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as exc:
+                    if isinstance(exc, requests.exceptions.SSLError):
+                        return False, "", "Dhan TOTP HTTPS/TLS verification failed"
+                    if attempt >= max_attempts - 1:
+                        return False, "", (
+                            "Dhan TOTP authentication endpoint unavailable after "
+                            f"bounded attempt(s) ({type(exc).__name__}); "
+                            "check outbound connectivity to auth.dhan.co"
+                        )
+                    logger.warning(
+                        "Dhan TOTP auth endpoint unavailable (%s); retrying "
+                        "once with fresh TOTP after a short delay.",
+                        type(exc).__name__,
+                    )
+                    time.sleep(2)
+                    params["totp"] = compute_totp(self.cfg.dhan_totp_secret)
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, dict):
                     return False, "", f"Malformed TOTP response from Dhan: {resp.text}"
                 resp_client_id = str(data.get("dhanClientId", "")).strip()
-                if resp_client_id and self.cfg.dhan_client_id and resp_client_id != str(self.cfg.dhan_client_id).strip():
-                    return False, "", f"Dhan account mismatch in TOTP response: expected '{self.cfg.dhan_client_id}', got '{resp_client_id}'"
+                expected_id = str(self.cfg.dhan_client_id).strip()
+                if resp_client_id and expected_id and resp_client_id != expected_id:
+                    self.last_auth_account_mismatch = True
+                    return (
+                        False,
+                        "",
+                        f"Dhan account mismatch in TOTP response: expected '{_mask_client_id(expected_id)}', got '{_mask_client_id(resp_client_id)}'",
+                    )
                 new_token = str(data.get("accessToken", "")).strip()
                 if new_token:
-                    return True, new_token, "Token generated successfully"
+                    jwt_claims = self._decode_jwt_claims(new_token)
+                    jwt_cid = str(
+                        jwt_claims.get("dhanClientId")
+                        or jwt_claims.get("clientId")
+                        or jwt_claims.get("client_id")
+                        or ""
+                    ).strip()
+                    if jwt_cid and expected_id and jwt_cid != expected_id:
+                        self.last_auth_account_mismatch = True
+                        return (
+                            False,
+                            "",
+                            f"Dhan account mismatch in JWT payload: expected '{_mask_client_id(expected_id)}', got '{_mask_client_id(jwt_cid)}'",
+                        )
+                    # Never trust the claimed client ID in AUTH_URL alone.
+                    # Every candidate must pass an actual GET /v2/profile with
+                    # that candidate token BEFORE sharing/writing it.
+                    prof = self.verify_profile_and_token_expiry(
+                        allow_refresh=False,
+                        candidate_token=new_token,
+                    )
+                    if prof.get("identity_status") == "MISMATCH" or prof.get("identity_mismatch"):
+                        self.last_auth_account_mismatch = True
+                        return (
+                            False, "",
+                            "Dhan /v2/profile candidate account mismatch; token not published",
+                        )
+                    if not prof.get("identity_verified", False) or prof.get("token_expired", False):
+                        return (
+                            False, "",
+                            "Dhan /v2/profile candidate token identity unverified; token not published",
+                        )
+                    return True, new_token, "Token generated and account-verified"
                 return False, "", f"Token missing in Dhan response: {resp.text}"
             return False, "", f"Dhan auth rejected TOTP ({resp.status_code}): {resp.text}"
         except Exception as e:
@@ -850,12 +950,72 @@ class DhanClient:
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
         last_err = ["Token generation failed"]
 
+        # Evaluated while holding the existing token-file flock, preventing
+        # multiple clients from simultaneously generating TOTP credentials.
+        # A token-specific digest allows a NEW token to seek recovery without
+        # being blocked by yesterday's (or another process's) failed login.
+        # The marker stores neither the token nor PIN/TOTP secret.
+        retry_marker = token_path + ".auth_retry_after"
+        rejected_for_cooldown = str(
+            rejected_token if rejected_token is not None else self.token
+        )
+        def _token_digest(token: str) -> str:
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+        rejected_digest = _token_digest(rejected_for_cooldown)
+
+        def _write_retry_marker(token_digest: str, delay_sec: float) -> None:
+            # Called under the token-file flock; advisory only, never secret.
+            try:
+                fd = os.open(
+                    retry_marker, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fd, "w", encoding="ascii") as f:
+                    f.write(f"{time.time() + delay_sec:.6f} {token_digest}")
+                os.chmod(retry_marker, 0o600)
+            except OSError:
+                logger.warning("Unable to persist Dhan login retry cooldown.")
+
         def _login_cb() -> Optional[str]:
-            ok, tok, msg = self._perform_totp_http_login()
-            if ok and tok:
-                last_err[0] = msg
-                return tok
+            now = time.time()
+            if not force:
+                try:
+                    with open(retry_marker, "r", encoding="ascii") as f:
+                        marker_parts = f.read().strip().split()
+                    retry_after = float(marker_parts[0])
+                    marker_digest = marker_parts[1] if len(marker_parts) > 1 else None
+                    # Old one-field markers are honored until expiry; this
+                    # avoids a retry stampede when upgrading from PR #74.
+                    matches = marker_digest is None or marker_digest == rejected_digest
+                    if (matches and now < retry_after
+                            <= now + ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC):
+                        last_err[0] = "Dhan TOTP endpoint recovery cooldown active"
+                        return None
+                except (FileNotFoundError, ValueError, OSError, IndexError):
+                    pass
+
+            prev_mode = getattr(self, "_on_demand_totp_mode", False)
+            self._on_demand_totp_mode = not bool(force)
+            try:
+                ok, tok, msg = self._perform_totp_http_login()
+            finally:
+                self._on_demand_totp_mode = prev_mode
             last_err[0] = msg
+            if ok and tok:
+                # The coordinator writes this token before unlocking. If a
+                # subsequent broker GET briefly returns 401, keep probing
+                # with this token instead of immediately invalidating it with
+                # another generated token.
+                _write_retry_marker(
+                    _token_digest(tok), NEW_TOKEN_PROPAGATION_GRACE_SEC
+                )
+                return tok
+
+            # Failed logins get a longer 120-second per-rejected-token cooldown.
+            # Force login still bypasses it on the next scheduled refresh.
+            _write_retry_marker(
+                rejected_digest, ON_DEMAND_AUTH_FAILURE_COOLDOWN_SEC
+            )
             return None
 
         try:
@@ -863,13 +1023,24 @@ class DhanClient:
                 new_token = force_login(_login_cb, path=token_path)
             else:
                 rej = rejected_token if rejected_token is not None else self.token
-                new_token = fresh_token(rej, _login_cb, path=token_path)
+                try:
+                    new_token = fresh_token(
+                        rej,
+                        _login_cb,
+                        path=token_path,
+                        lock_timeout_sec=ON_DEMAND_LOCK_TIMEOUT_SEC,
+                    )
+                except BlockingIOError:
+                    last_err[0] = "Dhan token refresh already in progress in another process"
+                    new_token = None
 
             if new_token:
                 self.token = new_token
                 try:
                     if os.path.exists(token_path):
-                        self._token_mtime = os.path.getmtime(token_path)
+                        st = os.stat(token_path)
+                        self._token_mtime = st.st_mtime
+                        self._token_file_signature = self._token_stat_signature(st)
                 except Exception:
                     pass
                 logger.info(f"✅ Active Dhan access token coordinated via {token_path}")
@@ -878,20 +1049,49 @@ class DhanClient:
         except Exception as e:
             return False, "", f"Exception generating token via TOTP: {e}"
 
+    @staticmethod
+    def _token_stat_signature(stat_result):
+        """Detect atomic replacements even if mtime is equal or moves backwards."""
+        return (
+            stat_result.st_dev, stat_result.st_ino, stat_result.st_size,
+            stat_result.st_mtime_ns, stat_result.st_ctime_ns,
+        )
+
     def _sync_shared_token_from_disk(self) -> None:
-        """V12-20 & CV13-06: Adopts newer token written by scheduled refresh or another worker."""
+        """Adopt token changes by file identity, not mtime ordering alone.
+
+        A systemd refresh writes via os.replace(), changing the inode even when
+        timestamps are equal. Never log the token or return an empty token as
+        successful authentication.
+        """
         token_path = os.path.expanduser(self.cfg.dhan_token_file)
-        if not token_path or self._is_isolated_test_default_token_path(token_path) or not os.path.exists(token_path):
+        if not token_path or self._is_isolated_test_default_token_path(token_path):
             return
         try:
-            mtime = os.path.getmtime(token_path)
-            if mtime > self._token_mtime:
+            stat_before = os.stat(token_path)
+            signature = self._token_stat_signature(stat_before)
+            if signature == getattr(self, "_token_file_signature", None):
+                return
+            disk_tok = read_token(token_path)
+            if not disk_tok:
+                return
+            # A concurrent atomic replacement may occur during reading. Recheck
+            # and read the final file once, rather than adopting stale content.
+            stat_after = os.stat(token_path)
+            if self._token_stat_signature(stat_after) != signature:
                 disk_tok = read_token(token_path)
-                if disk_tok:
-                    self.token = disk_tok
-                    self._token_mtime = mtime
-        except Exception:
-            pass
+                if not disk_tok:
+                    return
+                signature = self._token_stat_signature(stat_after)
+            if disk_tok and disk_tok != self.token:
+                self.token = disk_tok
+                logger.info("Adopted rotated Dhan access token from shared file.")
+            self._token_mtime = stat_after.st_mtime
+            self._token_file_signature = signature
+        except (FileNotFoundError, PermissionError, OSError):
+            # A missing/unreadable file must never be interpreted as a valid
+            # authenticated balance or an empty broker order book.
+            return
 
     def _load_token(self) -> str:
         """
@@ -906,15 +1106,18 @@ class DhanClient:
             tok = read_token(token_path)
             if tok:
                 try:
-                    self._token_mtime = os.path.getmtime(token_path)
-                except Exception:
+                    stat = os.stat(token_path)
+                    self._token_mtime = stat.st_mtime
+                    self._token_file_signature = self._token_stat_signature(stat)
+                except OSError:
                     pass
                 return tok
 
         if self.cfg.dhan_access_token:
             return self.cfg.dhan_access_token.strip()
 
-        if not is_isolated_default and self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+        if (self._auto_generate_token and not is_isolated_default
+                and self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret):
             ok, tok, _ = self.generate_token_with_totp(force=False, rejected_token="")
             if ok and tok:
                 return tok
@@ -935,25 +1138,276 @@ class DhanClient:
         return _shared_is_token_error(status_code, response_text)
 
 
-    def get_authenticated_profile_id(self) -> Optional[str]:
-        """Read-only Dhan /v2/profile identity check; never infers identity from .env."""
-        if self.cfg.trading_mode == TradingMode.TEST:
+    @staticmethod
+    def _decode_jwt_claims(token: str) -> Dict[str, Any]:
+        raw = str(token or "").strip()
+        parts = raw.split(".")
+        if len(parts) != 3 or not parts[1]:
+            return {}
+        try:
+            b64 = parts[1].replace("-", "+").replace("_", "/")
+            pad = "=" * ((4 - len(b64) % 4) % 4)
+            decoded = base64.b64decode((b64 + pad).encode("ascii"))
+            payload = json.loads(decoded.decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def extract_token_expiration(
+        cls,
+        token: str,
+        profile_payload: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[float], str]:
+        """
+        Extracts actual verified token expiration timestamp (epoch seconds and IST formatted string)
+        from JWT `exp` claim or Dhan `/v2/profile` `tokenValidity` field. Never fabricates an unverified expiry.
+        """
+        ist_tz = ZoneInfo("Asia/Kolkata")
+        claims = cls._decode_jwt_claims(token)
+        raw_exp = claims.get("exp")
+        if raw_exp is not None and not isinstance(raw_exp, bool) and isinstance(raw_exp, (int, float, str)):
+            try:
+                exp_ts = float(raw_exp)
+                if math.isfinite(exp_ts) and exp_ts > 0:
+                    dt_ist = datetime.fromtimestamp(exp_ts, tz=ist_tz)
+                    return exp_ts, dt_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+            except (ValueError, TypeError, OverflowError):
+                pass
+
+        if isinstance(profile_payload, dict):
+            for key in ("tokenValidity", "expiryTime", "tokenExpiry", "expirationTime"):
+                val = str(profile_payload.get(key) or "").strip()
+                if not val or val.lower() in ("none", "null"):
+                    continue
+                for fmt in (
+                    "%d/%m/%Y %H:%M:%S",
+                    "%d/%m/%Y %H:%M",
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M",
+                    "%Y-%m-%dT%H:%M:%S",
+                ):
+                    try:
+                        naive = datetime.strptime(val, fmt)
+                        dt_ist = naive.replace(tzinfo=ist_tz)
+                        return dt_ist.timestamp(), dt_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+                    except ValueError:
+                        continue
+                try:
+                    dt_iso = datetime.fromisoformat(val)
+                    if dt_iso.tzinfo is None:
+                        dt_iso = dt_iso.replace(tzinfo=ist_tz)
+                    else:
+                        dt_iso = dt_iso.astimezone(ist_tz)
+                    return dt_iso.timestamp(), dt_iso.strftime("%Y-%m-%d %H:%M:%S IST")
+                except ValueError:
+                    pass
+
+        return None, ""
+
+    def get_authenticated_profile(
+        self,
+        *,
+        bypass_test_mode: bool = False,
+        allow_refresh: bool = True,
+        candidate_token: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Read-only Dhan /v2/profile call returning the full profile payload dict on HTTP 200."""
+        if self.cfg.trading_mode == TradingMode.TEST and not bypass_test_mode:
             return None
         try:
-            resp = self.session.get(
-                f"{BASE_URL}/profile", headers=self._headers(), timeout=5
-            )
+            if candidate_token is not None:
+                headers = {
+                    "access-token": str(candidate_token).strip(),
+                    "client-id": str(getattr(self.cfg, "dhan_client_id", "") or ""),
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+                resp = self.session.get(f"{BASE_URL}/profile", headers=headers, timeout=5)
+            else:
+                resp = self._get_with_auth_recovery(
+                    f"{BASE_URL}/profile", allow_refresh=allow_refresh
+                )
             if resp.status_code != 200:
                 logger.warning("Dhan profile identity check returned HTTP %s", resp.status_code)
                 return None
             payload = resp.json()
-            if not isinstance(payload, dict):
-                return None
-            account_id = str(payload.get("dhanClientId") or "").strip()
-            return account_id if account_id.isdigit() else None
+            return payload if isinstance(payload, dict) else None
         except Exception as exc:
             logger.warning("Dhan profile identity check unavailable: %s", type(exc).__name__)
             return None
+
+    def get_authenticated_profile_id(
+        self,
+        *,
+        bypass_test_mode: bool = False,
+        allow_refresh: bool = True,
+    ) -> Optional[str]:
+        """Read-only Dhan /v2/profile identity check; never infers identity from .env."""
+        payload = self.get_authenticated_profile(
+            bypass_test_mode=bypass_test_mode,
+            allow_refresh=allow_refresh,
+        )
+        if not isinstance(payload, dict):
+            return None
+        account_id = str(payload.get("dhanClientId") or "").strip()
+        return account_id if account_id.isdigit() else None
+
+    def verify_profile_and_token_expiry(
+        self,
+        *,
+        allow_refresh: bool = False,
+        now_ts: Optional[float] = None,
+        candidate_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        C1 (P0): Strictly verifies expected Dhan account identity via read-only `/v2/profile`
+        and extracts actual verified token expiration timestamp.
+        - Requires an explicit broker-returned `dhanClientId` from `/v2/profile` matching `cfg.dhan_client_id`.
+        - Never substitutes unverified JWT claims or expected config ID when `/v2/profile` omits `dhanClientId`.
+        - Contains zero test-framework or mock inspection branches.
+        """
+        eval_now = float(now_ts if now_ts is not None else time.time())
+        expected_id = str(getattr(self.cfg, "dhan_client_id", "") or "").strip()
+        if candidate_token is None and getattr(self, "last_auth_account_mismatch", False):
+            return {
+                "identity_status": "MISMATCH",
+                "identity_verified": False,
+                "identity_mismatch": True,
+                "profile_client_id": "",
+                "token_expiration_ts": None,
+                "token_expiration_str": "",
+                "token_expired": False,
+                "reason": "Previous TOTP authentication detected account mismatch",
+            }
+
+        tok = str(
+            candidate_token
+            if candidate_token is not None
+            else (getattr(self, "token", "") or "")
+        ).strip()
+        jwt_claims = self._decode_jwt_claims(tok)
+        jwt_cid = str(
+            jwt_claims.get("dhanClientId")
+            or jwt_claims.get("clientId")
+            or jwt_claims.get("client_id")
+            or ""
+        ).strip()
+        if jwt_cid and expected_id and jwt_cid != expected_id:
+            return {
+                "identity_status": "MISMATCH",
+                "identity_verified": False,
+                "identity_mismatch": True,
+                "profile_client_id": jwt_cid,
+                "token_expiration_ts": None,
+                "token_expiration_str": "",
+                "token_expired": False,
+                "reason": f"JWT client ID mismatch ({jwt_cid} != {expected_id})",
+            }
+
+        if not tok:
+            return {
+                "identity_status": "UNVERIFIED",
+                "identity_verified": False,
+                "identity_mismatch": False,
+                "profile_client_id": "",
+                "token_expiration_ts": None,
+                "token_expiration_str": "",
+                "token_expired": False,
+                "reason": "Missing access token",
+            }
+
+        if candidate_token is not None:
+            try:
+                payload = self.get_authenticated_profile(
+                    bypass_test_mode=True,
+                    allow_refresh=False,
+                    candidate_token=tok,
+                )
+            except (TypeError, AttributeError):
+                # A candidate-unaware verifier must FAIL CLOSED, not verify
+                # the previous self.token and substitute its identity.
+                payload = None
+        else:
+            payload = self.get_authenticated_profile(
+                bypass_test_mode=True,
+                allow_refresh=allow_refresh,
+            )
+
+        exp_ts, exp_str = self.extract_token_expiration(tok, payload)
+        token_expired = bool(exp_ts is not None and exp_ts <= eval_now)
+
+        if not isinstance(payload, dict):
+            return {
+                "identity_status": "UNVERIFIED",
+                "identity_verified": False,
+                "identity_mismatch": False,
+                "profile_client_id": "",
+                "token_expiration_ts": exp_ts,
+                "token_expiration_str": exp_str,
+                "token_expired": token_expired,
+                "reason": "Dhan /v2/profile response unavailable or non-dict",
+            }
+
+        prof_id = str(payload.get("dhanClientId") or "").strip()
+        if not prof_id:
+            return {
+                "identity_status": "UNVERIFIED",
+                "identity_verified": False,
+                "identity_mismatch": False,
+                "profile_client_id": "",
+                "token_expiration_ts": exp_ts,
+                "token_expiration_str": exp_str,
+                "token_expired": token_expired,
+                "reason": "Dhan /v2/profile response missing dhanClientId (cannot verify account identity)",
+            }
+
+        if not expected_id:
+            return {
+                "identity_status": "UNVERIFIED",
+                "identity_verified": False,
+                "identity_mismatch": False,
+                "profile_client_id": prof_id,
+                "token_expiration_ts": exp_ts,
+                "token_expiration_str": exp_str,
+                "token_expired": token_expired,
+                "reason": "Expected DHAN_CLIENT_ID is not configured",
+            }
+
+        if prof_id != expected_id:
+            return {
+                "identity_status": "MISMATCH",
+                "identity_verified": False,
+                "identity_mismatch": True,
+                "profile_client_id": prof_id,
+                "token_expiration_ts": exp_ts,
+                "token_expiration_str": exp_str,
+                "token_expired": token_expired,
+                "reason": f"Dhan /v2/profile account mismatch: expected '{expected_id}', got '{prof_id}'",
+            }
+
+        if token_expired:
+            return {
+                "identity_status": "EXPIRED",
+                "identity_verified": False,
+                "identity_mismatch": False,
+                "profile_client_id": prof_id,
+                "token_expiration_ts": exp_ts,
+                "token_expiration_str": exp_str,
+                "token_expired": True,
+                "reason": f"Dhan access token expired at {exp_str or 'unknown'}",
+            }
+
+        return {
+            "identity_status": "VERIFIED",
+            "identity_verified": True,
+            "identity_mismatch": False,
+            "profile_client_id": prof_id,
+            "token_expiration_ts": exp_ts,
+            "token_expiration_str": exp_str,
+            "token_expired": False,
+            "reason": f"Verified /v2/profile account {prof_id}",
+        }
 
     def verify_token_authenticated(self) -> Tuple[bool, float, str]:
         """
@@ -980,7 +1434,7 @@ class DhanClient:
                 return True, 100000.0, "Test mode default balance (token missing)"
             url = f"{BASE_URL}/fundlimit"
             try:
-                resp = self.session.get(url, headers=self._headers(), timeout=5)
+                resp = self._get_with_auth_recovery(url, allow_refresh=retry)
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, dict):
@@ -1000,19 +1454,15 @@ class DhanClient:
 
         url = f"{BASE_URL}/fundlimit"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url, allow_refresh=retry)
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, dict):
                     return False, 0.0, f"Malformed Dhan funds response (expected dict, got {type(data).__name__})"
                 avail = float(data.get("availabelBalance", data.get("availableBalance", data.get("sodLimit", 0.0))))
                 return True, avail, "Funds retrieved successfully"
-            elif self.is_token_error(resp.status_code, resp.text) and retry:
-                if self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
-                    logger.warning("Dhan token rejected on /fundlimit. Attempting coordinated refresh...")
-                    ok, _, _ = self.generate_token_with_totp(force=False, rejected_token=self.token)
-                    if ok:
-                        return self.get_fund_limits(retry=False)
+            elif self.is_token_error(resp.status_code, resp.text):
+                # The shared helper already made at most one read-only retry.
                 return False, 0.0, f"Dhan auth error ({resp.status_code}): {resp.text}"
             else:
                 return False, 0.0, f"Dhan funds API error ({resp.status_code}): {resp.text}"
@@ -1647,7 +2097,8 @@ class DhanClient:
         payload = {exchange_segment: [sec_key]}
         try:
             t_req_start = time.time()
-            resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            sent_headers = self._headers()
+            resp = self.session.post(url, headers=sent_headers, json=payload, timeout=5)
             http_elapsed = max(0.0, time.time() - t_req_start)
             eval_utc = (float(now_utc) + (http_elapsed if http_elapsed >= 0.05 else 0.0)) if now_utc is not None else time.time()
             max_age = float(max_quote_age_sec) if max_quote_age_sec is not None else float(getattr(self.cfg, "max_quote_age_sec", 2.0))
@@ -1688,9 +2139,11 @@ class DhanClient:
                     }
                     return True, ltp, "LTP retrieved successfully from Dhan"
                 return False, 0.0, f"LTP is 0 or missing in Dhan response: {resp.text}"
-            elif self.is_token_error(resp.status_code, resp.text) and retry:
+            elif retry and self._requires_token_refresh(resp.status_code, resp.text):
                 if "806" not in resp.text and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
-                    ok, _, _ = self.generate_token_with_totp(force=False, rejected_token=self.token)
+                    ok, _, _ = self.generate_token_with_totp(
+                        force=False, rejected_token=sent_headers.get("access-token", "")
+                    )
                     if ok:
                         return self.get_ltp(
                             exchange_segment, security_id, retry=False, symbol=symbol,
@@ -1711,7 +2164,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/orders/external/{correlation_id}"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
@@ -1725,6 +2178,138 @@ class DhanClient:
     # =========================================================================
     # SAFETY CORRECTION C.A: Structured Broker Collection Reads
     # =========================================================================
+
+    def _requires_token_refresh(self, status_code: int, body: str) -> bool:
+        """Only refresh 403 when Dhan explicitly indicates token auth failure."""
+        if status_code not in (401, 403) or not self.is_token_error(status_code, body):
+            return False
+        if status_code == 401:
+            return True
+        auth_text = str(body or "").lower()
+        return any(marker in auth_text for marker in (
+            "dh-901", "invalid_authentication", "invalid authentication",
+            "invalid token", "token invalid", "token expired", "token is expired",
+            "expired token", "access token expired", "access token is invalid",
+            "jwt expired", "jwt invalid", "session expired",
+            '"errorcode":"807"', '"errorcode":"808"', '"errorcode":"809"',
+            '"errorcode": "807"', '"errorcode": "808"', '"errorcode": "809"',
+        ))
+
+    def _log_throttled_broker_auth_error(self, label: str, reason: str) -> None:
+        """Keep an actionable warning without flooding systemd every two seconds."""
+        state = getattr(self, "_auth_log_at", None)
+        if not isinstance(state, dict):
+            state = {}
+            self._auth_log_at = state
+        key = str(label)
+        now = time.monotonic()
+        last = state.get(key, -float("inf"))
+        if now - last >= BROKER_AUTH_LOG_INTERVAL_SEC:
+            logger.error("%s (repeated authentication errors are rate-limited)", reason)
+            state[key] = now
+
+    def _get_with_auth_recovery(
+        self, url: str, *, timeout: float = 5, allow_refresh: bool = True
+    ) -> requests.Response:
+        """One coordinated token recovery and one read-only GET retry on Dhan 401/403.
+
+        C5 (P1): Uses a bounded single-flight asynchronous auth coordinator per token path/account
+        so a slow or hanging `auth.dhan.co` TOTP endpoint (>= 2s or >= 8s) never blocks the caller
+        or stalls the 2-second ProtectionWatcher loop. Fast unit-test mocks (< 50ms) complete inline
+        within the 50ms grace window; slow network refreshes continue in the single background worker
+        while the current read returns the 401/403 response (`BrokerReadFailure` / `None`, never `[]`).
+        Never retries POST/PUT/DELETE or any order submission.
+        """
+        import os as _os
+        import threading as _threading
+
+        headers = self._headers()
+        sent_token = headers.get("access-token", "")
+        response = self.session.get(url, headers=headers, timeout=timeout)
+        status = int(getattr(response, "status_code", 0) or 0)
+        error_text = str(getattr(response, "text", "") or "")
+        if not allow_refresh or not self._requires_token_refresh(status, error_text):
+            return response
+
+        rejected = sent_token
+        self._sync_shared_token_from_disk()
+        if self.token and self.token != rejected:
+            logger.warning("Dhan read auth rejected; adopting updated shared token.")
+        elif self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+            coord_lock, inflight_map = globals().setdefault(
+                "_ASYNC_AUTH_COORD_STATE", (_threading.Lock(), {})
+            )
+            raw_tok_file = str(getattr(self.cfg, "dhan_token_file", "") or "").strip()
+            path_key = (
+                _os.path.realpath(_os.path.abspath(_os.path.expanduser(raw_tok_file)))
+                if raw_tok_file else f"client:{id(self)}"
+            )
+            account_key = str(getattr(self.cfg, "dhan_client_id", "") or "").strip()
+            coord_key = (path_key, account_key)
+            with coord_lock:
+                # A misconfigured shared token file for DIFFERENT Dhan accounts
+                # must not cause a token from one account to be published/adopted
+                # by the other's authentication recovery worker.
+                conflicting = any(
+                    key[0] == path_key and key[1] != account_key
+                    and item["thread"].is_alive()
+                    for key, item in inflight_map.items()
+                )
+                if conflicting:
+                    logger.error(
+                        "Dhan async recovery blocked: distinct accounts share one active token-file path"
+                    )
+                    return response
+                existing = inflight_map.get(coord_key)
+                if existing is not None and existing["thread"].is_alive():
+                    done_event = existing["done_event"]
+                else:
+                    done_event = _threading.Event()
+                    result_box = {"ok": False, "msg": "in_progress"}
+
+                    def _auth_worker() -> None:
+                        try:
+                            ok_w, _, msg_w = self.generate_token_with_totp(
+                                force=False, rejected_token=rejected
+                            )
+                            result_box["ok"] = bool(ok_w)
+                            result_box["msg"] = str(msg_w or "")
+                        except Exception as exc:
+                            result_box["ok"] = False
+                            result_box["msg"] = type(exc).__name__
+                        finally:
+                            done_event.set()
+
+                    worker = _threading.Thread(
+                        target=_auth_worker,
+                        name="dhan-auth-recovery",
+                        daemon=True,
+                    )
+                    inflight_map[coord_key] = {
+                        "thread": worker,
+                        "done_event": done_event,
+                        "result": result_box,
+                    }
+                    worker.start()
+
+            # Short grace for mocks and fast shared-token adoption only; slow
+            # auth network I/O NEVER blocks the protection watcher cycle.
+            if not done_event.wait(timeout=0.05):
+                return response
+            # A successful worker writes through the per-file flock. Every
+            # caller re-reads *its own* shared file; there is no broadcast of
+            # token strings into unrelated DhanClient instances.
+            self._sync_shared_token_from_disk()
+        else:
+            return response
+
+        retry_headers = self._headers()
+        retry_token = retry_headers.get("access-token", "")
+        if not retry_token or retry_token == rejected:
+            return response
+        # A successful/failed second GET is terminal for this call. It must
+        # never trigger a second token generation or a trading order replay.
+        return self.session.get(url, headers=retry_headers, timeout=timeout)
 
     def _read_collection(
         self,
@@ -1743,7 +2328,7 @@ class DhanClient:
 
         url = f"{BASE_URL}{path_suffix}"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             status_code = int(getattr(resp, "status_code", 0) or 0)
             if status_code == 200:
                 try:
@@ -1766,7 +2351,10 @@ class DhanClient:
 
             err_text = str(getattr(resp, "text", "") or "")
             err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}"
-            logger.error(err)
+            if self._requires_token_refresh(status_code, err_text):
+                self._log_throttled_broker_auth_error(label, err)
+            else:
+                logger.error(err)
             return BrokerReadFailure(status=BrokerReadStatus.FAILED.value, error=err, status_code=status_code)
         except Exception as e:
             err = f"HTTP exception fetching {label}: {e}"
@@ -2553,7 +3141,7 @@ class DhanClient:
         url = f"{BASE_URL}/orders/{requested_id}"
 
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             if resp.status_code == 200:
                 data = resp.json()
                 candidates = [data] if isinstance(data, dict) else (
@@ -2572,6 +3160,12 @@ class DhanClient:
                     "Dhan single-order read failed: %s HTTP %s",
                     requested_id, resp.status_code
                 )
+                if int(resp.status_code) in (401, 403) and self.is_token_error(
+                    int(resp.status_code), str(getattr(resp, "text", "") or "")
+                ):
+                    # A failed auth recovery is UNKNOWN, not a cancelled/empty order.
+                    # Avoid a second TOTP refresh via the order-book fallback.
+                    return None
         except Exception as exc:
             logger.warning(
                 "Dhan single-order read exception for %s: %s",
@@ -2716,7 +3310,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/trades/{order_id}"
         try:
-            resp = self.session.get(url, headers=self._headers(), timeout=5)
+            resp = self._get_with_auth_recovery(url)
             status_code = int(getattr(resp, "status_code", 0) or 0)
             if status_code == 200:
                 try:

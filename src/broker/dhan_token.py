@@ -4,7 +4,7 @@ Shared Dhan Access Token Coordinator (adopted from `darvas_script/client_agent/d
 Ensures that multiple processes on the same VM (e.g. main trading bot daemon, CLI `bot check-dhan`,
 or scheduled daily refresh) share a single Dhan access token safely via an `fcntl.flock` lockfile
 and PID/thread-unique `0600` atomic file replacement (`V12-20`, `CV13-06`), preventing
-self-invalidation and concurrent temp-file collisions.
+self-invalidation, concurrent temp-file collisions, and publication of unverified candidate tokens.
 """
 
 from contextlib import contextmanager
@@ -77,15 +77,36 @@ def write_token_atomic(token: str, path: Optional[str] = None) -> None:
 
 
 @contextmanager
-def locked_token_file(path: Optional[str] = None):
+def locked_token_file(path: Optional[str] = None, timeout_sec: Optional[float] = None):
+    import time
     target = os.path.expanduser(path or TOKEN_FILE)
     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     fd = os.open(f"{target}.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    acquired = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if timeout_sec is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            acquired = True
+        else:
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise BlockingIOError(
+                            f"Timed out waiting {timeout_sec:.2f}s for Dhan token lock {target}.lock"
+                        )
+                    time.sleep(0.02)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         os.close(fd)
 
 
@@ -93,20 +114,27 @@ def fresh_token(
     rejected: str,
     login: Callable[[], Optional[str]],
     path: Optional[str] = None,
+    lock_timeout_sec: Optional[float] = None,
+    verify_candidate: Optional[Callable[[str], bool]] = None,
 ) -> Optional[str]:
     """
     Returns a usable token after `rejected` failed (pass '' when there is no token yet).
     Adopts a newer token from the shared file if another process already logged in;
-    otherwise calls `login()` and writes the new token atomically with 0600 permissions.
+    otherwise calls `login()`, validates the candidate under the lock when `verify_candidate`
+    is provided, and writes the verified token atomically with 0600 permissions.
+    Never restores an invalidated old token.
     """
     target = os.path.expanduser(path or TOKEN_FILE)
-    with locked_token_file(target):
+    with locked_token_file(target, timeout_sec=lock_timeout_sec):
         shared = read_token(target)
         if shared and shared != rejected:
             logger.info("Adopted fresh Dhan token from shared token file (no new TOTP login needed).")
             return shared
         token = login()
         if token:
+            if callable(verify_candidate) and not verify_candidate(token):
+                logger.error("Candidate Dhan token failed identity verification before publish; not writing to %s", target)
+                return None
             write_token_atomic(token, target)
         return token
 
@@ -114,11 +142,20 @@ def fresh_token(
 def force_login(
     login: Callable[[], Optional[str]],
     path: Optional[str] = None,
+    lock_timeout_sec: Optional[float] = None,
+    verify_candidate: Optional[Callable[[str], bool]] = None,
 ) -> Optional[str]:
-    """Scheduled daily 08:00 refresh: always performs TOTP login under lock and shares the new token."""
+    """
+    Scheduled daily 17:00 IST refresh: performs TOTP login under lock, validates candidate
+    identity before publication when `verify_candidate` is provided, and atomically writes
+    the verified token with 0600 permissions. Never restores an invalidated old token.
+    """
     target = os.path.expanduser(path or TOKEN_FILE)
-    with locked_token_file(target):
+    with locked_token_file(target, timeout_sec=lock_timeout_sec):
         token = login()
         if token:
+            if callable(verify_candidate) and not verify_candidate(token):
+                logger.error("Candidate Dhan token failed identity verification before publish; not writing to %s", target)
+                return None
             write_token_atomic(token, target)
         return token

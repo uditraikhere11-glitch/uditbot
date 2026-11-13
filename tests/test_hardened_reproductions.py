@@ -182,7 +182,7 @@ class TestHardenedReproductionGates(unittest.TestCase):
         """H-11: Token file is written strictly with 0600 permissions."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"accessToken": "eyJmock_token_0600"}
+        mock_resp.json.return_value = {"dhanClientId": "1113731536", "accessToken": "eyJmock_token_0600"}
         mock_post.return_value = mock_resp
 
         token_path = os.path.join(self.temp_dir.name, "dhan_token_0600.txt")
@@ -196,7 +196,12 @@ class TestHardenedReproductionGates(unittest.TestCase):
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
 
         client = DhanClient(cfg, stop_manager=stop_mgr)
-        ok, tok, msg = client.generate_token_with_totp()
+        # H-11 verifies 0600 permissions; the mandatory broker identity
+        # handshake is mocked here and covered by separate P0 tests.
+        with patch.object(client, "verify_profile_and_token_expiry", return_value={
+            "identity_verified": True, "identity_status": "VERIFIED", "token_expired": False,
+        }):
+            ok, tok, msg = client.generate_token_with_totp()
 
         self.assertTrue(ok)
         self.assertTrue(os.path.exists(token_path))
