@@ -231,6 +231,7 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         return True
     else:
         print(f"\n❌ Failed to generate token: {msg}")
+        print("[!] Unverified candidate token was not published; no unsafe rollback was performed.")
         print("=======================================================")
         return False
 
@@ -313,35 +314,63 @@ def format_morning_health_report(
     effective_expired = bool(token_expired or (parsed_exp_ts is not None and parsed_exp_ts <= float(now_ts)))
     auth_ok = bool(token_verified and identity_ok and not effective_expired)
 
-    # Determine verified holiday calendar and next required trading session window (09:15 - 15:35 IST)
-    cal_ok = True
+    # The calendar is authoritative only after its loader succeeds. A missing,
+    # throwing, or stale file MUST NOT make next-session readiness green.
+    # The optional False override can force the report unverified, but True
+    # must never override a failed authoritative calendar check.
+    from src.engine.market import load_holidays_verified
     holidays_set = set()
+    cal_ok = False
+    verified_years = set()
+    try:
+        loaded_ok, loaded_holidays, _ = load_holidays_verified(
+            required_year=ist.year
+        )
+        if loaded_ok and loaded_holidays:
+            holidays_set = set(loaded_holidays)
+            verified_years.add(ist.year)
+            cal_ok = True
+    except (OSError, ValueError, TypeError, RuntimeError):
+        cal_ok = False
+    except Exception:
+        # Defensive fail closed for unexpected loader failures as well.
+        cal_ok = False
     if holiday_calendar_verified is False:
         cal_ok = False
-    else:
-        try:
-            from src.engine.market import load_holidays_verified
-            loaded_ok, loaded_holidays, _ = load_holidays_verified()
-            if holiday_calendar_verified is True:
-                cal_ok = True
-                holidays_set = set(loaded_holidays or set())
-            else:
-                cal_ok = bool(loaded_ok)
-                holidays_set = set(loaded_holidays or set())
-        except Exception:
-            cal_ok = bool(holiday_calendar_verified) if holiday_calendar_verified is not None else True
 
     cur_date = ist.date()
     session_close_time = datetime.time(15, 35, 0)
     session_open_time = datetime.time(9, 15, 0)
-    if cur_date.weekday() < 5 and cur_date not in holidays_set and ist.time() < session_close_time:
-        next_session_date = cur_date
-    else:
-        next_session_date = cur_date + datetime.timedelta(days=1)
-        for _ in range(15):
-            if next_session_date.weekday() < 5 and (not cal_ok or next_session_date not in holidays_set):
-                break
+    # The next session can fall in a different calendar year. Require that
+    # year's verified holiday data before declaring readiness (Dec/Jan case).
+    next_session_date = cur_date
+    if ist.time() >= session_close_time:
+        next_session_date += datetime.timedelta(days=1)
+    for _ in range(370):
+        if next_session_date.weekday() >= 5:
             next_session_date += datetime.timedelta(days=1)
+            continue
+        if next_session_date.year not in verified_years and cal_ok:
+            try:
+                year_ok, year_holidays, _ = load_holidays_verified(
+                    required_year=next_session_date.year
+                )
+                if year_ok and year_holidays:
+                    holidays_set.update(year_holidays)
+                    verified_years.add(next_session_date.year)
+                else:
+                    cal_ok = False
+            except Exception:
+                cal_ok = False
+        if not cal_ok:
+            # We may display an indicative weekday only. It is NOT a verified
+            # exchange session and cannot authorize a green status.
+            break
+        if next_session_date not in holidays_set:
+            break
+        next_session_date += datetime.timedelta(days=1)
+    else:
+        cal_ok = False
 
     next_open_dt = datetime.datetime.combine(next_session_date, session_open_time, tzinfo=ist_tz)
     next_close_dt = datetime.datetime.combine(next_session_date, session_close_time, tzinfo=ist_tz)
@@ -371,19 +400,17 @@ def format_morning_health_report(
         expiry_line = f"✅ <code>{html.escape(clean_exp)}</code> (Covers next session through {next_close_str})"
         next_session_expiry_ok = True
 
-    reconcil_gate_ok = bool(
-        reconciliation_ok
-        and int(unresolved_intents_count or 0) == 0
-        and int(unprotected_positions_count or 0) == 0
-    )
     ready = bool(
         auth_ok
+        and cal_ok
         and next_session_expiry_ok
         and funds_verified
         and not fallback_funds
         and master_loaded
         and not is_stopped
-        and reconcil_gate_ok
+        and reconciliation_ok
+        and int(unresolved_intents_count or 0) == 0
+        and int(unprotected_positions_count or 0) == 0
     )
     token_line = "✅ VERIFIED" if auth_ok else "❌ FAILED"
     if raw_id_status == "VERIFIED" and auth_ok:
@@ -404,13 +431,9 @@ def format_morning_health_report(
 
     master_line = "✅ OK" if master_loaded else "⚠️ WARNING (UNAVAILABLE / STALE)"
     stop_line = "🔴 ACTIVE — NEW ENTRIES BLOCKED" if is_stopped else "✅ INACTIVE"
-    readiness_line = (
-        "✅ VERIFIED CHECKS"
-        if ready
-        else ("⚠️ REVIEW REQUIRED — NEW ENTRIES BLOCKED" if not reconcil_gate_ok else "⚠️ REVIEW REQUIRED")
-    )
+    readiness_line = "✅ VERIFIED CHECKS" if ready else "⚠️ REVIEW REQUIRED"
     overall_line = "✅ SUCCESS" if ready else "❌ ACTION REQUIRED"
-    lines = [
+    lines = (
         "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
         f"🤖 Instance: <b>{name}</b> | 🕒 {ist:%d %b %Y, %H:%M:%S} IST",
         f"🔑 Dhan authentication: {token_line}",
@@ -420,19 +443,20 @@ def format_morning_health_report(
         f"📚 Scrip master: {master_line}",
         f"⚙️ Trading mode: <b>{mode}</b>",
         f"🛡️ Emergency STOP: {stop_line}",
-    ]
-    if not reconcil_gate_ok or reconciliation_summary:
-        unres_n = int(unresolved_intents_count or 0)
-        unprot_n = int(unprotected_positions_count or 0)
-        extra_detail = f" — {html.escape(str(reconciliation_summary))}" if reconciliation_summary else ""
-        lines.append(
-            f"🧭 Reconciliation & protection: ⚠️ NEW ENTRIES BLOCKED "
-            f"(RECONCILIATION PENDING ({unres_n}), PROTECTION UNVERIFIED ({unprot_n})){extra_detail}"
-        )
-    lines.extend([
         f"🚦 Next trading session readiness: {readiness_line}",
         f"📊 <b>Overall result: {overall_line}</b>",
-    ])
+    )
+    if not (reconciliation_ok and int(unresolved_intents_count or 0) == 0
+            and int(unprotected_positions_count or 0) == 0):
+        detail = str(reconciliation_summary or "").strip()
+        if not detail:
+            detail = (
+                f"RECONCILIATION PENDING ({int(unresolved_intents_count or 0)}); "
+                f"UNPROTECTED ({int(unprotected_positions_count or 0)})"
+            )
+        lines = lines[:-2] + (
+            "🧾 Reconciliation: ⚠️ NEW ENTRIES BLOCKED — " + html.escape(detail),
+        ) + lines[-2:]
     return "\n".join(lines)
 
 
@@ -518,28 +542,16 @@ def dispatch_morning_health_report_once(
     identity = f"DAILY_HEALTH:{ist_date}:{cfg.dhan_client_id}:{getattr(cfg, 'instance_name', 'AuditBot')}"
 
     text_up = str(report or "").upper()
-    is_fail_report = (
-        any(
-            m in text_up
-            for m in (
-                "ACTION REQUIRED",
-                "REVIEW REQUIRED",
-                "❌ FAILED",
-                "STATUS: FAILED",
-            )
-        )
-        or "FAILED" in text_up
-    )
-    is_ready_report = (not is_fail_report) and any(
-        m in text_up
-        for m in (
-            "OVERALL RESULT: ✅ SUCCESS",
-            "✅ CHECKS PASSED",
-            "NEXT TRADING SESSION READINESS: ✅ VERIFIED CHECKS",
-            "RECOVERED",
-            "SUCCESS",
-        )
-    )
+    is_ready_report = (
+        "OVERALL RESULT: ✅ SUCCESS" in text_up
+        or "✅ CHECKS PASSED" in text_up
+        or ("<B>RECOVERED</B>" in text_up and "FAILED" not in text_up)
+    ) and not any(marker in text_up for marker in (
+        "OVERALL RESULT: ❌", "NEXT TRADING SESSION READINESS: ⚠️",
+        "OVERALL RESULT: ⚠️",
+    ))
+    # An ambiguous or malformed report is never silently treated as READY.
+    is_fail_report = not is_ready_report
 
     # Separate lock from the Dhan token lock; never hold the token lock across
     # Telegram network I/O. The DB claim is unique across service restarts.
@@ -565,6 +577,12 @@ def dispatch_morning_health_report_once(
                         (identity, "DAILY_HEALTH_1700_RECOVERY"),
                     ).fetchone()
                 )
+                has_deterioration = bool(
+                    conn.execute(
+                        "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
+                        (identity, "DAILY_HEALTH_1700_DETERIORATION"),
+                    ).fetchone()
+                )
 
             if not has_initial:
                 event_key = "DAILY_HEALTH_1700_REPORT"
@@ -576,6 +594,13 @@ def dispatch_morning_health_report_once(
             elif has_failed and is_ready_report and not has_recovery:
                 event_key = "DAILY_HEALTH_1700_RECOVERY"
                 state_key = "DAILY_HEALTH_1700_READY"
+            elif is_fail_report and not has_deterioration and (
+                not has_failed or has_recovery
+            ):
+                # A green 17:00 report must never hide a new 17:10 failure.
+                # One deterioration and one recovery per IST date bound flips.
+                event_key = "DAILY_HEALTH_1700_DETERIORATION"
+                state_key = "DAILY_HEALTH_1700_FAILED"
             else:
                 return "ALREADY SENT OR QUEUED"
 
@@ -699,21 +724,20 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     auth_verified = bool(tok_ok and identity_ok and not token_expired)
     unres_intents_cnt = 0
     unprot_pos_cnt = 0
-    if callable(getattr(db, "get_non_terminal_intents", None)):
-        try:
-            nt_list = db.get_non_terminal_intents()
-            if isinstance(nt_list, list):
-                unres_intents_cnt = len(nt_list)
-        except Exception:
-            pass
-    if callable(getattr(db, "get_unprotected_orders", None)):
-        try:
-            up_list = db.get_unprotected_orders()
-            if isinstance(up_list, list):
-                unprot_pos_cnt = len(up_list)
-        except Exception:
-            pass
-
+    local_reconciliation_verified = True
+    try:
+        if not hasattr(db, "get_non_terminal_intents") or not hasattr(db, "get_unprotected_orders"):
+            local_reconciliation_verified = False
+        else:
+            intents = db.get_non_terminal_intents()
+            unprotected = db.get_unprotected_orders()
+            if not isinstance(intents, list) or not isinstance(unprotected, list):
+                local_reconciliation_verified = False
+            else:
+                unres_intents_cnt = len(intents)
+                unprot_pos_cnt = len(unprotected)
+    except Exception:
+        local_reconciliation_verified = False
     report = format_morning_health_report(
         cfg,
         now_ts=report_now,
@@ -728,9 +752,10 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         token_expiration_str=token_expiration_str,
         token_expiration_ts=token_expiration_ts,
         token_expired=token_expired,
-        reconciliation_ok=(unres_intents_cnt == 0 and unprot_pos_cnt == 0),
+        reconciliation_ok=local_reconciliation_verified and unres_intents_cnt == 0 and unprot_pos_cnt == 0,
         unresolved_intents_count=unres_intents_cnt,
         unprotected_positions_count=unprot_pos_cnt,
+        reconciliation_summary=("Local journal health check unavailable" if not local_reconciliation_verified else ""),
     )
     notify_status = dispatch_morning_health_report_once(
         cfg, db, report, now_ts=report_now
