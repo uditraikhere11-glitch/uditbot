@@ -11,14 +11,20 @@ jobs:
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Archive exact PR78 source
         run: |
           git archive --format=tar HEAD | gzip -9 > source.tar.gz
           git rev-parse HEAD > branch_sha.txt
+          git archive --format=tar 6ac2d99a3746a7cc5ae833fed839c95659539d37 | gzip -9 > main-baseline.tar.gz
+          git diff --binary 6ac2d99a3746a7cc5ae833fed839c95659539d37 2453acfcca472d334be61a73f2e546f1c3763aa3 > pr78.patch
       - uses: actions/upload-artifact@v4
         with:
           name: pr78-exact-source-for-audit
           path: |
             source.tar.gz
             branch_sha.txt
+            main-baseline.tar.gz
+            pr78.patch
           retention-days: 1
