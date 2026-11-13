@@ -151,7 +151,7 @@ case "${1:-}" in
         echo "  bot dashboard           Live read-only SSH terminal dashboard"
         echo "  bot check-dhan          Diagnose Dhan API connection, funds, LTP, and execution readiness"
         echo "  bot login               Generate fresh 24h Dhan access token using TOTP"
-        echo "  bot daily_health_check  Run scheduled 08:00 IST token refresh & health probe"
+        echo "  bot daily_health_check  Run scheduled 17:00 IST token refresh & health probe"
         echo "  bot setup               Run interactive terminal setup wizard"
         echo "  bot web                 Launch localhost setup web interface (127.0.0.1:8080)"
         echo "  bot journal [n]         View last n signal evaluation records"

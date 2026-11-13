@@ -1,11 +1,12 @@
 # Reference timer template only.
 # Provision on a fresh VM via: bash deploy/install_vm_services.sh --install
+# Upgrade timer on an existing VM via: bash deploy/install_vm_services.sh --upgrade-timer
 # Default Persistent=false prevents unplanned missed-run catch-up TOTP refresh on VM rebuild.
 [Unit]
-Description=Daily Dhan token refresh at 08:00 IST Mon-Fri
+Description=Daily Dhan token refresh at 17:00 IST (all calendar days)
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 08:00:00 Asia/Kolkata
+OnCalendar=*-*-* 17:00:00 Asia/Kolkata
 Persistent=false
 RandomizedDelaySec=15
 Unit=dhan-token-refresh.service

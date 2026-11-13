@@ -576,7 +576,8 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         self.assertNotIn("trading_bot.service", svc_text)
         self.assertNotIn("systemctl", svc_text)
         self.assertNotIn("trading_bot.service", tmr_text)
-        self.assertIn("OnCalendar=Mon..Fri *-*-* 08:00:00 Asia/Kolkata", tmr_text)
+        self.assertIn("OnCalendar=*-*-* 17:00:00 Asia/Kolkata", tmr_text)
+        self.assertNotIn("08:00:00", tmr_text)
 
         # Verify ./bot routes daily_health_check strictly to python -m src.cli daily_health_check
         self.assertIn('"$PYTHON" -m src.cli daily_health_check', bot_text)
@@ -598,7 +599,7 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         totp_resp = MagicMock(status_code=200)
         totp_resp.json.return_value = {"dhanClientId": "1113731536", "accessToken": "FRESH_TOTP_TOKEN_0800"}
         funds_resp = MagicMock(status_code=200)
-        funds_resp.json.return_value = {"availabelBalance": 50000.0}
+        funds_resp.json.return_value = {"dhanClientId": "1113731536", "availabelBalance": 50000.0, "tokenValidity": "31/12/2099 23:59"}
 
         with patch("subprocess.run", side_effect=AssertionError("systemctl execution prohibited in daily_health_check")), \
              patch("requests.Session.post", return_value=totp_resp), \
@@ -611,8 +612,9 @@ class TestCV1306And07Consolidated(unittest.TestCase):
 
     def test_11_p1_totp_recovery_requires_verified_broker_auth(self):
         """
-        P1 Verification: A failed newly generated token is NOT verified and
-        must NOT trigger restoration of a potentially expired previous token.
+        P1 Verification:
+        - Do not assume restoring an earlier token makes it valid after a new token has been generated.
+        - Require verified broker authentication (/fundlimit HTTP 200) before claiming recovery.
         """
         cfg = AppConfig(
             trading_mode=TradingMode.TEST,
@@ -629,41 +631,45 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         )
         stop_mgr.provision_initial_clean_state("Udit", "1113731536")
 
+        # Repeated DH-901: broker authentication remains unverified, even after
+        # bounded propagation checks. No old token should be restored.
         totp_ok = MagicMock(status_code=200)
         totp_ok.json.return_value = {
-            "dhanClientId": "1113731536", "accessToken": "NEW_BROKEN_TOKEN"
+            "dhanClientId": "1113731536",
+            "accessToken": "NEW_BROKEN_TOKEN",
         }
         funds_401 = MagicMock(
             status_code=401,
             text='{"errorCode":"DH-901","errorMessage":"Token Invalidated"}',
         )
 
-        # Repeated DH-901: broker authentication remains unverified, even
-        # after bounded propagation checks. No old token should be restored.
         with patch("requests.Session.post", return_value=totp_ok), \
              patch("requests.Session.get", return_value=funds_401), \
              patch("src.cli.time.sleep"):
             buf1 = io.StringIO()
             with redirect_stdout(buf1):
                 res1 = cmd_refresh_token(cfg, stop_mgr)
+            out1 = buf1.getvalue()
             self.assertFalse(res1)
-            self.assertIn("no unsafe rollback", buf1.getvalue())
-            self.assertNotIn("RECOVERY_VERIFIED", buf1.getvalue())
+            self.assertIn("no unsafe rollback", out1)
+            self.assertNotIn("RECOVERY_VERIFIED", out1)
             self.assertEqual(read_token(self.tok_path), "NEW_BROKEN_TOKEN")
 
         # Non-auth 500: do not retry TOTP, do not accept an unverified old
         # token, and do not claim broker recovery.
         write_token_atomic("PREV_STILL_VALID_TOKEN", self.tok_path)
         funds_500 = MagicMock(status_code=500, text="Gateway error")
+
         with patch("requests.Session.post", return_value=totp_ok), \
              patch("requests.Session.get", return_value=funds_500), \
              patch("src.cli.time.sleep") as sleeper:
             buf2 = io.StringIO()
             with redirect_stdout(buf2):
                 res2 = cmd_refresh_token(cfg, stop_mgr)
+            out2 = buf2.getvalue()
             self.assertFalse(res2)
-            self.assertIn("Post-refresh broker verification failed", buf2.getvalue())
-            self.assertNotIn("RECOVERY_VERIFIED", buf2.getvalue())
+            self.assertIn("Post-refresh broker verification failed", out2)
+            self.assertNotIn("RECOVERY_VERIFIED", out2)
             self.assertEqual(read_token(self.tok_path), "NEW_BROKEN_TOKEN")
             sleeper.assert_not_called()
 

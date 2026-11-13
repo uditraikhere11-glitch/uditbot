@@ -120,7 +120,10 @@ class VMRebuildDeploymentTests(unittest.TestCase):
         self.assertNotIn('Persistent=true', self.refresh_tmr)
 
     def test_weekday_refresh_no_unplanned_catchup(self):
-        self.assertIn('Mon..Fri *-*-* 08:00:00 Asia/Kolkata', self.install)
+        self.assertIn('*-*-* 17:00:00 Asia/Kolkata', self.install)
+        self.assertIn('*-*-* 17:00:00 Asia/Kolkata', self.refresh_tmr)
+        self.assertNotIn('08:00:00', self.install)
+        self.assertNotIn('08:00:00', self.refresh_tmr)
         self.assertIn('AUDITBOT_TOKEN_CATCHUP:-0', self.install)
         self.assertIn('bot daily_health_check', self.install)
 

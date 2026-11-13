@@ -40,23 +40,23 @@ class TestDhanTotpTimeoutRecovery(unittest.TestCase):
             }),
         ]
         with patch("src.broker.dhan_client.compute_totp",
-                   side_effect=["111111", "222222"]) as totp, patch(
+            side_effect=["111111", "222222"]) as totp, patch(
             "src.broker.dhan_client.time.sleep"
         ) as sleep:
             ok, token, message = self.client._perform_totp_http_login()
-        self.assertTrue(ok, message)
-        self.assertEqual(token, "verified-token")
-        self.assertEqual(self.client.session.post.call_count, 2)
-        for call_args in self.client.session.post.call_args_list:
-            self.assertEqual(call_args.args[0], AUTH_URL)
-            self.assertEqual(call_args.kwargs["timeout"], (5, 25))
-        self.assertEqual(
-            [call_args.kwargs["params"]["totp"]
-             for call_args in self.client.session.post.call_args_list],
-            ["111111", "222222"],
-        )
-        self.assertEqual(totp.call_count, 2)
-        sleep.assert_called_once_with(2)
+            self.assertTrue(ok, message)
+            self.assertEqual(token, "verified-token")
+            self.assertEqual(self.client.session.post.call_count, 2)
+            for call_args in self.client.session.post.call_args_list:
+                self.assertEqual(call_args.args[0], AUTH_URL)
+                self.assertEqual(call_args.kwargs["timeout"], (5, 25))
+                self.assertEqual(
+                    [call_args.kwargs["params"]["totp"]
+                    for call_args in self.client.session.post.call_args_list],
+                    ["111111", "222222"],
+                )
+            self.assertEqual(totp.call_count, 2)
+            sleep.assert_called_once_with(2)
 
     def test_second_timeout_is_failure_with_at_most_two_calls(self):
         self.client.session.post.side_effect = [
@@ -64,15 +64,15 @@ class TestDhanTotpTimeoutRecovery(unittest.TestCase):
             self.requests.exceptions.ReadTimeout("attempt two"),
         ]
         with patch("src.broker.dhan_client.compute_totp",
-                   side_effect=["111111", "222222"]), patch(
+            side_effect=["111111", "222222"]), patch(
             "src.broker.dhan_client.time.sleep"
         ):
             ok, token, message = self.client._perform_totp_http_login()
-        self.assertFalse(ok)
-        self.assertEqual(token, "")
-        self.assertIn("unavailable", message)
-        self.assertNotIn("test-pin", message)
-        self.assertEqual(self.client.session.post.call_count, 2)
+            self.assertFalse(ok)
+            self.assertEqual(token, "")
+            self.assertIn("unavailable", message)
+            self.assertNotIn("test-pin", message)
+            self.assertEqual(self.client.session.post.call_count, 2)
 
     def test_wrong_pin_http_403_does_not_generate_another_totp(self):
         self.client.session.post.return_value = _response(
@@ -82,11 +82,11 @@ class TestDhanTotpTimeoutRecovery(unittest.TestCase):
             "src.broker.dhan_client.time.sleep"
         ) as sleep:
             ok, token, message = self.client._perform_totp_http_login()
-        self.assertFalse(ok)
-        self.assertEqual(token, "")
-        self.assertIn("403", message)
-        self.assertEqual(self.client.session.post.call_count, 1)
-        sleep.assert_not_called()
+            self.assertFalse(ok)
+            self.assertEqual(token, "")
+            self.assertIn("403", message)
+            self.assertEqual(self.client.session.post.call_count, 1)
+            sleep.assert_not_called()
 
     def test_tls_certificate_error_is_not_retried(self):
         self.client.session.post.side_effect = self.requests.exceptions.SSLError(
@@ -96,11 +96,11 @@ class TestDhanTotpTimeoutRecovery(unittest.TestCase):
             "src.broker.dhan_client.time.sleep"
         ) as sleep:
             ok, token, message = self.client._perform_totp_http_login()
-        self.assertFalse(ok)
-        self.assertEqual(token, "")
-        self.assertIn("TLS", message)
-        self.assertEqual(self.client.session.post.call_count, 1)
-        sleep.assert_not_called()
+            self.assertFalse(ok)
+            self.assertEqual(token, "")
+            self.assertIn("TLS", message)
+            self.assertEqual(self.client.session.post.call_count, 1)
+            sleep.assert_not_called()
 
 
 class TestDhanReadAuthRecovery(unittest.TestCase):
@@ -392,7 +392,7 @@ class TestScheduledRefreshStartup(unittest.TestCase):
                 client = DhanClient(
                     cfg, stop_manager=Mock(), auto_generate_token=False
                 )
-            self.assertEqual(client.token, "")
+                self.assertEqual(client.token, "")
 
 
 class TestScheduledTokenVerification(unittest.TestCase):
@@ -417,8 +417,8 @@ class TestScheduledTokenVerification(unittest.TestCase):
                 "src.cli.time.sleep"
             ) as sleep:
                 self.assertTrue(cmd_refresh_token(cfg, object()))
-            fake.generate_token_with_totp.assert_called_once_with(force=True)
-            self.assertEqual(sleep.call_args_list, [call(2), call(3)])
+        fake.generate_token_with_totp.assert_called_once_with(force=True)
+        self.assertEqual(sleep.call_args_list, [call(2), call(3)])
 
     def test_failed_verification_retains_new_token_without_rollback(self):
         from src.cli import cmd_refresh_token
@@ -458,7 +458,7 @@ class TestScheduledTokenVerification(unittest.TestCase):
             return_value=True
         ):
             code = cmd_daily_health_check(cfg, Mock(), object())
-        self.assertEqual(code, 1)
+            self.assertEqual(code, 1)
 
 
 class TestDailyTelegramHealthReport(unittest.TestCase):
@@ -479,8 +479,8 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
             os.path.join(self.tempdir.name, "journal.db"),
             account_id=self.cfg.dhan_client_id,
         )
-        # Fixed time is representative of the 08:00 IST daily systemd job.
-        self.fixed_ts = 1794450605.0
+        # Fixed time is representative of the 17:00 IST daily systemd job.
+        self.fixed_ts = 1794483005.0
 
     def test_healthy_report_includes_account_mode_timestamp_and_real_funds(self):
         from src.cli import format_morning_health_report
@@ -488,13 +488,16 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
             self.cfg, now_ts=self.fixed_ts, token_verified=True,
             funds_verified=True, fallback_funds=False,
             available_balance=1200.5, master_loaded=True, is_stopped=False,
+            account_identity_status="VERIFIED",
+            token_expiration_str="2026-11-13 17:00:05 IST",
         )
-        self.assertIn("Morning Dhan Health", card)
-        self.assertIn("08:00:", card)
+        self.assertIn("AUDITBOT — 05:00 PM DHAN HEALTH CHECK", card)
+        self.assertIn("17:00:", card)
         self.assertIn("***7890", card)
         self.assertIn("LIVE", card)
         self.assertIn("₹1,200.50", card)
-        self.assertIn("CHECKS PASSED", card)
+        self.assertIn("VERIFIED CHECKS", card)
+        self.assertIn("SUCCESS", card)
         self.assertNotIn("1234567890", card)
 
     def test_stop_master_warning_and_paper_balance_never_claim_ready(self):
@@ -508,8 +511,11 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
                 available_balance=100000.0, master_loaded=master, is_stopped=stop,
             )
             self.assertIn("REVIEW REQUIRED", card)
-            self.assertNotIn("CHECKS PASSED", card)
-        self.assertIn("TEST FALLBACK", card)
+            self.assertIn("ACTION REQUIRED", card)
+            self.assertNotIn("VERIFIED CHECKS", card)
+            self.assertNotIn("Overall result: ✅ SUCCESS", card)
+            if paper:
+                self.assertIn("TEST FALLBACK", card)
 
     def test_direct_bot_api_sends_only_once_per_ist_day(self):
         from src.cli import dispatch_morning_health_report_once
@@ -523,10 +529,10 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
             b = dispatch_morning_health_report_once(
                 self.cfg, self.db, "<b>morning report</b>", now_ts=self.fixed_ts + 60
             )
-        self.assertIn("DELIVERED", a)
-        self.assertIn("ALREADY", b)
-        sender.assert_called_once()
-        self.assertEqual(self.db.fetch_pending_outbox(), [])
+            self.assertIn("DELIVERED", a)
+            self.assertIn("ALREADY", b)
+            sender.assert_called_once()
+            self.assertEqual(self.db.fetch_pending_outbox(), [])
 
     def test_bot_api_failure_is_queued_once_and_not_claimed_delivered(self):
         from src.cli import dispatch_morning_health_report_once
@@ -540,12 +546,12 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
             b = dispatch_morning_health_report_once(
                 self.cfg, self.db, "Health report", now_ts=self.fixed_ts + 10
             )
-        self.assertIn("QUEUED", a)
-        self.assertIn("ALREADY", b)
-        sender.assert_called_once()
-        messages = self.db.fetch_pending_outbox()
-        self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0]["event_type"], "ORDER_STATUS_UPDATE")
+            self.assertIn("QUEUED", a)
+            self.assertIn("ALREADY", b)
+            sender.assert_called_once()
+            messages = self.db.fetch_pending_outbox()
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]["event_type"], "ORDER_STATUS_UPDATE")
 
     def test_without_bot_token_queues_for_running_telethon_worker(self):
         from src.cli import dispatch_morning_health_report_once
@@ -557,8 +563,8 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
             msg = dispatch_morning_health_report_once(
                 self.cfg, self.db, "morning", now_ts=self.fixed_ts
             )
-        self.assertIn("QUEUED", msg)
-        self.assertEqual(len(self.db.fetch_pending_outbox()), 1)
+            self.assertIn("QUEUED", msg)
+            self.assertEqual(len(self.db.fetch_pending_outbox()), 1)
 
     def test_failed_auth_still_sends_truthful_morning_alert(self):
         from src.cli import cmd_daily_health_check
@@ -580,12 +586,12 @@ class TestDailyTelegramHealthReport(unittest.TestCase):
             side_effect=lambda body: cards.append(body) or True
         ):
             rc = cmd_daily_health_check(self.cfg, self.db, stop_mgr)
-        self.assertEqual(rc, 1)
-        self.assertEqual(len(cards), 1)
-        self.assertIn("Dhan authentication: ❌ NOT VERIFIED", cards[0])
-        self.assertIn("Emergency STOP: 🛑 ACTIVE", cards[0])
-        self.assertIn("REVIEW REQUIRED", cards[0])
-        broker.generate_token_with_totp.assert_not_called()
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(cards), 1)
+            self.assertIn("Dhan authentication: ❌ FAILED", cards[0])
+            self.assertIn("Emergency STOP: 🔴 ACTIVE", cards[0])
+            self.assertIn("REVIEW REQUIRED", cards[0])
+            broker.generate_token_with_totp.assert_not_called()
 
     def test_unconfigured_log_group_never_claims_delivered(self):
         from src.cli import dispatch_morning_health_report_once

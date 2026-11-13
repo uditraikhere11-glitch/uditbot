@@ -161,7 +161,7 @@ def cmd_emergency_stop(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopMan
     print(">>> EMERGENCY STOP ACTIVATED <<<")
     print(f"Operator: {op_name}")
     print(f"Reason: {stop_reason}")
-    print(f"Account: {cfg.dhan_client_id or 'All'}")
+    print(f"Account: {_mask_account_id(cfg.dhan_client_id) if cfg.dhan_client_id else 'All'}")
     print("All NEW risk-increasing broker order submissions are now BLOCKED.")
     print("Risk-reducing cancellations and open-position protection legs remain authorized.")
 
@@ -187,7 +187,7 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
     print("=======================================================")
     print("         DHAN AUTOMATED TOTP TOKEN REFRESH            ")
     print("=======================================================")
-    print(f"[*] Dhan Client ID    : {cfg.dhan_client_id or 'Not Configured'}")
+    print(f"[*] Dhan Client ID    : {_mask_account_id(cfg.dhan_client_id)}")
     print(f"[*] Dhan PIN          : {'Configured' if cfg.dhan_pin else 'MISSING'}")
     print(f"[*] Dhan TOTP Secret  : {'Configured' if cfg.dhan_totp_secret else 'MISSING'}")
 
@@ -245,50 +245,214 @@ def format_morning_health_report(
     available_balance: float,
     master_loaded: bool,
     is_stopped: bool,
+    account_identity_status: str = "",
+    identity_status: str = "",
+    profile_client_id: str = "",
+    token_expiration_str: str = "",
+    token_expiration_ts: float = 0.0,
+    token_expired: bool = False,
+    holiday_calendar_verified=None,
 ) -> str:
-    """Report measured status, never a paper balance or STOP state as LIVE-ready."""
+    """
+    Builds the scheduled 05:00 PM IST after-market Dhan health report (`AUDITBOT — 05:00 PM DHAN HEALTH CHECK`).
+    - C3 (P0): Strictly distinguishes current authentication (`Dhan authentication: ✅ VERIFIED`) from
+      next-session readiness (`Next trading session readiness: ✅ VERIFIED CHECKS` vs `⚠️ REVIEW REQUIRED`).
+    - Requires a verified token expiration extending through the next trading session lifecycle close
+      (`15:35 IST`) with a verified NSE holiday calendar before declaring `✅ VERIFIED CHECKS` or `✅ SUCCESS`.
+    - Reports only measured statuses; never exposes raw tokens, PINs, TOTP secrets, or unmasked account IDs.
+    """
     import html
 
-    ist = datetime.datetime.fromtimestamp(
-        now_ts, tz=zoneinfo.ZoneInfo("Asia/Kolkata")
-    )
+    ist_tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+    ist = datetime.datetime.fromtimestamp(now_ts, tz=ist_tz)
     name = html.escape(str(getattr(cfg, "instance_name", "AuditBot") or "AuditBot"))
-    account = html.escape(_mask_account_id(str(getattr(cfg, "dhan_client_id", "") or "")))
+    raw_acct = str(profile_client_id or getattr(cfg, "dhan_client_id", "") or "")
+    account = html.escape(_mask_account_id(raw_acct))
     configured_mode = getattr(cfg, "trading_mode", "UNKNOWN")
     mode = html.escape(str(getattr(configured_mode, "value", configured_mode)))
-    ready = bool(token_verified and funds_verified and master_loaded and not is_stopped)
-    token_line = "✅ VERIFIED" if token_verified else "❌ NOT VERIFIED"
-    if funds_verified:
+
+    raw_id_status = str(account_identity_status or identity_status or "").strip().upper()
+    if not raw_id_status:
+        raw_id_status = "VERIFIED" if token_verified else "UNVERIFIED"
+    identity_ok = (raw_id_status == "VERIFIED")
+
+    clean_exp = str(token_expiration_str or "").strip()
+    parsed_exp_ts = float(token_expiration_ts) if (token_expiration_ts and float(token_expiration_ts) > 0) else None
+    if parsed_exp_ts is None and clean_exp and clean_exp.upper() != "UNVERIFIED":
+        raw_for_parse = clean_exp[:-4].strip() if clean_exp.upper().endswith(" IST") else clean_exp
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d %b %Y, %H:%M:%S",
+            "%d %b %Y %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                naive_dt = datetime.datetime.strptime(raw_for_parse, fmt)
+                parsed_exp_ts = naive_dt.replace(tzinfo=ist_tz).timestamp()
+                break
+            except ValueError:
+                continue
+        if parsed_exp_ts is None:
+            try:
+                dt_iso = datetime.datetime.fromisoformat(raw_for_parse)
+                if dt_iso.tzinfo is None:
+                    dt_iso = dt_iso.replace(tzinfo=ist_tz)
+                else:
+                    dt_iso = dt_iso.astimezone(ist_tz)
+                parsed_exp_ts = dt_iso.timestamp()
+            except ValueError:
+                parsed_exp_ts = None
+
+    effective_expired = bool(token_expired or (parsed_exp_ts is not None and parsed_exp_ts <= float(now_ts)))
+    auth_ok = bool(token_verified and identity_ok and not effective_expired)
+
+    # The calendar is authoritative only after its loader succeeds. A missing,
+    # throwing, or stale file MUST NOT make next-session readiness green.
+    # The optional False override can force the report unverified, but True
+    # must never override a failed authoritative calendar check.
+    from src.engine.market import load_holidays_verified
+    holidays_set = set()
+    cal_ok = False
+    verified_years = set()
+    try:
+        loaded_ok, loaded_holidays, _ = load_holidays_verified(
+            required_year=ist.year
+        )
+        if loaded_ok and loaded_holidays:
+            holidays_set = set(loaded_holidays)
+            verified_years.add(ist.year)
+            cal_ok = True
+    except (OSError, ValueError, TypeError, RuntimeError):
+        cal_ok = False
+    except Exception:
+        # Defensive fail closed for unexpected loader failures as well.
+        cal_ok = False
+    if holiday_calendar_verified is False:
+        cal_ok = False
+
+    cur_date = ist.date()
+    session_close_time = datetime.time(15, 35, 0)
+    session_open_time = datetime.time(9, 15, 0)
+    # The next session can fall in a different calendar year. Require that
+    # year's verified holiday data before declaring readiness (Dec/Jan case).
+    next_session_date = cur_date
+    if ist.time() >= session_close_time:
+        next_session_date += datetime.timedelta(days=1)
+    for _ in range(370):
+        if next_session_date.weekday() >= 5:
+            next_session_date += datetime.timedelta(days=1)
+            continue
+        if next_session_date.year not in verified_years and cal_ok:
+            try:
+                year_ok, year_holidays, _ = load_holidays_verified(
+                    required_year=next_session_date.year
+                )
+                if year_ok and year_holidays:
+                    holidays_set.update(year_holidays)
+                    verified_years.add(next_session_date.year)
+                else:
+                    cal_ok = False
+            except Exception:
+                cal_ok = False
+        if not cal_ok:
+            # We may display an indicative weekday only. It is NOT a verified
+            # exchange session and cannot authorize a green status.
+            break
+        if next_session_date not in holidays_set:
+            break
+        next_session_date += datetime.timedelta(days=1)
+    else:
+        cal_ok = False
+
+    next_open_dt = datetime.datetime.combine(next_session_date, session_open_time, tzinfo=ist_tz)
+    next_close_dt = datetime.datetime.combine(next_session_date, session_close_time, tzinfo=ist_tz)
+    next_open_ts = next_open_dt.timestamp()
+    next_close_ts = next_close_dt.timestamp()
+    next_open_str = next_open_dt.strftime("%a %d %b %H:%M IST")
+    next_close_str = next_close_dt.strftime("%a %d %b %H:%M IST")
+
+    next_session_expiry_ok = False
+    if effective_expired:
+        expiry_line = f"❌ EXPIRED (<code>{html.escape(clean_exp or 'expired')}</code>)"
+    elif not auth_ok or not clean_exp or clean_exp.upper() == "UNVERIFIED" or parsed_exp_ts is None:
+        expiry_line = "⚠️ UNVERIFIED"
+    elif not cal_ok:
+        expiry_line = f"⚠️ <code>{html.escape(clean_exp)}</code> (Holiday calendar UNVERIFIED)"
+    elif parsed_exp_ts < next_open_ts:
+        expiry_line = (
+            f"⚠️ <code>{html.escape(clean_exp)}</code> "
+            f"(Expires before next session open {next_open_str}; scheduled 17:00 IST refresh required)"
+        )
+    elif parsed_exp_ts < next_close_ts:
+        expiry_line = (
+            f"⚠️ <code>{html.escape(clean_exp)}</code> "
+            f"(Expires during next session before {next_close_str})"
+        )
+    else:
+        expiry_line = f"✅ <code>{html.escape(clean_exp)}</code> (Covers next session through {next_close_str})"
+        next_session_expiry_ok = True
+
+    ready = bool(
+        auth_ok
+        and cal_ok
+        and next_session_expiry_ok
+        and funds_verified
+        and not fallback_funds
+        and master_loaded
+        and not is_stopped
+    )
+    token_line = "✅ VERIFIED" if auth_ok else "❌ FAILED"
+    if raw_id_status == "VERIFIED" and auth_ok:
+        identity_line = f"✅ VERIFIED (<code>{account}</code>)"
+    elif raw_id_status.startswith("MISMATCH"):
+        identity_line = f"❌ MISMATCH (<code>{account}</code>)"
+    elif effective_expired or raw_id_status == "EXPIRED":
+        identity_line = f"❌ EXPIRED (<code>{account}</code>)"
+    else:
+        identity_line = f"❌ UNVERIFIED (<code>{account}</code>)"
+
+    if funds_verified and not fallback_funds:
         funds_line = f"✅ VERIFIED — ₹{available_balance:,.2f}"
     elif fallback_funds:
         funds_line = "⚠️ TEST FALLBACK — NOT VERIFIED WITH DHAN"
     else:
-        funds_line = "❌ NOT VERIFIED"
-    master_line = "✅ AVAILABLE" if master_loaded else "⚠️ UNAVAILABLE / STALE"
-    stop_line = "🛑 ACTIVE — NEW ENTRIES BLOCKED" if is_stopped else "✅ INACTIVE"
-    result = "✅ CHECKS PASSED" if ready else "⚠️ REVIEW REQUIRED"
+        funds_line = "❌ UNVERIFIED"
+
+    master_line = "✅ OK" if master_loaded else "⚠️ WARNING (UNAVAILABLE / STALE)"
+    stop_line = "🔴 ACTIVE — NEW ENTRIES BLOCKED" if is_stopped else "✅ INACTIVE"
+    readiness_line = "✅ VERIFIED CHECKS" if ready else "⚠️ REVIEW REQUIRED"
+    overall_line = "✅ SUCCESS" if ready else "❌ ACTION REQUIRED"
     return "\n".join((
-        f"☀️ <b>{name} — Morning Dhan Health</b>",
-        f"🕗 {ist:%d %b %Y, %H:%M:%S} IST",
-        f"🪪 Dhan account: <code>{account}</code>",
-        f"⚙️ Trading mode: <b>{mode}</b>",
+        "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
+        f"🤖 Instance: <b>{name}</b> | 🕒 {ist:%d %b %Y, %H:%M:%S} IST",
         f"🔑 Dhan authentication: {token_line}",
+        f"💳 Dhan account identity: {identity_line}",
+        f"⏳ Token expiration: {expiry_line}",
         f"💰 Broker funds: {funds_line}",
         f"📚 Scrip master: {master_line}",
+        f"⚙️ Trading mode: <b>{mode}</b>",
         f"🛡️ Emergency STOP: {stop_line}",
-        f"📊 <b>Overall: {result}</b>",
+        f"🚦 Next trading session readiness: {readiness_line}",
+        f"📊 <b>Overall result: {overall_line}</b>",
     ))
+
+
+format_after_market_health_report = format_morning_health_report
 
 
 def dispatch_morning_health_report_once(
     cfg: AppConfig, db: JournalDB, report: str, *, now_ts: float
 ) -> str:
-    """Send once per account/IST date to the configured Telegram log group.
+    """Send once per account/IST date to the configured Telegram log group, plus one recovery notice.
 
-    Direct Bot API delivery works even when the trading service is stopped.
-    Without a Bot API destination, or after delivery failure, atomically queue
-    a durable outbox notice for the existing Telethon/Telegram notifier worker.
-    Never label a queued notification as delivered.
+    C4 (P1): Preserves at most one routine initial daily report (`DAILY_HEALTH_1700_REPORT`),
+    records `DAILY_HEALTH_1700_FAILED` when the initial report indicates failure/review-required,
+    and allows one separately deduplicated recovery notification (`DAILY_HEALTH_1700_RECOVERY`)
+    if a subsequent run on the same IST date transitions to healthy/ready (`SUCCESS` / `RECOVERED`).
+    Never labels a queued notification as delivered.
     """
     if not getattr(cfg, "log_group_id", 0):
         return "NOT_CONFIGURED (LOG_GROUP_ID is missing)"
@@ -299,18 +463,67 @@ def dispatch_morning_health_report_once(
         now_ts, tz=zoneinfo.ZoneInfo("Asia/Kolkata")
     ).strftime("%Y-%m-%d")
     identity = f"DAILY_HEALTH:{ist_date}:{cfg.dhan_client_id}:{getattr(cfg, 'instance_name', 'AuditBot')}"
-    event_key = "MORNING_REPORT"
+
+    text_up = str(report or "").upper()
+    is_ready_report = (
+        "OVERALL RESULT: ✅ SUCCESS" in text_up
+        or "✅ CHECKS PASSED" in text_up
+    ) and not any(marker in text_up for marker in (
+        "OVERALL RESULT: ❌", "NEXT TRADING SESSION READINESS: ⚠️",
+        "OVERALL RESULT: ⚠️",
+    ))
+    # An ambiguous or malformed report is never silently treated as READY.
+    is_fail_report = not is_ready_report
+
     # Separate lock from the Dhan token lock; never hold the token lock across
     # Telegram network I/O. The DB claim is unique across service restarts.
     lock_path = os.path.join(cfg.data_dir, ".morning_health_report")
     try:
         with locked_token_file(lock_path):
             with db._get_conn() as conn:
-                existing = conn.execute(
-                    "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
-                    (identity, event_key),
-                ).fetchone()
-            if existing:
+                has_initial = bool(
+                    conn.execute(
+                        "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
+                        (identity, "DAILY_HEALTH_1700_REPORT"),
+                    ).fetchone()
+                )
+                has_failed = bool(
+                    conn.execute(
+                        "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
+                        (identity, "DAILY_HEALTH_1700_FAILED"),
+                    ).fetchone()
+                )
+                has_recovery = bool(
+                    conn.execute(
+                        "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
+                        (identity, "DAILY_HEALTH_1700_RECOVERY"),
+                    ).fetchone()
+                )
+                has_deterioration = bool(
+                    conn.execute(
+                        "SELECT 1 FROM order_notification_events WHERE order_id=? AND event_key=?",
+                        (identity, "DAILY_HEALTH_1700_DETERIORATION"),
+                    ).fetchone()
+                )
+
+            if not has_initial:
+                event_key = "DAILY_HEALTH_1700_REPORT"
+                state_key = (
+                    "DAILY_HEALTH_1700_FAILED"
+                    if is_fail_report
+                    else ("DAILY_HEALTH_1700_READY" if is_ready_report else "")
+                )
+            elif has_failed and is_ready_report and not has_recovery:
+                event_key = "DAILY_HEALTH_1700_RECOVERY"
+                state_key = "DAILY_HEALTH_1700_READY"
+            elif is_fail_report and not has_deterioration and (
+                not has_failed or has_recovery
+            ):
+                # A green 17:00 report must never hide a new 17:10 failure.
+                # One deterioration and one recovery per IST date bound flips.
+                event_key = "DAILY_HEALTH_1700_DETERIORATION"
+                state_key = "DAILY_HEALTH_1700_FAILED"
+            else:
                 return "ALREADY SENT OR QUEUED"
 
             notifier = TelegramNotifier(cfg)
@@ -320,27 +533,54 @@ def dispatch_morning_health_report_once(
                         "INSERT OR IGNORE INTO order_notification_events (order_id, event_key, created_at) VALUES (?, ?, ?)",
                         (identity, event_key, float(now_ts)),
                     )
+                    if state_key:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO order_notification_events (order_id, event_key, created_at) VALUES (?, ?, ?)",
+                            (identity, state_key, float(now_ts)),
+                        )
                 return "DELIVERED VIA TELEGRAM BOT API"
 
             # Existing outbox worker delivers using Telegram Bot API or, if the
             # bot token is absent, its Telegram user session (when running).
             queued = db.enqueue_order_notification_once(identity, event_key, report)
-            return "QUEUED FOR TELEGRAM RETRY" if queued else "ALREADY QUEUED"
+            if queued and state_key:
+                try:
+                    with db._get_conn() as conn:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO order_notification_events (order_id, event_key, created_at) VALUES (?, ?, ?)",
+                            (identity, state_key, float(now_ts)),
+                        )
+                except Exception:
+                    pass
+            return "QUEUED FOR TELEGRAM RETRY" if queued else "ALREADY SENT OR QUEUED"
     except Exception as exc:
         # Notification failure must never change token validation or trading mode.
         return f"NOTIFICATION ERROR ({type(exc).__name__})"
 
 
+dispatch_after_market_health_report_once = dispatch_morning_health_report_once
+
+
 def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager) -> int:
     """
-    V12-24: Executes the scheduled 08:00 IST daily token refresh and health probe invoked by
-    `dhan-token-refresh.service`. Returns exit code 0 on success, 1 on failure.
+    V12-24 & C7 (P1): Executes the scheduled 17:00 IST (05:00 PM IST) daily token refresh and
+    after-market readiness check invoked by `dhan-token-refresh.service`.
+
+    Exit-Code Contract:
+    - Separates `AUTH_CHECK` (`PASS` / `FAIL`: TOTP refresh, `/v2/profile` account identity,
+      non-expired token, and verified real `/v2/fundlimit` balance) from
+      `NEXT_SESSION_READINESS` (`VERIFIED_CHECKS` / `REVIEW_REQUIRED`: `AUTH_CHECK == PASS`
+      plus verified token expiration covering the next trading session close at 15:35 IST
+      with a verified holiday calendar, fresh scrip master, and inactive Emergency STOP).
+    - Returns exit code `0` ONLY when both `AUTH_CHECK == PASS` and
+      `NEXT_SESSION_READINESS == VERIFIED_CHECKS`. Returns `1` whenever any mandatory
+      authentication or next-session readiness check fails or requires operator review.
     """
     from src.broker.dhan_client import DhanClient
     from src.instruments.resolver import InstrumentResolver
 
     print("=======================================================")
-    print("       AUDIT BOT 08:00 IST DAILY HEALTH CHECK          ")
+    print("     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          ")
     print("=======================================================")
 
     tok_ok = cmd_refresh_token(cfg, stop_mgr)
@@ -348,6 +588,40 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     # Do not implicitly generate another token while gathering the report.
     client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
     ok_funds, avail_bal, funds_msg = client.get_fund_limits(retry=False)
+
+    report_now = time.time()
+    identity_status = "UNVERIFIED"
+    identity_ok = False
+    profile_client_id = ""
+    token_expiration_str = ""
+    token_expiration_ts = 0.0
+    token_expired = False
+    verify_fn = getattr(client, "verify_profile_and_token_expiry", None)
+    if callable(verify_fn):
+        try:
+            prof_info = verify_fn(allow_refresh=False, now_ts=report_now)
+            if isinstance(prof_info, dict):
+                raw_id_st = str(prof_info.get("identity_status") or "").strip().upper()
+                profile_client_id = str(prof_info.get("profile_client_id") or "").strip()
+                if raw_id_st == "MISMATCH" or prof_info.get("identity_mismatch"):
+                    identity_status = "MISMATCH"
+                    identity_ok = False
+                elif raw_id_st == "VERIFIED" and bool(prof_info.get("identity_verified", False)) and tok_ok:
+                    identity_status = "VERIFIED"
+                    identity_ok = True
+                elif raw_id_st == "EXPIRED" or prof_info.get("token_expired"):
+                    identity_status = "EXPIRED"
+                    identity_ok = False
+                else:
+                    identity_status = "UNVERIFIED"
+                    identity_ok = False
+                token_expiration_str = str(prof_info.get("token_expiration_str") or "").strip()
+                raw_exp_ts = prof_info.get("token_expiration_ts")
+                token_expiration_ts = float(raw_exp_ts) if (raw_exp_ts is not None and float(raw_exp_ts) > 0) else 0.0
+                token_expired = bool(prof_info.get("token_expired", False))
+        except Exception:
+            identity_status = "UNVERIFIED"
+            identity_ok = False
 
     scrip_path = os.path.join(cfg.data_dir, "scrip_master.csv")
     resolver = InstrumentResolver()
@@ -369,23 +643,39 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         else {"is_stopped": True}
     )
     is_stopped = bool(stop_state.get("is_stopped", True))
-    report_now = time.time()
+    auth_verified = bool(tok_ok and identity_ok and not token_expired)
     report = format_morning_health_report(
         cfg,
         now_ts=report_now,
-        token_verified=tok_ok,
+        token_verified=auth_verified,
         funds_verified=funds_verified,
         fallback_funds=fallback_funds,
         available_balance=avail_bal,
         master_loaded=master_ok,
         is_stopped=is_stopped,
+        account_identity_status=identity_status,
+        profile_client_id=profile_client_id,
+        token_expiration_str=token_expiration_str,
+        token_expiration_ts=token_expiration_ts,
+        token_expired=token_expired,
     )
     notify_status = dispatch_morning_health_report_once(
         cfg, db, report, now_ts=report_now
     )
-    overall_ok = bool(tok_ok and funds_verified)
+    auth_check_ok = bool(auth_verified and funds_verified)
+    next_session_ready = (
+        "Next trading session readiness: ✅ VERIFIED CHECKS" in report
+        and "Overall result: ✅ SUCCESS" in report
+    )
+    auth_check_label = "PASS" if auth_check_ok else "FAIL"
+    readiness_label = "VERIFIED_CHECKS" if next_session_ready else "REVIEW_REQUIRED"
+    overall_ok = bool(auth_check_ok and next_session_ready)
     summary = (
-        f"token_refresh={'OK' if tok_ok else 'FAIL'}, "
+        f"AUTH_CHECK={auth_check_label}, "
+        f"NEXT_SESSION_READINESS={readiness_label}, "
+        f"token_refresh={'OK' if auth_verified else 'FAIL'}, "
+        f"account_identity={identity_status}, "
+        f"token_expiration={token_expiration_str or 'UNVERIFIED'}, "
         f"funds={'OK' if funds_verified else 'UNVERIFIED'} ({avail_bal:,.2f} INR: {funds_msg}), "
         f"scrip_master={'OK' if master_ok else 'WARN'}, "
         f"emergency_stop={'ACTIVE' if is_stopped else 'INACTIVE'}, "
@@ -407,7 +697,7 @@ def cmd_check_dhan(cfg: AppConfig, stop_mgr: EmergencyStopManager):
     print("=======================================================")
     print("        DHAN API CONNECTION & EXECUTION DIAGNOSTIC      ")
     print("=======================================================")
-    print(f"[*] Client ID           : {cfg.dhan_client_id or 'NOT CONFIGURED'}")
+    print(f"[*] Client ID           : {_mask_account_id(cfg.dhan_client_id) if cfg.dhan_client_id else 'NOT CONFIGURED'}")
     print(f"[*] Token File Location : {cfg.dhan_token_file}")
 
     client = DhanClient(cfg, stop_manager=stop_mgr)
