@@ -426,6 +426,157 @@ class StartupReconciliationGate:
         self._last_matched_oco_ids = matched_gids
         return True, covered, "OK"
 
+
+    def _preflight_zero_id_historical_evidence(
+        self,
+        eligible: List[Dict[str, Any]],
+        trades_by_oid: Dict[str, List[Dict[str, Any]]],
+        full_history: List[Dict[str, Any]],
+        expected_account_id: str,
+        now_ts: float,
+    ) -> Optional[str]:
+        """R01: All zero-ID candidates pass before any journal fill is written.
+
+        Exact broker profile + one authenticated settled holdings snapshot are
+        required. Aggregate all bot-owned shares per security, never separately
+        credit the same holdings quantity to two one-share orders.
+        """
+        missing_id_intents = []
+        required_by_security: Dict[str, int] = {}
+        isins_by_security: Dict[str, str] = {}
+        seen_exchange_orders: Dict[str, str] = {}
+        today_ist = datetime.fromtimestamp(now_ts, tz=IST).date()
+
+        for row in full_history:
+            if not row.get("_broker_attested_no_execution_id"):
+                continue
+            eoid = str(row.get("exchangeOrderId") or "").strip()
+            oid = str(row.get("orderId") or "").strip()
+            if not eoid or eoid in ("0", "None", "null"):
+                return "Historical zero-ID record has no exchange order ID"
+            if eoid in seen_exchange_orders and seen_exchange_orders[eoid] != oid:
+                return "Exchange order ID reused across different historical broker orders"
+            seen_exchange_orders[eoid] = oid
+
+        for intent in eligible:
+            oid = str(intent.get("broker_order_id") or "").strip()
+            candidate_rows = trades_by_oid.get(oid, [])
+            if not any(row.get("_broker_attested_no_execution_id") for row in candidate_rows):
+                continue
+            if len(candidate_rows) != 1:
+                return f"Order {oid}: multiple/mixed historical records with absent exchange trade IDs"
+            row = candidate_rows[0]
+            seg = str(intent.get("exchange_segment") or "").upper()
+            prod = str(intent.get("product_type") or "").upper()
+            if seg not in ("NSE_EQ", "BSE_EQ") or prod != "CNC":
+                return f"Order {oid}: zero-ID fallback restricted to CNC cash equity"
+            qty = int(intent.get("quantity") or 0)
+            if qty <= 0 or int(row.get("tradedQuantity") or 0) != qty:
+                return f"Order {oid}: missing-ID record is not a complete single fill"
+
+            raw_time = str(row.get("exchangeTime") or "")
+            try:
+                exchange_dt = datetime.fromisoformat(
+                    raw_time.replace("Z", "+00:00").replace(" ", "T")
+                )
+                if exchange_dt.tzinfo is None:
+                    exchange_dt = exchange_dt.replace(tzinfo=IST)
+                exchange_ts = exchange_dt.timestamp()
+                trade_date = datetime.fromtimestamp(exchange_ts, tz=IST).date()
+                order_ts = float(intent.get("created_at") or 0)
+                intent_date = datetime.fromtimestamp(order_ts, tz=IST).date()
+            except (ValueError, TypeError, OverflowError):
+                return f"Order {oid}: invalid historical exchange time"
+            if (
+                not order_ts
+                or trade_date != intent_date
+                or trade_date > today_ist
+                or exchange_ts + 60 < order_ts
+            ):
+                return f"Order {oid}: exchange time does not match submitted order date"
+            if str(row.get("dhanClientId") or "") != expected_account_id:
+                return f"Order {oid}: historical account identity mismatch"
+            if str(row.get("securityId") or "") != str(intent.get("security_id") or ""):
+                return f"Order {oid}: historical security identity mismatch"
+            sec = str(intent["security_id"])
+            row_isin = str(row.get("isin") or "").strip().upper()
+            if not row_isin:
+                return f"Order {oid}: missing ISIN required for corroborating broker holdings"
+            if sec in isins_by_security and row_isin != isins_by_security[sec]:
+                return f"Order {oid}: conflicting ISIN for the same security ID"
+            isins_by_security[sec] = row_isin
+            required_by_security[sec] = required_by_security.get(sec, 0) + qty
+            missing_id_intents.append(intent)
+
+        if not missing_id_intents:
+            return None
+
+        profile_fn = getattr(self.broker, "get_authenticated_profile_id", None)
+        if not callable(profile_fn):
+            return "Broker profile identity verification unavailable for zero-ID historical proof"
+        try:
+            profile_acct = str(
+                profile_fn(bypass_test_mode=True, allow_refresh=False) or ""
+            ).strip()
+        except Exception as exc:
+            return f"Broker profile identity verification failed: {type(exc).__name__}"
+        if profile_acct != expected_account_id:
+            return "Broker /profile account missing or differs from historical account"
+
+        ok_hold, holdings, hold_err = self._read_required_broker_collection(
+            "get_holdings", "holdings"
+        )
+        if not ok_hold:
+            return f"Missing-ID historical evidence cannot verify holdings: {hold_err}"
+        holdings_by_security: Dict[str, int] = {}
+        for holding in holdings:
+            sec = str(holding.get("securityId") or "").strip()
+            if sec not in required_by_security:
+                continue
+            if holding.get("dhanClientId") is not None and (
+                str(holding["dhanClientId"]).strip() != expected_account_id
+            ):
+                return f"Broker holdings account mismatch for security {sec}"
+            if str(holding.get("isin") or "").strip().upper() != isins_by_security[sec]:
+                return f"Broker holdings ISIN mismatch/missing for security {sec}"
+            raw_dp_qty = holding.get("dpQty")
+            if isinstance(raw_dp_qty, bool) or not str(raw_dp_qty).strip().isdigit():
+                return f"Invalid settled dpQty in broker holdings for security {sec}"
+            holdings_by_security[sec] = (
+                holdings_by_security.get(sec, 0) + int(raw_dp_qty)
+            )
+
+        # Include previously reconciled bot-owned lots on the same security.
+        # This prevents the same two DP shares from satisfying four bot orders.
+        if self.db and hasattr(self.db, "get_open_positions_lifecycle"):
+            try:
+                previous_lots = self.db.get_open_positions_lifecycle()
+            except Exception:
+                return "Cannot inspect existing bot-owned settled position ledger"
+            if not isinstance(previous_lots, list):
+                return "Malformed bot-owned position ledger"
+            candidate_oids = {
+                str(r.get("broker_order_id") or "") for r in missing_id_intents
+            }
+            for row in previous_lots:
+                sec = str(row.get("security_id") or "").strip()
+                if (
+                    sec in required_by_security
+                    and str(row.get("parent_order_id") or "") not in candidate_oids
+                    and str(row.get("product_type") or "").upper() == "CNC"
+                ):
+                    required_by_security[sec] += max(
+                        0, int(row.get("confirmed_open_qty") or 0)
+                    )
+
+        for sec, expected_qty in required_by_security.items():
+            if holdings_by_security.get(sec, 0) < expected_qty:
+                return (
+                    f"Insufficient verified settled broker holdings for security {sec}: "
+                    f"DP={holdings_by_security.get(sec, 0)}, bot-owned required={expected_qty}"
+                )
+        return None
+
     def _reconcile_unresolved_intents_via_historical_trades(
         self,
         unresolved_intent_rows: List[Dict[str, Any]],
@@ -515,6 +666,14 @@ class StartupReconciliationGate:
             if oid_key:
                 trades_by_oid.setdefault(oid_key, []).append(raw_tr)
 
+        preflight_error = self._preflight_zero_id_historical_evidence(
+            eligible, trades_by_oid, hist_res, expected_acct, eval_now,
+        )
+        if preflight_error:
+            return [], remaining_reasons, (
+                "Historical missing-execution-ID verification blocked: " + preflight_error
+            )
+
         resolved_full_cids: List[str] = []
         for intent in eligible:
             cid = str(intent["correlation_id"])
@@ -545,6 +704,7 @@ class StartupReconciliationGate:
                     expected_exchange_segment=seg,
                     expected_product_type=prod,
                     expected_transaction_type="BUY",
+                    allow_missing_exchange_trade_id=True,
                 )
                 if not ok_v or norm_tr is None:
                     validation_err = v_err
@@ -558,18 +718,34 @@ class StartupReconciliationGate:
                 continue
 
             try:
-                tx_res = self.db.apply_verified_historical_fills(
-                    correlation_id=cid,
-                    broker_order_id=boid,
-                    expected_account_id=intent_acct,
-                    symbol=sym,
-                    security_id=sec_id,
-                    exchange_segment=seg,
-                    product_type=prod,
-                    requested_quantity=req_qty,
-                    verified_trades=validated_for_order,
-                    now=eval_now,
-                )
+                if validated_for_order[0].get("_broker_attested_no_execution_id"):
+                    # Preflight already rejected multi-row/mixed-ID fills,
+                    # incomplete pagination, account and settled-share mismatches.
+                    tx_res = self.db.apply_attested_historical_order_fill(
+                        correlation_id=cid,
+                        broker_order_id=boid,
+                        expected_account_id=intent_acct,
+                        symbol=sym,
+                        security_id=sec_id,
+                        exchange_segment=seg,
+                        product_type=prod,
+                        requested_quantity=req_qty,
+                        attested_trade=validated_for_order[0],
+                        now=eval_now,
+                    )
+                else:
+                    tx_res = self.db.apply_verified_historical_fills(
+                        correlation_id=cid,
+                        broker_order_id=boid,
+                        expected_account_id=intent_acct,
+                        symbol=sym,
+                        security_id=sec_id,
+                        exchange_segment=seg,
+                        product_type=prod,
+                        requested_quantity=req_qty,
+                        verified_trades=validated_for_order,
+                        now=eval_now,
+                    )
             except Exception as db_exc:
                 return (
                     [],
@@ -634,7 +810,10 @@ class StartupReconciliationGate:
                 resolved_full_cids.append(cid)
                 self.last_historical_reconciled_ids.append(boid)
                 logger.info(
-                    f"[RECONCILIATION] Historical trade recovery resolved {cid} (orderId={boid}) -> TRADED ({filled_q}/{req_qty} @ {vwap_p:.4f})"
+                    "[RECONCILIATION] Historical recovery %s orderId=%s -> TRADED "
+                    "(%s/%s at %.4f; evidence=%s)",
+                    cid, boid, filled_q, req_qty, vwap_p,
+                    tx_res.get("evidence_source", "EXCHANGE_TRADE_ID"),
                 )
             else:
                 # H07: Partial historical fill preserves unresolved remainder and blocks startup

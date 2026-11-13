@@ -3393,6 +3393,7 @@ class DhanClient:
         expected_exchange_segment: Optional[str] = None,
         expected_product_type: Optional[str] = None,
         expected_transaction_type: Optional[str] = "BUY",
+        allow_missing_exchange_trade_id: bool = False,
     ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         """
         Strictly validates a single historical trade record from `GET /v2/trades/{from-date}/{to-date}/{page}`.
@@ -3422,14 +3423,30 @@ class DhanClient:
         if isinstance(raw_etid, bool):
             return False, None, "Historical trade record has boolean exchangeTradeId"
         etid = str(raw_etid or "").strip()
-        if (
-            not etid
-            or etid in ("0", "None", "null")
-            or "-TRD-" in etid
-            or "-FILL-" in etid
-            or "-RECON-" in etid
+        missing_exchange_trade_id = not etid or etid in ("0", "None", "null")
+        if not missing_exchange_trade_id and any(
+            marker in etid for marker in ("-TRD-", "-FILL-", "-RECON-")
         ):
             return False, None, f"Historical trade record missing or synthetic exchangeTradeId ({etid!r})"
+        if missing_exchange_trade_id and not allow_missing_exchange_trade_id:
+            return False, None, f"Historical trade record missing or synthetic exchangeTradeId ({etid!r})"
+
+        # R01: Distinguish missing exchange execution IDs from exchange ORDER IDs.
+        # This alternate evidence must undergo further unique-order, date and
+        # broker-holdings checks before it can affect the journal.
+        exchange_order_id = str(item.get("exchangeOrderId") or "").strip()
+        exchange_time = str(item.get("exchangeTime") or "").strip()
+        if missing_exchange_trade_id:
+            if exchange_order_id in ("", "0", "None", "null"):
+                return False, None, "Historical trade missing usable exchangeOrderId for zero-ID fallback"
+            try:
+                exchange_dt = datetime.fromisoformat(
+                    exchange_time.replace("Z", "+00:00").replace(" ", "T")
+                )
+                if exchange_dt.year < 2000 or exchange_dt.year > 2100:
+                    raise ValueError("out-of-range date")
+            except (ValueError, TypeError, OverflowError):
+                return False, None, "Historical trade missing valid exchangeTime for zero-ID fallback"
 
         t_sec = str(item.get("securityId") or "").strip()
         if not t_sec or t_sec in ("0", "None", "null"):
@@ -3484,14 +3501,17 @@ class DhanClient:
         norm = dict(item)
         norm["dhanClientId"] = t_acct
         norm["orderId"] = t_oid
-        norm["exchangeTradeId"] = etid
+        norm["exchangeTradeId"] = None if missing_exchange_trade_id else etid
+        norm["_broker_attested_no_execution_id"] = missing_exchange_trade_id
+        norm["exchangeOrderId"] = exchange_order_id
+        norm["exchangeTime"] = exchange_time
         norm["securityId"] = t_sec
         norm["exchangeSegment"] = t_seg
         norm["productType"] = t_prod
         norm["transactionType"] = t_side
         norm["tradedQuantity"] = qty
         norm["tradedPrice"] = price
-        norm["_has_explicit_exchange_trade_id"] = True
+        norm["_has_explicit_exchange_trade_id"] = not missing_exchange_trade_id
         return True, norm, "OK"
 
     def get_historical_trades_page(
@@ -3564,6 +3584,7 @@ class DhanClient:
                     row,
                     expected_account_id=exp_acct,
                     expected_transaction_type=None,
+                    allow_missing_exchange_trade_id=True,
                 )
                 if not ok_v or norm_row is None:
                     return BrokerReadFailure(
@@ -3665,6 +3686,12 @@ class DhanClient:
                 break
 
             for row in page_res:
+                # Do not deduplicate zero-ID records by a shared "0" or NULL.
+                # Retain every occurrence; order-level recovery will reject
+                # all multi-row/ambiguous missing-ID executions.
+                if row.get("_broker_attested_no_execution_id"):
+                    deduped_trades.append(row)
+                    continue
                 etid = str(row["exchangeTradeId"])
                 sig = (
                     str(row["orderId"]),

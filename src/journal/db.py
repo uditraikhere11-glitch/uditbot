@@ -20,6 +20,7 @@ Implements STEP 08, STEP 14, STEP 16, STEP 24 + V13 Safety Corrections (includin
 from contextlib import contextmanager
 from datetime import date
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -226,6 +227,18 @@ class JournalDB:
                 traded_price REAL,
                 traded_quantity INTEGER,
                 traded_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS broker_attested_historical_fills (
+                account_id TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL,
+                correlation_id TEXT NOT NULL,
+                exchange_order_id TEXT NOT NULL,
+                evidence_fingerprint TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (account_id, broker_order_id),
+                UNIQUE (account_id, exchange_order_id)
             );
 
             CREATE TABLE IF NOT EXISTS protection_orders (
@@ -510,6 +523,7 @@ class JournalDB:
                 "ALTER TABLE fills ADD COLUMN product_type TEXT DEFAULT ''",
                 "ALTER TABLE fills ADD COLUMN parent_order_id TEXT DEFAULT ''",
                 "ALTER TABLE fills ADD COLUMN is_verified_trade INTEGER DEFAULT 1",
+                "ALTER TABLE fills ADD COLUMN evidence_source TEXT DEFAULT 'LEGACY'",
                 "ALTER TABLE outbox ADD COLUMN claimed_at REAL DEFAULT 0.0",
             ]:
                 try:
@@ -551,6 +565,19 @@ class JournalDB:
                     conn.execute("PRAGMA foreign_keys = ON;")
             except Exception:
                 pass
+
+            # R01: nullable exchange_trade_id is deliberate; broker-attested order
+            # evidence has its own unique identity and must not be confused with
+            # a trade identifier issued by an exchange.
+            try:
+                conn.execute("ALTER TABLE fills ADD COLUMN evidence_source TEXT DEFAULT 'LEGACY'")
+            except sqlite3.OperationalError:
+                pass
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_attested_historical_fill_once "
+                "ON fills(broker_order_id) "
+                "WHERE evidence_source='BROKER_HISTORICAL_NO_EXECUTION_ID'"
+            )
 
     # --- Durable Protection-Attempt Lifecycle (Safety Correction A & CV13-01) ---
 
@@ -1392,6 +1419,17 @@ class JournalDB:
 
         with self._get_conn() as conn:
             if verified_flag == 1 and boid:
+                # A later genuine trade ID must be reconciled by an explicit
+                # upgrade, never inserted alongside an existing order-level
+                # broker attestation (which would double-count the position).
+                if conn.execute(
+                    "SELECT 1 FROM broker_attested_historical_fills WHERE broker_order_id = ? LIMIT 1",
+                    (boid,),
+                ).fetchone():
+                    raise ValueError(
+                        f"Exchange trade ID appeared for previously broker-attested order {boid}; "
+                        "manual source-upgrade review required"
+                    )
                 # Remove synthetic order-summary placeholders for this order so real tradebook fills never double-count
                 conn.execute(
                     "DELETE FROM fills WHERE broker_order_id = ? AND is_verified_trade = 0",
@@ -2415,6 +2453,14 @@ class JournalDB:
 
         with self._get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM broker_attested_historical_fills WHERE broker_order_id = ? LIMIT 1",
+                (boid,),
+            ).fetchone():
+                raise ValueError(
+                    f"Order {boid} already has broker-attested no-execution-ID proof; "
+                    "cannot add exchange-ID fills without a separate audited upgrade"
+                )
             intent_row = conn.execute(
                 "SELECT * FROM order_intents WHERE correlation_id = ? LIMIT 1",
                 (cid,),
@@ -2574,6 +2620,238 @@ class JournalDB:
             "resolved_state": resolved_state,
             "newly_inserted_fills": newly_inserted,
             "exchange_trade_ids": etids_sorted,
+        }
+
+
+    def apply_attested_historical_order_fill(
+        self,
+        *,
+        correlation_id: str,
+        broker_order_id: str,
+        expected_account_id: str,
+        symbol: str,
+        security_id: str,
+        exchange_segment: str,
+        product_type: str,
+        requested_quantity: int,
+        attested_trade: Dict[str, Any],
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """R01: Atomic, idempotent single-fill historical broker attestation.
+
+        A missing exchange execution ID is persisted as SQL NULL, never as an
+        invented exchange ID or an exchange order ID. Source, canonical evidence
+        fingerprint and cross-order uniqueness are durable.
+        The caller must first verify full pagination, profile identity and
+        aggregated settled holdings. This method rechecks exact order identity.
+        """
+        from src.broker.dhan_client import DhanClient
+
+        cid = str(correlation_id or "").strip()
+        oid = str(broker_order_id or "").strip()
+        acct = str(expected_account_id or "").strip()
+        sec = str(security_id or "").strip()
+        seg = str(exchange_segment or "").strip().upper()
+        prod = str(product_type or "").strip().upper()
+        req_qty = int(requested_quantity or 0)
+        if not all((cid, oid, acct, sec, seg, prod)) or req_qty <= 0:
+            raise ValueError("Missing broker-attested order identity or quantity")
+        if self.account_id and self.account_id != acct:
+            raise ValueError("Broker-attested account differs from journal account")
+        if seg not in ("NSE_EQ", "BSE_EQ") or prod != "CNC":
+            raise ValueError("Zero-ID attestation is permitted only for CNC cash equity")
+
+        valid, tr, error = DhanClient.validate_historical_trade_record(
+            attested_trade,
+            expected_account_id=acct,
+            expected_order_id=oid,
+            expected_security_id=sec,
+            expected_exchange_segment=seg,
+            expected_product_type=prod,
+            expected_transaction_type="BUY",
+            allow_missing_exchange_trade_id=True,
+        )
+        if not valid or not tr or not tr.get("_broker_attested_no_execution_id"):
+            raise ValueError(f"Not a valid missing-ID historical broker trade: {error}")
+        if int(tr["tradedQuantity"]) != req_qty:
+            raise ValueError("Attested single-fill quantity differs from full order quantity")
+
+        exchange_oid = str(tr["exchangeOrderId"])
+        exchange_time = str(tr["exchangeTime"])
+        try:
+            ex_dt = datetime.datetime.fromisoformat(
+                exchange_time.replace("Z", "+00:00").replace(" ", "T")
+            )
+            if ex_dt.tzinfo is None:
+                ex_dt = ex_dt.replace(tzinfo=IST)
+            trade_ts = ex_dt.timestamp()
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError("Invalid attested exchange timestamp") from exc
+
+        evidence = {
+            "source": "BROKER_HISTORICAL_NO_EXECUTION_ID",
+            "dhanClientId": acct,
+            "orderId": oid,
+            "exchangeOrderId": exchange_oid,
+            "exchangeTradeId": None,
+            "securityId": sec,
+            "exchangeSegment": seg,
+            "productType": prod,
+            "transactionType": "BUY",
+            "isin": str(tr.get("isin") or "").strip(),
+            "exchangeTime": exchange_time,
+            "tradedQuantity": req_qty,
+            "tradedPrice": round(float(tr["tradedPrice"]), 6),
+        }
+        canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        ts = float(now if now is not None else time.time())
+        price = float(tr["tradedPrice"])
+
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            intent = conn.execute(
+                "SELECT * FROM order_intents WHERE correlation_id=? LIMIT 1",
+                (cid,),
+            ).fetchone()
+            if (
+                not intent
+                or str(intent["broker_order_id"] or "") != oid
+                or str(intent["security_id"] or "") != sec
+                or str(intent["exchange_segment"] or "").upper() != seg
+                or str(intent["product_type"] or "").upper() != prod
+                or int(intent["quantity"] or 0) != req_qty
+                or (str(intent["account_id"] or "") and str(intent["account_id"]) != acct)
+            ):
+                raise ValueError("Attested evidence disagrees with durable order intent")
+
+            placed_at = datetime.datetime.fromtimestamp(
+                float(intent["created_at"]), tz=IST
+            ).date()
+            # Same-IST-date execution only in v1; AMO/multi-day recovery
+            # without an exchange execution ID requires separate review.
+            if datetime.datetime.fromtimestamp(trade_ts, tz=IST).date() != placed_at:
+                raise ValueError("Attested trade date differs from order intent IST date")
+            if trade_ts + 60 < float(intent["created_at"]):
+                raise ValueError("Attested exchange timestamp predates order intent")
+
+            previous = conn.execute(
+                "SELECT * FROM broker_attested_historical_fills "
+                "WHERE account_id=? AND broker_order_id=?",
+                (acct, oid),
+            ).fetchone()
+            if previous is not None:
+                if (
+                    str(previous["evidence_fingerprint"]) != fingerprint
+                    or str(previous["correlation_id"]) != cid
+                    or str(previous["exchange_order_id"]) != exchange_oid
+                ):
+                    raise ValueError("Conflicting repeat broker-attestation evidence")
+            else:
+                conn.execute(
+                    "INSERT INTO broker_attested_historical_fills "
+                    "(account_id, broker_order_id, correlation_id, exchange_order_id, "
+                    "evidence_fingerprint, evidence_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (acct, oid, cid, exchange_oid, fingerprint, canonical, ts),
+                )
+
+            prior_fills = conn.execute(
+                "SELECT * FROM fills WHERE broker_order_id=? AND is_verified_trade=1",
+                (oid,),
+            ).fetchall()
+            for old in prior_fills:
+                if (
+                    str(old["evidence_source"] or "") != "BROKER_HISTORICAL_NO_EXECUTION_ID"
+                    or old["exchange_trade_id"] is not None
+                    or int(old["traded_quantity"] or 0) != req_qty
+                    or abs(float(old["traded_price"] or 0.0) - price) > 1e-6
+                    or str(old["security_id"] or "") != sec
+                    or str(old["exchange_segment"] or "").upper() != seg
+                    or str(old["product_type"] or "").upper() != prod
+                    or str(old["transaction_type"] or "").upper() != "BUY"
+                ):
+                    raise ValueError("Existing verified fills conflict with broker attestation")
+            if len(prior_fills) > 1:
+                raise ValueError("Multiple verified fills conflict with single-order attestation")
+            if not prior_fills:
+                conn.execute(
+                    "DELETE FROM fills WHERE broker_order_id=? AND is_verified_trade=0",
+                    (oid,),
+                )
+                conn.execute(
+                    "INSERT INTO fills (broker_order_id, exchange_trade_id, symbol, "
+                    "traded_price, traded_quantity, traded_at, transaction_type, "
+                    "security_id, exchange_segment, product_type, parent_order_id, "
+                    "is_verified_trade, evidence_source) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, 'BUY', ?, ?, ?, ?, 1, ?)",
+                    (
+                        oid, str(symbol or intent["symbol"] or ""), price, req_qty,
+                        trade_ts, sec, seg, prod, oid,
+                        "BROKER_HISTORICAL_NO_EXECUTION_ID",
+                    ),
+                )
+
+            result = conn.execute(
+                "UPDATE order_intents SET state='TRADED', updated_at=? WHERE correlation_id=?",
+                (ts, cid),
+            )
+            if result.rowcount != 1:
+                raise ValueError("Attested intent update failed")
+            result = conn.execute(
+                "UPDATE orders SET status='TRADED', filled_quantity=?, updated_at=? "
+                "WHERE correlation_id=? AND broker_order_id=?",
+                (req_qty, ts, cid, oid),
+            )
+            if result.rowcount != 1:
+                raise ValueError("Attested order record missing or ambiguous")
+            event_payload = json.dumps(
+                {
+                    "correlation_id": cid,
+                    "broker_order_id": oid,
+                    "account_id": acct,
+                    "symbol": str(symbol or intent["symbol"] or ""),
+                    "security_id": sec,
+                    "exchange_segment": seg,
+                    "product_type": prod,
+                    "requested_quantity": req_qty,
+                    "filled_quantity": req_qty,
+                    "vwap": round(price, 4),
+                    "resolved_state": "TRADED",
+                    "exchange_trade_ids": [],
+                    "evidence_source": "BROKER_HISTORICAL_NO_EXECUTION_ID",
+                    "evidence_fingerprint": fingerprint,
+                    "exchange_order_id": exchange_oid,
+                },
+                sort_keys=True,
+            )
+            if not conn.execute(
+                "SELECT 1 FROM system_events "
+                "WHERE event_type='HISTORICAL_FILL_RECONCILED' AND payload=? LIMIT 1",
+                (event_payload,),
+            ).fetchone():
+                conn.execute(
+                    "INSERT INTO system_events "
+                    "(event_type, description, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        "HISTORICAL_FILL_RECONCILED",
+                        f"Broker-attested historical BUY without exchange trade ID: "
+                        f"{oid} ({req_qty}/{req_qty} at {price:.4f})",
+                        event_payload,
+                        ts,
+                    ),
+                )
+
+        return {
+            "correlation_id": cid,
+            "broker_order_id": oid,
+            "requested_quantity": req_qty,
+            "filled_quantity": req_qty,
+            "vwap": round(price, 4),
+            "resolved_state": "TRADED",
+            "newly_inserted_fills": 0 if prior_fills else 1,
+            "exchange_trade_ids": [],
+            "evidence_source": "BROKER_HISTORICAL_NO_EXECUTION_ID",
         }
 
     def repair_interrupted_fill_states(self, now: Optional[float] = None) -> int:
