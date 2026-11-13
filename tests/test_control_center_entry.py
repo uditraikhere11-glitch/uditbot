@@ -82,6 +82,45 @@ class ControlCenterFacadeTests(unittest.TestCase):
         self.assertTrue(auth.permitted_transport(req('control.example')))
         self.assertFalse(auth.permitted_transport(req('control.example','8.8.8.8')))
 
+    def test_insecure_public_http_requires_exact_operator_optin(self):
+        from starlette.requests import Request
+        def remote(scope_scheme="http"):
+            return Request({
+                'type':'http', 'method':'GET', 'scheme':scope_scheme,
+                'path':'/login', 'root_path':'',
+                'headers':[(b'host',b'public.example'),
+                           (b'x-forwarded-for',b'127.0.0.1')],
+                'client':('203.0.113.25', 12345),
+                'server':('0.0.0.0',80),
+            })
+        key = 'UDITBOT_WEBUI_ALLOW_INSECURE_PUBLIC_HTTP'
+        with patch.dict(os.environ, {key:'true'}):
+            self.assertFalse(auth.public_http_explicitly_enabled())
+            self.assertFalse(auth.permitted_transport(remote()))
+            self.assertTrue(auth.cookie_secure(remote()))
+        with patch.dict(os.environ, {key:'I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK'}):
+            self.assertTrue(auth.public_http_explicitly_enabled())
+            self.assertTrue(auth.permitted_transport(remote()))
+            self.assertFalse(auth.cookie_secure(remote()))
+            self.assertTrue(auth.cookie_secure(remote('https')))
+            self.assertTrue(auth.authenticate(PASSWORD, '203.0.113.25'))
+        self.assertFalse(auth.permitted_transport(remote()))
+
+    def test_login_via_public_http_optin_warns_and_cookie_is_not_secure(self):
+        key='UDITBOT_WEBUI_ALLOW_INSECURE_PUBLIC_HTTP'
+        with patch.dict(os.environ, {key:'I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK'}):
+            client = TestClient(app,base_url='http://public.example',follow_redirects=False)
+            warning = client.get('/login')
+            self.assertEqual(warning.status_code, 200)
+            self.assertIn('Public HTTP does not encrypt',warning.text)
+            response = client.post('/login',data={'password': PASSWORD})
+            self.assertEqual(response.status_code, 303)
+            self.assertIn('httponly',response.headers['set-cookie'].lower())
+            self.assertNotIn('; secure',response.headers['set-cookie'].lower())
+            self.assertEqual(client.get('/').status_code,200)
+            self.assertEqual(client.get('/setup').status_code,200)
+            self.assertEqual(client.get('/control/status').status_code,200)
+
     def test_expired_session_is_rejected(self):
         self.login()
         self.assertEqual(self.client.get('/').status_code, 200)
