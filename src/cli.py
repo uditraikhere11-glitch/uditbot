@@ -253,6 +253,10 @@ def format_morning_health_report(
     token_expiration_ts: float = 0.0,
     token_expired: bool = False,
     holiday_calendar_verified=None,
+    reconciliation_ok: bool = True,
+    unresolved_intents_count: int = 0,
+    unprotected_positions_count: int = 0,
+    reconciliation_summary: str = "",
 ) -> str:
     """
     Builds the scheduled 05:00 PM IST after-market Dhan health report (`AUDITBOT — 05:00 PM DHAN HEALTH CHECK`).
@@ -404,6 +408,9 @@ def format_morning_health_report(
         and not fallback_funds
         and master_loaded
         and not is_stopped
+        and reconciliation_ok
+        and int(unresolved_intents_count or 0) == 0
+        and int(unprotected_positions_count or 0) == 0
     )
     token_line = "✅ VERIFIED" if auth_ok else "❌ FAILED"
     if raw_id_status == "VERIFIED" and auth_ok:
@@ -426,7 +433,7 @@ def format_morning_health_report(
     stop_line = "🔴 ACTIVE — NEW ENTRIES BLOCKED" if is_stopped else "✅ INACTIVE"
     readiness_line = "✅ VERIFIED CHECKS" if ready else "⚠️ REVIEW REQUIRED"
     overall_line = "✅ SUCCESS" if ready else "❌ ACTION REQUIRED"
-    return "\n".join((
+    lines = (
         "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
         f"🤖 Instance: <b>{name}</b> | 🕒 {ist:%d %b %Y, %H:%M:%S} IST",
         f"🔑 Dhan authentication: {token_line}",
@@ -438,10 +445,79 @@ def format_morning_health_report(
         f"🛡️ Emergency STOP: {stop_line}",
         f"🚦 Next trading session readiness: {readiness_line}",
         f"📊 <b>Overall result: {overall_line}</b>",
-    ))
+    )
+    if not (reconciliation_ok and int(unresolved_intents_count or 0) == 0
+            and int(unprotected_positions_count or 0) == 0):
+        detail = str(reconciliation_summary or "").strip()
+        if not detail:
+            detail = (
+                f"RECONCILIATION PENDING ({int(unresolved_intents_count or 0)}); "
+                f"UNPROTECTED ({int(unprotected_positions_count or 0)})"
+            )
+        lines = lines[:-2] + (
+            "🧾 Reconciliation: ⚠️ NEW ENTRIES BLOCKED — " + html.escape(detail),
+        ) + lines[-2:]
+    return "\n".join(lines)
 
 
 format_after_market_health_report = format_morning_health_report
+
+
+def format_startup_online_card(
+    cfg: AppConfig,
+    *,
+    allowed_chats_count: int,
+    reconciliation_ok: bool,
+    reconciliation_msg: str = "",
+    unresolved_intents_count: int = 0,
+    unprotected_positions_count: int = 0,
+    is_stopped: bool = False,
+) -> str:
+    """
+    H14: Formats the startup Telegram card with explicit separation between
+    `LISTENER RUNNING`, `NEW ENTRIES BLOCKED` vs `OPEN`, `RECONCILIATION PENDING (N)`,
+    and `PROTECTION UNVERIFIED`. Never claims the bot is ready to place entries when
+    reconciliation is blocked or Emergency STOP is active.
+    """
+    import html
+
+    name = html.escape(str(getattr(cfg, "instance_name", "Audit bot") or "Audit bot"))
+    configured_mode = getattr(cfg, "trading_mode", "UNKNOWN")
+    mode = html.escape(str(getattr(configured_mode, "value", configured_mode)))
+    channel_note = " (monitored channels only)" if mode == "LIVE" else " (including test channel)"
+    unres_n = int(unresolved_intents_count or 0)
+    unprot_n = int(unprotected_positions_count or 0)
+    entries_open = bool(reconciliation_ok and not is_stopped and unres_n == 0 and unprot_n == 0)
+
+    if entries_open:
+        return (
+            f"🟢 <b>{name} Online</b>\n"
+            f"Mode: <code>{mode}</code>\n"
+            f"Listener: <code>LISTENER RUNNING</code> ({allowed_chats_count} channels{channel_note})\n"
+            f"Reconciliation: <code>HEALTHY</code>\n"
+            f"Protection Watcher: <code>ACTIVE (VERIFIED)</code>\n"
+            f"New Entries Gate: <code>OPEN (ACCEPTING SIGNALS)</code>\n"
+            f"Status: Actively listening for trade signals"
+        )
+
+    rec_status = f"RECONCILIATION PENDING ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "HEALTHY"
+    if reconciliation_msg:
+        rec_status = f"{rec_status} — {html.escape(str(reconciliation_msg))}"
+    prot_status = (
+        "PROTECTION UNVERIFIED"
+        if (unprot_n > 0 or "unprotected" in str(reconciliation_msg or "").lower())
+        else "ACTIVE (SUPERVISING)"
+    )
+    return (
+        f"🟡 <b>{name} Online — New Entries Blocked</b>\n"
+        f"Mode: <code>{mode}</code>\n"
+        f"Listener: <code>LISTENER RUNNING</code> ({allowed_chats_count} channels{channel_note})\n"
+        f"Reconciliation: <code>{rec_status}</code>\n"
+        f"Protection Watcher: <code>{prot_status}</code>\n"
+        f"New Entries Gate: <code>NEW ENTRIES BLOCKED</code>\n"
+        f"Status: Listener running; new trading entries are BLOCKED until reconciliation/protection is verified"
+    )
+
 
 
 def dispatch_morning_health_report_once(
@@ -646,6 +722,22 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     )
     is_stopped = bool(stop_state.get("is_stopped", True))
     auth_verified = bool(tok_ok and identity_ok and not token_expired)
+    unres_intents_cnt = 0
+    unprot_pos_cnt = 0
+    local_reconciliation_verified = True
+    try:
+        if not hasattr(db, "get_non_terminal_intents") or not hasattr(db, "get_unprotected_orders"):
+            local_reconciliation_verified = False
+        else:
+            intents = db.get_non_terminal_intents()
+            unprotected = db.get_unprotected_orders()
+            if not isinstance(intents, list) or not isinstance(unprotected, list):
+                local_reconciliation_verified = False
+            else:
+                unres_intents_cnt = len(intents)
+                unprot_pos_cnt = len(unprotected)
+    except Exception:
+        local_reconciliation_verified = False
     report = format_morning_health_report(
         cfg,
         now_ts=report_now,
@@ -660,6 +752,10 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         token_expiration_str=token_expiration_str,
         token_expiration_ts=token_expiration_ts,
         token_expired=token_expired,
+        reconciliation_ok=local_reconciliation_verified and unres_intents_cnt == 0 and unprot_pos_cnt == 0,
+        unresolved_intents_count=unres_intents_cnt,
+        unprotected_positions_count=unprot_pos_cnt,
+        reconciliation_summary=("Local journal health check unavailable" if not local_reconciliation_verified else ""),
     )
     notify_status = dispatch_morning_health_report_once(
         cfg, db, report, now_ts=report_now

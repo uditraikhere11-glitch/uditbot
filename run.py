@@ -179,16 +179,19 @@ async def main():
         asyncio.create_task(outbox_worker.run())
         print("📬 Durable Outbox Worker activated (non-blocking notification pipeline)")
 
-        # Enqueue startup readiness card via durable outbox
+        # Enqueue startup readiness card via durable outbox (H14: separate listener, entry gate, reconciliation & protection)
         if cfg.log_group_id:
-            channel_note = " (monitored channels only)" if cfg.trading_mode.value == "LIVE" else " (including test channel)"
-            startup_card = (
-                f"🟢 <b>{getattr(cfg, 'instance_name', 'Audit bot')} Online</b>\n"
-                f"Mode: <code>{cfg.trading_mode.value}</code>\n"
-                f"Monitoring: {len(allowed_chats)} channels{channel_note}\n"
-                f"Reconciliation: {'Healthy' if rec_ok else 'Blocked/Warning'}\n"
-                f"Protection Watcher: Active\n"
-                f"Status: Actively listening for trade signals"
+            from src.cli import format_startup_online_card
+            pending_cnt = len(pipeline.db.get_non_terminal_intents()) if hasattr(pipeline.db, "get_non_terminal_intents") else 0
+            unprot_cnt = len(pipeline.db.get_unprotected_orders()) if hasattr(pipeline.db, "get_unprotected_orders") else 0
+            startup_card = format_startup_online_card(
+                cfg,
+                allowed_chats_count=len(allowed_chats),
+                reconciliation_ok=rec_ok,
+                reconciliation_msg=rec_msg,
+                unresolved_intents_count=pending_cnt,
+                unprotected_positions_count=unprot_cnt,
+                is_stopped=pipeline.stop_manager.is_stopped(),
             )
             await asyncio.to_thread(pipeline.dispatch_notification, "SYSTEM_STARTUP", startup_card)
 
