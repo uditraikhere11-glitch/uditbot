@@ -913,29 +913,25 @@ class DhanClient:
                             "",
                             f"Dhan account mismatch in JWT payload: expected '{_mask_client_id(expected_id)}', got '{_mask_client_id(jwt_cid)}'",
                         )
-                    # C2 (P0): Never publish a candidate token without verified account identity.
-                    # When AUTH_URL omits dhanClientId (or explicit candidate profile verification
-                    # is requested), verify the candidate against /v2/profile under the token lock
-                    # BEFORE atomic publication to ~/.dhan_token.
-                    if not resp_client_id or getattr(self, "_require_candidate_profile_check", False):
-                        prof = self.verify_profile_and_token_expiry(
-                            allow_refresh=False,
-                            candidate_token=new_token,
+                    # Never trust the claimed client ID in AUTH_URL alone.
+                    # Every candidate must pass an actual GET /v2/profile with
+                    # that candidate token BEFORE sharing/writing it.
+                    prof = self.verify_profile_and_token_expiry(
+                        allow_refresh=False,
+                        candidate_token=new_token,
+                    )
+                    if prof.get("identity_status") == "MISMATCH" or prof.get("identity_mismatch"):
+                        self.last_auth_account_mismatch = True
+                        return (
+                            False, "",
+                            "Dhan /v2/profile candidate account mismatch; token not published",
                         )
-                        if prof.get("identity_status") == "MISMATCH" or prof.get("identity_mismatch"):
-                            self.last_auth_account_mismatch = True
-                            return (
-                                False,
-                                "",
-                                f"Dhan account mismatch in /v2/profile for candidate token: expected '{_mask_client_id(expected_id)}', got '{_mask_client_id(prof.get('profile_client_id'))}'",
-                            )
-                        if not prof.get("identity_verified", False):
-                            return (
-                                False,
-                                "",
-                                f"Candidate token identity unverified before publish ({prof.get('identity_status', 'UNVERIFIED')}): {prof.get('reason', 'missing dhanClientId or /v2/profile unreachable')}",
-                            )
-                    return True, new_token, "Token generated successfully"
+                    if not prof.get("identity_verified", False) or prof.get("token_expired", False):
+                        return (
+                            False, "",
+                            "Dhan /v2/profile candidate token identity unverified; token not published",
+                        )
+                    return True, new_token, "Token generated and account-verified"
                 return False, "", f"Token missing in Dhan response: {resp.text}"
             return False, "", f"Dhan auth rejected TOTP ({resp.status_code}): {resp.text}"
         except Exception as e:
@@ -1330,11 +1326,10 @@ class DhanClient:
                     allow_refresh=False,
                     candidate_token=tok,
                 )
-            except TypeError:
-                payload = self.get_authenticated_profile(
-                    bypass_test_mode=True,
-                    allow_refresh=False,
-                )
+            except (TypeError, AttributeError):
+                # A candidate-unaware verifier must FAIL CLOSED, not verify
+                # the previous self.token and substitute its identity.
+                payload = None
         else:
             payload = self.get_authenticated_profile(
                 bypass_test_mode=True,
@@ -2247,66 +2242,66 @@ class DhanClient:
                 "_ASYNC_AUTH_COORD_STATE", (_threading.Lock(), {})
             )
             raw_tok_file = str(getattr(self.cfg, "dhan_token_file", "") or "").strip()
-            coord_key = (
-                _os.path.abspath(_os.path.expanduser(raw_tok_file))
-                if raw_tok_file
-                else f"acct:{getattr(self.cfg, 'dhan_client_id', '')}:{id(self)}"
+            path_key = (
+                _os.path.realpath(_os.path.abspath(_os.path.expanduser(raw_tok_file)))
+                if raw_tok_file else f"client:{id(self)}"
             )
+            account_key = str(getattr(self.cfg, "dhan_client_id", "") or "").strip()
+            coord_key = (path_key, account_key)
             with coord_lock:
+                # A misconfigured shared token file for DIFFERENT Dhan accounts
+                # must not cause a token from one account to be published/adopted
+                # by the other's authentication recovery worker.
+                conflicting = any(
+                    key[0] == path_key and key[1] != account_key
+                    and item["thread"].is_alive()
+                    for key, item in inflight_map.items()
+                )
+                if conflicting:
+                    logger.error(
+                        "Dhan async recovery blocked: distinct accounts share one active token-file path"
+                    )
+                    return response
                 existing = inflight_map.get(coord_key)
                 if existing is not None and existing["thread"].is_alive():
                     done_event = existing["done_event"]
-                    result_box = existing["result"]
-                    clients_ref = existing["clients"]
-                    clients_ref.add(self)
                 else:
                     done_event = _threading.Event()
-                    result_box = {"ok": False, "token": "", "msg": "in_progress"}
-                    clients_ref = {self}
+                    result_box = {"ok": False, "msg": "in_progress"}
 
                     def _auth_worker() -> None:
                         try:
-                            ok_w, tok_w, msg_w = self.generate_token_with_totp(
+                            ok_w, _, msg_w = self.generate_token_with_totp(
                                 force=False, rejected_token=rejected
                             )
                             result_box["ok"] = bool(ok_w)
-                            result_box["token"] = str(tok_w or "")
                             result_box["msg"] = str(msg_w or "")
-                            if ok_w and tok_w:
-                                for cl in list(clients_ref):
-                                    try:
-                                        cl.token = tok_w
-                                    except Exception:
-                                        pass
                         except Exception as exc:
                             result_box["ok"] = False
-                            result_box["msg"] = str(exc)
+                            result_box["msg"] = type(exc).__name__
                         finally:
                             done_event.set()
 
                     worker = _threading.Thread(
                         target=_auth_worker,
-                        name=f"dhan-auth-recovery-{coord_key[-16:]}",
+                        name="dhan-auth-recovery",
                         daemon=True,
                     )
                     inflight_map[coord_key] = {
                         "thread": worker,
                         "done_event": done_event,
                         "result": result_box,
-                        "clients": clients_ref,
-                        "rejected": rejected,
                     }
                     worker.start()
 
-            finished = done_event.wait(timeout=0.05)
-            if not finished:
-                # Slow external TOTP refresh is running asynchronously in the single-flight
-                # worker; return immediately so 2-second ProtectionWatcher polling never stalls.
+            # Short grace for mocks and fast shared-token adoption only; slow
+            # auth network I/O NEVER blocks the protection watcher cycle.
+            if not done_event.wait(timeout=0.05):
                 return response
-            if not result_box.get("ok"):
-                return response
-            if result_box.get("token") and (not self.token or self.token == rejected):
-                self.token = result_box["token"]
+            # A successful worker writes through the per-file flock. Every
+            # caller re-reads *its own* shared file; there is no broadcast of
+            # token strings into unrelated DhanClient instances.
+            self._sync_shared_token_from_disk()
         else:
             return response
 
