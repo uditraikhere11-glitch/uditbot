@@ -61,19 +61,73 @@ python -m src.control_center_entry --host 127.0.0.1 --port 18080
 
 From an SSH tunnel or on the VM, visit `http://127.0.0.1:18080/login` and confirm `/`, `/setup`, login/logout, and read-only health. Do **not** invoke Start, Stop, Restart or AMO toggles while staging against a LIVE account.
 
-## Production WebUI-only cutover after separate approval
+## Existing VM: reversible WebUI-only startup migration (after independent approval)
 
-1. Verify all source/regression tests pass, and confirm a private/HTTPS ingress exists. Capture `systemctl cat auditbot-web.service` and `systemctl show ... -p ExecStart -p DropInPaths` (a systemd drop-in overrides the main unit).
-2. Back up `/etc/systemd/system/auditbot-web.service` **and every existing** `/etc/systemd/system/auditbot-web.service.d/*.conf` to a restricted root-owned backup directory. Record the running WebUI PID and command.
-3. Set an opt-in systemd drop-in with an explicit `ExecStart=` reset followed by:
+The fresh-install template alone **does not** switch an existing VM. On UditBot,
+the old WebUI was started by an existing `auditbot-web.service.d/override.conf`,
+with `src.setup_app --host 0.0.0.0 --port 80`. This PR now supplies
+`deploy/migrate_existing_webui_to_control_center.sh`, which adds a separate
+later-ordered systemd drop-in and verifies the resulting effective ExecStart.
 
-   `ExecStart=/home/<service-user>/uditbot/venv/bin/python3 -m src.control_center_entry --host 127.0.0.1 --port 80`
+**Do not execute this before the PR has been independently audited and installed
+on the intended VM.** Do not copy source between UditBot and AmanBot blindly.
 
-   Replace the path with the verified actual VM checkout, not another VM's path.
-4. `sudo systemctl daemon-reload` and restart **auditbot-web.service only**. Verify `systemctl is-active`, PID/ExecStart and local GET `/login` (200); unauthenticated `/` (303); authenticated `/` and `/setup` (200). Confirm the browser can reach the verified private/HTTPS ingress.
-5. If any check fails, restore the original unit and all drop-ins, reload systemd and restart **auditbot-web.service only**. The original `src.setup_app` will again be served at `/`.
+The operator-requested direct public HTTP mode is deliberately insecure:
+interception of the password or session permits takeover of the WebUI.
+For an encrypted alternative, use the loopback/tunnel configuration described above.
 
-**Never restart `trading_bot.service` or change any order journal while switching the WebUI.** The installer intentionally preserves an existing WebUI unit instead of forcing a cutover.
+First, from the **actual WebUI service user's** shell on the **intended VM**:
+
+```bash
+cd ~/uditbot
+venv/bin/python3 -m src.webui_password provision
+sudo bash deploy/migrate_existing_webui_to_control_center.sh --check-public-http
+```
+
+The provision command prompts privately for a strong password (entered twice).
+It saves a salted, private verifier, not a plaintext password. If provisioning or
+preflight fails, **stop** and inspect the error; do not bypass permissions.
+The read-only preflight discovers the live WebUI WorkingDirectory, service User,
+effective existing ExecStart and password readiness. It does not alter systemd
+or restart services.
+
+After the **separate approval to activate** the unencrypted public-HTTP mode:
+
+```bash
+cd ~/uditbot
+sudo env UDITBOT_CONFIRM_PUBLIC_HTTP_RISK=I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK \
+  bash deploy/migrate_existing_webui_to_control_center.sh --apply-public-http
+```
+
+This backs up the existing unit/drop-ins to a root-private timestamped directory,
+writes **only** the migration-owned drop-in, performs `systemctl daemon-reload`,
+validates `ExecStart` and the WebUI-only HTTP environment opt-in, restarts
+**only** `auditbot-web.service`, and locally checks that `/login` serves the
+password form and unauthenticated `/`, `/setup` and `/control/status`
+redirect to `/login`. If activation fails, the migration attempts to restore
+the old WebUI automatically. Do not claim remote access is secure: port 80 is
+plaintext HTTP.
+
+Expected URL after successful cutover:
+`http://<existing-VM-IP>/login`. One login opens Control Center `/` and
+the original Setup at `/setup`. The migration does not verify authenticated
+Setup writes or execute trading controls; those remain separate review gates.
+
+**Immediate rollback to previous WebUI startup** (does not change the password
+verifier and does not restart trading):
+
+```bash
+cd ~/uditbot
+sudo bash deploy/migrate_existing_webui_to_control_center.sh --rollback
+```
+
+Rollback removes the uniquely marked PR78 drop-in, reloads systemd, and restarts
+only `auditbot-web.service`; all pre-existing base units and override files
+remain intact. Review `systemctl cat auditbot-web.service` and the WebUI journal
+if another override or an unrelated service failure prevents either startup.
+
+No automatic VM deployment, trading service restart, order journal edit,
+`.env` replacement, broker call or token modification is performed by this PR.
 
 ## Known limitation
 
