@@ -1,21 +1,16 @@
-"""Opt-in, authenticated Control Center facade around unchanged AuditBot Setup.
+"""Password-only, loopback-gated Control Center around unchanged AuditBot Setup.
 
-The legacy src.setup_app module and all existing trading/business logic remain
-byte-for-byte unchanged. Deployment must explicitly switch the WebUI process to
-``python -m src.control_center_entry`` after independent approval.
+The original Setup application and trading service are not rewritten.
+Do not bind to public HTTP; deploy via a private encrypted tunnel or local
+TLS-terminating proxy after operator approval.
 """
 from __future__ import annotations
 
-import base64
-import binascii
-import hashlib
-import hmac
 import os
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
-from src.config import parse_env_dict
 from src.control_center_backend import register_control_center_routes
 from src.control_center_ui import render_control_center
 from src.setup_app import (
@@ -24,58 +19,88 @@ from src.setup_app import (
     app as legacy_setup_app,
     get_setup_page,
 )
+from src import webui_password as auth
 
 app = FastAPI(title="UDITBOT — Control Center")
 register_control_center_routes(app, SETUP_CSRF_TOKEN)
 
 
-def _password_hash() -> str:
-    """Require explicit operator provisioning; no insecure hard-coded defaults."""
-    target = str(os.environ.get("UDITBOT_WEBUI_PASSWORD_SHA256") or "").strip().lower()
-    if not target:
-        try:
-            target = str(parse_env_dict(".env").get("UDITBOT_WEBUI_PASSWORD_SHA256") or "").strip().lower()
-        except (OSError, ValueError):
-            return ""
-    return target if len(target) == 64 and all(ch in "0123456789abcdef" for ch in target) else ""
-
-
-def _valid_basic_auth(header: str, expected_digest: str) -> bool:
-    if not header.startswith("Basic "):
-        return False
-    try:
-        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
-        username, password = decoded.split(":", 1)
-    except (binascii.Error, UnicodeError, ValueError):
-        return False
-    supplied = hashlib.sha256(password.encode("utf-8")).hexdigest()
-    return hmac.compare_digest(username, "uditbot") and hmac.compare_digest(supplied, expected_digest)
-
-
 @app.middleware("http")
 async def require_operator_login(request: Request, call_next):
-    """Gate *all* routes, including mounted legacy POST /setup/service-control."""
-    # Refuse direct non-TLS remote use. HTTPS reverse proxies and loopback
-    # SSH/IAP tunnels remain supported; never offer a Basic challenge to a
-    # remote plaintext HTTP client.
-    client_host = request.client.host if request.client else ""
-    if request.url.scheme != "https" and client_host not in ("127.0.0.1", "::1", "testclient"):
-        return PlainTextResponse("Secure HTTPS or a loopback tunnel is required", status_code=426,
-                                 headers={"Cache-Control": "no-store"})
-    expected = _password_hash()
-    if not expected:
+    """Single outer gate for the Control Center and ALL mounted Setup routes."""
+    if not auth.permitted_transport(request):
         return PlainTextResponse(
-            "UDITBOT Control Center is inactive: operator authentication has not been configured.",
+            "Private tunnel or verified local TLS proxy required", status_code=403,
+            headers={"Cache-Control": "no-store"},
+        )
+    if not auth.password_configured():
+        return PlainTextResponse(
+            "Control Center password not provisioned. Run: python -m src.webui_password provision",
             status_code=503, headers={"Cache-Control": "no-store"},
         )
-    if not _valid_basic_auth(request.headers.get("authorization", ""), expected):
-        return PlainTextResponse(
-            "Operator authentication required", status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="UDITBOT Control Center"',
-                     "Cache-Control": "no-store"},
+    if request.url.path not in ("/login", "/logout") and not auth.valid_session(
+        request.cookies.get(auth.cookie_name(), "")
+    ):
+        return RedirectResponse("/login", status_code=303) if request.method in ("GET", "HEAD") else PlainTextResponse(
+            "Authentication required", status_code=401,
         )
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+_LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UDITBOT — Unlock</title><style>
+:root{font-family:system-ui,-apple-system,sans-serif;color-scheme:dark}
+body{background:#0b0f19;color:#f1f5f9;min-height:100svh;display:grid;place-items:center;margin:0;padding:18px}
+main{width:min(100%,390px);background:#111726;border:1px solid #26334d;border-radius:20px;padding:30px}
+h1{text-align:center;margin:0 0 10px}p{text-align:center;color:#94a3b8}
+label{display:block;margin:22px 0 8px}input,button{font:inherit;width:100%;min-height:50px;box-sizing:border-box;border-radius:10px}
+input{background:#0b0f19;color:#fff;border:1px solid #64748b;padding:12px}
+button{background:#047857;color:#fff;border:0;margin-top:18px;font-weight:700;cursor:pointer}
+.notice{color:#fda4af;min-height:1.3em;font-size:14px}</style></head><body>
+<main><h1>🔒 UDITBOT</h1><p>One password for Control Center and Setup</p>
+<p class="notice">__MESSAGE__</p><form method="post" action="/login">
+<label for="password">WebUI password</label><input id="password" type="password" name="password" autocomplete="current-password" required autofocus>
+<button type="submit">Unlock Control Center</button></form></main></body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return HTMLResponse(_LOGIN_PAGE.replace("__MESSAGE__", ""))
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    if auth.blocked(ip):
+        return HTMLResponse(_LOGIN_PAGE.replace("__MESSAGE__", "Too many attempts. Try later."), status_code=429)
+    if "application/x-www-form-urlencoded" not in request.headers.get("content-type", ""):
+        return PlainTextResponse("Form encoded password required", status_code=415)
+    if len(await request.body()) > 2048:
+        return PlainTextResponse("Form too large", status_code=413)
+    form = await request.form()
+    password = form.get("password")
+    if not isinstance(password, str) or not auth.authenticate(password, ip):
+        return HTMLResponse(_LOGIN_PAGE.replace("__MESSAGE__", "Invalid password"), status_code=401)
+    token = auth.start_session()
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(auth.cookie_name(), token, max_age=8*3600, httponly=True,
+                        secure=auth.cookie_secure(request), samesite="strict", path="/")
+    return response
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    form = await request.form()
+    if form.get("csrf_token") != SETUP_CSRF_TOKEN:
+        return PlainTextResponse("Invalid CSRF token", status_code=403)
+    auth.end_session(request.cookies.get(auth.cookie_name(), ""))
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(auth.cookie_name(), path="/")
     return response
 
 
@@ -117,4 +142,6 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=80)
     args = parser.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port)
+    if args.host not in ("127.0.0.1", "::1", "localhost"):
+        parser.error("Control Center binds to loopback only; use a private tunnel or local HTTPS proxy")
+    uvicorn.run(app, host=args.host, port=args.port, proxy_headers=False)

@@ -1029,11 +1029,13 @@ def cmd_service_control(cfg: AppConfig, action: str, args: list) -> int:
 
 
 def cmd_web(port: int = 8080, host: str = "127.0.0.1"):
-    """STEP 06: Binds setup web UI strictly to localhost (127.0.0.1) by default."""
-    print(f"Starting Audit Bot Setup Web Interface on http://{host}:{port}...")
+    """WebUI Control Center, loopback only; original Setup remains at /setup."""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise ValueError("Control Center requires loopback and a private/HTTPS ingress")
+    print(f"Starting UDITBOT Control Center on http://{host}:{port}...")
     import uvicorn
-    from src.setup_app import app
-    uvicorn.run(app, host=host, port=port)
+    from src.control_center_entry import app
+    uvicorn.run(app, host=host, port=port, proxy_headers=False)
 
 
 def main():
