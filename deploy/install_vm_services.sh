@@ -246,9 +246,13 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
+# Fresh WebUI provisioning is explicit: never boot an unconfigured login screen.
+if [[ "$WEB_EXISTED" == 0 && ! -f "$REPO_DIR/data/webui_password.json" ]]; then
+    fail "Provision one-password WebUI first: $REPO_DIR/venv/bin/python3 -m src.webui_password provision"
+fi
 cat >"$TMP/auditbot-web.service" <<EOF
 [Unit]
-Description=AuditBot WebUI (localhost-only; setup dashboard)
+Description=UDITBOT Control Center (localhost-only; password protected)
 After=network.target
 
 [Service]
@@ -257,7 +261,7 @@ User=$BOT_USER
 Group=$BOT_USER
 WorkingDirectory=$REPO_DIR
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$REPO_DIR/venv/bin/python3 -m src.setup_app --host 127.0.0.1 --port 80
+ExecStart=$REPO_DIR/venv/bin/python3 -m src.control_center_entry --host 127.0.0.1 --port 80
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -311,4 +315,4 @@ if [[ "$TRADING_EXISTED" == 0 && "$BOOT" == 1 ]]; then
 fi
 printf '\nProvisioning finished. Existing service units were not overwritten.\n'
 printf 'Trading bot not started or restarted by this installer.\n'
-printf 'Fresh WebUI defaults to http://127.0.0.1:80 (SSH tunnel required).\n'
+printf 'Fresh WebUI Control Center defaults to http://127.0.0.1:80 (private SSH tunnel or local TLS proxy required).\n'

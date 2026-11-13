@@ -72,7 +72,7 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
   <div class="logo"><div class="logo-icon" aria-hidden="true">🤖</div><div>
     <h1>UDITBOT</h1><div class="subtitle">Control Center · Verified status, never assumed</div>
   </div></div>
-  <a class="setup" href="/setup" aria-label="Open full Setup page">⚙ Setup</a>
+  <div style="display:flex;gap:8px;align-items:center"><a class="setup" href="/setup" aria-label="Open full Setup page">⚙ Setup</a><form action="/logout" method="post"><input type="hidden" name="csrf_token" value="__CSRF_TOKEN__"><button type="submit">Logout</button></form></div>
 </header>
 <section aria-label="Bot operating state">
   <div class="grid">
