@@ -1,8 +1,8 @@
-"""Password-only, loopback-gated WebUI authentication; no trading-engine imports.
+"""Password-only WebUI authentication with an explicit insecure HTTP opt-in.
 
-Only access through an authenticated SSH/VPN tunnel or a TLS-terminating
-reverse proxy connecting to loopback. Never present a password form directly
-over a public plaintext HTTP connection.
+Default requires loopback or trusted encrypted ingress. The optional public
+plaintext HTTP mode transmits passwords and session tokens without encryption;
+only the operator may enable this acknowledged-risk compatibility mode.
 """
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ _SESSION_SECONDS = 8 * 3600
 _MAX_FAILURES = 5
 _LOCK_SECONDS = 300
 _COOKIE = "uditbot_webui_session"
+_PUBLIC_HTTP_ENV = "UDITBOT_WEBUI_ALLOW_INSECURE_PUBLIC_HTTP"
+_PUBLIC_HTTP_CONFIRM = "I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK"
 _lock = threading.RLock()
 _sessions: dict[str, tuple[float, str]] = {}
 _failures: dict[str, tuple[int, float]] = {}
@@ -168,17 +170,26 @@ def cookie_name() -> str:
     return _COOKIE
 
 
+def public_http_explicitly_enabled() -> bool:
+    """Never enable public plaintext HTTP by accident or from a browser input."""
+    return os.environ.get(_PUBLIC_HTTP_ENV, "") == _PUBLIC_HTTP_CONFIRM
+
+
 def cookie_secure(request: Request) -> bool:
-    """HTTPS browser cookies are Secure; HTTP permitted only via local tunnel."""
+    """A Secure cookie will not work on explicit plaintext HTTP (known risk)."""
+    if public_http_explicitly_enabled():
+        return request.url.scheme == "https"
     return request.url.hostname not in ("127.0.0.1", "localhost", "::1")
 
 
 def permitted_transport(request: Request) -> bool:
-    """Reject all direct remote clients, even with spoofed proxy/IAP headers."""
+    """Require loopback by default; opt-in permits remote peers without trusting headers."""
     host = request.client.host if request.client else ""
-    return host in ("127.0.0.1", "::1") or (
-        host == "testclient" and os.environ.get("AUDITBOT_TEST_ISOLATION") == "1"
-    )
+    if host in ("127.0.0.1", "::1"):
+        return True
+    if host == "testclient" and os.environ.get("AUDITBOT_TEST_ISOLATION") == "1":
+        return True
+    return public_http_explicitly_enabled()
 
 
 def cli() -> None:
