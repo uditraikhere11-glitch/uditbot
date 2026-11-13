@@ -1,0 +1,24 @@
+name: Temporary PR78 exact review snapshot
+on:
+  push:
+    branches: [audit/pr78-source-snapshot-20261114]
+    paths: ['.github/workflows/pr78-source-snapshot.yml']
+permissions:
+  contents: read
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive exact PR78 source
+        run: |
+          git archive --format=tar HEAD | gzip -9 > source.tar.gz
+          git rev-parse HEAD > branch_sha.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr78-exact-source-for-audit
+          path: |
+            source.tar.gz
+            branch_sha.txt
+          retention-days: 1
