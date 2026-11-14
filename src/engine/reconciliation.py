@@ -180,6 +180,9 @@ class StartupReconciliationGate:
         # ProtectionWatcher thread. Only one bounded background recheck may run.
         self._historical_background_lock = threading.Lock()
         self._historical_background_retry_after = 0.0
+        self._in_startup_reconciliation_pass: bool = False
+        self._active_pass_holdings: Optional[List[Dict[str, Any]]] = None
+        self._active_pass_forever_orders: Optional[List[Dict[str, Any]]] = None
 
     @property
     def is_accepting_entries(self) -> bool:
@@ -532,6 +535,8 @@ class StartupReconciliationGate:
         )
         if not ok_hold:
             return f"Missing-ID historical evidence cannot verify holdings: {hold_err}"
+        if getattr(self, "_in_startup_reconciliation_pass", False):
+            self._active_pass_holdings = list(holdings)
         holdings_by_security: Dict[str, int] = {}
         for holding in holdings:
             sec = str(holding.get("securityId") or "").strip()
@@ -546,8 +551,13 @@ class StartupReconciliationGate:
             raw_dp_qty = holding.get("dpQty")
             if isinstance(raw_dp_qty, bool) or not str(raw_dp_qty).strip().isdigit():
                 return f"Invalid settled dpQty in broker holdings for security {sec}"
+            dp_q = int(raw_dp_qty)
+            raw_tot_qty = holding.get("totalQty")
+            if raw_tot_qty is not None:
+                if isinstance(raw_tot_qty, bool) or not str(raw_tot_qty).strip().isdigit() or int(raw_tot_qty) < dp_q:
+                    return f"Inconsistent totalQty ({raw_tot_qty!r}) vs dpQty ({dp_q}) in broker holdings for security {sec}"
             holdings_by_security[sec] = (
-                holdings_by_security.get(sec, 0) + int(raw_dp_qty)
+                holdings_by_security.get(sec, 0) + dp_q
             )
 
         # Include previously reconciled bot-owned lots on the same security.
@@ -679,6 +689,9 @@ class StartupReconciliationGate:
             )
 
         resolved_full_cids: List[str] = []
+        batch_fo_fetched: bool = False
+        batch_fo_ok: bool = False
+        batch_fo_list: Optional[List[Dict[str, Any]]] = None
         for intent in eligible:
             cid = str(intent["correlation_id"])
             boid = str(intent["broker_order_id"]).strip()
@@ -761,12 +774,31 @@ class StartupReconciliationGate:
             vwap_p = float(tx_res["vwap"])
             resolved_st = str(tx_res["resolved_state"])
 
-            ok_fo, ver_prot_q, _ = self._compute_verified_oco_for_order(
-                security_id=sec_id,
-                exchange_segment=seg,
-                product_type=prod,
-                expected_account_id=intent_acct,
-            )
+            if not batch_fo_fetched:
+                batch_fo_fetched = True
+                if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_forever_orders is not None:
+                    batch_fo_ok = True
+                    batch_fo_list = self._active_pass_forever_orders
+                elif hasattr(self.broker, "get_forever_orders"):
+                    batch_fo_ok, fo_rows_res, _ = self._read_required_broker_collection("get_forever_orders", "forever_orders")
+                    if batch_fo_ok:
+                        batch_fo_list = fo_rows_res
+                        if getattr(self, "_in_startup_reconciliation_pass", False):
+                            self._active_pass_forever_orders = list(fo_rows_res)
+                else:
+                    batch_fo_ok = True
+                    batch_fo_list = []
+
+            if batch_fo_ok and batch_fo_list is not None:
+                ok_fo, ver_prot_q, _ = self._compute_verified_oco_for_order(
+                    security_id=sec_id,
+                    exchange_segment=seg,
+                    product_type=prod,
+                    expected_account_id=intent_acct,
+                    forever_orders=batch_fo_list,
+                )
+            else:
+                ok_fo, ver_prot_q = False, 0
             if not ok_fo:
                 ver_prot_q = 0
 
@@ -936,11 +968,15 @@ class StartupReconciliationGate:
 
         # When open exposure exists, required protection reads must succeed
         forever_orders: List[Dict[str, Any]] = []
-        if hasattr(self.broker, "get_forever_orders"):
+        if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_forever_orders is not None:
+            forever_orders = list(self._active_pass_forever_orders)
+        elif hasattr(self.broker, "get_forever_orders"):
             ok_fo, fo_list, fo_msg = self._read_required_broker_collection("get_forever_orders", "forever_orders")
             if not ok_fo:
                 return False, fo_msg
             forever_orders = fo_list
+            if getattr(self, "_in_startup_reconciliation_pass", False):
+                self._active_pass_forever_orders = list(fo_list)
 
         super_orders: List[Dict[str, Any]] = []
         if hasattr(self.broker, "get_super_orders"):
@@ -1096,10 +1132,18 @@ class StartupReconciliationGate:
             or ""
         ).strip()
 
-        # Check live holdings if get_holdings is available on broker
+        # Check live holdings if get_holdings is available on broker (reusing in-pass snapshot if already fetched)
         holdings_by_sec: Dict[str, int] = {}
         has_holdings_api = False
-        if hasattr(self.broker, "get_holdings"):
+        if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_holdings is not None:
+            has_holdings_api = True
+            for h in self._active_pass_holdings:
+                if isinstance(h, dict):
+                    s_id = str(h.get("securityId") or "").strip()
+                    t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
+                    if s_id:
+                        holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+        elif hasattr(self.broker, "get_holdings"):
             try:
                 h_res = self.broker.get_holdings()
                 if isinstance(h_res, BrokerReadFailure) or getattr(h_res, "ok", True) is False:
@@ -1107,6 +1151,8 @@ class StartupReconciliationGate:
                     return False, f"Broker holdings read failed while verifying settled bot positions: {err_h}"
                 if isinstance(h_res, list):
                     has_holdings_api = True
+                    if getattr(self, "_in_startup_reconciliation_pass", False):
+                        self._active_pass_holdings = list(h_res)
                     for h in h_res:
                         if isinstance(h, dict):
                             s_id = str(h.get("securityId") or "").strip()
@@ -1130,11 +1176,15 @@ class StartupReconciliationGate:
                 )
 
         forever_orders: List[Dict[str, Any]] = []
-        if hasattr(self.broker, "get_forever_orders"):
+        if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_forever_orders is not None:
+            forever_orders = list(self._active_pass_forever_orders)
+        elif hasattr(self.broker, "get_forever_orders"):
             ok_fo, fo_list, fo_msg = self._read_required_broker_collection("get_forever_orders", "forever_orders")
             if not ok_fo:
                 return False, fo_msg
             forever_orders = fo_list
+            if getattr(self, "_in_startup_reconciliation_pass", False):
+                self._active_pass_forever_orders = list(fo_list)
 
         forever_groups: Dict[str, List[Dict[str, Any]]] = {}
         for row in forever_orders:
@@ -1301,6 +1351,15 @@ class StartupReconciliationGate:
                 oid,
             )
 
+    def _fail_reconciliation_locked(self, reason: str, starting_halt_generation: int) -> Tuple[bool, str]:
+        with self._entry_state_lock:
+            self._accepting_entries = False
+            self.state = ReconciliationState.BLOCKED
+            if self._halt_generation != starting_halt_generation and self.last_error:
+                return False, self.last_error
+            self.last_error = reason
+            return False, self.last_error
+
     def run_startup_reconciliation(self) -> Tuple[bool, str]:
         """
         Executes fail-closed startup reconciliation before listener accepts live trades.
@@ -1312,225 +1371,275 @@ class StartupReconciliationGate:
                 self.state = ReconciliationState.RECONCILING
                 self._accepting_entries = False
             self.last_historical_reconciled_ids = []
-
-            # 0. Repair any interrupted SQLite fill/order state before querying broker (H09)
-            if self.db and hasattr(self.db, "repair_interrupted_fill_states"):
-                try:
-                    self.db.repair_interrupted_fill_states()
-                except Exception as rep_exc:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = f"Failed to repair interrupted SQLite fill state: {rep_exc}"
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
-
-            # H09 post-commit crash window: fill journal may have committed just
-            # before the process died, leaving watcher/lifecycle unpersisted.
+            self._in_startup_reconciliation_pass = True
+            self._active_pass_holdings = None
+            self._active_pass_forever_orders = None
             try:
-                self._restore_committed_historical_watcher_records()
-            except Exception as restore_exc:
-                self.state = ReconciliationState.BLOCKED
-                self.last_error = f"Historical watcher restoration failed: {restore_exc}"
-                logger.critical("[RECONCILIATION] %s", self.last_error)
-                return False, self.last_error
+                return self._run_startup_reconciliation_inner(starting_halt_generation)
+            finally:
+                self._in_startup_reconciliation_pass = False
+                self._active_pass_holdings = None
+                self._active_pass_forever_orders = None
 
-            # 1. Check emergency stop first (H13: allow historical read-only recovery first if intents pending,
-            #    but NEVER open the entry gate when Emergency STOP is active!)
-            stop_active_at_start = bool(self.stop_manager.is_stopped())
+    def _run_startup_reconciliation_inner(self, starting_halt_generation: int) -> Tuple[bool, str]:
 
-            # 2. Verify broker connection and fund limits
+        # 0. Repair any interrupted SQLite fill/order state before querying broker (H09)
+        if self.db and hasattr(self.db, "repair_interrupted_fill_states"):
             try:
-                ok, avail, msg = self.broker.get_fund_limits()
-                if not ok:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = f"Broker funds check failed: {msg}"
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
-            except Exception as e:
+                self.db.repair_interrupted_fill_states()
+            except Exception as rep_exc:
                 self.state = ReconciliationState.BLOCKED
-                self.last_error = f"Broker connection exception: {e}"
+                self.last_error = f"Failed to repair interrupted SQLite fill state: {rep_exc}"
                 logger.critical(f"[RECONCILIATION] {self.last_error}")
                 return False, self.last_error
 
-            # 3. Query broker trade book and positions (Safety Correction C.A: fail closed on read error/malformed)
-            if hasattr(self.broker, "get_trade_book"):
-                ok_tb, trade_book, tb_msg = self._read_required_broker_collection("get_trade_book", "trade_book")
-                if not ok_tb:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = tb_msg
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
+        # H09 post-commit crash window: fill journal may have committed just
+        # before the process died, leaving watcher/lifecycle unpersisted.
+        try:
+            self._restore_committed_historical_watcher_records()
+        except Exception as restore_exc:
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = f"Historical watcher restoration failed: {restore_exc}"
+            logger.critical("[RECONCILIATION] %s", self.last_error)
+            return False, self.last_error
 
-                for trade in trade_book:
-                    if trade.get("orderId") and trade.get("exchangeTradeId") and hasattr(self.db, "record_fill"):
-                        try:
-                            self.db.record_fill(
-                                broker_order_id=str(trade["orderId"]),
-                                exchange_trade_id=str(trade["exchangeTradeId"]),
-                                symbol=str(trade.get("tradingSymbol") or trade.get("customSymbol") or ""),
-                                traded_price=float(trade.get("tradedPrice") or 0.0),
-                                traded_quantity=int(trade.get("tradedQuantity") or 0),
-                                transaction_type=str(trade.get("transactionType") or "BUY").upper(),
-                                security_id=str(trade.get("securityId") or ""),
-                                exchange_segment=str(trade.get("exchangeSegment") or ""),
-                                product_type=str(trade.get("productType") or ""),
-                                is_verified_trade=True,
-                            )
-                        except Exception as fill_exc:
-                            # P1: Never silently swallow fill persistence failures!
-                            self.state = ReconciliationState.BLOCKED
-                            self.last_error = f"Failed to persist broker trade fill for order {trade.get('orderId')}: {fill_exc}"
-                            logger.critical(f"[RECONCILIATION] {self.last_error}")
-                            if hasattr(self.db, "record_system_event"):
-                                try:
-                                    self.db.record_system_event("FILL_PERSISTENCE_ERROR", self.last_error)
-                                except Exception:
-                                    pass
-                            return False, self.last_error
+        # 1. Check emergency stop first (H13: allow historical read-only recovery first if intents pending,
+        #    but NEVER open the entry gate when Emergency STOP is active!)
+        stop_active_at_start = bool(self.stop_manager.is_stopped())
 
-            positions: List[Dict[str, Any]] = []
-            if hasattr(self.broker, "get_positions"):
-                ok_pos, pos_list, pos_msg = self._read_required_broker_collection("get_positions", "positions")
-                if not ok_pos:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = pos_msg
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
-                positions = pos_list
+        # 2. Verify broker connection and fund limits
+        try:
+            ok, avail, msg = self.broker.get_fund_limits()
+            if not ok:
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = f"Broker funds check failed: {msg}"
+                logger.critical(f"[RECONCILIATION] {self.last_error}")
+                return False, self.last_error
+        except Exception as e:
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = f"Broker connection exception: {e}"
+            logger.critical(f"[RECONCILIATION] {self.last_error}")
+            return False, self.last_error
 
-            # 4. Reconcile all non-terminal intents from journal (current-day book first, then bounded historical fallback)
-            try:
-                if hasattr(self.db, "get_non_terminal_intents"):
-                    pending_intents = self.db.get_non_terminal_intents()
-                else:
-                    pending_intents = self.db.get_unknown_intents()
+        # 3. Query broker trade book and positions (Safety Correction C.A: fail closed on read error/malformed)
+        if hasattr(self.broker, "get_trade_book"):
+            ok_tb, trade_book, tb_msg = self._read_required_broker_collection("get_trade_book", "trade_book")
+            if not ok_tb:
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = tb_msg
+                logger.critical(f"[RECONCILIATION] {self.last_error}")
+                return False, self.last_error
 
-                unresolved_intents: List[str] = []
-                needs_historical_fallback: List[Dict[str, Any]] = []
-                if pending_intents:
-                    logger.warning(f"[RECONCILIATION] Found {len(pending_intents)} pending intent(s) to reconcile.")
-                    order_book: List[Dict[str, Any]] = []
-                    if hasattr(self.broker, "get_order_book"):
-                        ok_ob, ob_list, _ = self._read_required_broker_collection("get_order_book", "order_book")
-                        if ok_ob:
-                            order_book = ob_list
-
-                    for intent in pending_intents:
-                        corr_id = intent["correlation_id"]
-                        broker_oid = intent.get("broker_order_id")
-                        st = self._lookup_intent_at_broker(corr_id, broker_oid, order_book, intent=intent)
-
-                        if isinstance(st, dict) and st.get("orderId"):
-                            order_status = str(st.get("orderStatus", "PENDING")).upper()
-                            resolved_broker_id = str(st.get("orderId"))
-                            filled_qty = int(st.get("filledQty") or 0)
-                            self.db.update_order_intent(corr_id, state=order_status, broker_order_id=resolved_broker_id)
-                            logger.info(f"[RECONCILIATION] Resolved intent {corr_id} -> {order_status} (Broker ID: {resolved_broker_id})")
-
-                            existing_in_watcher = (
-                                hasattr(self.watcher, "pending")
-                                and isinstance(self.watcher.pending, dict)
-                                and resolved_broker_id in self.watcher.pending
-                            )
-                            if order_status not in ("CANCELLED", "REJECTED", "EXPIRED") or filled_qty > 0 or existing_in_watcher:
-                                self._track_or_merge_intent_in_watcher(intent, resolved_broker_id, st)
-                        else:
-                            needs_historical_fallback.append(intent)
-
-                    if needs_historical_fallback:
-                        _, hist_unres_reasons, hist_fatal_err = self._reconcile_unresolved_intents_via_historical_trades(
-                            needs_historical_fallback
+            expected_tb_acct = str(
+                getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "")
+                or getattr(self.db, "account_id", "")
+                or ""
+            ).strip()
+            for trade in trade_book:
+                if not isinstance(trade, dict):
+                    return self._fail_reconciliation_locked("Malformed non-dict record in trade_book", starting_halt_generation)
+                tr_acct = str(trade.get("dhanClientId") or "").strip()
+                if expected_tb_acct and tr_acct and tr_acct != expected_tb_acct:
+                    return self._fail_reconciliation_locked(
+                        f"Tradebook account mismatch: expected {expected_tb_acct!r}, got {tr_acct!r}",
+                        starting_halt_generation,
+                    )
+                if not trade.get("orderId"):
+                    return self._fail_reconciliation_locked("Missing orderId in current-day trade_book", starting_halt_generation)
+                if hasattr(self.db, "record_fill"):
+                    raw_etid = trade.get("exchangeTradeId")
+                    etid_str = str(raw_etid).strip() if not isinstance(raw_etid, bool) else ""
+                    if (
+                        not etid_str
+                        or etid_str.lower() in ("none", "null", "na", "nan", "inf", "infinity")
+                        or re.fullmatch(r"[+-]?0+(?:\.0+)?", etid_str)
+                        or any(m in etid_str for m in ("-TRD-", "-FILL-", "-RECON-"))
+                    ):
+                        return self._fail_reconciliation_locked(
+                            f"Invalid or zero exchangeTradeId ({etid_str!r}) in current-day trade_book for order {trade.get('orderId')}",
+                            starting_halt_generation,
                         )
-                        if hist_fatal_err:
-                            self.state = ReconciliationState.BLOCKED
-                            self.last_error = hist_fatal_err
-                            self.unresolved_count = len(needs_historical_fallback)
-                            logger.critical(f"[RECONCILIATION] {self.last_error}")
-                            return False, self.last_error
-                        for reason_str in hist_unres_reasons:
-                            unresolved_intents.append(reason_str)
-                            logger.warning(f"[RECONCILIATION] {reason_str}")
-
-                    self.unresolved_count = len(unresolved_intents)
-                    if unresolved_intents:
+                    try:
+                        raw_qty = trade.get("tradedQuantity")
+                        if isinstance(raw_qty, bool) or not re.fullmatch(r"[+]?[0-9]+", str(raw_qty)):
+                            raise ValueError("invalid integer tradedQuantity")
+                        t_qty = int(raw_qty)
+                        if isinstance(trade.get("tradedPrice"), bool):
+                            raise ValueError("boolean tradedPrice")
+                        t_price = float(trade.get("tradedPrice") or 0.0)
+                        if t_qty <= 0 or not math.isfinite(t_price) or t_price <= 0.0:
+                            raise ValueError(f"invalid quantity/price ({t_qty}, {t_price})")
+                        self.db.record_fill(
+                            broker_order_id=str(trade["orderId"]),
+                            exchange_trade_id=etid_str,
+                            symbol=str(trade.get("tradingSymbol") or trade.get("customSymbol") or ""),
+                            traded_price=t_price,
+                            traded_quantity=t_qty,
+                            transaction_type=str(trade.get("transactionType") or "BUY").upper(),
+                            security_id=str(trade.get("securityId") or ""),
+                            exchange_segment=str(trade.get("exchangeSegment") or ""),
+                            product_type=str(trade.get("productType") or ""),
+                            is_verified_trade=True,
+                        )
+                    except Exception as fill_exc:
+                        # P1: Never silently swallow fill persistence failures!
                         self.state = ReconciliationState.BLOCKED
-                        self.last_error = (
-                            f"Unresolved order intent(s) present: {len(unresolved_intents)} unverified order(s) require broker reconciliation "
-                            f"({'; '.join(unresolved_intents)})"
-                        )
+                        self.last_error = f"Failed to persist broker trade fill for order {trade.get('orderId')}: {fill_exc}"
                         logger.critical(f"[RECONCILIATION] {self.last_error}")
+                        if hasattr(self.db, "record_system_event"):
+                            try:
+                                self.db.record_system_event("FILL_PERSISTENCE_ERROR", self.last_error)
+                            except Exception:
+                                pass
                         return False, self.last_error
-                else:
-                    self.unresolved_count = 0
-            except Exception as e:
-                self.state = ReconciliationState.BLOCKED
-                self.last_error = f"Journal intent reconciliation exception: {e}"
-                logger.critical(f"[RECONCILIATION] {self.last_error}")
-                return False, self.last_error
 
-            # H13: If Emergency STOP is active, read-only historical fill recovery above was permitted,
-            #      but the new-entry gate MUST remain BLOCKED!
-            if stop_active_at_start or self.stop_manager.is_stopped():
-                self.state = ReconciliationState.BLOCKED
-                self.last_error = "Durable EMERGENCY STOP is active"
-                logger.warning(f"[RECONCILIATION] {self.last_error}. Remaining in fail-closed state.")
-                return False, self.last_error
-
-            # 5. Check existing pending protection orders in watcher
-            if self.watcher and hasattr(self.watcher, "check_once"):
-                try:
-                    self.watcher.check_once()
-                except Exception as e:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = f"Watcher reconciliation pass failed: {e}"
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
-
-            # 6a. Verify all open intraday broker positions are covered by active broker protection (Safety Correction C.B & CV13-05)
-            pos_ok, pos_msg = self._verify_open_positions_protected(positions)
-            if not pos_ok:
+        positions: List[Dict[str, Any]] = []
+        if hasattr(self.broker, "get_positions"):
+            ok_pos, pos_list, pos_msg = self._read_required_broker_collection("get_positions", "positions")
+            if not ok_pos:
                 self.state = ReconciliationState.BLOCKED
                 self.last_error = pos_msg
                 logger.critical(f"[RECONCILIATION] {self.last_error}")
                 return False, self.last_error
+            positions = pos_list
 
-            # 6b. Verify all bot-owned settled CNC/MTF holdings have active Forever OCO protection or audited manual-risk acknowledgement (H08 & H16)
-            hld_ok, hld_msg = self._verify_bot_owned_holdings_protected(positions)
-            if not hld_ok:
+        # 4. Reconcile all non-terminal intents from journal (current-day book first, then bounded historical fallback)
+        try:
+            if hasattr(self.db, "get_non_terminal_intents"):
+                pending_intents = self.db.get_non_terminal_intents()
+            else:
+                pending_intents = self.db.get_unknown_intents()
+
+            unresolved_intents: List[str] = []
+            needs_historical_fallback: List[Dict[str, Any]] = []
+            if pending_intents:
+                logger.warning(f"[RECONCILIATION] Found {len(pending_intents)} pending intent(s) to reconcile.")
+                order_book: List[Dict[str, Any]] = []
+                if hasattr(self.broker, "get_order_book"):
+                    ok_ob, ob_list, _ = self._read_required_broker_collection("get_order_book", "order_book")
+                    if ok_ob:
+                        order_book = ob_list
+
+                for intent in pending_intents:
+                    corr_id = intent["correlation_id"]
+                    broker_oid = intent.get("broker_order_id")
+                    st = self._lookup_intent_at_broker(corr_id, broker_oid, order_book, intent=intent)
+
+                    if isinstance(st, dict) and st.get("orderId"):
+                        order_status = str(st.get("orderStatus", "PENDING")).upper()
+                        resolved_broker_id = str(st.get("orderId"))
+                        filled_qty = int(st.get("filledQty") or 0)
+                        self.db.update_order_intent(corr_id, state=order_status, broker_order_id=resolved_broker_id)
+                        logger.info(f"[RECONCILIATION] Resolved intent {corr_id} -> {order_status} (Broker ID: {resolved_broker_id})")
+
+                        existing_in_watcher = (
+                            hasattr(self.watcher, "pending")
+                            and isinstance(self.watcher.pending, dict)
+                            and resolved_broker_id in self.watcher.pending
+                        )
+                        if order_status not in ("CANCELLED", "REJECTED", "EXPIRED") or filled_qty > 0 or existing_in_watcher:
+                            self._track_or_merge_intent_in_watcher(intent, resolved_broker_id, st)
+                    else:
+                        needs_historical_fallback.append(intent)
+
+                if needs_historical_fallback:
+                    _, hist_unres_reasons, hist_fatal_err = self._reconcile_unresolved_intents_via_historical_trades(
+                        needs_historical_fallback
+                    )
+                    if hist_fatal_err:
+                        self.state = ReconciliationState.BLOCKED
+                        self.last_error = hist_fatal_err
+                        self.unresolved_count = len(needs_historical_fallback)
+                        logger.critical(f"[RECONCILIATION] {self.last_error}")
+                        return False, self.last_error
+                    for reason_str in hist_unres_reasons:
+                        unresolved_intents.append(reason_str)
+                        logger.warning(f"[RECONCILIATION] {reason_str}")
+
+                self.unresolved_count = len(unresolved_intents)
+                if unresolved_intents:
+                    self.state = ReconciliationState.BLOCKED
+                    self.last_error = (
+                        f"Unresolved order intent(s) present: {len(unresolved_intents)} unverified order(s) require broker reconciliation "
+                        f"({'; '.join(unresolved_intents)})"
+                    )
+                    logger.critical(f"[RECONCILIATION] {self.last_error}")
+                    return False, self.last_error
+            else:
+                self.unresolved_count = 0
+        except Exception as e:
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = f"Journal intent reconciliation exception: {e}"
+            logger.critical(f"[RECONCILIATION] {self.last_error}")
+            return False, self.last_error
+
+        # H13: If Emergency STOP is active, read-only historical fill recovery above was permitted,
+        #      but the new-entry gate MUST remain BLOCKED!
+        if stop_active_at_start or self.stop_manager.is_stopped():
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = "Durable EMERGENCY STOP is active"
+            logger.warning(f"[RECONCILIATION] {self.last_error}. Remaining in fail-closed state.")
+            return False, self.last_error
+
+        # Broker mutations during watcher reconciliation invalidate earlier proof snapshots.
+        self._active_pass_holdings = None
+        self._active_pass_forever_orders = None
+        # 5. Check existing pending protection orders in watcher
+        if self.watcher and hasattr(self.watcher, "check_once"):
+            try:
+                self.watcher.check_once()
+            except Exception as e:
                 self.state = ReconciliationState.BLOCKED
-                self.last_error = hld_msg
+                self.last_error = f"Watcher reconciliation pass failed: {e}"
                 logger.critical(f"[RECONCILIATION] {self.last_error}")
                 return False, self.last_error
 
-            # 7. Verify no UNPROTECTED fills or unresolved protection attempts remain in journal
-            if hasattr(self.db, "get_unprotected_orders"):
-                unprot = self.db.get_unprotected_orders()
-                if unprot:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = f"Unprotected filled position(s) present: {len(unprot)} order(s) lack active broker SL/Target"
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
+        # 6a. Verify all open intraday broker positions are covered by active broker protection (Safety Correction C.B & CV13-05)
+        pos_ok, pos_msg = self._verify_open_positions_protected(positions)
+        if not pos_ok:
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = pos_msg
+            logger.critical(f"[RECONCILIATION] {self.last_error}")
+            return False, self.last_error
 
-            if hasattr(self.db, "get_unresolved_protection_attempts"):
-                unres_att = self.db.get_unresolved_protection_attempts()
-                if unres_att:
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = f"Unresolved protection attempt(s) present: {len(unres_att)} attempt(s) awaiting broker verification"
-                    logger.critical(f"[RECONCILIATION] {self.last_error}")
-                    return False, self.last_error
+        # 6b. Verify all bot-owned settled CNC/MTF holdings have active Forever OCO protection or audited manual-risk acknowledgement (H08 & H16)
+        hld_ok, hld_msg = self._verify_bot_owned_holdings_protected(positions)
+        if not hld_ok:
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = hld_msg
+            logger.critical(f"[RECONCILIATION] {self.last_error}")
+            return False, self.last_error
 
-            # 8. Invariant check passed -> open the gate
-            with self._entry_state_lock:
-                if self._halt_generation != starting_halt_generation or self.stop_manager.is_stopped():
-                    self._accepting_entries = False
-                    self.state = ReconciliationState.BLOCKED
-                    self.last_error = self.last_error or "Safety halt occurred during reconciliation"
-                    return False, self.last_error
-                self._accepting_entries = True
-                self.state = ReconciliationState.HEALTHY
-                self.last_reconciled_at = time.time()
-                self.last_error = ""
-            logger.info("✅ [RECONCILIATION] Invariant checks passed! Gate opened: ACCEPTING_NEW_ENTRIES=True.")
-            return True, "Reconciliation successful, system healthy and accepting new trades."
+        # 7. Verify no UNPROTECTED fills or unresolved protection attempts remain in journal
+        if hasattr(self.db, "get_unprotected_orders"):
+            unprot = self.db.get_unprotected_orders()
+            if unprot:
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = f"Unprotected filled position(s) present: {len(unprot)} order(s) lack active broker SL/Target"
+                logger.critical(f"[RECONCILIATION] {self.last_error}")
+                return False, self.last_error
+
+        if hasattr(self.db, "get_unresolved_protection_attempts"):
+            unres_att = self.db.get_unresolved_protection_attempts()
+            if unres_att:
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = f"Unresolved protection attempt(s) present: {len(unres_att)} attempt(s) awaiting broker verification"
+                logger.critical(f"[RECONCILIATION] {self.last_error}")
+                return False, self.last_error
+
+        # 8. Invariant check passed -> open the gate
+        with self._entry_state_lock:
+            if self._halt_generation != starting_halt_generation or self.stop_manager.is_stopped():
+                self._accepting_entries = False
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = self.last_error or "Safety halt occurred during reconciliation"
+                return False, self.last_error
+            self._accepting_entries = True
+            self.state = ReconciliationState.HEALTHY
+            self.last_reconciled_at = time.time()
+            self.last_error = ""
+        logger.info("✅ [RECONCILIATION] Invariant checks passed! Gate opened: ACCEPTING_NEW_ENTRIES=True.")
+        return True, "Reconciliation successful, system healthy and accepting new trades."
 
     def recheck_and_recover_if_verified(self) -> Tuple[bool, str]:
         """
