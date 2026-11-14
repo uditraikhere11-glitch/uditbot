@@ -172,6 +172,8 @@ class StartupReconciliationGate:
         self.last_error: str = ""
         self.unresolved_count: int = 0
         self._reconcile_lock = threading.Lock()
+        self._entry_state_lock = threading.Lock()
+        self._halt_generation = 0
         self.last_notified_gate_state: str = ""
         self.last_historical_reconciled_ids: List[str] = []
         # Do not run 31-day, multi-page broker history reads on the two-second
@@ -189,9 +191,11 @@ class StartupReconciliationGate:
         11-F / 15-E: Immediately closes the entry gate when unprotected fill exposure,
         an UNKNOWN order outcome, or a runtime broker reconciliation failure is detected.
         """
-        self._accepting_entries = False
-        self.state = ReconciliationState.BLOCKED
-        self.last_error = reason
+        with self._entry_state_lock:
+            self._halt_generation += 1
+            self._accepting_entries = False
+            self.state = ReconciliationState.BLOCKED
+            self.last_error = reason
         logger.critical(f"🛑 [RECONCILIATION GATE HALTED] Blocking all new entries: {reason}")
         if hasattr(self.db, "record_system_event"):
             try:
@@ -1303,8 +1307,10 @@ class StartupReconciliationGate:
         """
         with self._reconcile_lock:
             logger.info("🔄 [RECONCILIATION] Starting broker-authoritative startup reconciliation...")
-            self.state = ReconciliationState.RECONCILING
-            self._accepting_entries = False
+            with self._entry_state_lock:
+                starting_halt_generation = self._halt_generation
+                self.state = ReconciliationState.RECONCILING
+                self._accepting_entries = False
             self.last_historical_reconciled_ids = []
 
             # 0. Repair any interrupted SQLite fill/order state before querying broker (H09)
@@ -1513,10 +1519,16 @@ class StartupReconciliationGate:
                     return False, self.last_error
 
             # 8. Invariant check passed -> open the gate
-            self._accepting_entries = True
-            self.state = ReconciliationState.HEALTHY
-            self.last_reconciled_at = time.time()
-            self.last_error = ""
+            with self._entry_state_lock:
+                if self._halt_generation != starting_halt_generation or self.stop_manager.is_stopped():
+                    self._accepting_entries = False
+                    self.state = ReconciliationState.BLOCKED
+                    self.last_error = self.last_error or "Safety halt occurred during reconciliation"
+                    return False, self.last_error
+                self._accepting_entries = True
+                self.state = ReconciliationState.HEALTHY
+                self.last_reconciled_at = time.time()
+                self.last_error = ""
             logger.info("✅ [RECONCILIATION] Invariant checks passed! Gate opened: ACCEPTING_NEW_ENTRIES=True.")
             return True, "Reconciliation successful, system healthy and accepting new trades."
 

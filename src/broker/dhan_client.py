@@ -34,6 +34,7 @@ from datetime import datetime, time as clock_time
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
+import sqlite3
 from src.broker.yahoo_observer import (
     YAHOO_HTTP_TIMEOUT,
     YAHOO_HTTP_HEADERS,
@@ -813,6 +814,10 @@ class DhanClient:
         auto_generate_token: bool = True,
     ):
         self.cfg = config
+        from src.broker.read_governor import ReadGovernor
+        self._read_governor = ReadGovernor(
+            os.path.join(config.data_dir, "broker_read_control"), config.dhan_client_id
+        )
         # The scheduled force-refresh must not perform a first implicit TOTP
         # login just because the token file is missing.
         self._auto_generate_token = auto_generate_token
@@ -1225,7 +1230,7 @@ class DhanClient:
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 }
-                resp = self.session.get(f"{BASE_URL}/profile", headers=headers, timeout=5)
+                resp = self._governed_get(f"{BASE_URL}/profile", headers=headers, timeout=5)
             else:
                 resp = self._get_with_auth_recovery(
                     f"{BASE_URL}/profile", allow_refresh=allow_refresh
@@ -2210,6 +2215,63 @@ class DhanClient:
             logger.error("%s (repeated authentication errors are rate-limited)", reason)
             state[key] = now
 
+    @staticmethod
+    def _is_rate_limited_response(response) -> bool:
+        if int(getattr(response, "status_code", 0) or 0) == 429:
+            return True
+        try:
+            payload = response.json()
+            return isinstance(payload, dict) and str(payload.get("errorCode", "")).upper() == "DH-904"
+        except Exception:
+            return False
+
+    def _halt_for_read_deferral(self):
+        gate = getattr(self, "reconciliation_gate", None)
+        if gate is not None and hasattr(gate, "halt_new_entries"):
+            if getattr(gate, "state", None) != "BLOCKED":
+                gate.halt_new_entries(
+                    "Dhan read throttled/unavailable: fresh broker evidence required before new entries"
+                )
+
+    def _read_deferral_response(self, exc):
+        from src.broker.read_governor import ReadDeferred
+        self._halt_for_read_deferral()
+        result = requests.Response()
+        result.status_code = 429 if isinstance(exc, ReadDeferred) else 503
+        result._content = str(exc).encode("utf-8")
+        result.headers["X-AuditBot-Local-Deferral"] = "1"
+        if isinstance(exc, ReadDeferred):
+            result.headers["Retry-After"] = str(exc.seconds)
+        return result
+
+    def _governed_get(self, url, *, headers, timeout):
+        """All Dhan GETs, including candidate-profile and auth retry, share admission."""
+        from src.broker.read_governor import ReadDeferred
+        governor = getattr(self, "_read_governor", None)
+        try:
+            if governor is not None:
+                from urllib.parse import urlsplit
+                path = urlsplit(url).path
+                historical = bool(re.fullmatch(r"/v2/trades/\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}/\d+", path))
+                governor.admit(historical=historical)
+        except (ReadDeferred, OSError, sqlite3.Error) as exc:
+            return self._read_deferral_response(exc)
+        # Transport exceptions retain the callers' UNAVAILABLE classification.
+        response = self.session.get(url, headers=headers, timeout=timeout)
+        if self._is_rate_limited_response(response):
+            self._halt_for_read_deferral()
+            if governor is not None:
+                try:
+                    governor.throttled(getattr(response, "headers", {}).get("Retry-After"))
+                except (OSError, sqlite3.Error) as exc:
+                    return self._read_deferral_response(exc)
+            if int(response.status_code) != 429:
+                result = requests.Response()
+                result.status_code = 429
+                result._content = b'{"errorCode":"DH-904","errorMessage":"Broker rate limit"}'
+                return result
+        return response
+
     def _get_with_auth_recovery(
         self, url: str, *, timeout: float = 5, allow_refresh: bool = True
     ) -> requests.Response:
@@ -2227,7 +2289,7 @@ class DhanClient:
 
         headers = self._headers()
         sent_token = headers.get("access-token", "")
-        response = self.session.get(url, headers=headers, timeout=timeout)
+        response = self._governed_get(url, headers=headers, timeout=timeout)
         status = int(getattr(response, "status_code", 0) or 0)
         error_text = str(getattr(response, "text", "") or "")
         if not allow_refresh or not self._requires_token_refresh(status, error_text):
@@ -2311,7 +2373,7 @@ class DhanClient:
             return response
         # A successful/failed second GET is terminal for this call. It must
         # never trigger a second token generation or a trading order replay.
-        return self.session.get(url, headers=retry_headers, timeout=timeout)
+        return self._governed_get(url, headers=retry_headers, timeout=timeout)
 
     def _read_collection(
         self,
@@ -3144,6 +3206,8 @@ class DhanClient:
 
         try:
             resp = self._get_with_auth_recovery(url)
+            if self._is_rate_limited_response(resp) or getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return None  # UNKNOWN; never amplify throttle/storage failure via fallback.
             if resp.status_code == 200:
                 data = resp.json()
                 candidates = [data] if isinstance(data, dict) else (
@@ -3612,7 +3676,7 @@ class DhanClient:
         to_date: str,
         *,
         max_pages: int = MAX_HISTORICAL_TRADE_PAGES,
-        page_delay_sec: float = 0.0,
+        page_delay_sec: float = 0.25,
         bypass_test_mode: bool = False,
     ) -> Union[BrokerReadList, BrokerReadFailure]:
         """
