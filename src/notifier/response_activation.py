@@ -12,7 +12,8 @@ import os
 import time
 from typing import Any, Iterable, Optional, Tuple
 
-from src.notifier.dhan_response import normalize_group_name, resolve_dhan_response_group
+from src.notifier import dhan_response
+from src.notifier.dhan_response import normalize_group_name
 from src.engine.config_manager import write_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -84,14 +85,14 @@ async def resolve_with_fallback(
         reason, verified = 'INTENTIONALLY_DISABLED', True
     else:
         try:
-            entity = await resolve_dhan_response_group(client, wanted, forbidden_chat_ids)
+            entity = await dhan_response.resolve_dhan_response_group(client, wanted, forbidden_chat_ids)
             active, verified, reason = wanted, True, 'REQUESTED_DESTINATION_RESOLVED'
         except Exception as exc:
             logger.warning('Dhan Response target verification failed: %s', type(exc).__name__)
             fallback = _fallback_for(data_dir, wanted)
             if fallback:
                 try:
-                    entity = await resolve_dhan_response_group(client, fallback, forbidden_chat_ids)
+                    entity = await dhan_response.resolve_dhan_response_group(client, fallback, forbidden_chat_ids)
                     active, reason = fallback, 'PREVIOUS_DESTINATION_RESTORED'
                 except Exception as err:
                     logger.warning('Dhan Response fallback unavailable: %s', type(err).__name__)
