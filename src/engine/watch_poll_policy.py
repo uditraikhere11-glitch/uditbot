@@ -20,6 +20,25 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
     """Return a scheduled GET cycle interval; never suppress an open record."""
     pending_records = list((pending or {}).values())
     if pending_records:
+        # Uncertain cancellation, incomplete protection or reserved retry are
+        # time-critical. Never impose a 5-minute overnight wait on these
+        # states; the governor still enforces the hard request quota and
+        # must fail closed when an urgent read cannot be admitted.
+        for rec in pending_records:
+            if not isinstance(rec, dict):
+                continue
+            pending_oco = rec.get("pending_oco")
+            uncertain_oco = (
+                isinstance(pending_oco, dict)
+                and str(pending_oco.get("state") or "").upper() in
+                ("SUBMITTING", "UNKNOWN", "ACKED_UNVERIFIED")
+            )
+            if uncertain_oco or any(bool(rec.get(flag)) for flag in (
+                "cancel_uncertain", "cancel_requested",
+                "entry_timeout_elapsed", "retry_reserved",
+                "persistence_uncertain", "reconciliation_required",
+            )):
+                return 10.0
         for rec in pending_records:
             if not isinstance(rec, dict):
                 continue
