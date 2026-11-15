@@ -59,7 +59,11 @@ class TestSetupApp(unittest.TestCase):
                 with open(".env") as f:
                     content = f.read()
                 self.assertIn("DHAN_CLIENT_ID=1100998877", content)
-                self.assertIn("TRADING_MODE=TEST", content)
+                # Field-scoped updates do not materialize unchanged defaults.
+                # TEST is the effective mode even without an explicit key.
+                from src.config import AppConfig, parse_env_dict
+                effective = AppConfig.from_env(env=parse_env_dict(".env"), env_file="")
+                self.assertEqual(effective.trading_mode.value, "TEST")
                 self.assertIn("BOT_INSTANCE_NAME=SapphireAlgo", content)
                 self.assertIn("MAX_DAILY_TRADES=20", content)
                 self.assertNotIn("TRADING_MODE=LIVE", content)
