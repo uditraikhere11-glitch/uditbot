@@ -1591,8 +1591,22 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     cmp_badge = f'<span class="status-pill pill-darvas">{cmp_label}</span>'
     
     clean_v_id = escape_html(str(act_v).replace("v-", ""), quote=True)
+    # A running process is not proof that it consumed recently saved settings.
+    # Verify the actual systemd PID and acknowledged configuration hash.
+    runtime_matches_saved = False
     if is_svc_active:
-        ver_badge = f'<span class="status-pill pill-online">🟢 Up to Date &amp; Active</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
+        try:
+            runtime_matches_saved, _, _ = tracker.is_active_version_confirmed(
+                expected_hashes={compute_config_version(cfg)},
+                expected_mode=cfg.trading_mode.value,
+                require_systemd_active=True,
+            )
+        except Exception:
+            runtime_matches_saved = False
+    if runtime_matches_saved:
+        ver_badge = f'<span class="status-pill pill-online">🟢 Active Configuration Verified</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
+    elif is_svc_active:
+        ver_badge = f'<span class="status-pill pill-offline">⚠️ Saved — Running Version Not Verified</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
     else:
         ver_badge = f'<span class="status-pill pill-offline">⚪ Saved (Start Bot to Apply)</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
 
