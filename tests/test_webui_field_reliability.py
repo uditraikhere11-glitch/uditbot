@@ -3,6 +3,7 @@
 No real broker, Telegram, systemctl or network resources are used.
 """
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
@@ -123,12 +124,12 @@ class ConfigurationCoordinatorReliabilityTests(unittest.TestCase):
         with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state", return_value=(service, "mocked")), \
              mock.patch.object(ConfigChangeTracker, "get_readonly_broker", side_effect=AssertionError("Broker must not be used")):
             return submit_webui_patch(
-                self.tracker, patch, self.path, expected_revision=revision(open(self.path, encoding="utf-8").read()),
+                self.tracker, patch, self.path, expected_revision=revision(Path(self.path).read_text(encoding="utf-8")),
                 request_id=req_id, spawn_worker=False, **extras,
             )
 
     def test_ac01_ac02_notification_does_not_use_broker_or_restart(self):
-        orig = open(self.path, encoding="utf-8").read()
+        orig = Path(self.path).read_text(encoding="utf-8")
         rec = self._submit({"dhan_response_group_name": "-5514889030"})
         self.assertEqual(rec.state.value, "SAVED_FOR_NEXT_START")
         self.assertFalse(rec.runtime_verified)
@@ -136,16 +137,16 @@ class ConfigurationCoordinatorReliabilityTests(unittest.TestCase):
         self.assertFalse(rec.broker_checks_required)
         self.assertEqual(rec.changed_fields, ["DHAN_RESPONSE_GROUP_NAME"])
         self.assertEqual(rec.application_method, "SAVE_FOR_CONTROLLED_START")
-        now = open(self.path, encoding="utf-8").read()
+        now = Path(self.path).read_text(encoding="utf-8")
         self.assertEqual(now.replace("DHAN_RESPONSE_GROUP_NAME=-5514889030", "DHAN_RESPONSE_GROUP_NAME=-1234567890  # old destination"), orig)
 
     def test_ac09_stale_form_conflict_and_no_write(self):
-        old = open(self.path, encoding="utf-8").read()
+        old = Path(self.path).read_text(encoding="utf-8")
         with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state", return_value=(ServiceOperatingState.RUNNING, "mocked")):
             with self.assertRaises(ConfigurationConflict):
                 submit_webui_patch(self.tracker, {"dhan_response_group_name": "-5514889030"}, self.path,
                                    expected_revision="stale", request_id="STALE-REQUEST-0001", spawn_worker=False)
-        self.assertEqual(open(self.path, encoding="utf-8").read(), old)
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), old)
 
     def test_ac10_same_request_cannot_replay(self):
         request = {"dhan_response_group_name": "-5514889030"}
