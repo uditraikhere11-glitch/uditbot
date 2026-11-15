@@ -636,13 +636,12 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
         os.chdir(self.temp_dir.name)
         try:
             original = (
-                "TRADING_MODE=TEST\\n"
-                "DHAN_CLIENT_ID=1113731536\\n"
-                "BOT_INSTANCE_NAME=Audit bot\\n"
-                "OPERATOR_NAME=Udit\\n"
-                "DHAN_PIN=SYNTHETIC_UNCHANGED\\n"
+                "TRADING_MODE=TEST\n"
+                "DHAN_CLIENT_ID=1113731536\n"
+                "BOT_INSTANCE_NAME=Audit bot\n"
+                "OPERATOR_NAME=Udit\n"
+                "DHAN_PIN=SYNTHETIC_UNCHANGED\n"
             )
-            original = original.replace("\\\\n", "\\n")
             with open(".env", "w", encoding="utf-8") as ef:
                 ef.write(original)
             with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
@@ -656,8 +655,8 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             self.assertIn("Audit bot Configuration Saved", saved_html)
             with open(".env", "r", encoding="utf-8") as ef:
                 env_text = ef.read()
-            self.assertEqual(env_text, original.replace("OPERATOR_NAME=Udit\\n",
-                                                       "OPERATOR_NAME=Udit Updated\\n"))
+            self.assertEqual(env_text, original.replace("OPERATOR_NAME=Udit\n",
+                                                       "OPERATOR_NAME=Udit Updated\n"))
         finally:
             os.chdir(old_cwd)
 
