@@ -652,7 +652,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
                 )
             self.assertEqual(saved_resp.status_code, 200)
             saved_html = saved_resp.body.decode("utf-8")
-            self.assertIn("Audit bot Configuration Saved", saved_html)
+            self.assertIn("Audit bot Configuration Request Recorded", saved_html)
             with open(".env", "r", encoding="utf-8") as ef:
                 env_text = ef.read()
             self.assertEqual(env_text, original.replace("OPERATOR_NAME=Udit\n",
