@@ -290,7 +290,7 @@ def submit_webui_patch(
         )
         # Additive metadata; old API fields retain their meaning.
         rec.changed_fields = sorted(changed)
-        rec.application_method = "LEGACY_SAFETY_COORDINATOR" if policy == "SAFETY_CONTROLLED" else "SAVE_FOR_CONTROLLED_START"
+        rec.application_method = "LEGACY_SAFETY_COORDINATOR" if policy == "SAFETY_CONTROLLED" and is_running else "SAVE_FOR_CONTROLLED_START"
         rec.broker_checks_required = policy == "SAFETY_CONTROLLED" and is_running
         rec.client_request_id = request_id
         rec.previous_file_revision = revision(raw)
@@ -315,7 +315,7 @@ def submit_webui_patch(
 
         # A running safety-controlled change still requires authoritative broker
         # reconciliation and the existing restart identity verification.
-        if policy == "SAFETY_CONTROLLED":
+        if policy == "SAFETY_CONTROLLED" and is_running:
             rec = tracker.enqueue_durable_configuration_update(
                 form_params=new_env, env_content=new_content, env_path=env_path,
                 check_service_fn=check_service_fn,
@@ -403,7 +403,7 @@ def submit_webui_patch(
                 # verified already. The PREPARED journal remains recoverable;
                 # do not falsely turn a completed safe save into a new update.
                 pass
-    if policy == "SAFETY_CONTROLLED" and spawn_worker:
+    if policy == "SAFETY_CONTROLLED" and is_running and spawn_worker:
         try:
             # Only broker-sensitive settings need a broker adapter. Instantiate
             # it outside the submission lock; no order submission occurs here.
