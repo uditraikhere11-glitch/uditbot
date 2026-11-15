@@ -1773,34 +1773,39 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
         response_reporter = getattr(pipeline.watcher, "execution_reporter", None)
         if response_reporter is not None:
             response_reporter.dhan_response_enabled = False
-        if cfg.dhan_response_group_name:
-            from src.notifier.dhan_response import resolve_dhan_response_group
-            try:
-                response_entity = await resolve_dhan_response_group(
-                    client, cfg.dhan_response_group_name,
-                    forbidden_chat_ids=allowed_chats,
+        from src.notifier.response_activation import resolve_with_fallback
+        response_entity, active_response_name, response_target_verified = await resolve_with_fallback(
+            client, cfg.dhan_response_group_name,
+            forbidden_chat_ids=allowed_chats, data_dir=cfg.data_dir,
+        )
+        if response_entity is not None:
+            loop = asyncio.get_running_loop()
+
+            def _send_dhan_response(message: str) -> bool:
+                """Uses the already authenticated Telegram client from the outbox thread."""
+                future = asyncio.run_coroutine_threadsafe(
+                    client.send_message(response_entity, message, parse_mode="html"), loop
                 )
-                loop = asyncio.get_running_loop()
+                try:
+                    future.result(timeout=12)
+                    return True
+                except Exception as exc:
+                    future.cancel()
+                    logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
+                    return False
 
-                def _send_dhan_response(message: str) -> bool:
-                    """Runs exclusively from the outbox worker thread, never the trading event loop."""
-                    future = asyncio.run_coroutine_threadsafe(
-                        client.send_message(response_entity, message, parse_mode="html"), loop
-                    )
-                    try:
-                        future.result(timeout=12)
-                        return True
-                    except Exception as exc:
-                        future.cancel()
-                        logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
-                        return False
-
-                dhan_response_dispatch_fn = _send_dhan_response
-                if response_reporter is not None:
-                    response_reporter.dhan_response_enabled = True
-                logger.info("Dhan final response group resolved uniquely: %s", cfg.dhan_response_group_name)
-            except (ValueError, OSError, RuntimeError) as exc:
-                logger.warning("Dhan Response group unavailable; final mirroring disabled: %s", exc)
+            dhan_response_dispatch_fn = _send_dhan_response
+            if response_reporter is not None:
+                response_reporter.dhan_response_enabled = True
+            if not response_target_verified:
+                logger.warning(
+                    "Dhan Response requested group could not be verified; "
+                    "using independently validated previous group until corrected"
+                )
+            else:
+                logger.info("Dhan final response group resolved uniquely: %s", active_response_name)
+        elif cfg.dhan_response_group_name:
+            logger.warning("Dhan Response requested and previous destinations unverified; final mirroring disabled")
 
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         outbox_worker = OutboxWorker(
