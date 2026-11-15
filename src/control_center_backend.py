@@ -463,7 +463,7 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 if "expected_revision" in body and body["expected_revision"] != revision(previous):
                     return _json({"error": "Settings changed since the dashboard was loaded; refresh before retrying"}, 409)
                 old_dict = parse_env_content_string(previous)
-                old_value = old_dict.get(_CONFIG_KEY, "false")
+                old_value = old_dict.get("FNO_AMO_ENABLED", "false")
                 if str(old_value).strip().lower() not in ("false", "true", "0", "1", "yes", "no", "on", "off"):
                     return _json({"error": "Existing F&O AMO setting is invalid"}, 409)
                 current_enabled = str(old_value).strip().lower() in ("true", "1", "yes", "on")
