@@ -1249,6 +1249,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
+      <div id="modalApplicationFacts" style="font-size: 12px; color: #cbd5e1; margin-bottom: 12px;" aria-live="polite">
+        Application: pending · Restart: not performed · Runtime: not verified
+      </div>
       <div style="background: #0d1321; border: 1px solid #26334d; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 120px; overflow-y: auto;">
         <div style="font-size: 11px; text-transform: uppercase; color: #94a3b8; font-weight: 600; margin-bottom: 6px;">Changes Audit Trail (Credentials Redacted)</div>
         <div id="modalChangesList" style="font-size: 12px; color: #cbd5e1; font-family: monospace; line-height: 1.6;">None</div>
@@ -1291,6 +1294,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const reasonBox = document.getElementById('modalReason');
     reasonBox.textContent = (action === 'start' ? 'Starting AuditBot service...' : 'Stopping AuditBot service safely...');
     reasonBox.className = 'modal-reason';
+    document.getElementById('modalApplicationFacts').textContent = 'Service control: ' + String(action) + ' · Runtime verification pending';
     try {
       const resp = await fetch('/setup/service-control', {
         method: 'POST',
@@ -1315,10 +1319,13 @@ document.addEventListener('DOMContentLoaded', function() {
       }
       reasonBox.textContent = res.message || res.error || 'Service control operation completed.';
       reasonBox.className = res.ok ? 'modal-reason success' : (res.deferred ? 'modal-reason warning' : 'modal-reason error');
+      document.getElementById('modalApplicationFacts').textContent = 'Service control: ' + String(action) +
+        ' · Runtime: ' + (res.runtime_verified === true ? 'Verified' : 'Not verified');
       if (res.service_state === 'RUNNING') {
         startBotBtn.style.display = 'none';
         stopBotBtn.style.display = res.deferred ? 'none' : 'inline-block';
-        document.getElementById('modalActiveVersion').textContent = (res.running_mode || res.saved_mode || 'TEST') + ' — Verified';
+        document.getElementById('modalActiveVersion').textContent = (res.running_mode || res.saved_mode || 'TEST') +
+          (res.runtime_verified === true ? ' — Verified' : ' — Running, configuration not verified');
       } else if (res.service_state && res.service_state.startsWith('STOPPED')) {
         startBotBtn.style.display = 'inline-block';
         stopBotBtn.style.display = 'none';
@@ -1452,6 +1459,11 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('modalProgressStepText').textContent = stepCaption;
 
     document.getElementById('modalServiceStatus').textContent = rec.service_state_label || rec.service_status || 'UNKNOWN';
+    document.getElementById('modalApplicationFacts').textContent =
+      'Application: ' + String(rec.application_method || 'Legacy controlled transition') +
+      ' · Trading restart: ' + (rec.restart_performed === true ? 'Performed' : 'Not performed') +
+      ' · Broker safety check: ' + (rec.broker_checks_required === true ? 'Required' : 'Not required') +
+      ' · Runtime: ' + (rec.runtime_verified === true ? 'Verified' : 'Not verified');
 
     const prevMode = rec.previous_mode || 'TEST';
     const reqMode = rec.requested_mode || 'TEST';
@@ -1466,7 +1478,7 @@ document.addEventListener('DOMContentLoaded', function() {
       document.getElementById('modalActiveVersion').textContent = (rec.running_mode || prevMode) + ' — Waiting for Order';
     } else if (rec.state === 'SAVED_FOR_NEXT_START') {
       document.getElementById('modalActiveVersion').textContent = 'Saved: ' + (rec.saved_mode || reqMode) + ' — Current running settings unchanged; activation pending';
-    } else if (rec.effective_version_hash) {
+    } else if (rec.runtime_verified === true && rec.effective_version_hash) {
       document.getElementById('modalActiveVersion').textContent = (rec.running_mode || reqMode) + ' — Verified (Ref: ' + rec.effective_version_hash.slice(0, 8) + ')';
     } else {
       document.getElementById('modalActiveVersion').textContent = 'Pending Verification';
@@ -1507,6 +1519,10 @@ document.addEventListener('DOMContentLoaded', function() {
     if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
       startBotBtn.style.display = 'none';
       stopBotBtn.style.display = 'none';
+      waitBadge.textContent = (rec.blocked_reason === 'LIVE_ORDER_IN_PROGRESS' ||
+                               rec.blocked_reason === 'UNPROTECTED_POSITION')
+        ? '⏳ Waiting for broker-safe existing order verification'
+        : '⏳ Trading transition deferred: ' + String(rec.blocked_reason || 'Safety check pending');
       waitBadge.style.display = 'inline-block';
     } else if (rec.service_state === 'RUNNING' || rec.service_status === 'LIVE' || rec.service_status === 'TEST') {
       startBotBtn.style.display = 'none';
