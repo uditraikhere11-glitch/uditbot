@@ -1581,13 +1581,13 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     cmp_label = "📈 Darvas Live Market Price" if cmp_pol == "DARVAS_HTTP_SUCCESS" else "⏱️ Strict 2s Market Price"
     cmp_badge = f'<span class="status-pill pill-darvas">{cmp_label}</span>'
     
-    clean_v_id = act_v.replace("v-", "")
+    clean_v_id = escape_html(str(act_v).replace("v-", ""), quote=True)
     if is_svc_active:
         ver_badge = f'<span class="status-pill pill-online">🟢 Up to Date &amp; Active</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
     else:
         ver_badge = f'<span class="status-pill pill-offline">⚪ Saved (Start Bot to Apply)</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
 
-    dhan_masked = _mask_account_id(cfg.dhan_client_id)
+    dhan_masked = escape_html(_mask_account_id(cfg.dhan_client_id), quote=True)
     dhan_badge = f'<span class="status-pill pill-neutral">Connected ({dhan_masked})</span>' if cfg.dhan_client_id else '<span class="status-pill pill-offline">Not Configured</span>'
 
     status_bar = f"""
@@ -1632,7 +1632,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     next_steps = ""
     if saved:
         info = saved_info or {}
-        mode_val = info.get("mode", cfg.trading_mode.value)
+        mode_val = escape_html(str(info.get("mode", cfg.trading_mode.value)), quote=True)
         badge_cls = "badge-live" if mode_val == "LIVE" else "badge-test"
         
         banner = f"""
@@ -1640,10 +1640,10 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
           <div style="width: 100%;">
             <div class="banner-header">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-              <span>Audit bot Configuration Saved & Applied!</span>
+              <span>Audit bot Configuration Saved</span>
             </div>
             <p style="font-size: 13px; color: #a7f3d0; margin-bottom: 8px;">
-              Your parameters were written to <code>.env</code> (chmod 0600). {f"⚡ <strong>trading_bot.service</strong> restarted automatically in <strong>{mode_val}</strong> mode!" if info.get("service_restarted") else "(Note: If service is running, run <code>./bot restart</code> to apply)."}
+              Configuration safely saved. {f"Restart verified in <strong>{mode_val}</strong> mode." if info.get("service_restarted") else "Running settings remain unchanged until the next permitted start or verified activation. Use the Control Center when ready."}
             </p>
             <div class="summary-grid">
               <div class="summary-chip">
@@ -1652,19 +1652,19 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
               </div>
               <div class="summary-chip">
                 <div class="chip-label">Operator</div>
-                <div class="chip-value">{info.get('operator', getattr(cfg, 'operator_name', 'Udit'))}</div>
+                <div class="chip-value">{escape_html(str(info.get('operator', getattr(cfg, 'operator_name', 'Udit'))), quote=True)}</div>
               </div>
               <div class="summary-chip">
                 <div class="chip-label">Bot Instance</div>
-                <div class="chip-value">{info.get('instance', getattr(cfg, 'instance_name', 'Audit bot'))}</div>
+                <div class="chip-value">{escape_html(str(info.get('instance', getattr(cfg, 'instance_name', 'Audit bot'))), quote=True)}</div>
               </div>
               <div class="summary-chip">
                 <div class="chip-label">Dhan Client ID</div>
-                <div class="chip-value">{info.get('dhan_id', cfg.dhan_client_id or 'Not Set')}</div>
+                <div class="chip-value">{escape_html(_mask_account_id(info.get('dhan_id', cfg.dhan_client_id or '')), quote=True)}</div>
               </div>
               <div class="summary-chip">
                 <div class="chip-label">Telegram Log Group</div>
-                <div class="chip-value">{info.get('log_group', cfg.log_group_id or 'Not Set')}</div>
+                <div class="chip-value">{escape_html(str(info.get('log_group', cfg.log_group_id or 'Not Set')), quote=True)}</div>
               </div>
               <div class="summary-chip">
                 <div class="chip-label">Monitored Channels</div>
