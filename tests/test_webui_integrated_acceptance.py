@@ -180,26 +180,26 @@ class CoordinatorIntegrationAudit(unittest.TestCase):
         def worker(index, field, value):
             start.wait()
             try:
-                with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
-                                  return_value=(ServiceOperatingState.RUNNING, "synthetic")):
-                    rec = submit_webui_patch(
-                        self.tracker, {field: value}, self.env_path,
-                        expected_revision=previous,
-                        request_id="TEST-RACE-0000000" + str(index),
-                        spawn_worker=False,
-                    )
-                    results.append(("ok", rec.change_id))
+                rec = submit_webui_patch(
+                    self.tracker, {field: value}, self.env_path,
+                    expected_revision=previous,
+                    request_id="TEST-RACE-0000000" + str(index),
+                    spawn_worker=False,
+                )
+                results.append(("ok", rec.change_id))
             except ConfigurationConflict:
                 results.append(("conflict", index))
         threads = [
             threading.Thread(target=worker, args=(1, "operator_name", "A_TEST")),
             threading.Thread(target=worker, args=(2, "dhan_response_group_name", "-5514889030")),
         ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=5)
-            self.assertFalse(thread.is_alive())
+        with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                          return_value=(ServiceOperatingState.RUNNING, "synthetic")):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
         self.assertCountEqual([x[0] for x in results], ["ok", "conflict"])
 
     def test_ac12_ac18_without_telegram_ack_do_not_claim_runtime(self):
