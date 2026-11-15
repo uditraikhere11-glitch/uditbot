@@ -1679,10 +1679,10 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
           <div style="width: 100%;">
             <div class="banner-header">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-              <span>Audit bot Configuration Saved</span>
+              <span>Audit bot Configuration Request Recorded</span>
             </div>
             <p style="font-size: 13px; color: #a7f3d0; margin-bottom: 8px;">
-              Configuration safely saved. {f"Restart verified in <strong>{mode_val}</strong> mode." if info.get("service_restarted") else "Running settings remain unchanged until the next permitted start or verified activation. Use the Control Center when ready."}
+              {escape_html(str(info.get("state", "UNKNOWN")), quote=True)} — {f"Restart verified in <strong>{mode_val}</strong> mode." if info.get("service_restarted") else "A requested change may be queued for a broker-safe transition or saved for next controlled start. Only VERIFIED means active."}
             </p>
             <div class="summary-grid">
               <div class="summary-chip">
@@ -2112,7 +2112,12 @@ async def handle_setup_submission_async(request: Request):
     """B11: Durable, serialized asynchronous WebUI submission returning change_id immediately."""
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
-        raw_data = await request.json()
+        try:
+            raw_data = await request.json()
+        except ValueError:
+            return JSONResponse(status_code=400, content={"state": "REJECTED", "reason": "Invalid JSON request"})
+        if not isinstance(raw_data, dict):
+            return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": "Expected a JSON object"})
     else:
         form = await request.form()
         if any(len(form.getlist(k)) != 1 for k in form.keys()):
@@ -2151,7 +2156,8 @@ async def handle_setup_submission_async(request: Request):
 @app.get("/setup/change-status/{change_id}")
 def get_change_status(change_id: str):
     """Section F: Strictly read-only polling endpoint for real-time modal progress."""
-    tracker = ConfigChangeTracker(data_dir="data")
+    cfg = AppConfig.from_env()
+    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
     rec = tracker.get_change_record(change_id)
     if not rec:
         rec = tracker.get_change_record()
@@ -2253,7 +2259,8 @@ async def handle_service_control(request: Request):
 @app.get("/setup/active-version")
 def get_active_version():
     """CV13-06G: Returns currently running configuration version and latest change record."""
-    tracker = ConfigChangeTracker(data_dir="data")
+    cfg = AppConfig.from_env()
+    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
     info = tracker.get_active_running_version() or {}
     svc_state, _ = tracker.resolve_service_operating_state()
     is_active = (svc_state.value == "RUNNING")
