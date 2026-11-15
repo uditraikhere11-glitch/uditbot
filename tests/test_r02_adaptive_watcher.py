@@ -31,7 +31,7 @@ class R02CadencePolicyTests(unittest.TestCase):
     def test_manual_risk_is_still_open_but_uses_lower_get_cadence(self):
         hold = record()
         self.assertEqual(
-            watcher_cadence_seconds(pending={}, open_records=[hold], now=100000),
+            watcher_cadence_seconds(pending={}, open_records=[hold], now=100000, market_open=True),
             60.0,
         )
         self.assertEqual(hold["position_state"], "UNPROTECTED_MANUAL_RISK")
@@ -41,7 +41,7 @@ class R02CadencePolicyTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.assertEqual(
                     watcher_cadence_seconds(
-                        pending={}, open_records=[record(state=state)], now=100000,
+                        pending={}, open_records=[record(state=state)], now=100000, market_open=True,
                     ), 45.0
                 )
 
@@ -49,13 +49,13 @@ class R02CadencePolicyTests(unittest.TestCase):
         fresh = {"created_at": 99990, "state": "ACKED"}
         self.assertEqual(
             watcher_cadence_seconds(
-                pending={"SYNTH-2": fresh}, open_records=[], now=100000,
+                pending={"SYNTH-2": fresh}, open_records=[], now=100000, market_open=True,
             ), POLL_HEARTBEAT_SECONDS
         )
         self.assertEqual(
             watcher_cadence_seconds(
-                pending={"SYNTH-2": fresh}, open_records=[], now=100050,
-            ), 45.0
+                pending={"SYNTH-2": fresh}, open_records=[], now=100050, market_open=True,
+            ), 75.0
         )
 
     def test_manual_risk_does_not_override_a_pending_order(self):
@@ -72,8 +72,43 @@ class R02CadencePolicyTests(unittest.TestCase):
             watcher_cadence_seconds(
                 pending={}, open_records=[
                     record(state="POSITION_CLOSED"), record("DRY-123")
-                ], now=100000,
+                ], now=100000, market_open=True,
             ), 90.0
+        )
+
+    def test_after_hours_holdings_continue_to_be_monitored(self):
+        for state in ("UNPROTECTED_MANUAL_RISK", "PROTECTED", "UNPROTECTED"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    watcher_cadence_seconds(
+                        pending={}, open_records=[record(state=state)],
+                        now=100000, market_open=False,
+                    ), 300.0
+                )
+
+    def test_both_hourly_and_24_hour_steady_state_budget(self):
+        import math
+        for state in ("PROTECTED", "UNPROTECTED_MANUAL_RISK"):
+            market = watcher_cadence_seconds(
+                pending={}, open_records=[record(state=state)],
+                now=100000, market_open=True,
+            )
+            off = watcher_cadence_seconds(
+                pending={}, open_records=[record(state=state)],
+                now=100000, market_open=False,
+            )
+            # Five shared broker book snapshots per supervision pass.
+            hourly = math.ceil(3600 / market) * 5
+            daily = math.ceil(6.34 * 3600 / market) * 5 + math.ceil(17.66 * 3600 / off) * 5
+            self.assertLess(hourly, 640)
+            self.assertLess(daily, 4400)
+
+    def test_stale_pending_order_slows_outside_lifecycle_hours(self):
+        pending = {"SYNTH-2": {"created_at": 1}}
+        self.assertEqual(
+            watcher_cadence_seconds(
+                pending=pending, open_records=[], now=100000, market_open=False,
+            ), 300.0
         )
 
     def test_read_requirement_is_bounded(self):
