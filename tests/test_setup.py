@@ -14,7 +14,8 @@ except Exception:
     TestClient = None
     HAS_TESTCLIENT = False
 
-from src.setup_app import app
+from src.setup_app import app, SETUP_CSRF_TOKEN
+from src.engine.config_patch import revision
 
 
 class TestSetupApp(unittest.TestCase):
@@ -49,6 +50,8 @@ class TestSetupApp(unittest.TestCase):
                     "max_drawdown_pct": 5.0,
                     "daily_trade_limit": 20,
                     "is_live_mode": False,
+                    "csrf_token": SETUP_CSRF_TOKEN,
+                    "expected_revision": revision(""),
                 }
                 resp = self.client.post("/setup", data=data)
                 self.assertEqual(resp.status_code, 200)
@@ -58,6 +61,8 @@ class TestSetupApp(unittest.TestCase):
                 self.assertIn("DHAN_CLIENT_ID=1100998877", content)
                 self.assertIn("TRADING_MODE=TEST", content)
                 self.assertIn("BOT_INSTANCE_NAME=SapphireAlgo", content)
+                self.assertIn("MAX_DAILY_TRADES=20", content)
+                self.assertNotIn("TRADING_MODE=LIVE", content)
             finally:
                 os.chdir(old_cwd)
 
