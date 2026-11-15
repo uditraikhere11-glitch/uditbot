@@ -51,6 +51,22 @@ def _payload_hash(form_data: Mapping[str, Any]) -> str:
     return sha256(json.dumps(dict(form_data), sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def _persist_record(tracker: ConfigChangeTracker, rec: ConfigChangeRecord) -> None:
+    """The legacy tracker logs disk-write failures instead of raising them.
+
+    The field coordinator cannot accept that silently: a saved environment
+    with an unrecorded status would leave the owner unable to recover safely.
+    """
+    tracker.save_change_record(rec)
+    stored = tracker.get_change_record(rec.change_id)
+    if (stored is None or stored.state != rec.state
+            or stored.operation_state != rec.operation_state
+            or stored.requested_file_revision != rec.requested_file_revision):
+        raise ConfigurationConflict(
+            "Configuration status could not be durably verified; review transaction recovery before another update"
+        )
+
+
 def _request_path(tracker: ConfigChangeTracker, request_id: str) -> str:
     return os.path.join(tracker.data_dir, "config_request_ids", sha256(request_id.encode()).hexdigest() + ".json")
 
@@ -71,7 +87,15 @@ def _existing_request(tracker: ConfigChangeTracker, request_id: str, payload_has
         raise ConfigurationConflict("Request ID reused for a different configuration change")
     rec = tracker.get_change_record(old.get("change_id"))
     if rec is not None:
-        return rec
+        if (rec.application_method == "SAVE_FOR_CONTROLLED_START"
+                and rec.state in _BUSY):
+            # Previous request may have crashed after accepting the receipt,
+            # before finishing its atomic file update. Recover in place
+            # instead of replaying it or returning an indefinite 15% state.
+            recover_field_transactions(tracker)
+            rec = tracker.get_change_record(old.get("change_id"))
+        if rec is not None:
+            return rec
     # An older request has already been accepted. Never replay it over newer changes.
     raise ConfigurationConflict("This configuration request has already been handled; refresh the page")
 
@@ -115,8 +139,18 @@ def recover_legacy_notification_deferred(tracker: ConfigChangeTracker, env_path:
         staged_norm = normalize_configuration_dict(staged)
         different = {k for k in set(old_norm) | set(staged_norm)
                      if old_norm.get(k) != staged_norm.get(k)}
-        if different != {"dhan_response_group_name"}:
+        if different not in ({"dhan_response_group_name"}, set()):
             return False
+        if not different:
+            # If the coordinator crashed after replacing .env but before
+            # storing its completion state, current/staged values match.
+            # Accept only an operation whose original intent was explicitly
+            # notification-only; never reinterpret a real mode transition.
+            if not rec.changes_summary or not all(
+                "dhan_response_group_name" in str(item).lower()
+                for item in rec.changes_summary
+            ):
+                return False
         protected = {k for k in set(old) | set(staged)
                      if any(s in k.lower() for s in ("pin", "token", "secret", "hash", "session", "password", "client_id"))}
         if any(old.get(k, "") != staged.get(k, "") for k in protected):
@@ -126,7 +160,7 @@ def recover_legacy_notification_deferred(tracker: ConfigChangeTracker, env_path:
         new_raw, changes = patch_env(old_raw, {
             "dhan_response_group_name": staged.get("DHAN_RESPONSE_GROUP_NAME", "")
         })
-        if set(changes) != {"DHAN_RESPONSE_GROUP_NAME"}:
+        if set(changes) != ({"DHAN_RESPONSE_GROUP_NAME"} if different else set()):
             return False
         validate_effective_config(new_raw)
     except (ConfigurationConflict, ConfigurationRejected, ValueError, OSError):
@@ -157,7 +191,7 @@ def recover_legacy_notification_deferred(tracker: ConfigChangeTracker, env_path:
             "Legacy notification-only update recovered and saved for next controlled start; "
             "running destination is not yet verified. No broker or order records changed."
         )
-        tracker.save_change_record(rec)
+        _persist_record(tracker, rec)
         # Do not clear an unrelated LIVE entry gate. Only remove the old
         # notification stage, whose content is now reflected in saved .env.
         tracker.clear_deferred_artifacts(clear_gate=False)
@@ -259,7 +293,7 @@ def submit_webui_patch(
             rec.current_step = "PERSISTED"
             rec.restart_required = False
             rec.reason = "No configuration values changed. No service was restarted or broker called."
-            tracker.save_change_record(rec)
+            _persist_record(tracker, rec)
             _remember_request(tracker, request_id, payload_hash, change_id)
             return rec
 
@@ -284,7 +318,7 @@ def submit_webui_patch(
             rec.previous_file_revision = revision(raw)
             rec.requested_file_revision = revision(new_content)
             rec.changes_summary = changes_summary
-            tracker.save_change_record(rec)
+            _persist_record(tracker, rec)
             _remember_request(tracker, request_id, payload_hash, rec.change_id)
         else:
             # Commit record before the file update so a crash never presents an
@@ -303,7 +337,7 @@ def submit_webui_patch(
                 "status": "PREPARED", "backup_path": backup,
                 "env_path": env_path, "policy": policy,
             })
-            tracker.save_change_record(rec)
+            _persist_record(tracker, rec)
             _remember_request(tracker, request_id, payload_hash, change_id)
             try:
                 # CAS against outside writers while under the shared WebUI lock.
@@ -323,12 +357,12 @@ def submit_webui_patch(
                         rec.state = ConfigApplyState.APPLY_FAILED
                         rec.operation_state = OperationState.FAILED.value
                         rec.runtime_verified = False
-                        tracker.save_change_record(rec)
+                        _persist_record(tracker, rec)
                         raise ConfigurationConflict(rec.reason) from None
                 rec.reason = "Configuration write failed and the previous file was retained"
                 rec.state = ConfigApplyState.APPLY_FAILED
                 rec.operation_state = OperationState.FAILED.value
-                tracker.save_change_record(rec)
+                _persist_record(tracker, rec)
                 raise ConfigurationConflict(rec.reason) from None
             rec.state = ConfigApplyState.SAVED_FOR_NEXT_START
             rec.operation_state = OperationState.SAVED_FOR_NEXT_START.value
@@ -344,14 +378,20 @@ def submit_webui_patch(
                 if is_running else
                 "Saved for next start; the trading service remains stopped. No broker calls were made."
             )
-            tracker.save_change_record(rec)
-            write_json_atomic(txn_path, {
-                "change_id": change_id,
-                "previous_sha256": revision(raw),
-                "target_sha256": revision(new_content),
-                "status": "SAVED_FOR_NEXT_START", "backup_path": backup,
-                "env_path": env_path, "policy": policy,
-            })
+            _persist_record(tracker, rec)
+            try:
+                write_json_atomic(txn_path, {
+                    "change_id": change_id,
+                    "previous_sha256": revision(raw),
+                    "target_sha256": revision(new_content),
+                    "status": "SAVED_FOR_NEXT_START", "backup_path": backup,
+                    "env_path": env_path, "policy": policy,
+                })
+            except OSError:
+                # Both the exact .env bytes and durable change record were
+                # verified already. The PREPARED journal remains recoverable;
+                # do not falsely turn a completed safe save into a new update.
+                pass
     if policy == "SAFETY_CONTROLLED" and spawn_worker:
         try:
             # Only broker-sensitive settings need a broker adapter. Instantiate
@@ -385,6 +425,15 @@ def recover_field_transactions(tracker: ConfigChangeTracker) -> Dict[str, str]:
                 if meta.get("status") != "PREPARED":
                     continue
                 rec = tracker.get_change_record(meta["change_id"])
+                if rec is None:
+                    # Crash may have occurred before the status file survived.
+                    # Reconstruct a safe state from durable hashes only. Never
+                    # infer runtime activation or permission to enter LIVE.
+                    rec = ConfigChangeRecord(
+                        change_id=meta["change_id"], state=ConfigApplyState.APPLY_FAILED,
+                        runtime_verified=False, restart_performed=False,
+                        application_method="SAVE_FOR_CONTROLLED_START",
+                    )
                 current = revision(_read_env(meta["env_path"]))
                 if current == meta["target_sha256"]:
                     if rec is not None:
@@ -395,7 +444,7 @@ def recover_field_transactions(tracker: ConfigChangeTracker) -> Dict[str, str]:
                         rec.restart_required = False
                         rec.runtime_verified = False
                         rec.reason = "Recovered saved configuration after interrupted WebUI transaction; awaiting controlled startup"
-                        tracker.save_change_record(rec)
+                        _persist_record(tracker, rec)
                     meta["status"] = "SAVED_FOR_NEXT_START"
                     outcome[meta["change_id"]] = "RECOVERED_SAVED"
                 elif current == meta["previous_sha256"]:
@@ -404,7 +453,7 @@ def recover_field_transactions(tracker: ConfigChangeTracker) -> Dict[str, str]:
                         rec.operation_state = OperationState.FAILED.value
                         rec.runtime_verified = False
                         rec.reason = "Interrupted before file replacement; previous configuration retained"
-                        tracker.save_change_record(rec)
+                        _persist_record(tracker, rec)
                     meta["status"] = "FAILED_PREVIOUS_RETAINED"
                     outcome[meta["change_id"]] = "PREVIOUS_RETAINED"
                 else:
@@ -414,7 +463,7 @@ def recover_field_transactions(tracker: ConfigChangeTracker) -> Dict[str, str]:
                         rec.operation_state = OperationState.FAILED.value
                         rec.reason = "Configuration conflict after interrupted save; owner review required"
                         rec.runtime_verified = False
-                        tracker.save_change_record(rec)
+                        _persist_record(tracker, rec)
                     meta["status"] = "UNRESOLVED_CONFLICT"
                     outcome[meta["change_id"]] = "UNRESOLVED_CONFLICT"
                 write_json_atomic(path, meta)
