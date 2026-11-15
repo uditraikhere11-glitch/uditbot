@@ -195,6 +195,24 @@ def recover_legacy_notification_deferred(tracker: ConfigChangeTracker, env_path:
         # Do not clear an unrelated LIVE entry gate. Only remove the old
         # notification stage, whose content is now reflected in saved .env.
         tracker.clear_deferred_artifacts(clear_gate=False)
+        # The old global coordinator could have created a transition gate
+        # even for this notification-only update. Release it ONLY if its
+        # durable owner is this exact change and there is no real pending
+        # LIVE transition or Owner Stop. Never release a foreign/unknown gate.
+        gate = tracker.inspect_transition_gate_status(read_only=True)
+        if (gate.get("active") is True and gate.get("ok") is True
+                and gate.get("change_id") == rec.change_id):
+            still_required, _, _ = tracker._has_pending_transition_or_stop_in_state()
+            if not still_required:
+                release = tracker.set_transition_gate(
+                    active=False, change_id=rec.change_id,
+                    target_mode=rec.requested_mode,
+                    reason="Notification-only legacy update recovered; no trading transition pending",
+                )
+                if not release:
+                    rec.blocked_reason = "TRANSITION_GATE_RELEASE_UNVERIFIED"
+                    rec.reason += " Existing entry gate was retained; operator review required."
+                    _persist_record(tracker, rec)
         return True
     except Exception:
         # Never claim success without preserving existing active configuration.
