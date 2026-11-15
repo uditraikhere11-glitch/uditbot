@@ -221,3 +221,45 @@ jobs:
             UDITBOT_WebUI_Reliability_Audit_Report.md
             UDITBOT_WebUI_Reliability_Acceptance_Report.md
             UDITBOT_WebUI_Reliability_SHA256.txt
+
+  pr83-compatibility:
+    name: PR #83 read-governor and watcher compatibility (no GitHub merge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUDITBOT_TEST_ISOLATION: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out the exact PR #84 candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Make a temporary in-run integration tree for PR #83
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin fix/manual-risk-120s-session-supervision
+          test "$(git rev-parse FETCH_HEAD)" = "27a0faf255487762b4aa2b53c841db846a0a01c3"
+          git -c user.name=ci -c user.email=ci@local.invalid merge --no-commit --no-ff FETCH_HEAD
+          git diff --cached --check
+          echo "Integration exists only in this CI workspace; neither PR is merged."
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install mock-only test dependencies
+        run: python -m pip install -r requirements.txt -r requirements-test.txt
+      - name: Compile merged tree
+        run: python -m compileall -q src tests
+      - name: R02/R11 integration regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -W error::ResourceWarning -m unittest -v \
+            tests.test_manual_risk_session_polling \
+            tests.test_r02_adaptive_watcher \
+            tests.test_webui_field_reliability \
+            tests.test_webui_integrated_acceptance
+      - name: Full combined offline regression
+        shell: bash
+        run: python -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
