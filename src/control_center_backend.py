@@ -456,14 +456,11 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 # Do not silently rewrite other keys or request service restart on noop.
                 if new_content == previous:
                     return _json({"ok": True, "state": "UNCHANGED", "message": "F&O AMO setting already saved"})
-                if not requested:
-                    # Disable action invalidates all undisbursed local entries
-                    # before the coordinator handles service restart.
-                    from src.engine.fno_amo_queue import FnoAmoQueue
-                    try:
-                        FnoAmoQueue(data_dir, account_id=cfg.dhan_client_id).cancel_all_queued()
-                    except Exception:
-                        return _json({"error": "F&O AMO queued orders could not be cancelled safely"}, 503)
+                # IMPORTANT: Do not mutate legacy local F&O AMO queue here.
+                # The settings transaction may still fail to enqueue, defer,
+                # or be cancelled. Operator cancellation is a separate
+                # deliberate /control/amo/fno/cancel action. The legacy queue
+                # has no automatic broker dispatch route in the current BRAIN.
                 # Persist via established durable coordinator. No direct .env write.
                 read_only_broker = tracker.get_readonly_broker(env_path=env_path)
                 rec = tracker.enqueue_durable_configuration_update(
@@ -478,8 +475,9 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             # Coordinator wakes AFTER releasing outer cross-process lock.
             try:
                 tracker.start_coordinator_daemon(env_path=env_path, broker=read_only_broker, stop_when_idle=False)
-                message = ("F&O AMO setting queued for verified application; switching it OFF "
-                           "will not cancel any existing Dhan broker orders")
+                message = ("F&O AMO setting queued for verified application; no Dhan broker orders or local "
+                           "queued entries were cancelled. Use the separate Cancel action to remove legacy "
+                           "undisbursed entries if needed.")
             except Exception:
                 message = "F&O AMO queued durably; coordinator wake not confirmed. Verify configuration status before retrying."
             return _json({"ok": True, "change_id": change_id, "state": state_name,
