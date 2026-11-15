@@ -171,6 +171,12 @@ def recover_legacy_notification_deferred(tracker: ConfigChangeTracker, env_path:
         write_env_atomic(backup, old_raw)
         if revision(_read_env(env_path)) != revision(old_raw):
             return False
+        if "DHAN_RESPONSE_GROUP_NAME" in changes:
+            from src.notifier.response_activation import stage_destination_change
+            stage_destination_change(
+                tracker.data_dir, old.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                staged.get("DHAN_RESPONSE_GROUP_NAME", ""),
+            )
         write_env_atomic(env_path, new_raw)
         if revision(_read_env(env_path)) != revision(new_raw):
             raise OSError("Legacy notification recovery write could not be verified")
@@ -330,6 +336,23 @@ def submit_webui_patch(
         # preexisting broker and emergency-stop guards in the transition engine.
         if old_mode != "LIVE" and new_mode == "LIVE" and form_data.get("confirm_live") not in (True, "true", "1", "yes", "on"):
             raise ConfigurationRejected("Enabling LIVE requires explicit owner confirmation")
+
+        # Record an old destination candidate for a future Telegram session
+        # restart BEFORE the .env is changed, without resolving or sending to
+        # Telegram from the WebUI process. Stale metadata is ignored unless the
+        # running requested group matches the pending target.
+        if "DHAN_RESPONSE_GROUP_NAME" in changed:
+            from src.notifier.response_activation import stage_destination_change
+            try:
+                stage_destination_change(
+                    tracker.data_dir,
+                    old_env.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                    new_env.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                )
+            except OSError as exc:
+                raise ConfigurationConflict(
+                    "Could not stage safe Telegram destination fallback; configuration unchanged"
+                ) from None
 
         # A running safety-controlled change still requires authoritative broker
         # reconciliation and the existing restart identity verification.
