@@ -50,6 +50,7 @@ from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
+from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement
 
 logger = logging.getLogger(__name__)
 
@@ -4245,20 +4246,114 @@ class ProtectionWatcher:
                 return False
         return False
 
+    def _poll_snapshot(self):
+        """Take a consistent local snapshot to wake promptly on new obligations.
+
+        A manual-risk holding remains an open position. No record is dropped,
+        marked closed, or protected merely to save broker GETs.
+        """
+        with self._lock:
+            pending = dict(self.pending)
+            records = list(self.terminal_orders.values()) + [
+                r for r in pending.values()
+                if isinstance(r, dict) and r.get("entry_only_amo")
+            ]
+            signature = tuple(sorted(
+                (
+                    str(oid),
+                    str(rec.get("state") or ""),
+                    str(rec.get("filled_qty") or ""),
+                    str(rec.get("position_state") or ""),
+                    str(rec.get("pending_oco") or ""),
+                )
+                for oid, rec in list(self.pending.items()) + list(self.terminal_orders.items())
+                if isinstance(rec, dict)
+            ))
+        return pending, records, signature
+
     async def run(self, is_market_open_fn: Optional[Callable[[], bool]] = None):
+        """Adapt scheduled checks to open risk and remaining Dhan GET capacity.
+
+        The 2-second heartbeat is local only. A new order/changed local state
+        wakes the watcher at the next heartbeat; steady state does NOT run
+        five broker GETs every two seconds. Governor deferrals never count
+        as broker proof and always keep new LIVE entries fail-closed.
+        """
+        from src.broker.read_governor import ReadGovernor
+
         with self._running_lock:
             if self._is_running:
                 logger.warning("[Protection] Watcher run() loop already active in this instance; skipping duplicate launch.")
                 return
             self._is_running = True
 
+        next_due = 0.0
+        last_signature = None
+        last_notice = 0.0
         try:
             while True:
                 try:
-                    if self.should_poll(is_market_open_fn):
-                        await asyncio.to_thread(self.check_once)
-                except Exception as e:
-                    logger.error(f"[Protection] Watcher loop error: {e}")
+                    if not self.should_poll(is_market_open_fn):
+                        next_due = 0.0
+                        last_signature = None
+                    else:
+                        now = time.monotonic()
+                        pending, open_records, signature = self._poll_snapshot()
+                        if signature != last_signature or now >= next_due:
+                            cadence = watcher_cadence_seconds(
+                                pending=pending,
+                                open_records=open_records,
+                                now=self.clock(),
+                                market_open=True,
+                            )
+                            governor = getattr(self.broker, "_read_governor", None)
+                            if not isinstance(governor, ReadGovernor):
+                                governor = None
+                            wait = 0.0
+                            blocked_reason = None
+                            if governor is not None:
+                                try:
+                                    # Validate the account binding first, without issuing a GET.
+                                    check_binding = getattr(self.broker, "_get_active_read_governor", None)
+                                    if callable(check_binding):
+                                        governor = check_binding()
+                                    wait = governor.seconds_until_capacity(
+                                        required=supervision_read_requirement(len(pending)),
+                                        priority="urgent" if pending else "routine",
+                                    )
+                                except Exception as exc:
+                                    wait = 60.0
+                                    blocked_reason = "Local broker read-budget verification unavailable"
+                                    if now >= last_notice:
+                                        logger.error("[Protection] Broker governor preflight failed: %s", type(exc).__name__)
+                            if wait > 0:
+                                blocked_reason = blocked_reason or "Broker GET admission deferred; fresh position evidence unavailable"
+                                gate = getattr(self.broker, "reconciliation_gate", None)
+                                if gate is not None and hasattr(gate, "halt_new_entries"):
+                                    state = getattr(gate, "state", None)
+                                    state_value = getattr(state, "value", state)
+                                    if getattr(gate, "is_accepting_entries", False) or str(state_value).upper() != "BLOCKED":
+                                        gate.halt_new_entries(blocked_reason)
+                                if now >= last_notice:
+                                    logger.warning(
+                                        "[Protection] Governor-aware supervision deferred for %.1fs; "
+                                        "no broker GET sent; entry gate remains closed", wait,
+                                    )
+                                    last_notice = now + max(60.0, min(wait, 600.0))
+                                next_due = now + max(POLL_INTERVAL_SEC, min(wait, 60.0))
+                                last_signature = signature
+                            else:
+                                await asyncio.to_thread(self.check_once)
+                                next_due = time.monotonic() + cadence
+                                # Record state AFTER a check, avoiding a second GET
+                                # pass just because check_once updated lifecycle fields.
+                                _, _, last_signature = self._poll_snapshot()
+                except Exception as exc:
+                    logger.error("[Protection] Watcher loop error: %s", type(exc).__name__)
+                    gate = getattr(self.broker, "reconciliation_gate", None)
+                    if gate is not None and getattr(gate, "is_accepting_entries", False):
+                        gate.halt_new_entries("Protection watcher scheduling failure; broker status unverified")
+                    next_due = time.monotonic() + 60.0
                 await asyncio.sleep(POLL_INTERVAL_SEC)
         finally:
             with self._running_lock:
