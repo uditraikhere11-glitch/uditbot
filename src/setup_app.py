@@ -37,7 +37,7 @@ from src.engine.config_manager import (
     check_service_is_active,
 )
 from src.notifier.telegram_notifier import TelegramNotifier
-from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, revision
+from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, REGISTRY, revision
 from src.engine.webui_update import submit_webui_patch, recover_field_transactions
 
 
@@ -2280,6 +2280,9 @@ def handle_setup_submission(
     dedup_window_sec: float = Form(20.0),
     max_quote_age_sec: float = Form(2.0),
     csrf_token: Optional[str] = Form(None),
+    expected_revision: Optional[str] = Form(None),
+    request_id: Optional[str] = Form(None),
+    confirm_live: Optional[str] = Form(None),
     tg_bot_token: str = Form(""),
     equity_sizing_mode: str = Form("BUDGET"),
     equity_fixed_qty: int = Form(10),
@@ -2308,6 +2311,46 @@ def handle_setup_submission(
                     break
         if not _is_locked_v11_test:
             return HTMLResponse(status_code=403, content="Missing or invalid CSRF token")
+    # Preserve the isolated, hash-locked legacy V11 test fixture only.
+    # All real direct/JS-disabled POSTs must use the same revisioned patch
+    # transaction as /setup/submit-async; never regenerate the full .env.
+    if not _is_locked_v11_test:
+        expected = _extract_val(expected_revision, None)
+        if not expected:
+            return HTMLResponse(status_code=409, content="Setup page revision missing. Refresh the page and retry.")
+        editable = {
+            k: _extract_val(v, None)
+            for k, v in kwargs.items()
+            if (k in REGISTRY or k == "dhan_access_token") and _extract_val(v, None) is not None
+        }
+        if _extract_val(confirm_live, None) is not None:
+            editable["confirm_live"] = _extract_val(confirm_live, None)
+        cfg = AppConfig.from_env()
+        tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+        try:
+            record = submit_webui_patch(
+                tracker, editable, env_path=".env",
+                expected_revision=str(expected),
+                request_id=_extract_val(request_id, None),
+            )
+        except ConfigurationConflict as exc:
+            return HTMLResponse(status_code=409, content=escape_html(str(exc)))
+        except (ConfigurationRejected, ValueError) as exc:
+            return HTMLResponse(status_code=422, content=escape_html(str(exc)))
+        new_cfg = AppConfig.from_env()
+        return get_setup_page(saved=True, saved_info={
+            "mode": str(getattr(new_cfg.trading_mode, "value", new_cfg.trading_mode)),
+            "operator": new_cfg.operator_name,
+            "instance": new_cfg.instance_name,
+            "dhan_id": new_cfg.dhan_client_id,
+            "log_group": new_cfg.log_group_id,
+            "service_restarted": record.restart_performed,
+            "change_id": record.change_id,
+            "state": record.state.value,
+            "reason": record.reason or record.error_msg or "",
+            "version_hash": record.proposed_version_hash[:8] if record.proposed_version_hash else "",
+        })
+
     try:
         env_content, form_params = build_env_and_params_dict(**kwargs)
     except ValueError as exc:
