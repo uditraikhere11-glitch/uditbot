@@ -137,6 +137,10 @@ class CoordinatorIntegrationAudit(unittest.TestCase):
             "change_id": rec.change_id, "env_path": self.env_path,
             "db_path": str(sqlite_path),
         })
+        self.assertTrue(self.tracker.set_transition_gate(
+            active=True, change_id=rec.change_id, target_mode="LIVE",
+            reason="Historical notification update incorrectly held LIVE transition gate",
+        ))
         with patch.object(ConfigChangeTracker, "evaluate_trading_safety_gate_detailed",
                           side_effect=AssertionError("NO broker checks for group change")), \
              patch.object(ConfigChangeTracker, "get_readonly_broker",
@@ -147,6 +151,7 @@ class CoordinatorIntegrationAudit(unittest.TestCase):
         self.assertFalse(after.runtime_verified)
         self.assertEqual(sqlite_path.read_bytes(), before)
         self.assertFalse(Path(self.tracker.deferred_env_file).exists())
+        self.assertFalse(self.tracker.inspect_transition_gate_status(read_only=True)["active"])
 
     def test_ac06_confirmation_required_before_live_transition(self):
         path = Path(self.env_path)
