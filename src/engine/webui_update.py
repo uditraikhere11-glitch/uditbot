@@ -234,6 +234,17 @@ def submit_webui_patch(
         prior_result = _existing_request(tracker, request_id, payload_hash)
         if prior_result is not None:
             return prior_result
+        # Reconcile an interrupted save before accepting any NEW request.
+        # Unknown disk state is never interpreted as a clean prior version,
+        # even when the browser supplied the latest file hash.
+        recovery = recover_field_transactions(tracker)
+        unresolved = [cid for cid, outcome in recovery.items()
+                      if outcome not in ("RECOVERED_SAVED", "PREVIOUS_RETAINED")]
+        if unresolved:
+            raise ConfigurationConflict(
+                "An earlier configuration save is unresolved. Open Configuration Change "
+                "Tracker and resolve the file conflict before changing settings."
+            )
         # Do not supersede a safety-critical pending transition in the legacy
         # single-record coordinator. Independent, non-restart changes would be
         # possible in a multi-record tracker, but not by overwriting its gate.
