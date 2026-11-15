@@ -207,6 +207,21 @@ def is_isolated_test_environment() -> bool:
     )
 
 
+def _fsync_directory(parent_dir: str) -> None:
+    """Durably publish atomic rename on filesystems supporting directory fsync."""
+    fd = None
+    try:
+        fd = os.open(parent_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(fd)
+    except OSError:
+        # File fsync and atomic replace still succeeded. Unsupported directory
+        # durability must not be misreported as a failed file replacement.
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def write_env_atomic(env_path: str, content: str) -> None:
     """Writes .env atomically with strict 0600 permissions."""
     parent_dir = os.path.dirname(os.path.abspath(env_path))
@@ -224,6 +239,7 @@ def write_env_atomic(env_path: str, content: str) -> None:
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, env_path)
         os.chmod(env_path, 0o600)
+        _fsync_directory(parent_dir)
     except Exception:
         if os.path.exists(tmp_path):
             try:
@@ -250,6 +266,7 @@ def write_json_atomic(file_path: str, data: Dict[str, Any], mode: int = 0o600) -
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, file_path)
         os.chmod(file_path, mode)
+        _fsync_directory(parent_dir)
     except Exception:
         if os.path.exists(tmp_path):
             try:
@@ -751,6 +768,13 @@ class ConfigChangeRecord:
     pre_restart_pid: int = 0
     pre_restart_starttime: Optional[int] = None
     observed_systemd_state: str = ""
+    # Additive WebUI field-scoped metadata (never includes unredacted secrets).
+    changed_fields: List[str] = field(default_factory=list)
+    application_method: str = ""
+    broker_checks_required: bool = False
+    client_request_id: str = ""
+    previous_file_revision: str = ""
+    requested_file_revision: str = ""
 
     @property
     def step_status(self) -> Dict[str, str]:
@@ -5592,7 +5616,8 @@ def execute_configuration_update(
                 existing_change_id=existing_change_id,
             )
 
-        repair_and_export_sqlite_session(data_dir=tracker.data_dir, env_path=env_path)
+        # Telegram session schema repair and credential exports are explicit
+        # maintenance operations, never side effects of configuration saves.
 
         previous_env_raw = ctx["previous_env_raw"]
         combined_new_params = ctx["combined_new_params"]
