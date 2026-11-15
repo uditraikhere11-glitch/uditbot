@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   frozen-candidate:
+    needs: pr83-compatibility
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -28,6 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -109,6 +111,11 @@ jobs:
               'src/engine/config_patch.py':'New editable-field schema; strict patching, CAS and validation',
               'src/engine/webui_update.py':'Field-aware coordinator with backups, idempotency and legacy recovery',
               'src/engine/config_manager.py':'Durable rename, additive status metadata and decoupled session repair',
+              'src/control_center_backend.py':'Canonical Equity/F&O AMO validation and revision CAS; corrected F&O no-op key; removed premature queue cancellation',
+              'src/control_center_ui.py':'Send observed configuration revision with AMO switch request',
+              'tests/test_webui_reliability_remaining.py':'Field invalid inputs, lifecycle/broker mocks, recovery, AMO queue and stale Control Center revision tests',
+              'tests/test_v14_webui_backend_fix_02.py':'Explicit running LIVE service fixture for deferred broker-sensitive transition',
+              'tests/test_setup.py':'Authenticated versioned direct Setup regression',
               'src/setup_app.py':'Authenticated Setup patch route, form provenance, escaping and honest status',
               'tests/test_webui_field_reliability.py':'Strict isolation, types, secrets, rollback and idempotency tests',
               'tests/test_webui_integrated_acceptance.py':'YESBANK legacy and concurrency recovery, governor isolation, field coverage',
@@ -141,11 +148,11 @@ jobs:
               '- The single-record legacy coordinator rejects independent edits while an unrelated genuine safety-sensitive transition is already pending; multi-record rebase is not part of this release.',
               '- No in-process hot reload of notification destinations is implemented. To activate while running requires a later owner-authorized safe lifecycle transition; broker-unavailable cases may remain deferred.',
               '- Exact real-world shutdown/restart behavior and historical production DB contents cannot be verified offline. Owner must perform backup-first post-approval VM validation.',
-              '- Draft PR #83 changes protection watcher cadence and supersedes PR #81; these drafts are not included in this candidate. Combined branch integration remains pending and must be audited separately.',
+              '- Draft PR #83 watcher/governor changes are not included in this candidate. This workflow requires the isolated PR #83 merge-and-full-test compatibility job to pass before packaging; neither PR is merged.',
               '', '## Independent adversarial review limitations',
-              '- Schema/consumer mapping and negative tests are included; a complete cross-process crash matrix and Dhan state matrix remain unverified.',
+              '- Schema/consumer mapping and negative tests include synthetic crash and broker-state checks, but complete real systemd and broker outage scenarios are not executable offline.',
               '- The baseline has immutable Setup file hash tests. Updated tests retain unmodified file hash locks and replace the obsolete Setup hash with preserved endpoint and field contracts.',
-              '- Existing Control Center F&O AMO queue cancellation precedes its durable enqueue; this pre-existing behavior warrants a separate safety review before production approval.',
+              '- Control Center F&O AMO disable now leaves legacy queued entries unchanged until an explicit operator cancellation; regression tests verify failed enqueue cannot erase queued entries.',
               '', '## Recommended deployment (NOT authorized)',
               '1. Independent ChatGPT changed-files audit against current main and PR #83 compatibility; resolve every P0/P1.',
               '2. Obtain explicit owner approval for PR #84 and decide PR #83 ordering.',
@@ -215,7 +222,7 @@ jobs:
       - name: Upload immutable audit deliverables
         uses: actions/upload-artifact@v4
         with:
-          name: UDITBOT-WebUI-Reliability-${{ github.sha }}
+          name: UDITBOT-WebUI-Reliability-${{ github.event.pull_request.head.sha || github.sha }}
           if-no-files-found: error
           retention-days: 30
           path: |
@@ -237,6 +244,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Make a temporary in-run integration tree for PR #83
         shell: bash
         run: |
