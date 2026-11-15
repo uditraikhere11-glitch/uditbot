@@ -855,14 +855,28 @@ class TestCV1306And07Consolidated(unittest.TestCase):
                       "csrf_token": SETUP_CSRF_TOKEN},
             )
             self.assertEqual(r_sync_missing_revision.status_code, 409)
+            # A fresh controlled Setup form with a current revision remains
+            # functional, without sharing the earlier async queued operation.
             from src.engine.config_patch import revision
-            current = Path(".env").read_text(encoding="utf-8")
-            r_sync_ok = client.post(
-                "/setup",
-                data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000",
-                      "csrf_token": SETUP_CSRF_TOKEN, "expected_revision": revision(current)},
-            )
+            from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState
+            direct_dir = Path(self.tmp_dir.name) / "direct_form"
+            direct_dir.mkdir()
+            os.chdir(direct_dir)
+            initial = ("TRADING_MODE=TEST\nDHAN_CLIENT_ID=1113731536\n"
+                       "EQUITY_BUDGET_INR=500\nOPERATOR_NAME=Udit\n")
+            Path(".env").write_text(initial, encoding="utf-8")
+            with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                              return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "synthetic")):
+                r_sync_ok = client.post(
+                    "/setup",
+                    data={"equity_budget_inr": "30000",
+                          "csrf_token": SETUP_CSRF_TOKEN,
+                          "expected_revision": revision(initial)},
+                )
             self.assertEqual(r_sync_ok.status_code, 200)
+            after = Path(".env").read_text(encoding="utf-8")
+            self.assertEqual(after, initial.replace("EQUITY_BUDGET_INR=500\n",
+                                                    "EQUITY_BUDGET_INR=30000\n"))
         finally:
             os.chdir(old_cwd)
 
