@@ -111,6 +111,25 @@ class R02CadencePolicyTests(unittest.TestCase):
             ), 300.0
         )
 
+    def test_uncertain_cancel_or_protection_never_waits_five_minutes(self):
+        for fields in (
+            {"cancel_uncertain": True},
+            {"cancel_requested": True},
+            {"entry_timeout_elapsed": True},
+            {"persistence_uncertain": True},
+            {"reconciliation_required": True},
+            {"retry_reserved": True},
+            {"pending_oco": {"state": "UNKNOWN"}},
+            {"pending_oco": {"state": "SUBMITTING"}},
+        ):
+            with self.subTest(fields=fields):
+                self.assertEqual(
+                    watcher_cadence_seconds(
+                        pending={"UNRESOLVED": {"created_at": 1, **fields}},
+                        open_records=[], now=100000, market_open=False,
+                    ), 10.0
+                )
+
     def test_read_requirement_is_bounded(self):
         self.assertEqual(supervision_read_requirement(0), 8)
         self.assertEqual(supervision_read_requirement(2), 12)
