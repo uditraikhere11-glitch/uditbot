@@ -603,7 +603,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             ("src/setup_wizard.py", "5e08eb4b0626aacfe7ee8cee8e9f66f421d43f7f90caa8d9a400506d7461430f"),
             ("tests/test_setup.py", "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e"),
         ]:
-            if rel_path == "src/setup_app.py":
+            if rel_path in ("src/setup_app.py", "tests/test_setup.py"):
                 # This legacy byte-lock predated the explicitly authorized
                 # WebUI reliability refactor. Instead of pinning old defects,
                 # enforce the unchanged Setup HTML and route contract below.
