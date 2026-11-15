@@ -51,7 +51,7 @@ from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
-from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only
+from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only, has_urgent_obligation
 
 logger = logging.getLogger(__name__)
 
@@ -4370,7 +4370,9 @@ class ProtectionWatcher:
                                         governor = check_binding()
                                     wait = governor.seconds_until_capacity(
                                         required=supervision_read_requirement(len(pending)),
-                                        priority="urgent" if pending else "routine",
+                                        priority="urgent" if pending or any(
+                                            has_urgent_obligation(r) for r in open_records
+                                        ) else "routine",
                                     )
                                 except Exception as exc:
                                     wait = 60.0
