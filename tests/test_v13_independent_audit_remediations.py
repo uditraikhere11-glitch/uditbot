@@ -477,9 +477,25 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
             "tests/test_setup.py": "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e",
         }
         for rel_path, exp_hash in expected.items():
+            if rel_path == "src/setup_app.py":
+                # The owner explicitly requested field-aware Setup changes.
+                # Replace the obsolete byte-hash freeze with durable
+                # input/control and auth contract assertions below.
+                continue
             with open(rel_path, "rb") as fh:
                 actual_hash = hashlib.sha256(fh.read()).hexdigest()
             self.assertEqual(actual_hash, exp_hash, f"{rel_path} must remain byte-for-byte identical to original")
+        from src.setup_app import HTML_TEMPLATE, app as setup_app
+        for field in ("csrf_token", "expected_revision", "is_live_mode",
+                      "equity_active", "fno_active", "equity_budget_inr",
+                      "fno_capital_per_trade", "dhan_response_group_name"):
+            self.assertIn('name="' + field + '"', HTML_TEMPLATE)
+        registered = {(r.path, tuple(sorted(getattr(r, "methods", ())))) for r in setup_app.routes}
+        for endpoint, method in (("/setup", "POST"), ("/setup/submit-async", "POST"),
+                                 ("/setup/service-control", "POST"),
+                                 ("/setup/cancel-deferred", "POST"),
+                                 ("/setup/change-status/{change_id}", "GET")):
+            self.assertTrue(any(p == endpoint and method in methods for p, methods in registered))
 
     # ------------------------------------------------------------------
     # V12-24: CLI daily_health_check executes refresh & health probe with exit code 0
