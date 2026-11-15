@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from src.config import AppConfig, parse_env_dict
+from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
 from src.engine.config_manager import (
     ConfigApplyState,
     ConfigChangeTracker,
@@ -102,6 +103,17 @@ def _single_key_change(content: str, enabled: bool, key: str = _CONFIG_KEY) -> s
     return "".join(lines)
 
 
+def _revision_for_control(env_path: str) -> str:
+    """Return a revision fingerprint, never raw configuration or secrets."""
+    try:
+        if os.path.islink(env_path):
+            return "UNAVAILABLE"
+        with open(env_path, "r", encoding="utf-8", newline="") as fh:
+            return revision(fh.read())
+    except (OSError, UnicodeError):
+        return "UNAVAILABLE"
+
+
 def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     """A read-only, field-allowlisted status; never expose raw systemd/config."""
     cfg, absolute_env, data_dir = _config_and_paths(env_path)
@@ -133,6 +145,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     )
     return {
         "service_state": state,
+        "config_file_revision": _revision_for_control(absolute_env),
         "service_detail": "Runtime inspected through the existing systemd service coordinator",
         "saved_mode": str(raw.get("saved_mode") or "UNKNOWN"),
         "running_mode": str(raw.get("running_mode") or "UNKNOWN"),
