@@ -11,7 +11,8 @@ POLL_HEARTBEAT_SECONDS = 2.0
 NEW_ORDER_FAST_WINDOW_SECONDS = 45.0
 NORMAL_OPEN_SECONDS = 45.0
 MANUAL_RISK_OPEN_SECONDS = 60.0
-STALE_PENDING_SECONDS = 45.0
+STALE_PENDING_SECONDS = 75.0
+AFTER_HOURS_SECONDS = 300.0
 IDLE_MARKET_SECONDS = 90.0
 
 
@@ -28,7 +29,11 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
                 created = 0
             if math.isfinite(created) and created > 0 and 0 <= now - created <= NEW_ORDER_FAST_WINDOW_SECONDS:
                 return POLL_HEARTBEAT_SECONDS
-        return STALE_PENDING_SECONDS
+        if not market_open:
+            return AFTER_HOURS_SECONDS
+        # Repeated stale pending reads are never allowed to consume the
+        # entire hourly budget just because their status is unresolved.
+        return max(STALE_PENDING_SECONDS, supervision_read_requirement(len(pending_records)) * 7.5)
 
     open_recs = [
         rec for rec in (open_records or [])
@@ -38,6 +43,11 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
         and str(rec.get("position_state") or "") != "POSITION_CLOSED"
     ]
     if open_recs:
+        # Broker-side SL/Target orders remain live outside exchange hours;
+        # slower verification still monitors holdings without burning the
+        # durable 24-hour GET quota overnight.
+        if not market_open:
+            return AFTER_HOURS_SECONDS
         if all(
             str(rec.get("position_state") or "") == "UNPROTECTED_MANUAL_RISK"
             for rec in open_recs
@@ -45,7 +55,7 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
             return MANUAL_RISK_OPEN_SECONDS
         return NORMAL_OPEN_SECONDS
 
-    return IDLE_MARKET_SECONDS if market_open else IDLE_MARKET_SECONDS
+    return IDLE_MARKET_SECONDS if market_open else AFTER_HOURS_SECONDS
 
 
 def supervision_read_requirement(pending_count):
