@@ -37,6 +37,19 @@ from src.engine.config_manager import (
     check_service_is_active,
 )
 from src.notifier.telegram_notifier import TelegramNotifier
+from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, revision
+from src.engine.webui_update import submit_webui_patch, recover_field_transactions
+
+
+def _setup_revision() -> str:
+    try:
+        with open(".env", "r", encoding="utf-8", newline="") as fh:
+            return revision(fh.read())
+    except FileNotFoundError:
+        return revision("")
+    except OSError:
+        return "UNAVAILABLE"
+
 
 app = FastAPI(title="Audit bot - Setup Dashboard")
 
@@ -68,6 +81,13 @@ def ensure_webui_coordinator_started(
 @app.on_event("startup")
 def _on_webui_startup() -> None:
     if not is_isolated_test_environment():
+        # Recover interrupted save-only configuration transactions without
+        # starting the trading service or contacting Dhan.
+        try:
+            cfg = AppConfig.from_env()
+            recover_field_transactions(ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data")))
+        except Exception:
+            pass
         ensure_webui_coordinator_started(stop_when_idle=False)
 
 
@@ -656,6 +676,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <form method="POST" action="/setup">
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
+        <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
       
       <!-- 1. Master Execution Mode & Segments -->
       <div class="section-card">
@@ -1374,6 +1395,11 @@ document.addEventListener('DOMContentLoaded', function() {
       document.getElementById('modalCloseBtn').style.display = 'none';
 
       const formData = new FormData(form);
+      const newId = (window.crypto && window.crypto.getRandomValues)
+        ? Array.from(window.crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('')
+        : String(Date.now()) + '-' + String(Math.random()).slice(2);
+      formData.set('request_id', newId);
+      if (liveCheckbox && liveCheckbox.checked) formData.set('confirm_live', 'true');
       try {
         const resp = await fetch('/setup/submit-async', {
           method: 'POST',
@@ -1410,9 +1436,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     let stepCaption = pct + '% — ' + (rec.state_label || rec.current_step || rec.state);
     if (rec.state === 'WAITING_FOR_SAFE_APPLY' || rec.operation_state === 'WAITING_FOR_ORDER') {
-      stepCaption = pct + '% — Waiting for Existing LIVE Order';
+      stepCaption = pct + '% — Waiting for Broker-Safe Trading Transition';
     } else if (rec.state === 'SAVED_FOR_NEXT_START') {
-      stepCaption = pct + '% — Settings Saved (Bot Not Started — Runtime Verification Skipped)';
+      stepCaption = pct + '% — Saved for Next Controlled Start (Not Yet Active)';
     }
     document.getElementById('modalProgressStepText').textContent = stepCaption;
 
@@ -1430,7 +1456,7 @@ document.addEventListener('DOMContentLoaded', function() {
     } else if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
       document.getElementById('modalActiveVersion').textContent = (rec.running_mode || prevMode) + ' — Waiting for Order';
     } else if (rec.state === 'SAVED_FOR_NEXT_START') {
-      document.getElementById('modalActiveVersion').textContent = 'Bot Not Running (Saved: ' + (rec.saved_mode || reqMode) + ' — Runtime Verification Not Performed)';
+      document.getElementById('modalActiveVersion').textContent = 'Saved: ' + (rec.saved_mode || reqMode) + ' — Current running settings unchanged; activation pending';
     } else if (rec.effective_version_hash) {
       document.getElementById('modalActiveVersion').textContent = (rec.running_mode || reqMode) + ' — Verified (Ref: ' + rec.effective_version_hash.slice(0, 8) + ')';
     } else {
@@ -1454,12 +1480,17 @@ document.addEventListener('DOMContentLoaded', function() {
       reasonBox.className = 'modal-reason';
     }
 
-    if (rec.changes_summary && rec.changes_summary.length > 0) {
-      document.getElementById('modalChangesList').innerHTML = rec.changes_summary.map(c => '<div>• ' + c + '</div>').join('');
-    } else if (rec.previous_version_hash && rec.previous_version_hash === rec.proposed_version_hash) {
-      document.getElementById('modalChangesList').innerHTML = '<div>No settings changed; the requested configuration already matches the saved configuration.</div>';
-    } else {
-      document.getElementById('modalChangesList').innerHTML = '<div>None</div>';
+    const changesList = document.getElementById('modalChangesList');
+    changesList.replaceChildren();
+    const changes = (rec.changes_summary && rec.changes_summary.length > 0)
+      ? rec.changes_summary
+      : (rec.previous_version_hash && rec.previous_version_hash === rec.proposed_version_hash)
+        ? ['No configuration values changed.']
+        : ['None'];
+    for (const change of changes) {
+      const row = document.createElement('div');
+      row.textContent = '• ' + String(change);
+      changesList.appendChild(row);
     }
 
     // Context-sensitive Start / Stop / Waiting controls (Part 5)
@@ -1690,9 +1721,10 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--EQUITY_CHECKED-->", "checked" if cfg.equity_active else "")
         .replace("<!--FNO_CHECKED-->", "checked" if cfg.fno_active else "")
         # Operator & Bot Name
-        .replace("<!--OPERATOR_NAME-->", getattr(cfg, "operator_name", os.environ.get("OPERATOR_NAME", "Udit")))
-        .replace("<!--INSTANCE_NAME-->", getattr(cfg, "instance_name", os.environ.get("BOT_INSTANCE_NAME", "Audit bot")))
+        .replace("<!--OPERATOR_NAME-->", escape_html(str(getattr(cfg, "operator_name", os.environ.get("OPERATOR_NAME", "Udit"))), quote=True))
+        .replace("<!--INSTANCE_NAME-->", escape_html(str(getattr(cfg, "instance_name", os.environ.get("BOT_INSTANCE_NAME", "Audit bot"))), quote=True))
         .replace("<!--CSRF_TOKEN-->", SETUP_CSRF_TOKEN)
+        .replace("<!--CONFIG_REVISION-->", _setup_revision())
         # Telegram (Secret values strictly excluded from HTML responses)
         .replace("<!--TG_API_ID-->", str(cfg.tg_api_id or ""))
         .replace("<!--TG_API_HASH-->", "")
@@ -1701,7 +1733,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--DHAN_RESPONSE_GROUP_NAME-->", escape_html(cfg.dhan_response_group_name, quote=True))
         .replace("<!--TEST_GROUP_ID-->", str(cfg.test_group_id or ""))
         # Dhan (Secret values strictly excluded from HTML responses)
-        .replace("<!--DHAN_CLIENT_ID-->", cfg.dhan_client_id or "")
+        .replace("<!--DHAN_CLIENT_ID-->", escape_html(str(cfg.dhan_client_id or ""), quote=True))
         .replace("<!--DHAN_PIN-->", "")
         .replace("<!--DHAN_TOTP_SECRET-->", "")
         .replace("<!--DHAN_ACCESS_TOKEN-->", "")
@@ -2044,6 +2076,8 @@ async def handle_setup_submission_async(request: Request):
         raw_data = await request.json()
     else:
         form = await request.form()
+        if any(len(form.getlist(k)) != 1 for k in form.keys()):
+            return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": "Duplicate form fields are not permitted"})
         raw_data = dict(form)
         raw_data["is_live_mode"] = "is_live_mode" in form
         raw_data["equity_active"] = "equity_active" in form
@@ -2059,40 +2093,20 @@ async def handle_setup_submission_async(request: Request):
         )
         return JSONResponse(status_code=403, content=rec.to_dict())
 
-    try:
-        env_content, form_params = build_env_and_params_dict(**raw_data)
-    except ValueError as exc:
-        return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": str(exc)})
     cfg = AppConfig.from_env()
-    data_dir = os.path.abspath(getattr(cfg, "data_dir", "data"))
-    env_path = os.path.abspath(".env")
-    notifier = TelegramNotifier(cfg) if cfg.log_group_id else None
-    tracker = ConfigChangeTracker(data_dir=data_dir)
-    ro_broker = tracker.get_readonly_broker(env_path=env_path)
-
-    # Support explicit sync_mode="1" only when caller explicitly requests blocking execution;
-    # standard Save & Apply is always durably queued and executed by the serialized coordinator (B11).
-    if str(raw_data.get("sync_mode", "")).lower() in ("1", "true"):
-        record = execute_configuration_update(
-            form_params=form_params,
-            env_content=env_content,
-            data_dir=data_dir,
-            env_path=env_path,
-            notifier=notifier,
-            broker=ro_broker,
+    tracker = ConfigChangeTracker(data_dir=os.path.abspath(getattr(cfg, "data_dir", "data")))
+    try:
+        rec = submit_webui_patch(
+            tracker, raw_data, env_path=os.path.abspath(".env"),
+            expected_revision=raw_data.get("expected_revision"),
+            request_id=raw_data.get("request_id"),
+            spawn_worker=str(raw_data.get("spawn_worker", "true")).lower() not in ("0", "false"),
         )
-        return JSONResponse(content=record.to_dict())
-
-    spawn_bg = str(raw_data.get("spawn_worker", "true")).lower() not in ("0", "false")
-    init_rec = tracker.enqueue_durable_configuration_update(
-        form_params=form_params,
-        env_content=env_content,
-        env_path=env_path,
-        notifier=notifier,
-        broker=ro_broker,
-        spawn_worker=spawn_bg,
-    )
-    return JSONResponse(content=init_rec.to_dict())
+    except ConfigurationConflict as exc:
+        return JSONResponse(status_code=409, content={"state": "REJECTED", "reason": str(exc)})
+    except (ConfigurationRejected, ValueError) as exc:
+        return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": str(exc)})
+    return JSONResponse(content=rec.to_dict())
 
 
 @app.get("/setup/change-status/{change_id}")
