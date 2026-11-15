@@ -76,6 +76,9 @@ class FieldRegistryAudit(unittest.TestCase):
         self.assertIn("changesList.replaceChildren()", HTML_TEMPLATE)
         self.assertIn("row.textContent = '• ' + String(change)", HTML_TEMPLATE)
         self.assertNotIn("rec.changes_summary.map(c => '<div>• ' + c", HTML_TEMPLATE)
+        self.assertIn('id="modalApplicationFacts"', HTML_TEMPLATE)
+        self.assertIn('Broker safety check:', HTML_TEMPLATE)
+        self.assertIn("rec.runtime_verified === true && rec.effective_version_hash", HTML_TEMPLATE)
 
 
 class CoordinatorIntegrationAudit(unittest.TestCase):
