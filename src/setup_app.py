@@ -2334,94 +2334,44 @@ def handle_setup_submission(
     partial_fill_retry_timeout_sec: float = Form(2.0),
     scrip_master_max_age_sec: float = Form(86400.0),
 ):
-    kwargs = locals()
     raw_csrf = _extract_val(csrf_token, None)
-    _is_locked_v11_test = False
-    if not raw_csrf or str(raw_csrf) != SETUP_CSRF_TOKEN:
-        # Allow only the hash-locked V11 baseline test_setup.py::test_post_setup_configuration fixture
-        _is_locked_v11_test = False
-        if raw_csrf is None:
-            for _f in sys._current_frames().values():
-                _cur = _f
-                while _cur is not None:
-                    if _cur.f_code.co_name == "test_post_setup_configuration" and _cur.f_code.co_filename.endswith("test_setup.py"):
-                        _is_locked_v11_test = True
-                        break
-                    _cur = _cur.f_back
-                if _is_locked_v11_test:
-                    break
-        if not _is_locked_v11_test:
-            return HTMLResponse(status_code=403, content="Missing or invalid CSRF token")
-    # Preserve the isolated, hash-locked legacy V11 test fixture only.
-    # All real direct/JS-disabled POSTs must use the same revisioned patch
-    # transaction as /setup/submit-async; never regenerate the full .env.
-    if not _is_locked_v11_test:
-        expected = _extract_val(expected_revision, None)
-        if not expected:
-            return HTMLResponse(status_code=409, content="Setup page revision missing. Refresh the page and retry.")
-        editable = {k: v for k, v in submitted.items()
-                    if k in REGISTRY or k == "dhan_access_token"}
-        # Checkboxes absent from a full HTML form are explicitly unchecked.
-        # In a partial API form, absent fields must never be reset.
-        if submitted.get("full_setup_form") == "1":
-            for key in ("is_live_mode", "equity_active", "fno_active"):
-                editable[key] = key in submitted
-        if submitted.get("confirm_live") is not None:
-            editable["confirm_live"] = submitted["confirm_live"]
-        cfg = AppConfig.from_env()
-        tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
-        try:
-            record = submit_webui_patch(
-                tracker, editable, env_path=".env",
-                expected_revision=str(expected),
-                request_id=_extract_val(request_id, None),
-            )
-        except ConfigurationConflict as exc:
-            return HTMLResponse(status_code=409, content=escape_html(str(exc)))
-        except (ConfigurationRejected, ValueError) as exc:
-            return HTMLResponse(status_code=422, content=escape_html(str(exc)))
-        new_cfg = AppConfig.from_env()
-        return get_setup_page(saved=True, saved_info={
-            "mode": str(getattr(new_cfg.trading_mode, "value", new_cfg.trading_mode)),
-            "operator": new_cfg.operator_name,
-            "instance": new_cfg.instance_name,
-            "dhan_id": new_cfg.dhan_client_id,
-            "log_group": new_cfg.log_group_id,
-            "service_restarted": record.restart_performed,
-            "change_id": record.change_id,
-            "state": record.state.value,
-            "reason": record.reason or record.error_msg or "",
-            "version_hash": record.proposed_version_hash[:8] if record.proposed_version_hash else "",
-        })
-
-    try:
-        env_content, form_params = build_env_and_params_dict(**kwargs)
-    except ValueError as exc:
-        return HTMLResponse(status_code=422, content=escape_html(str(exc)))
+    if raw_csrf != SETUP_CSRF_TOKEN:
+        return HTMLResponse(status_code=403, content="Missing or invalid CSRF token")
+    expected = _extract_val(expected_revision, None)
+    if not expected:
+        return HTMLResponse(status_code=409, content="Setup page revision missing. Refresh the page before saving.")
+    editable = {k: v for k, v in submitted.items()
+                if k in REGISTRY or k in ("dhan_access_token", "daily_trade_limit")}
+    if submitted.get("full_setup_form") == "1":
+        for key in ("is_live_mode", "equity_active", "fno_active"):
+            editable[key] = key in submitted
+    if submitted.get("confirm_live") is not None:
+        editable["confirm_live"] = submitted["confirm_live"]
     cfg = AppConfig.from_env()
-    notifier = TelegramNotifier(cfg) if cfg.log_group_id else None
-
-    record = execute_configuration_update(
-        form_params=form_params,
-        env_content=env_content,
-        data_dir=getattr(cfg, "data_dir", "data"),
-        env_path=".env",
-        notifier=notifier,
-    )
-
-    saved_info = {
-        "mode": form_params.get("TRADING_MODE", "TEST"),
-        "operator": form_params.get("OPERATOR_NAME", "Udit"),
-        "instance": form_params.get("BOT_INSTANCE_NAME", "Audit bot"),
-        "dhan_id": form_params.get("DHAN_CLIENT_ID", ""),
-        "log_group": form_params.get("LOG_GROUP_ID", ""),
-        "service_restarted": record.state == ConfigApplyState.APPLIED_VERIFIED,
+    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+    try:
+        record = submit_webui_patch(
+            tracker, editable, env_path=".env",
+            expected_revision=str(expected),
+            request_id=_extract_val(request_id, None),
+        )
+    except ConfigurationConflict as exc:
+        return HTMLResponse(status_code=409, content=escape_html(str(exc)))
+    except (ConfigurationRejected, ValueError) as exc:
+        return HTMLResponse(status_code=422, content=escape_html(str(exc)))
+    new_cfg = AppConfig.from_env()
+    return get_setup_page(saved=True, saved_info={
+        "mode": new_cfg.trading_mode.value,
+        "operator": new_cfg.operator_name,
+        "instance": new_cfg.instance_name,
+        "dhan_id": new_cfg.dhan_client_id,
+        "log_group": new_cfg.log_group_id,
+        "service_restarted": bool(record.restart_performed and record.runtime_verified),
         "change_id": record.change_id,
         "state": record.state.value,
         "reason": record.reason or record.error_msg or "",
         "version_hash": record.proposed_version_hash[:8] if record.proposed_version_hash else "",
-    }
-    return get_setup_page(saved=True, saved_info=saved_info)
+    })
 
 
 if __name__ == "__main__":
