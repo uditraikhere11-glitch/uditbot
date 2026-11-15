@@ -2269,7 +2269,11 @@ class DhanClient:
     def _halt_for_read_deferral(self):
         gate = getattr(self, "reconciliation_gate", None)
         if gate is not None and hasattr(gate, "halt_new_entries"):
-            if getattr(gate, "is_accepting_entries", False) or getattr(gate, "state", None) != "BLOCKED":
+            state = getattr(gate, "state", None)
+            state_name = getattr(state, "value", state)
+            # ReconciliationState.BLOCKED is an Enum, not the literal "BLOCKED".
+            # Repeated local deferrals must not spam halt events and SQLite.
+            if getattr(gate, "is_accepting_entries", False) or str(state_name).upper() != "BLOCKED":
                 gate.halt_new_entries(
                     "Dhan read throttled/unavailable: fresh broker evidence required before new entries"
                 )

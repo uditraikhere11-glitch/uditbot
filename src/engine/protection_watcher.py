@@ -20,6 +20,7 @@ Implements:
 """
 
 import asyncio
+import copy
 from datetime import date, datetime
 from enum import Enum
 import inspect
@@ -50,6 +51,7 @@ from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
+from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only
 
 logger = logging.getLogger(__name__)
 
@@ -1018,6 +1020,7 @@ class ProtectionWatcher:
 
     def check_once(self) -> bool:
         with self._pass_lock:
+            self._supervision_read_complete = False
             changed = False
             current_time = self.clock()
 
@@ -3189,7 +3192,7 @@ class ProtectionWatcher:
                     continue
                 if str(rec.get("order_id") or "").startswith("DRY-"):
                     continue
-                if int(rec.get("filled_qty") or 0) > 0 and str(rec.get("position_state") or "PROTECTED") not in (PositionLifecycleState.POSITION_CLOSED.value, "UNPROTECTED_MANUAL_RISK"):
+                if int(rec.get("filled_qty") or 0) > 0 and str(rec.get("position_state") or "PROTECTED") != PositionLifecycleState.POSITION_CLOSED.value:
                     return True
         return False
 
@@ -3212,7 +3215,7 @@ class ProtectionWatcher:
                 if isinstance(rec, dict)
                 and not str(rec.get("order_id") or "").startswith("DRY-")
                 and int(rec.get("filled_qty") or 0) > 0
-                and str(rec.get("position_state") or "PROTECTED") not in (PositionLifecycleState.POSITION_CLOSED.value, "UNPROTECTED_MANUAL_RISK")
+                and str(rec.get("position_state") or "PROTECTED") != PositionLifecycleState.POSITION_CLOSED.value
             ]
         if not open_recs:
             return False
@@ -3819,15 +3822,19 @@ class ProtectionWatcher:
                         aggregate_contract_open_qty += max(0, o_buy - o_sell)
 
             entry_only_unlinked_reduction = (
-                route == "ENTRY_ONLY_AMO" and broker_net_qty is not None
+                (route == "ENTRY_ONLY_AMO" or prev_pos_state == "UNPROTECTED_MANUAL_RISK")
+                and broker_net_qty is not None
                 and broker_net_qty < aggregate_contract_open_qty and sell_qty < buy_filled
             )
-            if entry_only_unlinked_reduction:
+            manual_risk_quantity_unverified = (
+                prev_pos_state == "UNPROTECTED_MANUAL_RISK" and broker_net_qty is None
+            )
+            if entry_only_unlinked_reduction or manual_risk_quantity_unverified:
                 rec["reconciliation_required"] = True
                 rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
                 rec["manual_exit_detected"] = True
                 if gate is not None and hasattr(gate, "halt_new_entries"):
-                    gate.halt_new_entries(f"Entry-only AMO {oid}: position reduction lacks complete parent-linked SELL evidence")
+                    gate.halt_new_entries(f"Open holding {oid}: quantity absent/reduced without complete parent-linked SELL evidence")
                 changed = True
 
             has_orphan_condition = (
@@ -4121,7 +4128,7 @@ class ProtectionWatcher:
                         except Exception:
                             pass
                 changed = True
-            elif entry_only_unlinked_reduction:
+            elif entry_only_unlinked_reduction or manual_risk_quantity_unverified:
                 # A partial linked exit does not account for an additional manual sale.
                 # Retain the unresolved quantity; do not fabricate a flat parent.
                 rec["confirmed_position_open_qty"] = confirmed_open_qty
@@ -4231,6 +4238,14 @@ class ProtectionWatcher:
             ):
                 self._sync_position_lifecycle(rec)
 
+        # A changed-state return value is not evidence of a successful read.
+        # Only a completed pass with all required books readable consumes the
+        # one-shot closed-session allowance.
+        self._supervision_read_complete = not unreadable_books and all(
+            book is not None for book in (
+                super_book, forever_book, trade_book, positions_book, holdings_book
+            )
+        )
         return changed
 
     def should_poll(self, is_market_open_fn: Optional[Callable[[], bool]] = None) -> bool:
@@ -4245,20 +4260,162 @@ class ProtectionWatcher:
                 return False
         return False
 
+    def request_supervision_check(self):
+        """Wake the scheduled watcher after an operator/broker event.
+
+        Local-only notification; it never bypasses the read governor. External
+        manual trades cannot be detected without a broker read or an event.
+        """
+        with self._lock:
+            self._supervision_request = getattr(self, "_supervision_request", 0) + 1
+
+    def _poll_snapshot(self):
+        with self._lock:
+            pending = copy.deepcopy(self.pending)
+            terminal = copy.deepcopy(self.terminal_orders)
+            request = getattr(self, "_supervision_request", 0)
+        records = list(terminal.values()) + [
+            r for r in pending.values()
+            if isinstance(r, dict) and r.get("entry_only_amo")
+        ]
+        account = str(getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "") or "")
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            rec["_schedule_ack_verified"] = False
+            if account and rec.get("position_state") == "UNPROTECTED_MANUAL_RISK" and self.journal_db:
+                try:
+                    security = str(rec.get("security_id") or "")
+                    rec["_schedule_ack_verified"] = bool(security) and (
+                        self.journal_db.is_manual_risk_acknowledged(
+                            str(rec.get("order_id") or ""),
+                            str(rec.get("correlation_id") or ""),
+                            expected_account_id=account,
+                            expected_security_id=security,
+                            required_qty=max(0, int(rec.get("filled_qty") or 0)
+                                             - int(rec.get("exit_filled_qty") or 0)),
+                        ) is True
+                    )
+                except Exception:
+                    # Missing/corrupt ack evidence must retain periodic supervision.
+                    rec["_schedule_ack_verified"] = False
+        keys = (
+            "state", "filled_qty", "exit_filled_qty", "position_state", "pending_oco",
+            "cancel_uncertain", "cancel_requested", "entry_timeout_elapsed", "retry_reserved",
+            "persistence_uncertain", "reconciliation_required", "sl_order_id", "tp_order_id",
+            "exit_order_id", "confirmed_protection_ids", "verified_leg_order_ids",
+            "verified_leg_map", "orphaned_leg_cancel_states", "_schedule_ack_verified",
+        )
+        signature = (request, tuple(sorted(
+            (str(oid), json.dumps({key: rec.get(key) for key in keys}, sort_keys=True, default=str))
+            for oid, rec in list(pending.items()) + list(terminal.items())
+            if isinstance(rec, dict)
+        )))
+        return pending, records, signature
+
     async def run(self, is_market_open_fn: Optional[Callable[[], bool]] = None):
+        """Adapt scheduled checks to open risk and remaining Dhan GET capacity.
+
+        The 2-second heartbeat is local only. A new order/changed local state
+        wakes the watcher at the next heartbeat; steady state does NOT run
+        five broker GETs every two seconds. Governor deferrals never count
+        as broker proof and always keep new LIVE entries fail-closed.
+        """
+        from src.broker.read_governor import ReadGovernor
+
         with self._running_lock:
             if self._is_running:
                 logger.warning("[Protection] Watcher run() loop already active in this instance; skipping duplicate launch.")
                 return
             self._is_running = True
 
+        next_due = 0.0
+        last_signature = None
+        last_notice = 0.0
+        failure_holdoff = 0.0
         try:
             while True:
+                if time.monotonic() < failure_holdoff:
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
                 try:
-                    if self.should_poll(is_market_open_fn):
-                        await asyncio.to_thread(self.check_once)
-                except Exception as e:
-                    logger.error(f"[Protection] Watcher loop error: {e}")
+                    if not self.should_poll(is_market_open_fn):
+                        next_due = 0.0
+                        last_signature = None
+                    else:
+                        now = time.monotonic()
+                        pending, open_records, signature = self._poll_snapshot()
+                        lifecycle_now = is_lifecycle_open()
+                        signature = (lifecycle_now, signature)
+                        # An exchange opening/closing transition wakes a
+                        # scheduled pass without waiting for off-hours cadence.
+                        if signature != last_signature or now >= next_due:
+                            one_shot = not lifecycle_now and manual_risk_only(pending, open_records)
+                            cadence = watcher_cadence_seconds(
+                                pending=pending,
+                                open_records=open_records,
+                                now=self.clock(),
+                                market_open=lifecycle_now,
+                            )
+                            governor = getattr(self.broker, "_read_governor", None)
+                            if not isinstance(governor, ReadGovernor):
+                                governor = None
+                            wait = 0.0
+                            blocked_reason = None
+                            if governor is not None:
+                                try:
+                                    # Validate the account binding first, without issuing a GET.
+                                    check_binding = getattr(self.broker, "_get_active_read_governor", None)
+                                    if callable(check_binding):
+                                        governor = check_binding()
+                                    wait = governor.seconds_until_capacity(
+                                        required=supervision_read_requirement(len(pending)),
+                                        priority="urgent" if pending else "routine",
+                                    )
+                                except Exception as exc:
+                                    wait = 60.0
+                                    blocked_reason = "Local broker read-budget verification unavailable"
+                                    if now >= last_notice:
+                                        logger.error("[Protection] Broker governor preflight failed: %s", type(exc).__name__)
+                            if wait > 0:
+                                blocked_reason = blocked_reason or "Broker GET admission deferred; fresh position evidence unavailable"
+                                gate = getattr(self.broker, "reconciliation_gate", None)
+                                if gate is not None and hasattr(gate, "halt_new_entries"):
+                                    state = getattr(gate, "state", None)
+                                    state_value = getattr(state, "value", state)
+                                    if getattr(gate, "is_accepting_entries", False) or str(state_value).upper() != "BLOCKED":
+                                        gate.halt_new_entries(blocked_reason)
+                                if now >= last_notice:
+                                    logger.warning(
+                                        "[Protection] Governor-aware supervision deferred for %.1fs; "
+                                        "no broker GET sent; entry gate remains closed", wait,
+                                    )
+                                    last_notice = now + max(60.0, min(wait, 600.0))
+                                next_due = now + max(POLL_INTERVAL_SEC, min(wait, 60.0))
+                                last_signature = signature
+                            else:
+                                self._supervision_read_complete = False
+                                await asyncio.to_thread(self.check_once)
+                                completed = getattr(self, "_supervision_read_complete", False) is True
+                                if one_shot and completed:
+                                    next_due = float("inf")
+                                    logger.info(
+                                        "[Protection] Closed-session manual-risk check completed; "
+                                        "next routine check at reopening. External manual trades after "
+                                        "this snapshot require operator verification or an explicit recheck."
+                                    )
+                                else:
+                                    next_due = time.monotonic() + (60.0 if one_shot else cadence)
+                                # Keep the pre-pass signature: a new order or cancellation
+                                # arriving during the worker must not be swallowed by it.
+                                last_signature = signature
+                except Exception as exc:
+                    logger.error("[Protection] Watcher loop error: %s", type(exc).__name__)
+                    gate = getattr(self.broker, "reconciliation_gate", None)
+                    if gate is not None and getattr(gate, "is_accepting_entries", False):
+                        gate.halt_new_entries("Protection watcher scheduling failure; broker status unverified")
+                    next_due = time.monotonic() + 60.0
+                    failure_holdoff = next_due
                 await asyncio.sleep(POLL_INTERVAL_SEC)
         finally:
             with self._running_lock:
