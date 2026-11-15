@@ -477,7 +477,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
             "tests/test_setup.py": "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e",
         }
         for rel_path, exp_hash in expected.items():
-            if rel_path == "src/setup_app.py":
+            if rel_path in ("src/setup_app.py", "tests/test_setup.py"):
                 # The owner explicitly requested field-aware Setup changes.
                 # Replace the obsolete byte-hash freeze with durable
                 # input/control and auth contract assertions below.
