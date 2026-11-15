@@ -44,7 +44,7 @@ class TestSetupApp(unittest.TestCase):
             try:
                 data = {
                     "dhan_client_id": "1100998877",
-                    "dhan_access_token": "test_token_123",
+                    "dhan_access_token": "",  # Token lifecycle is owned by the Dhan coordinator.
                     "instance_name": "SapphireAlgo",
                     "log_group_id": "-10012345678",
                     "max_drawdown_pct": 5.0,
