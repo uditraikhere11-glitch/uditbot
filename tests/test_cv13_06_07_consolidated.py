@@ -847,9 +847,20 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             )
             self.assertEqual(r_async_ok.status_code, 200)
 
+            # Explicit CSRF is necessary but no longer sufficient: the new
+            # field-scoped write contract rejects stale/unknown page revisions.
+            r_sync_missing_revision = client.post(
+                "/setup",
+                data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000",
+                      "csrf_token": SETUP_CSRF_TOKEN},
+            )
+            self.assertEqual(r_sync_missing_revision.status_code, 409)
+            from src.engine.config_patch import revision
+            current = Path(".env").read_text(encoding="utf-8")
             r_sync_ok = client.post(
                 "/setup",
-                data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000", "csrf_token": SETUP_CSRF_TOKEN},
+                data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000",
+                      "csrf_token": SETUP_CSRF_TOKEN, "expected_revision": revision(current)},
             )
             self.assertEqual(r_sync_ok.status_code, 200)
         finally:
