@@ -114,6 +114,8 @@ REQUEST_METADATA = frozenset({
     "csrf_token", "sync_mode", "spawn_worker", "expected_revision", "request_id", "confirm_live", "full_setup_form",
 })
 KEEP_BLANK_SECRETS = frozenset({"TG_API_HASH", "TG_BOT_TOKEN", "DHAN_PIN", "DHAN_TOTP_SECRET"})
+# Supported pre-registry Setup API alias, not a second independent setting.
+LEGACY_FORM_ALIASES = {"daily_trade_limit": "max_daily_trades"}
 _LINE = re.compile(r"^(?P<lead>[ \t]*)(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P<space>[ \t]*)=(?P<rhs>.*)$")
 _ID = re.compile(r"^[A-Za-z0-9_-]{8,100}$")
 
@@ -141,6 +143,10 @@ def parse_env_strict(content: str) -> Tuple[Dict[str, str], Dict[str, int]]:
                 raise ConfigurationConflict(f"Invalid assignment syntax at line {i + 1}")
             continue
         key = m.group("key").upper()
+        # Existing runtime parsers are case-sensitive. An editable lowercase
+        # .env assignment would be silently ignored by the running process.
+        if key in ENV_REGISTRY and m.group("key") != key:
+            raise ConfigurationConflict(f"Non-canonical configuration key {key} at line {i + 1}; correct casing before updating")
         if key in indexes:
             raise ConfigurationConflict(f"Duplicate configuration key {key} at line {i + 1}")
         rhs = m.group("rhs").strip()
@@ -252,7 +258,7 @@ def patch_env(content: str, requested: Mapping[str, Any], *, expected_revision: 
             if str(raw or "").strip():
                 raise ConfigurationRejected("Dhan access token is managed exclusively by the token coordinator")
             continue
-        spec = REGISTRY.get(form_key)
+        spec = REGISTRY.get(LEGACY_FORM_ALIASES.get(form_key, form_key))
         if spec is None:
             raise ConfigurationRejected(f"Unsupported WebUI field: {form_key}")
         if spec.key in proposed:
