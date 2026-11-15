@@ -193,7 +193,7 @@ $('equity-amo').addEventListener('change',async()=>{
   $('equity-amo').disabled=true;setText('amo-feedback','Saving Equity AMO request through safe configuration coordinator…');
   try{
     const r=await requestJSON('/control/amo/equity',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:requested,csrf_token:csrf})});
+      body:JSON.stringify({enabled:requested,csrf_token:csrf,expected_revision:current.config_file_revision})});
     setText('amo-feedback',r.message||('Request received: '+String(r.state||'PENDING')));
     if(r.change_id){
       const requestedChangeId=encodeURIComponent(String(r.change_id));
@@ -218,7 +218,7 @@ $('fno-amo').addEventListener('change',async()=>{
   $('fno-amo').disabled=true;setText('amo-feedback','Requesting F&O AMO setting through safety coordinator…');
   try{
     const r=await requestJSON('/control/amo/fno',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:requested,csrf_token:csrf})});
+      body:JSON.stringify({enabled:requested,csrf_token:csrf,expected_revision:current.config_file_revision})});
     setText('amo-feedback',r.message||('Requested: '+String(r.state||'PENDING')));
     if(r.change_id){
       const id=encodeURIComponent(String(r.change_id));
