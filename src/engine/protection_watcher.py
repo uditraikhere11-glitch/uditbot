@@ -3189,7 +3189,7 @@ class ProtectionWatcher:
                     continue
                 if str(rec.get("order_id") or "").startswith("DRY-"):
                     continue
-                if int(rec.get("filled_qty") or 0) > 0 and str(rec.get("position_state") or "PROTECTED") != PositionLifecycleState.POSITION_CLOSED.value:
+                if int(rec.get("filled_qty") or 0) > 0 and str(rec.get("position_state") or "PROTECTED") not in (PositionLifecycleState.POSITION_CLOSED.value, "UNPROTECTED_MANUAL_RISK"):
                     return True
         return False
 
@@ -3212,7 +3212,7 @@ class ProtectionWatcher:
                 if isinstance(rec, dict)
                 and not str(rec.get("order_id") or "").startswith("DRY-")
                 and int(rec.get("filled_qty") or 0) > 0
-                and str(rec.get("position_state") or "PROTECTED") != PositionLifecycleState.POSITION_CLOSED.value
+                and str(rec.get("position_state") or "PROTECTED") not in (PositionLifecycleState.POSITION_CLOSED.value, "UNPROTECTED_MANUAL_RISK")
             ]
         if not open_recs:
             return False
