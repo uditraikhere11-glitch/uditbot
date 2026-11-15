@@ -111,7 +111,7 @@ assert len(REGISTRY) == len(ENV_REGISTRY) == len(_LAYOUT) == 51, "Duplicate or m
 # Protocol/control fields are never configuration settings. A submitted unknown
 # field is an error, rather than an excuse to guess a default.
 REQUEST_METADATA = frozenset({
-    "csrf_token", "sync_mode", "spawn_worker", "expected_revision", "request_id", "confirm_live",
+    "csrf_token", "sync_mode", "spawn_worker", "expected_revision", "request_id", "confirm_live", "full_setup_form",
 })
 KEEP_BLANK_SECRETS = frozenset({"TG_API_HASH", "TG_BOT_TOKEN", "DHAN_PIN", "DHAN_TOTP_SECRET"})
 _LINE = re.compile(r"^(?P<lead>[ \t]*)(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P<space>[ \t]*)=(?P<rhs>.*)$")
