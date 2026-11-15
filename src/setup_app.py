@@ -18,7 +18,7 @@ import sys
 from html import escape as escape_html
 from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -39,6 +39,14 @@ from src.engine.config_manager import (
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, REGISTRY, revision
 from src.engine.webui_update import submit_webui_patch, recover_field_transactions
+
+
+async def _submitted_webui_form(request: Request) -> dict:
+    """Read only fields actually supplied, not FastAPI Form defaults."""
+    form = await request.form()
+    if any(len(form.getlist(key)) != 1 for key in form):
+        raise HTTPException(status_code=422, detail="Duplicate form keys are not permitted")
+    return dict(form)
 
 
 def _setup_revision() -> str:
@@ -677,6 +685,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <form method="POST" action="/setup">
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
         <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
+        <input type="hidden" name="full_setup_form" value="1">
       
       <!-- 1. Master Execution Mode & Segments -->
       <div class="section-card">
@@ -2079,9 +2088,9 @@ async def handle_setup_submission_async(request: Request):
         if any(len(form.getlist(k)) != 1 for k in form.keys()):
             return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": "Duplicate form fields are not permitted"})
         raw_data = dict(form)
-        raw_data["is_live_mode"] = "is_live_mode" in form
-        raw_data["equity_active"] = "equity_active" in form
-        raw_data["fno_active"] = "fno_active" in form
+        if raw_data.get("full_setup_form") == "1":
+            for key in ("is_live_mode", "equity_active", "fno_active"):
+                raw_data[key] = key in form
 
     csrf_val = raw_data.get("csrf_token")
     if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
@@ -2283,6 +2292,7 @@ def handle_setup_submission(
     expected_revision: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
     confirm_live: Optional[str] = Form(None),
+    submitted: dict = Depends(_submitted_webui_form),
     tg_bot_token: str = Form(""),
     equity_sizing_mode: str = Form("BUDGET"),
     equity_fixed_qty: int = Form(10),
@@ -2319,13 +2329,15 @@ def handle_setup_submission(
         expected = _extract_val(expected_revision, None)
         if not expected:
             return HTMLResponse(status_code=409, content="Setup page revision missing. Refresh the page and retry.")
-        editable = {
-            k: _extract_val(v, None)
-            for k, v in kwargs.items()
-            if (k in REGISTRY or k == "dhan_access_token") and _extract_val(v, None) is not None
-        }
-        if _extract_val(confirm_live, None) is not None:
-            editable["confirm_live"] = _extract_val(confirm_live, None)
+        editable = {k: v for k, v in submitted.items()
+                    if k in REGISTRY or k == "dhan_access_token"}
+        # Checkboxes absent from a full HTML form are explicitly unchecked.
+        # In a partial API form, absent fields must never be reset.
+        if submitted.get("full_setup_form") == "1":
+            for key in ("is_live_mode", "equity_active", "fno_active"):
+                editable[key] = key in submitted
+        if submitted.get("confirm_live") is not None:
+            editable["confirm_live"] = submitted["confirm_live"]
         cfg = AppConfig.from_env()
         tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
         try:
