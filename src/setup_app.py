@@ -937,7 +937,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Stock Options Capital per Trade (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="500" name="fno_capital_per_trade" value="<!--FNO_CAPITAL_PER_TRADE-->" required>
+              <input type="number" step="any" name="fno_capital_per_trade" value="<!--FNO_CAPITAL_PER_TRADE-->" required>
             </div>
             <p class="help-text">Used to compute whole lots (rejects if &lt;1 lot)</p>
           </div>
@@ -993,7 +993,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Max Order Amount (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="1000" name="max_order_amount_inr" value="<!--MAX_ORDER_AMOUNT_INR-->" required>
+              <input type="number" step="any" name="max_order_amount_inr" value="<!--MAX_ORDER_AMOUNT_INR-->" required>
             </div>
             <p class="help-text">Hard ceiling per single order</p>
           </div>
@@ -1007,14 +1007,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Virtual Paper Balance (TEST Mode INR)</label>
             <div class="input-wrap">
-              <input type="number" step="10000" name="test_mode_paper_funds_inr" value="<!--TEST_MODE_PAPER_FUNDS_INR-->" required>
+              <input type="number" step="any" name="test_mode_paper_funds_inr" value="<!--TEST_MODE_PAPER_FUNDS_INR-->" required>
             </div>
             <p class="help-text">Simulated capital used for risk sizing in TEST mode</p>
           </div>
           <div class="form-group">
             <label>Max Daily Loss (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="1000" name="max_daily_loss_inr" value="<!--MAX_DAILY_LOSS_INR-->" required>
+              <input type="number" step="any" name="max_daily_loss_inr" value="<!--MAX_DAILY_LOSS_INR-->" required>
             </div>
             <p class="help-text">Daily circuit breaker threshold</p>
           </div>
@@ -1031,7 +1031,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Max Total Portfolio Exposure (INR)</label>
             <div class="input-wrap">
-              <input type="number" step="5000" name="max_total_exposure_inr" value="<!--MAX_TOTAL_EXPOSURE_INR-->" required>
+              <input type="number" step="any" name="max_total_exposure_inr" value="<!--MAX_TOTAL_EXPOSURE_INR-->" required>
             </div>
             <p class="help-text">Aggregate live exposure cap</p>
           </div>
@@ -1121,14 +1121,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Max Signal Message Age (Sec)</label>
             <div class="input-wrap">
-              <input type="number" step="1" name="max_message_age_sec" value="<!--MAX_MESSAGE_AGE_SEC-->" required>
+              <input type="number" step="any" name="max_message_age_sec" value="<!--MAX_MESSAGE_AGE_SEC-->" required>
             </div>
             <p class="help-text">Rejects stale historical signals</p>
           </div>
           <div class="form-group">
             <label>Dedup Window (Sec)</label>
             <div class="input-wrap">
-              <input type="number" step="1" name="dedup_window_sec" value="<!--DEDUP_WINDOW_SEC-->" required>
+              <input type="number" step="any" name="dedup_window_sec" value="<!--DEDUP_WINDOW_SEC-->" required>
             </div>
             <p class="help-text">Blocks duplicate signals per symbol</p>
           </div>
@@ -1145,7 +1145,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Entry Order Fill Timeout (Sec)</label>
             <div class="input-wrap">
-              <input type="number" step="1" name="order_timeout_sec" value="<!--ORDER_TIMEOUT_SEC-->" required>
+              <input type="number" step="any" name="order_timeout_sec" value="<!--ORDER_TIMEOUT_SEC-->" required>
             </div>
             <p class="help-text">Auto-cancels entry limit order if unfilled</p>
           </div>
@@ -1159,7 +1159,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Scrip Master Cache Lifetime (Sec)</label>
             <div class="input-wrap">
-              <input type="number" step="3600" name="scrip_master_max_age_sec" value="<!--SCRIP_MASTER_MAX_AGE_SEC-->" required>
+              <input type="number" step="any" name="scrip_master_max_age_sec" value="<!--SCRIP_MASTER_MAX_AGE_SEC-->" required>
             </div>
             <p class="help-text">Dhan catalog cache duration (default 86400s)</p>
           </div>
