@@ -21,7 +21,7 @@ from src.engine.config_patch import (
 )
 from src.engine.config_manager import (
     ConfigApplyState, ConfigChangeRecord, ConfigChangeTracker,
-    OperationState, ServiceOperatingState, compute_config_version,
+    OperationState, ServiceOperatingState, compute_config_version, normalize_configuration_dict,
     write_env_atomic, write_json_atomic,
 )
 
@@ -106,11 +106,20 @@ def recover_legacy_notification_deferred(tracker: ConfigChangeTracker, env_path:
     try:
         old, _ = parse_env_strict(old_raw)
         staged, _ = parse_env_strict(deferred)
-        # This test deliberately excludes any implicit defaults. Legacy full
-        # regeneration is not permission to overwrite newly added settings.
-        all_keys = set(old) | set(staged)
-        different = {k for k in all_keys if old.get(k) != staged.get(k)}
-        if different != {"DHAN_RESPONSE_GROUP_NAME"}:
+        # The legacy form regenerated a complete .env, often adding default
+        # values or reformatting comments. Reconcile only when *effective*
+        # non-secret values differ in the notification destination alone and
+        # raw secret values are identical. Apply against original raw text so
+        # legacy formatting is not imported into the saved .env.
+        old_norm = normalize_configuration_dict(old)
+        staged_norm = normalize_configuration_dict(staged)
+        different = {k for k in set(old_norm) | set(staged_norm)
+                     if old_norm.get(k) != staged_norm.get(k)}
+        if different != {"dhan_response_group_name"}:
+            return False
+        protected = {k for k in set(old) | set(staged)
+                     if any(s in k.lower() for s in ("pin", "token", "secret", "hash", "session", "password", "client_id"))}
+        if any(old.get(k, "") != staged.get(k, "") for k in protected):
             return False
         if old.get("TRADING_MODE", "TEST") != staged.get("TRADING_MODE", "TEST"):
             return False
