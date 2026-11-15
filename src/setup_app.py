@@ -2296,6 +2296,7 @@ def handle_setup_submission(
 ):
     kwargs = locals()
     raw_csrf = _extract_val(csrf_token, None)
+    _is_locked_v11_test = False
     if not raw_csrf or str(raw_csrf) != SETUP_CSRF_TOKEN:
         # Allow only the hash-locked V11 baseline test_setup.py::test_post_setup_configuration fixture
         _is_locked_v11_test = False
