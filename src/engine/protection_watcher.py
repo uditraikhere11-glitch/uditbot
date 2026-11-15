@@ -4299,12 +4299,16 @@ class ProtectionWatcher:
                     else:
                         now = time.monotonic()
                         pending, open_records, signature = self._poll_snapshot()
+                        lifecycle_now = is_lifecycle_open()
+                        signature = (lifecycle_now, signature)
+                        # An exchange opening/closing transition wakes a
+                        # scheduled pass without waiting for off-hours cadence.
                         if signature != last_signature or now >= next_due:
                             cadence = watcher_cadence_seconds(
                                 pending=pending,
                                 open_records=open_records,
                                 now=self.clock(),
-                                market_open=True,
+                                market_open=lifecycle_now,
                             )
                             governor = getattr(self.broker, "_read_governor", None)
                             if not isinstance(governor, ReadGovernor):
@@ -4347,7 +4351,8 @@ class ProtectionWatcher:
                                 next_due = time.monotonic() + cadence
                                 # Record state AFTER a check, avoiding a second GET
                                 # pass just because check_once updated lifecycle fields.
-                                _, _, last_signature = self._poll_snapshot()
+                                _, _, settled_signature = self._poll_snapshot()
+                                last_signature = (is_lifecycle_open(), settled_signature)
                 except Exception as exc:
                     logger.error("[Protection] Watcher loop error: %s", type(exc).__name__)
                     gate = getattr(self.broker, "reconciliation_gate", None)
