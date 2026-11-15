@@ -324,8 +324,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             body = await request.json()
         except Exception:
             return _json({"error": "Malformed JSON"}, 400)
-        if not isinstance(body, dict) or set(body) != {"enabled", "csrf_token"}:
-            return _json({"error": "Exactly enabled and csrf_token are required"}, 400)
+        if not isinstance(body, dict) or not {"enabled", "csrf_token"}.issubset(body) or set(body) - {"enabled", "csrf_token", "expected_revision"}:
+            return _json({"error": "Only enabled, csrf_token and optional expected_revision are permitted"}, 400)
         if not isinstance(body.get("csrf_token"), str) or body["csrf_token"] != csrf_token:
             return _json({"error": "Invalid CSRF token"}, 403)
         if type(body["enabled"]) is not bool:
@@ -353,6 +353,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                     return _json({"error": "Running configuration version cannot be verified"}, 409)
                 with open(env_path, "r", encoding="utf-8", newline="") as fh:
                     previous = fh.read()
+                if "expected_revision" in body and body["expected_revision"] != revision(previous):
+                    return _json({"error": "Settings changed since the dashboard was loaded; refresh before retrying"}, 409)
                 old_dict = parse_env_content_string(previous)
                 old_value = old_dict.get(_CONFIG_KEY, "false")
                 if str(old_value).strip().lower() not in ("false", "true", "0", "1", "yes", "no", "on", "off"):
@@ -360,7 +362,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 current_enabled = str(old_value).strip().lower() in ("true", "1", "yes", "on")
                 if current_enabled == requested:
                     return _json({"ok": True, "state": "UNCHANGED", "message": "Equity AMO setting already saved"})
-                new_content = _single_key_change(previous, requested)
+                new_content, _ = patch_env(previous, {"equity_amo_enabled": requested})
+                validate_effective_config(new_content)
                 new_params = parse_env_content_string(new_content)
                 # Do not silently rewrite other keys or request service restart on noop.
                 if new_content == previous:
@@ -428,8 +431,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             body = await request.json()
         except Exception:
             return _json({"error": "Malformed JSON"}, 400)
-        if not isinstance(body, dict) or set(body) != {"enabled", "csrf_token"}:
-            return _json({"error": "Exactly enabled and csrf_token are required"}, 400)
+        if not isinstance(body, dict) or not {"enabled", "csrf_token"}.issubset(body) or set(body) - {"enabled", "csrf_token", "expected_revision"}:
+            return _json({"error": "Only enabled, csrf_token and optional expected_revision are permitted"}, 400)
         if not isinstance(body.get("csrf_token"), str) or body["csrf_token"] != csrf_token:
             return _json({"error": "Invalid CSRF token"}, 403)
         if type(body["enabled"]) is not bool:
@@ -457,6 +460,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                     return _json({"error": "Running configuration version cannot be verified"}, 409)
                 with open(env_path, "r", encoding="utf-8", newline="") as fh:
                     previous = fh.read()
+                if "expected_revision" in body and body["expected_revision"] != revision(previous):
+                    return _json({"error": "Settings changed since the dashboard was loaded; refresh before retrying"}, 409)
                 old_dict = parse_env_content_string(previous)
                 old_value = old_dict.get(_CONFIG_KEY, "false")
                 if str(old_value).strip().lower() not in ("false", "true", "0", "1", "yes", "no", "on", "off"):
@@ -464,7 +469,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 current_enabled = str(old_value).strip().lower() in ("true", "1", "yes", "on")
                 if current_enabled == requested:
                     return _json({"ok": True, "state": "UNCHANGED", "message": "F&O AMO setting already saved"})
-                new_content = _single_key_change(previous, requested, key="FNO_AMO_ENABLED")
+                new_content, _ = patch_env(previous, {"fno_amo_enabled": requested})
+                validate_effective_config(new_content)
                 new_params = parse_env_content_string(new_content)
                 # Do not silently rewrite other keys or request service restart on noop.
                 if new_content == previous:
