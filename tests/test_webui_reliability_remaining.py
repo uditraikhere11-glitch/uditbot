@@ -295,6 +295,17 @@ class ControlCenterFnoAmoTransactionAudit(unittest.TestCase):
                 self.assertEqual(accepted.status_code, 202, accepted.text)
                 cancelled.assert_not_called()
                 self.assertIn('FNO_AMO_ENABLED=true', Path(env).read_text())
+                # Actual Control Center clients transmit the revision they
+                # received from GET /control/status. Stale submissions must be
+                # rejected before any mutation, for both AMO segments.
+                t.enqueue_durable_configuration_update.reset_mock()
+                for endpoint in ('/control/amo/equity', '/control/amo/fno'):
+                    stale = client.post(endpoint, json={
+                        'enabled': True, 'csrf_token': 'SYNTHETIC_CSRF',
+                        'expected_revision': '0' * 64,
+                    })
+                    self.assertEqual(stale.status_code, 409)
+                t.enqueue_durable_configuration_update.assert_not_called()
 
 
 if __name__ == '__main__':
