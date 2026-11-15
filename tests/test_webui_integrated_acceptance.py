@@ -332,10 +332,15 @@ class CrashRecoveryAudit(CoordinatorIntegrationAudit):
         )
         self.tracker.save_change_record(rec)
         self.tracker.save_deferred_metadata({"change_id": rec.change_id, "env_path": self.env_path})
+        self.assertTrue(self.tracker.set_transition_gate(
+            active=True, change_id="FOREIGN-LIVE-TRANSITION-01",
+            target_mode="TEST", reason="Unrelated LIVE-to-TEST transition",
+        ))
         self.assertTrue(recover_legacy_notification_deferred(self.tracker, self.env_path))
         self.assertEqual(self.tracker.get_change_record(rec.change_id).state,
                          ConfigApplyState.SAVED_FOR_NEXT_START)
         self.assertFalse(Path(self.tracker.deferred_env_file).exists())
+        self.assertTrue(self.tracker.inspect_transition_gate_status(read_only=True)["active"])
 
 
 if __name__ == "__main__":
