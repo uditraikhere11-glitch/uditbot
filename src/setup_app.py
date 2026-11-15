@@ -2167,7 +2167,48 @@ def get_change_status(change_id: str):
         rec = tracker.get_change_record()
         if not rec or rec.change_id != change_id:
             return JSONResponse(status_code=404, content={"error": f"Change {change_id} not found"})
-    return JSONResponse(content=rec.to_dict())
+    status = rec.to_dict()
+    # Read-only projection: a notification-only SAVE becomes VERIFIED only
+    # after the actual authenticated listener acknowledges the requested
+    # destination, matches systemd MainPID/start time, and confirms the exact
+    # active configuration version. No broker GET or state mutation here.
+    if rec.changed_fields == ["DHAN_RESPONSE_GROUP_NAME"]:
+        from src.notifier.response_activation import read_active_destination
+        ack = read_active_destination(tracker.data_dir)
+        saved_name = parse_env_dict(".env").get("DHAN_RESPONSE_GROUP_NAME", "")
+        running = tracker.get_active_running_version(require_live_pid=True)
+        if (ack and running
+                and ack.get("requested_name") == saved_name
+                and ack.get("pid") == running.get("pid")):
+            if ack.get("target_verified") is True and rec.proposed_version_hash == running.get("version_hash"):
+                confirmed, _, _ = tracker.is_active_version_confirmed(
+                    expected_hashes={rec.proposed_version_hash},
+                    expected_mode=rec.requested_mode,
+                    require_systemd_active=True,
+                )
+                if confirmed:
+                    status.update({
+                        "state": "APPLIED_VERIFIED",
+                        "operation_state": "APPLIED_VERIFIED",
+                        "state_label": "Dhan Response destination active and verified",
+                        "notification_destination_state": "ACTIVE_VERIFIED",
+                        "runtime_verified": True,
+                        "progress_percent": 100,
+                        "reason": "The connected Telegram listener confirmed the saved destination. No trading restart was issued by the configuration transaction.",
+                    })
+            elif ack.get("fallback_active"):
+                status.update({
+                    "notification_destination_state": "PREVIOUS_DESTINATION_ACTIVE",
+                    "state_label": "New destination unresolved; previous verified destination retained",
+                    "reason": "Requested Dhan Response group could not be verified. An independently verified previous group remains active; review the requested destination.",
+                })
+            elif not ack.get("target_verified"):
+                status.update({
+                    "notification_destination_state": "DESTINATION_UNVERIFIED",
+                    "state_label": "Requested Telegram destination unavailable",
+                    "reason": "The connected Telegram listener could not verify the requested destination. Notification mirroring is unavailable until corrected.",
+                })
+    return JSONResponse(content=status)
 
 
 @app.post("/setup/coordinator-tick")
