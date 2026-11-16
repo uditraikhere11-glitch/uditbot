@@ -253,6 +253,43 @@ class ManualRiskGateRegression(WebUIRegression):
             )
         self.assertFalse(ok)
 
+        # Restore quantity, then verify account, security, and pending-order
+        # identity mismatches all remain fail-closed, independently.
+        with db._get_conn() as conn:
+            conn.execute("UPDATE orders SET filled_quantity=1 WHERE broker_order_id=?", (refs[0][0],))
+        for field, bad, expected in (
+            ("account_id", "ANOTHER_DHAN_ACCOUNT", "FAKE_ACCOUNT"),
+            ("security_id", "999999", "11915"),
+        ):
+            with self.subTest(mismatched_field=field):
+                with db._get_conn() as conn:
+                    conn.execute(
+                        f"UPDATE manual_risk_acknowledgements SET {field}=? WHERE parent_order_id=?",
+                        (bad, refs[0][0]),
+                    )
+                with patch.object(tracker, "get_readonly_broker", return_value=None):
+                    safe, *_ = tracker.evaluate_trading_safety_gate_detailed(
+                        db_path=str(db_path), stop_state_path=str(db_path.parent / "emergency_stop.json"),
+                        env_path=str(self.path.resolve()), is_service_running=True,
+                        is_live_mode=True, target_is_live=True,
+                    )
+                self.assertFalse(safe)
+                with db._get_conn() as conn:
+                    conn.execute(
+                        f"UPDATE manual_risk_acknowledgements SET {field}=? WHERE parent_order_id=?",
+                        (expected, refs[0][0]),
+                    )
+
+        with db._get_conn() as conn:
+            conn.execute("UPDATE orders SET status='PENDING' WHERE broker_order_id=?", (refs[0][0],))
+        with patch.object(tracker, "get_readonly_broker", return_value=None):
+            safe, *_ = tracker.evaluate_trading_safety_gate_detailed(
+                db_path=str(db_path), stop_state_path=str(db_path.parent / "emergency_stop.json"),
+                env_path=str(self.path.resolve()), is_service_running=True,
+                is_live_mode=True, target_is_live=True,
+            )
+        self.assertFalse(safe)
+
 
 if __name__ == "__main__":
     unittest.main()
