@@ -264,48 +264,50 @@ class ControlCenterFnoAmoTransactionAudit(unittest.TestCase):
         from src.control_center_backend import register_control_center_routes
         from src.engine.fno_amo_queue import FnoAmoQueue
         with tempfile.TemporaryDirectory() as root:
-            env = os.path.join(root, '.env')
-            Path(env).write_text('TRADING_MODE=TEST\nFNO_AMO_ENABLED=true\nDHAN_PIN=FAKE_PIN\n')
-            app = FastAPI()
-            register_control_center_routes(app, 'SYNTHETIC_CSRF')
-            t = MagicMock()
-            t.pending_op_file = os.path.join(root, 'pending.json')
-            t.deferred_env_file = os.path.join(root, 'deferred.env')
-            t.get_change_record.return_value = None
-            t.get_service_control_record.return_value = {}
-            t.inspect_transition_gate_status.return_value = {'ok': True, 'active': False}
-            t.control_service.return_value = {'service_state': 'STOPPED_BY_OWNER'}
-            t.get_readonly_broker.return_value = None
-            t.enqueue_durable_configuration_update.return_value = ConfigChangeRecord(
-                change_id='CFG-FNO-0001', state=ConfigApplyState.REQUEST_RECEIVED)
-            cfg = SimpleNamespace(dhan_client_id='FAKE_ID', fno_amo_enabled=True,
-                                  equity_amo_enabled=False, data_dir=root)
-            with patch('src.control_center_backend._config_and_paths',return_value=(cfg,env,root)), \
-                 patch('src.control_center_backend.ConfigChangeTracker',return_value=t), \
-                 patch.object(FnoAmoQueue,'cancel_all_queued',
-                              side_effect=AssertionError('Queue cancellation must require explicit user action')) as cancelled:
+            cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                env = os.path.join(root, '.env')
+                before = 'TRADING_MODE=TEST\nFNO_AMO_ENABLED=true\nDHAN_PIN=FAKE_PIN\n'
+                Path(env).write_text(before)
+                app = FastAPI()
+                register_control_center_routes(app, 'SYNTHETIC_CSRF')
                 client = TestClient(app)
-                payload={'enabled':False, 'csrf_token':'SYNTHETIC_CSRF'}
-                t.enqueue_durable_configuration_update.side_effect = RuntimeError('Injected enqueue failure')
-                failed = client.post('/control/amo/fno', json=payload)
-                self.assertEqual(failed.status_code, 500)
-                cancelled.assert_not_called()
-                t.enqueue_durable_configuration_update.side_effect = None
-                accepted = client.post('/control/amo/fno', json=payload)
-                self.assertEqual(accepted.status_code, 202, accepted.text)
-                cancelled.assert_not_called()
-                self.assertIn('FNO_AMO_ENABLED=true', Path(env).read_text())
-                # Actual Control Center clients transmit the revision they
-                # received from GET /control/status. Stale submissions must be
-                # rejected before any mutation, for both AMO segments.
-                t.enqueue_durable_configuration_update.reset_mock()
-                for endpoint in ('/control/amo/equity', '/control/amo/fno'):
-                    stale = client.post(endpoint, json={
-                        'enabled': True, 'csrf_token': 'SYNTHETIC_CSRF',
-                        'expected_revision': '0' * 64,
-                    })
-                    self.assertEqual(stale.status_code, 409)
-                t.enqueue_durable_configuration_update.assert_not_called()
+                payload = {
+                    'enabled': False, 'csrf_token': 'SYNTHETIC_CSRF',
+                    'expected_revision': revision(before),
+                    'request_id': 'FNO-CANCEL-ISOLATION-0001',
+                }
+                with patch.object(FnoAmoQueue, 'cancel_all_queued',
+                                  side_effect=AssertionError('Queue cancellation requires deliberate action')) as cancelled, \
+                     patch('src.control_center_backend.submit_webui_patch',
+                           side_effect=OSError('Injected transaction failure')):
+                    failed = client.post('/control/amo/fno', json=payload)
+                    self.assertIn(failed.status_code, (409, 503))
+                    self.assertEqual(Path(env).read_text(), before)
+                    cancelled.assert_not_called()
+
+                with patch.object(ConfigChangeTracker, 'resolve_service_operating_state',
+                                  return_value=(ServiceOperatingState.STOPPED_BY_OWNER, 'synthetic stopped')), \
+                     patch.object(ConfigChangeTracker, 'get_readonly_broker',
+                                  side_effect=AssertionError('No broker for stopped AMO toggle')), \
+                     patch.object(FnoAmoQueue, 'cancel_all_queued',
+                                  side_effect=AssertionError('Queue must remain intact')) as cancelled:
+                    accepted = client.post('/control/amo/fno', json=payload)
+                    self.assertEqual(accepted.status_code, 200, accepted.text)
+                    self.assertEqual(accepted.json()['state'], 'SAVED_FOR_NEXT_START')
+                    cancelled.assert_not_called()
+                    self.assertIn('FNO_AMO_ENABLED=false', Path(env).read_text())
+                    self.assertIn('DHAN_PIN=FAKE_PIN', Path(env).read_text())
+                    for endpoint in ('/control/amo/equity', '/control/amo/fno'):
+                        stale = client.post(endpoint, json={
+                            'enabled': True, 'csrf_token': 'SYNTHETIC_CSRF',
+                            'expected_revision': '0' * 64,
+                        })
+                        self.assertEqual(stale.status_code, 409)
+                    cancelled.assert_not_called()
+            finally:
+                os.chdir(cwd)
 
 
 if __name__ == '__main__':
