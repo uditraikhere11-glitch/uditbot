@@ -82,7 +82,7 @@ class WebUIRegression(unittest.TestCase):
         from src.control_center_backend import register_control_center_routes
         from fastapi import FastAPI
         self.assertEqual(self.client.get("/control").status_code, 404)
-        self.assertEqual(self.client.get("/setup").status_code, 404)
+        self.assertEqual(self.client.get("/setup").status_code, 405)  # legacy supports POST only; facade owns GET
         self.assertTrue(any(getattr(route, "path", None) == "/control/amo/fno"
                             for route in authenticated_app.routes))
         with patch("src.webui_password.permitted_transport", return_value=True), \
