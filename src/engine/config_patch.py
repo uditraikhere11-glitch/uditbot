@@ -220,6 +220,10 @@ def normalize(spec: FieldSpec, input_value: Any) -> str:
 
 
 def _default_value(spec: FieldSpec) -> str:
+    if spec.key in {"TG_API_ID", "LOG_GROUP_ID", "TEST_GROUP_ID"}:
+        # The runtime treats missing and empty optional IDs as unconfigured.
+        # Avoid adding a new key during an unrelated full-form edit.
+        return ""
     from src.config import AppConfig
     from enum import Enum
     cfg = AppConfig()
