@@ -68,7 +68,10 @@ these results from unauthenticated loopback requests before reporting success:
 
 - `GET /`: HTTP 303 redirect to password login
 - `GET /setup`: HTTP 303 redirect to password login
+- `GET /control/status`: HTTP 303 redirect to password login
 - `GET /login`: HTTP 200 (password form itself)
+- Unauthenticated `POST /setup/submit-async`: HTTP 401
+- Unauthenticated `POST /setup/service-control`: HTTP 401
 
 Only `auditbot-web.service` is directly restarted by this migration, and
 only if it was already active. Existing trading and token timer unit files,
