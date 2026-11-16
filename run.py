@@ -146,8 +146,8 @@ async def main():
             signal_source_ids=allowed_chats,
             reporter=getattr(pipeline.watcher, "execution_reporter", None),
             loop=loop,
-            data_dir=cfg.data_dir,
-            config_version_hash=compute_config_version(cfg),
+            data_dir=getattr(cfg, "data_dir", "data"),
+            config_version_hash=compute_config_version(cfg) if hasattr(cfg, "data_dir") else "",
         )
 
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
