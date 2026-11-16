@@ -35,10 +35,26 @@ It automatically writes a secure `.env` file with `chmod 0600` permissions.
 If you prefer configuring via the web interface shown in your setup mockup:
 ```bash
 bot web
-# or:
-python3 -m src.setup_app
+# or, on a local-only port 8080:
+python3 -m src.control_center_entry --host 127.0.0.1 --port 8080
 ```
-Connect via SSH local port forwarding (`ssh -L 8080:localhost:8080 user@vm-ip`) and open `http://localhost:8080` in your browser.
+Provision a WebUI password on the VM using `./venv/bin/python3 -m src.webui_password provision`.
+Connect via SSH local forwarding (`ssh -L 8080:127.0.0.1:8080 user@vm-ip`) and open `http://127.0.0.1:8080` in your browser.
+**Never launch `src.setup_app` directly as a public service:** it does not include the authenticated outer Control Center gate.
+
+
+### 2.3 Existing-VM WebUI authentication migration
+
+The systemd service for an **existing** VM is intentionally preserved by the
+fresh-VM installer, which can leave the older, unauthenticated `src.setup_app`
+entrypoint running after a GitHub update. Use the documented, opt-in,
+backup-first migration in [WebUI service migration](docs/webui-service-migration.md)
+to switch that service to password-protected `src.control_center_entry`.
+
+The default is private localhost. Retaining public HTTP requires explicit
+acknowledgment that passwords and sessions are transmitted unencrypted. The
+migration never starts/restarts the trading bot and stops the WebUI rather than
+restoring an unauthenticated listener if verification fails.
 
 ---
 
