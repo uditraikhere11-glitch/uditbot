@@ -35,10 +35,12 @@ It automatically writes a secure `.env` file with `chmod 0600` permissions.
 If you prefer configuring via the web interface shown in your setup mockup:
 ```bash
 bot web
-# or:
-python3 -m src.setup_app
+# or, on a local-only port 8080:
+python3 -m src.control_center_entry --host 127.0.0.1 --port 8080
 ```
-Connect via SSH local port forwarding (`ssh -L 8080:localhost:8080 user@vm-ip`) and open `http://localhost:8080` in your browser.
+Provision a WebUI password on the VM using `./venv/bin/python3 -m src.webui_password provision`.
+Connect via SSH local forwarding (`ssh -L 8080:127.0.0.1:8080 user@vm-ip`) and open `http://127.0.0.1:8080` in your browser.
+**Never launch `src.setup_app` directly as a public service:** it does not include the authenticated outer Control Center gate.
 
 
 ### 2.3 Existing-VM WebUI authentication migration
