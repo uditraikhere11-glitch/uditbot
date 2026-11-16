@@ -65,16 +65,6 @@ app = FastAPI(title="Audit bot - Setup Dashboard")
 from src.notifier.message_designer_routes import register_routes as register_message_designer_routes
 register_message_designer_routes(app, SETUP_CSRF_TOKEN)
 
-# The production web service imports this module directly. Mount the Control
-# Center routes here, rather than leaving them in an unreferenced module.
-from src.control_center_backend import register_control_center_routes
-from src.control_center_ui import render_control_center
-register_control_center_routes(app, SETUP_CSRF_TOKEN)
-
-
-@app.get("/control", response_class=HTMLResponse)
-def get_control_center():
-    return HTMLResponse(content=render_control_center(SETUP_CSRF_TOKEN))
 
 
 
@@ -1586,7 +1576,6 @@ def _mask_account_id(acct: str) -> str:
     return f"***{acct_str[-4:]}"
 
 
-@app.get("/setup", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
 def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     # Render the authoritative editable .env and schema defaults only.
