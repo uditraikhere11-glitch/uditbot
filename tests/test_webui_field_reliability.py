@@ -155,6 +155,53 @@ class ConfigurationCoordinatorReliabilityTests(unittest.TestCase):
                     )
         self.assertEqual(Path(self.path).read_bytes(), original)
 
+    def test_ac09_external_writer_before_cas_is_never_rolled_back(self):
+        import src.engine.webui_update as coordinator
+        original = Path(self.path).read_text(encoding="utf-8")
+        externally_saved = original + "EXTERNAL_OPERATOR_NOTE=never-clobber-me\\n"
+        read_original = coordinator._read_env
+        calls = [0]
+
+        def concurrent_read(path):
+            if os.path.abspath(path) == os.path.abspath(self.path):
+                calls[0] += 1
+                if calls[0] == 2:  # CAS read, after WebUI has already snapshotted.
+                    Path(self.path).write_text(externally_saved, encoding="utf-8")
+            return read_original(path)
+
+        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                               return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "mocked")), \
+             mock.patch.object(coordinator, "_read_env", side_effect=concurrent_read):
+            with self.assertRaises(ConfigurationConflict):
+                submit_webui_patch(
+                    self.tracker, {"operator_name": "NEW_OPERATOR"},
+                    self.path, expected_revision=revision(original),
+                    request_id="EXTERNAL-PRE-CAS-0001", spawn_worker=False,
+                )
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), externally_saved)
+
+    def test_ac09_external_writer_after_atomic_replace_is_never_clobbered(self):
+        import src.engine.webui_update as coordinator
+        original = Path(self.path).read_text(encoding="utf-8")
+        external = original + "EXTERNAL_OPERATOR_NOTE=after-replacement\\n"
+        write_original = coordinator.write_env_atomic
+
+        def concurrent_write(path, content):
+            write_original(path, content)
+            if os.path.abspath(path) == os.path.abspath(self.path):
+                Path(self.path).write_text(external, encoding="utf-8")
+
+        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                               return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "mocked")), \
+             mock.patch.object(coordinator, "write_env_atomic", side_effect=concurrent_write):
+            with self.assertRaises(ConfigurationConflict):
+                submit_webui_patch(
+                    self.tracker, {"operator_name": "NEW_OPERATOR"},
+                    self.path, expected_revision=revision(original),
+                    request_id="EXTERNAL-POST-CAS-0001", spawn_worker=False,
+                )
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), external)
+
     def test_ac09_stale_form_conflict_and_no_write(self):
         old = Path(self.path).read_text(encoding="utf-8")
         with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state", return_value=(ServiceOperatingState.RUNNING, "mocked")):
