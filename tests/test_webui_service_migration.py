@@ -111,6 +111,11 @@ esac
     def assert_active(self, active=True):
         self.assertEqual((self.root / 'systemd/active').exists(), active)
 
+    def test_deployment_instructions_use_authenticated_entrypoint(self):
+        docs = (Path(__file__).resolve().parents[1] / 'DEPLOYMENT.md').read_text()
+        self.assertIn('python3 -m src.control_center_entry --host 127.0.0.1', docs)
+        self.assertNotIn('python3 -m src.setup_app\n', docs)
+
     def test_plan_is_read_only_even_if_password_missing(self):
         original = self.unit.read_bytes()
         result = self.run_cmd('--plan')
