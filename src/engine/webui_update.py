@@ -10,6 +10,7 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 import os
+import re
 import secrets
 import time
 from typing import Any, Dict, Mapping, Optional
@@ -252,6 +253,11 @@ def submit_webui_patch(
     request_id = str(request_id or secrets.token_hex(16))
     if not request_id_valid(request_id):
         raise ConfigurationRejected("Invalid idempotency request ID")
+    # Require a concrete browser-observed revision for every write, including
+    # idempotent submissions. Without it the optimistic CAS can be bypassed
+    # by omitting the field from JSON requests.
+    if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+        raise ConfigurationConflict("Missing or invalid configuration revision; refresh Setup before saving")
     form_data = dict(form_data)
     payload_hash = _payload_hash(form_data)
     with tracker.operation_lock(operation_type="FIELD_SCOPED_WEBUI", operation_id=request_id):
