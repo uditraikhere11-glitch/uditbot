@@ -70,7 +70,7 @@ class TestWebUIFlexibleBudget(unittest.TestCase):
 
         html = resp.body.decode("utf-8") if hasattr(resp, "body") else str(resp)
         self.assertIn('name="equity_budget_inr" value="100.5"', html)
-        self.assertIn('name="min_trade_funds_inr" value="0"', html)
+        self.assertIn('name="min_trade_funds_inr" value="0.0"', html)
 
 if __name__ == "__main__":
     unittest.main()
