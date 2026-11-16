@@ -397,29 +397,43 @@ def submit_webui_patch(
             })
             _persist_record(tracker, rec)
             _remember_request(tracker, request_id, payload_hash, change_id)
+            # This compare-and-swap may race with non-cooperating tools
+            # that do not take the WebUI operation lock. A failed CAS is NOT
+            # permission to restore the earlier snapshot over their edits.
+            write_started = False
             try:
-                # CAS against outside writers while under the shared WebUI lock.
                 if revision(_read_env(env_path)) != revision(raw):
                     raise ConfigurationConflict("Configuration changed before atomic replacement")
+                write_started = True
                 write_env_atomic(env_path, new_content)
                 if revision(_read_env(env_path)) != revision(new_content):
                     raise OSError("Persisted configuration failed verification")
             except Exception:
-                # Previous working file remains the fallback; a failed write
-                # must not claim that the new configuration is active.
-                if revision(_read_env(env_path)) != revision(raw):
+                try:
+                    current_revision = revision(_read_env(env_path))
+                except Exception:
+                    current_revision = None
+                if write_started and current_revision == revision(new_content):
+                    # Only restore an exact file created by THIS write. Never
+                    # overwrite unknown third-party changes (including a
+                    # pre-write revision mismatch).
                     try:
                         write_env_atomic(env_path, raw)
+                        current_revision = revision(_read_env(env_path))
                     except Exception:
-                        rec.reason = "Configuration write uncertain; manual review required before another update"
-                        rec.state = ConfigApplyState.APPLY_FAILED
-                        rec.operation_state = OperationState.FAILED.value
-                        rec.runtime_verified = False
-                        _persist_record(tracker, rec)
-                        raise ConfigurationConflict(rec.reason) from None
-                rec.reason = "Configuration write failed and the previous file was retained"
+                        current_revision = None
+                if current_revision == revision(raw):
+                    rec.reason = "Configuration write failed; previous file retained"
+                elif current_revision is None:
+                    rec.reason = "Configuration file cannot be verified after failed write; manual review required"
+                else:
+                    rec.reason = (
+                        "Configuration changed outside this WebUI transaction; "
+                        "external file preserved, manual review required"
+                    )
                 rec.state = ConfigApplyState.APPLY_FAILED
                 rec.operation_state = OperationState.FAILED.value
+                rec.runtime_verified = False
                 _persist_record(tracker, rec)
                 raise ConfigurationConflict(rec.reason) from None
             rec.state = ConfigApplyState.SAVED_FOR_NEXT_START
