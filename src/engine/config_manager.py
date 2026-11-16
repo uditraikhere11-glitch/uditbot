@@ -603,7 +603,7 @@ def human_readable_state_label(
     if op == OperationState.READY_TO_APPLY.value:
         return "Order Resolved — Ready to Apply"
     if st == ConfigApplyState.SAVED_FOR_NEXT_START.value:
-        return "Settings Saved — Bot Not Running"
+        return "Settings Saved — Awaiting Next Controlled Start"
     if st == ConfigApplyState.WAITING_FOR_SAFE_APPLY.value or op == OperationState.WAITING_FOR_ORDER.value:
         if blocked_reason in ("LIVE_ORDER_IN_PROGRESS", "UNPROTECTED_POSITION") or "order" in str(blocked_reason).lower():
             return "Waiting for Existing LIVE Order"
