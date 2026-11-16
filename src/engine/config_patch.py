@@ -182,6 +182,10 @@ def normalize(spec: FieldSpec, input_value: Any) -> str:
             raise ConfigurationRejected(f"Unsupported {spec.key} value")
         return value.upper()
     if spec.value_type == "integer":
+        # Blank Telegram IDs are intentionally unconfigured in .env.example
+        # and can be explicitly cleared in Setup without an HTTP 422.
+        if value == "" and spec.key in {"TG_API_ID", "LOG_GROUP_ID", "TEST_GROUP_ID"}:
+            return ""
         if not re.fullmatch(r"-?[0-9]+", value):
             raise ConfigurationRejected(f"{spec.key} requires a whole number")
         n = int(value)
