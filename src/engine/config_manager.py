@@ -3542,6 +3542,12 @@ class ConfigChangeTracker:
                             and not w_rec.get("pending_oco")
                             and not w_rec.get("retry_reserved")
                             and not w_rec.get("retry_eligible")
+                            and (
+                                not isinstance(order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid), dict)
+                                or str(
+                                    (order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid)).get("orderStatus") or ""
+                                ).strip().upper() == "TRADED"
+                            )
                         ):
                             reconciled_status_by_key[w_oid] = "TRADED"
                             reconciled_status_by_key[w_cid] = "TRADED"
@@ -3590,6 +3596,9 @@ class ConfigChangeTracker:
                             if _owner_accepted_manual_risk(
                                 o_boid, o_cid, odict.get("security_id") or (st_d or {}).get("securityId"),
                                 b_filled, o_st,
+                            ) and (
+                                not isinstance(st_d, dict)
+                                or str(st_d.get("orderStatus") or "").strip().upper() == "TRADED"
                             ):
                                 continue
                             ver_q, b_err = _compute_verified_protection_qty(
