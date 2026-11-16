@@ -4347,6 +4347,13 @@ class ConfigChangeTracker:
             "completed_stop": None,
         }
 
+        # First recover field-scoped save transactions. Otherwise a crash
+        # after atomic .env replacement but before status persistence can be
+        # incorrectly converted to APPLY_FAILED by the legacy 15-second timer.
+        # This is local journal recovery only (no broker or service actions).
+        from src.engine.webui_update import recover_field_transactions
+        outcomes["field_recovery"] = recover_field_transactions(self)
+
         # 0. Explicit gate recovery inside authorized coordinator (F02-06)
         self.reconcile_and_recover_transition_gate()
 
