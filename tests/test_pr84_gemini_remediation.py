@@ -150,5 +150,74 @@ class WebUIRegression(unittest.TestCase):
         self.assertEqual(self.path.read_text(), target)
 
 
+class ManualRiskGateRegression(WebUIRegression):
+    def test_f02_two_exact_owner_acknowledged_filled_holdings_do_not_block_safe_stop(self):
+        from src.journal.db import JournalDB
+        import time
+
+        db_path = Path(self.tmp.name) / "data" / "trade_journal.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = JournalDB(str(db_path), account_id="FAKE_ACCOUNT")
+        refs = (
+            ("SYNTHETIC-ENTRY-001", "SYN-CORR-001"),
+            ("SYNTHETIC-ENTRY-002", "SYN-CORR-002"),
+        )
+        with db._get_conn() as conn:
+            for oid, cid in refs:
+                conn.execute(
+                    "INSERT INTO order_intents "
+                    "(correlation_id, account_id, symbol, security_id, exchange_segment, "
+                    "product_type, order_type, price, quantity, state, broker_order_id, "
+                    "created_at, updated_at) "
+                    "VALUES (?, 'FAKE_ACCOUNT', 'YESBANK', '11915', 'NSE_EQ', "
+                    "'CNC', 'LIMIT', 15.6, 1, 'TRADED', ?, ?, ?)",
+                    (cid, oid, time.time(), time.time()),
+                )
+                conn.execute(
+                    "INSERT INTO orders "
+                    "(correlation_id, broker_order_id, trading_mode, product_type, "
+                    "exchange_segment, symbol, security_id, order_type, price, "
+                    "quantity, filled_quantity, status, created_at, updated_at) "
+                    "VALUES (?, ?, 'LIVE', 'CNC', 'NSE_EQ', 'YESBANK', '11915', "
+                    "'LIMIT', 15.6, 1, 1, 'TRADED', ?, ?)",
+                    (cid, oid, time.time(), time.time()),
+                )
+                conn.execute(
+                    "INSERT INTO watcher_orders "
+                    "(order_id, is_terminal, record_json, updated_at) VALUES (?, 0, ?, ?)",
+                    (oid, json.dumps({
+                        "order_id": oid, "correlation_id": cid, "security_id": "11915",
+                        "symbol": "YESBANK-EQ", "segment": "NSE_EQ", "product_type": "CNC",
+                        "state": "TRADED", "filled_qty": 1, "protected_qty": 0,
+                    }), time.time()),
+                )
+        for oid, cid in refs:
+            db.acknowledge_manual_risk_holding(
+                parent_order_id=oid, correlation_id=cid, account_id="FAKE_ACCOUNT",
+                symbol="YESBANK", security_id="11915", quantity=1,
+                acknowledged_by="SYNTHETIC_OWNER", reason="Controlled test holding",
+            )
+        tracker = ConfigChangeTracker(data_dir=str(db_path.parent))
+        with patch.object(tracker, "get_readonly_broker", return_value=None):
+            ok, reason, code, count = tracker.evaluate_trading_safety_gate_detailed(
+                db_path=str(db_path), stop_state_path=str(db_path.parent / "emergency_stop.json"),
+                env_path=str(self.path.resolve()), is_service_running=True,
+                is_live_mode=True, target_is_live=False,
+            )
+        self.assertTrue(ok, (reason, code, count))
+
+        # Changing just one share's filled quantity invalidates the waiver,
+        # and must fail closed rather than crediting another parent's ack.
+        with db._get_conn() as conn:
+            conn.execute("UPDATE orders SET filled_quantity=2 WHERE broker_order_id=?", (refs[0][0],))
+        with patch.object(tracker, "get_readonly_broker", return_value=None):
+            ok, reason, code, count = tracker.evaluate_trading_safety_gate_detailed(
+                db_path=str(db_path), stop_state_path=str(db_path.parent / "emergency_stop.json"),
+                env_path=str(self.path.resolve()), is_service_running=True,
+                is_live_mode=True, target_is_live=True,
+            )
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()
