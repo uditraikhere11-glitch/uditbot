@@ -67,6 +67,7 @@ from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock
 from src.notifier.outbox_worker import OutboxWorker
 from src.notifier.dhan_response import configure_dhan_response_group
+from src.engine.config_manager import compute_config_version
 from src.notifier.formatter import format_trade_log
 
 cfg = AppConfig.from_env()
@@ -145,6 +146,8 @@ async def main():
             signal_source_ids=allowed_chats,
             reporter=getattr(pipeline.watcher, "execution_reporter", None),
             loop=loop,
+            data_dir=cfg.data_dir,
+            config_version_hash=compute_config_version(cfg),
         )
 
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
