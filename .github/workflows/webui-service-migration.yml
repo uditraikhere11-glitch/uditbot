@@ -1,0 +1,37 @@
+name: Existing-VM authenticated WebUI migration
+on:
+  pull_request:
+    paths:
+      - 'deploy/upgrade_webui_control_center.sh'
+      - 'tests/test_webui_service_migration.py'
+      - 'docs/webui-service-migration.md'
+      - 'DEPLOYMENT.md'
+      - '.github/workflows/webui-service-migration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-migration-safety:
+    name: Mocked systemd/auth service migration regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AUDITBOT_TEST_ISOLATION: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Shell syntax and compile
+        run: |
+          bash -n deploy/upgrade_webui_control_center.sh
+          python -B -m py_compile tests/test_webui_service_migration.py
+      - name: Offline public/private and rollback scenarios
+        run: python -W error::ResourceWarning -m unittest -v tests.test_webui_service_migration
+      - name: Guard against trading-service mutation
+        run: |
+          ! grep -E 'sudo .*systemctl (start|restart|stop|enable|disable) trading_bot.service' deploy/upgrade_webui_control_center.sh
