@@ -841,9 +841,12 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             self.assertEqual(r_sync_wrong.status_code, 403)
 
             # 6. Both endpoints succeed (200) when valid SETUP_CSRF_TOKEN is provided
+            from src.engine.config_patch import revision
             r_async_ok = client.post(
                 "/setup/submit-async",
-                data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000", "csrf_token": SETUP_CSRF_TOKEN},
+                data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000",
+                      "csrf_token": SETUP_CSRF_TOKEN,
+                      "expected_revision": revision(Path(".env").read_text(encoding="utf-8"))},
             )
             self.assertEqual(r_async_ok.status_code, 200)
 
