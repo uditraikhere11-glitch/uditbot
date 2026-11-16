@@ -124,6 +124,7 @@ class DestinationStatusIdentityAcceptance(unittest.TestCase):
         }
         ack = {
             "pid": 2255, "process_starttime": 89237,
+            "config_version_hash": "synthetic-candidate-hash",
             "acknowledged_at": 120.0,
             "requested_name": "-5514889030",
             "target_verified": True, "fallback_active": False,
