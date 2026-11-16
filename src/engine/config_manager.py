@@ -2793,6 +2793,52 @@ class ConfigChangeTracker:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
 
+            # F-02: Manual-risk acknowledgement is narrowly tied to a single
+            # terminal filled parent order. It is never a generic protection
+            # waiver, and it must not suppress pending entries or broker errors.
+            from src.config import parse_env_dict
+            current_account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip()
+            manual_risk_by_parent: Dict[str, Dict[str, Any]] = {}
+            try:
+                for row in cur.execute(
+                    "SELECT parent_order_id, correlation_id, account_id, "
+                    "security_id, quantity, status, acknowledged_at "
+                    "FROM manual_risk_acknowledgements"
+                ).fetchall():
+                    item = dict(row)
+                    parent = str(item.get("parent_order_id") or "").strip()
+                    if parent and str(item.get("status") or "").upper() == "UNPROTECTED_MANUAL_RISK":
+                        manual_risk_by_parent[parent] = item
+            except sqlite3.OperationalError:
+                # Older journals without the acknowledgement table remain
+                # subject to ordinary verified-protection requirements.
+                pass
+
+            def _owner_accepted_manual_risk(
+                parent_order_id: str, correlation_id: str, security_id: str,
+                filled_qty: int, state: str,
+            ) -> bool:
+                # Only an already terminal, fully filled parent can be
+                # assigned to manual monitoring; never pending/partial orders.
+                if str(state or "").upper() != "TRADED":
+                    return False
+                parent = str(parent_order_id or "").strip()
+                ack = manual_risk_by_parent.get(parent)
+                if not ack or not current_account_id or int(filled_qty or 0) <= 0:
+                    return False
+                if str(ack.get("account_id") or "").strip() != current_account_id:
+                    return False
+                if str(ack.get("security_id") or "").strip() != str(security_id or "").strip():
+                    return False
+                cid = str(correlation_id or "").strip()
+                if cid and str(ack.get("correlation_id") or "").strip() != cid:
+                    return False
+                try:
+                    return (int(ack.get("quantity") or 0) >= int(filled_qty)
+                            and float(ack.get("acknowledged_at") or 0) > 0)
+                except (TypeError, ValueError):
+                    return False
+
             # 1. Load watcher_orders map (by order_id and correlation_id)
             watcher_map: Dict[str, Dict[str, Any]] = {}
             all_watcher_records: List[Dict[str, Any]] = []
@@ -2901,14 +2947,31 @@ class ConfigChangeTracker:
                         ):
                             non_term_orders.append(orow)
                         if o_mode == "LIVE" and (o_st == "TRADED" or int(odict.get("filled_quantity") or 0) > 0):
-                            has_filled_live_orders = True
+                            o_filled = int(odict.get("filled_quantity") or odict.get("quantity") or 0)
+                            if not _owner_accepted_manual_risk(
+                                odict.get("broker_order_id"), odict.get("correlation_id"),
+                                odict.get("security_id"), o_filled, o_st,
+                            ):
+                                has_filled_live_orders = True
             except sqlite3.OperationalError:
                 pass
 
             has_watcher_protective_obligations = any(
-                int(w.get("filled_qty") or 0) > 0
-                or int(w.get("protected_qty") or 0) > 0
-                or bool(w.get("_is_terminal_col"))
+                (
+                    int(w.get("filled_qty") or 0) > 0
+                    or int(w.get("protected_qty") or 0) > 0
+                    or bool(w.get("_is_terminal_col"))
+                )
+                and not (
+                    _owner_accepted_manual_risk(
+                        w.get("order_id"), w.get("correlation_id"),
+                        w.get("security_id"), int(w.get("filled_qty") or 0),
+                        w.get("state"),
+                    )
+                    and not w.get("pending_oco")
+                    and not w.get("retry_reserved")
+                    and not w.get("retry_eligible")
+                )
                 for w in all_watcher_records
             )
 
@@ -3471,6 +3534,18 @@ class ConfigChangeTracker:
                         if isinstance(st_d, dict):
                             w_filled = max(w_filled, int(st_d.get("filledQty") or st_d.get("tradedQuantity") or 0))
                     if w_filled > 0:
+                        if (
+                            _owner_accepted_manual_risk(
+                                w_oid, w_cid, w_rec.get("security_id"),
+                                w_filled, w_rec.get("state"),
+                            )
+                            and not w_rec.get("pending_oco")
+                            and not w_rec.get("retry_reserved")
+                            and not w_rec.get("retry_eligible")
+                        ):
+                            reconciled_status_by_key[w_oid] = "TRADED"
+                            reconciled_status_by_key[w_cid] = "TRADED"
+                            continue
                         ver_q, b_err = _compute_verified_protection_qty(
                             corr_id=w_cid,
                             b_oid=w_oid,
@@ -3512,6 +3587,11 @@ class ConfigChangeTracker:
                         else:
                             b_filled = int(odict.get("filled_quantity") or 0)
                         if b_filled > 0:
+                            if _owner_accepted_manual_risk(
+                                o_boid, o_cid, odict.get("security_id") or (st_d or {}).get("securityId"),
+                                b_filled, o_st,
+                            ):
+                                continue
                             ver_q, b_err = _compute_verified_protection_qty(
                                 corr_id=o_cid,
                                 b_oid=o_boid or o_cid,
