@@ -76,8 +76,24 @@ class WebUIRegression(unittest.TestCase):
         self.assertEqual(self.path.read_text(), ENV)
 
     def test_f10_control_center_is_mounted_and_stopped_amo_save_does_not_use_broker(self):
-        self.assertEqual(self.client.get("/control").status_code, 200)
-        self.assertEqual(self.client.get("/setup").status_code, 200)
+        # The real deployed app is the password facade, NOT bare Setup.
+        # Never expose the Control Center directly in unauthenticated Setup.
+        from src.control_center_entry import app as authenticated_app
+        from src.control_center_backend import register_control_center_routes
+        from fastapi import FastAPI
+        self.assertEqual(self.client.get("/control").status_code, 404)
+        self.assertEqual(self.client.get("/setup").status_code, 404)
+        self.assertTrue(any(getattr(route, "path", None) == "/control/amo/fno"
+                            for route in authenticated_app.routes))
+        with patch("src.webui_password.permitted_transport", return_value=True), \
+             patch("src.webui_password.password_configured", return_value=True), \
+             patch("src.webui_password.valid_session", return_value=False):
+            protected = TestClient(authenticated_app, follow_redirects=False)
+            self.assertEqual(protected.get("/control/status").status_code, 303)
+            self.assertEqual(protected.post("/control/amo/fno", json={}).status_code, 401)
+        test_app = FastAPI()
+        register_control_center_routes(test_app, SETUP_CSRF_TOKEN)
+        offline_client = TestClient(test_app)
         with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
                           return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "mocked")), \
              patch.object(ConfigChangeTracker, "get_readonly_broker",
@@ -88,11 +104,11 @@ class WebUIRegression(unittest.TestCase):
                 "expected_revision": revision(ENV),
                 "request_id": "OFFLINE-AMO-TOGGLE-0001",
             }
-            result = self.client.post("/control/amo/fno", json=body)
+            result = offline_client.post("/control/amo/fno", json=body)
             self.assertEqual(result.status_code, 200, result.text)
             self.assertEqual(result.json()["state"], "SAVED_FOR_NEXT_START")
             self.assertIn("FNO_AMO_ENABLED=true", self.path.read_text())
-            repeated = self.client.post("/control/amo/fno", json=body)
+            repeated = offline_client.post("/control/amo/fno", json=body)
             self.assertEqual(repeated.status_code, 200)
             self.assertEqual(repeated.json()["change_id"], result.json()["change_id"])
 
