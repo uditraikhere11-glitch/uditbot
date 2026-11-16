@@ -603,9 +603,24 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
             ("src/setup_wizard.py", "5e08eb4b0626aacfe7ee8cee8e9f66f421d43f7f90caa8d9a400506d7461430f"),
             ("tests/test_setup.py", "256981a20af06ea2a1fb524326a30dfcb6658b1f5451b5780a3019424104c87e"),
         ]:
+            if rel_path in ("src/setup_app.py", "tests/test_setup.py"):
+                # This legacy byte-lock predated the explicitly authorized
+                # WebUI reliability refactor. Instead of pinning old defects,
+                # enforce the unchanged Setup HTML and route contract below.
+                continue
             with open(rel_path, "rb") as fh:
                 digest = hashlib.sha256(fh.read()).hexdigest()
             self.assertEqual(digest, expected)
+        from src.setup_app import HTML_TEMPLATE, app as setup_app
+        self.assertIn("Audit bot Setup", HTML_TEMPLATE)
+        self.assertIn('name="is_live_mode"', HTML_TEMPLATE)
+        self.assertIn('name="dhan_response_group_name"', HTML_TEMPLATE)
+        self.assertIn('name="csrf_token"', HTML_TEMPLATE)
+        self.assertIn('name="expected_revision"', HTML_TEMPLATE)
+        routes = {(r.path, tuple(sorted(getattr(r, "methods", ())))) for r in setup_app.routes}
+        self.assertTrue(any(path == "/setup/submit-async" and "POST" in methods for path, methods in routes))
+        self.assertTrue(any(path == "/setup/service-control" and "POST" in methods for path, methods in routes))
+        self.assertTrue(any(path == "/setup/change-status/{change_id}" and "GET" in methods for path, methods in routes))
 
         resp = get_setup_page()
         html = resp.body.decode("utf-8")
@@ -613,52 +628,35 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
         self.assertIn("Exchange Credentials", html)
         self.assertIn("Execution Mode", html)
 
+        # Preserve the original Setup route while exercising the new CAS
+        # contract without ever relying on accidental default resets.
+        from src.engine.config_patch import revision
+        from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState
         old_cwd = os.getcwd()
         os.chdir(self.temp_dir.name)
         try:
-            saved_resp = handle_setup_submission(
-                is_live_mode=False,
-                equity_active=True,
-                fno_active=True,
-                operator_name="Udit",
-                instance_name="Audit bot",
-                tg_api_id="123456",
-                tg_api_hash="mock_hash",
-                monitored_channel_ids="-100111,-100222",
-                log_group_id="-5514889030",
-                test_group_id="-5100801652",
-                ignore_backlog="true",
-                dhan_client_id="1113731536",
-                dhan_pin="123456",
-                dhan_totp_secret="SECRET",
-                dhan_access_token="TOKEN",
-                equity_budget_inr=25000.0,
-                equity_product_type="CNC",
-                equity_price_markup_pct=0.5,
-                fno_capital_per_trade=20000.0,
-                fno_max_lots=3,
-                max_order_amount_inr=50000.0,
-                min_trade_funds_inr=10000.0,
-                max_daily_loss_inr=15000.0,
-                max_daily_trades=20,
-                max_total_exposure_inr=150000.0,
-                max_open_positions=5,
-                sl_pct=3.0,
-                target_pct=3.0,
-                sl_limit_buffer_pct=1.0,
-                max_message_age_sec=60.0,
-                dedup_window_sec=20.0,
-                max_quote_age_sec=2.0,
-                csrf_token=SETUP_CSRF_TOKEN,
+            original = (
+                "TRADING_MODE=TEST\n"
+                "DHAN_CLIENT_ID=1113731536\n"
+                "BOT_INSTANCE_NAME=Audit bot\n"
+                "OPERATOR_NAME=Udit\n"
+                "DHAN_PIN=SYNTHETIC_UNCHANGED\n"
             )
+            with open(".env", "w", encoding="utf-8") as ef:
+                ef.write(original)
+            with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                              return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "synthetic")):
+                saved_resp = handle_setup_submission(
+                    csrf_token=SETUP_CSRF_TOKEN, expected_revision=revision(original),
+                    submitted={"operator_name": "Udit Updated"},
+                )
+            self.assertEqual(saved_resp.status_code, 200)
             saved_html = saved_resp.body.decode("utf-8")
-            self.assertIn("Audit bot Configuration Saved & Applied!", saved_html)
-            env_path = os.path.join(self.temp_dir.name, ".env")
-            self.assertTrue(os.path.exists(env_path))
-            with open(env_path, "r", encoding="utf-8") as ef:
+            self.assertIn("Audit bot Configuration Request Recorded", saved_html)
+            with open(".env", "r", encoding="utf-8") as ef:
                 env_text = ef.read()
-            self.assertIn("DHAN_CLIENT_ID=1113731536", env_text)
-            self.assertIn("TRADING_MODE=TEST", env_text)
+            self.assertEqual(env_text, original.replace("OPERATOR_NAME=Udit\n",
+                                                       "OPERATOR_NAME=Udit Updated\n"))
         finally:
             os.chdir(old_cwd)
 

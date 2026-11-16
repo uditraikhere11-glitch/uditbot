@@ -14,7 +14,8 @@ except Exception:
     TestClient = None
     HAS_TESTCLIENT = False
 
-from src.setup_app import app
+from src.setup_app import app, SETUP_CSRF_TOKEN
+from src.engine.config_patch import revision
 
 
 class TestSetupApp(unittest.TestCase):
@@ -43,12 +44,14 @@ class TestSetupApp(unittest.TestCase):
             try:
                 data = {
                     "dhan_client_id": "1100998877",
-                    "dhan_access_token": "test_token_123",
+                    "dhan_access_token": "",  # Token lifecycle is owned by the Dhan coordinator.
                     "instance_name": "SapphireAlgo",
                     "log_group_id": "-10012345678",
                     "max_drawdown_pct": 5.0,
                     "daily_trade_limit": 20,
                     "is_live_mode": False,
+                    "csrf_token": SETUP_CSRF_TOKEN,
+                    "expected_revision": revision(""),
                 }
                 resp = self.client.post("/setup", data=data)
                 self.assertEqual(resp.status_code, 200)
@@ -56,8 +59,14 @@ class TestSetupApp(unittest.TestCase):
                 with open(".env") as f:
                     content = f.read()
                 self.assertIn("DHAN_CLIENT_ID=1100998877", content)
-                self.assertIn("TRADING_MODE=TEST", content)
+                # Field-scoped updates do not materialize unchanged defaults.
+                # TEST is the effective mode even without an explicit key.
+                from src.config import AppConfig, parse_env_dict
+                effective = AppConfig.from_env(env=parse_env_dict(".env"), env_file="")
+                self.assertEqual(effective.trading_mode.value, "TEST")
                 self.assertIn("BOT_INSTANCE_NAME=SapphireAlgo", content)
+                self.assertIn("MAX_DAILY_TRADES=20", content)
+                self.assertNotIn("TRADING_MODE=LIVE", content)
             finally:
                 os.chdir(old_cwd)
 

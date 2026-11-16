@@ -1,0 +1,300 @@
+name: UDITBOT WebUI reliability candidate artifacts
+
+on:
+  push:
+    branches:
+      - fix/webui-configuration-reliability-20261115
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webui-reliability-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frozen-candidate:
+    needs: pr83-compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUDITBOT_TEST_ISOLATION: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout exact candidate SHA with baseline history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install offline-test dependencies
+        run: python -m pip install -r requirements.txt -r requirements-test.txt
+      - name: Compile candidate
+        run: python -m compileall -q src tests
+      - name: Complete isolated offline test suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py' 2>&1 | tee test-results.txt
+      - name: Assemble exact changed-files ZIP, patch, reports and SHA256 manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from src.engine.config_patch import REGISTRY
+          import hashlib, os, re, subprocess, zipfile
+          from datetime import datetime, timezone
+
+          BASE = 'be1ee04707e0b86a378124fea2c5f113703fe1ef'
+          HEAD = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          def git(*args):
+              return subprocess.check_output(['git',*args], text=True)
+          names = [x for x in git('diff','--name-only',BASE,'HEAD').splitlines() if x]
+          assert names, 'No changes to package'
+          allowed = ('src/', 'tests/', '.github/workflows/webui-reliability-candidate.yml')
+          assert all(name.startswith(('src/','tests/')) or name in (allowed[2], 'run.py') for name in names), names
+          forbidden = ('src/parsers/', 'src/engine/risk_manager.py', 'src/engine/protection_watcher.py',
+                       'src/broker/dhan_client.py', 'src/broker/read_governor.py', 'src/journal/db.py')
+          assert not any(any(name.startswith(pre) for pre in forbidden) for name in names), 'Trading BRAIN or broker behavior changed'
+          assert not any('.env' in name or name.startswith(('data/','.git/','venv/')) for name in names), 'Sensitive artifact path'
+          cmd = ['git','diff','--check',BASE,'HEAD']
+          subprocess.run(cmd, check=True)
+
+          tests = Path('test-results.txt').read_text(encoding='utf-8', errors='replace')
+          matches = re.findall(r'Ran (\d+) tests? in [\d.]+s', tests)
+          # Refuse artifact readiness if runner output cannot prove a test count.
+          assert matches, 'Could not find unittest test count in this exact workflow run'
+          count = int(matches[-1]); assert count >= 900, f'Unexpectedly small test suite ({count})'
+          assert '\nOK\n' in tests or '\nOK (skipped=' in tests, 'No green unittest summary'
+
+          zip_name = 'UDITBOT_WebUI_Reliability_Final_Gemini_ChangedFiles.zip'
+          patch_name = 'UDITBOT_WebUI_Reliability_Final.patch'
+          report_name = 'UDITBOT_WebUI_Reliability_Audit_Report.md'
+          accept_name = 'UDITBOT_WebUI_Reliability_Acceptance_Report.md'
+          manifest_name = 'UDITBOT_WebUI_Reliability_SHA256.txt'
+
+          # Include every changed source/test/infrastructure file and preserve paths.
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for name in sorted(names):
+                  src = Path(name)
+                  assert src.is_file(), f'Deleted file not represented in ZIP: {name}'
+                  zf.write(src, arcname=name)
+          with open(patch_name, 'wb') as fh:
+              subprocess.run(['git','diff','--binary','--full-index',BASE,'HEAD'], check=True, stdout=fh)
+          patch = Path(patch_name).read_bytes()
+          assert patch and HEAD != BASE
+
+          issues = [
+              ('R12','P1','Global broker safety gate was applied to nontrading field edits.',
+               'New field-specific coordinator saves unrelated settings without broker GET or trading restart.'),
+              ('R13','P1','Setup reconstructed complete .env and could alter unrelated settings.',
+               'Strict editable-field registry and optimistic raw-file revision patching preserve other values and secrets.'),
+              ('R14','P1','Routine changes entered the trading-service restart path.',
+               'Nontrading fields persist for next controlled startup; no simulated live hot-reload acknowledgement.'),
+              ('R15','P1','Telegram session migration was executed during generic configuration updates.',
+               'Removed automatic session repair from ordinary execute_configuration_update.'),
+              ('R16','P2','75% waiting status and saved/runtime version states were misleading.',
+               'Saved-not-active distinction, additive tracker metadata, real systemd/hash status badge and escaped summaries.'),
+              ('R17','P1','Previous change summaries were injected into innerHTML.',
+               'Render untrusted summaries with textContent and escape server-rendered owner fields.'),
+              ('R18','P1','Overlapping or stale Setup POSTs lacked canonical field-level CAS.',
+               'Use effective field changes under shared cross-process lock and refuse stale browser revisions.'),
+              ('F-01','P0','run.py production Dhan Response path bypassed activation.',
+               'Production dispatcher now uses verified fallback and records PID/starttime/config hash.'),
+              ('F-02','P0','Owner-acknowledged settled fills were marked unprotected blockers.',
+               'Strict per-order/manual-risk matching permits only explicitly acknowledged terminal holdings.'),
+              ('F-03','P1','Blank optional Telegram IDs failed form validation.',
+               'Accept blank values and preserve missing/blank IDs during full-form roundtrips.'),
+              ('F-04','P1','HTML :g truncated decimal budget values.',
+               'Use full decimal display and regression test fractional inputs.'),
+              ('F-05','P1','Legacy coordinator tick ignored prepared post-write field transactions.',
+               'Recover field transactions before legacy timeout or gate checks.'),
+              ('F-06','P1','Safety enqueue had a crash window before request-id persistence.',
+               'Durable pending-op provenance supports idempotent retries and coordinator wake.'),
+              ('F-07','P1','Disabling Telegram mirroring retained stale known-good group.',
+               'Verified blank destination overwrites fallback checkpoint.'),
+              ('F-08','P1','Invalid prior env caused HTTP 500 before correction submission.',
+               'Read data directory without whole-config validation prior to field repair.'),
+              ('F-09','P2','Sync Setup accepted unknown form keys silently.',
+               'Reject unknown fields and display explicit LIVE consent control.'),
+              ('F-10','P2','AMO changes bypassed unified transaction and Control Center mount was missing.',
+               'Both toggles share Setup CAS path; mount routes and clarify saved/not-active state.'),
+          ]
+          reasons = {
+              'run.py':'Production Telegram Dhan Response dispatcher activation and runtime hash',
+              'src/notifier/dhan_response.py':'Verified fallback routing in the actual production dispatcher',
+              'src/notifier/response_activation.py':'Validated source/target acknowledgment and intentional disable checkpoint',
+              'tests/test_pr84_gemini_remediation.py':'Synthetic F02 F03 F05 F06 F08 F09 F10 adversarial tests',
+              'src/engine/config_patch.py':'New editable-field schema; strict patching, CAS and validation',
+              'src/engine/webui_update.py':'Field-aware coordinator with backups, idempotency and legacy recovery',
+              'src/engine/config_manager.py':'Durable rename, additive status metadata and decoupled session repair',
+              'src/control_center_backend.py':'Canonical Equity/F&O AMO validation and revision CAS; corrected F&O no-op key; removed premature queue cancellation',
+              'src/control_center_ui.py':'Send observed configuration revision with AMO switch request',
+              'tests/test_webui_reliability_remaining.py':'Field invalid inputs, lifecycle/broker mocks, recovery, AMO queue and stale Control Center revision tests',
+              'tests/test_v14_webui_backend_fix_02.py':'Explicit running LIVE service fixture for deferred broker-sensitive transition',
+              'tests/test_setup.py':'Authenticated versioned direct Setup regression',
+              'src/setup_app.py':'Authenticated Setup patch route, form provenance, escaping and honest status',
+              'tests/test_webui_field_reliability.py':'Strict isolation, types, secrets, rollback and idempotency tests',
+              'tests/test_webui_integrated_acceptance.py':'YESBANK legacy and concurrency recovery, governor isolation, field coverage',
+              'tests/test_v12_execution_safety.py':'Replace obsolete Setup byte-lock test with stronger modified-field preservation contract',
+              'tests/test_v13_independent_audit_remediations.py':'Replace obsolete Setup byte-lock with authenticated control/endpoint contract',
+              'tests/test_cv13_06_07_consolidated.py':'Ensure CSRF and expected revision both enforced for direct writes',
+              '.github/workflows/webui-reliability-candidate.yml':'Run offline suite and package the exact immutable HEAD artifacts',
+          }
+          lines = [
+              '# UDITBOT WebUI Reliability — Development and self-audit report',
+              f'- Baseline main: `{BASE}`',
+              f'- Candidate commit: `{HEAD}`',
+              '- Branch: `fix/webui-configuration-reliability-20261115` (draft PR #84)',
+              f'- Produced (UTC): {datetime.now(timezone.utc).isoformat()}',
+              '- VM: NOT accessed. Dhan: NO live calls. Telegram: NO production messages.',
+              f'- Workflow regression: `python -W error::ResourceWarning -m unittest discover -s tests -p "test_*.py"` → **{count} tests PASS**.',
+              '- Additional compile check: `python -m compileall -q src tests` → PASS.',
+              '- Diff whitespace check: `git diff --check BASE HEAD` → PASS.',
+              '', '## Root causes and corrections',
+          ]
+          lines.extend(f'- **{ident} ({severity})** — Root: {root} Correction: {fix}' for ident,severity,root,fix in issues)
+          lines += ['', '## File-by-file change manifest']
+          lines.extend(f'- `{name}` — {reasons.get(name,"Reviewed supporting source/test change")}' for name in names)
+          lines += [
+              '', '## Safety and operational constraints',
+              '- Dhan Response group changes are classified SAVE FOR NEXT CONTROLLED START when the existing listener cannot attest a safe hot reload. A written .env is never called ACTIVE/VERIFIED.',
+              '- No automated broker order cancellation, historical YESBANK repair, synthetic OCO, or Emergency STOP clearing is performed by the new coordinator.',
+              '- Safety-controlled transitions remain in the pre-existing broker-aware coordinator. No new Dhan order APIs are introduced.',
+              '- Full config version remains bound to the actual trading process; a notification-only save does not falsify its running configuration hash.',
+              '- The single-record legacy coordinator rejects independent edits while an unrelated genuine safety-sensitive transition is already pending; multi-record rebase is not part of this release.',
+              '- No in-process hot reload of notification destinations is implemented. To activate while running requires a later owner-authorized safe lifecycle transition; broker-unavailable cases may remain deferred.',
+              '- Exact real-world shutdown/restart behavior and historical production DB contents cannot be verified offline. Owner must perform backup-first post-approval VM validation.',
+              '- Draft PR #83 watcher/governor changes are not included in this candidate. This workflow requires the isolated PR #83 merge-and-full-test compatibility job to pass before packaging; neither PR is merged.',
+              '', '## Independent adversarial review limitations',
+              '- Schema/consumer mapping and negative tests include synthetic crash and broker-state checks, but complete real systemd and broker outage scenarios are not executable offline.',
+              '- The baseline has immutable Setup file hash tests. Updated tests retain unmodified file hash locks and replace the obsolete Setup hash with preserved endpoint and field contracts.',
+              '- Control Center F&O AMO disable now leaves legacy queued entries unchanged until an explicit operator cancellation; regression tests verify failed enqueue cannot erase queued entries.',
+              '', '## Recommended deployment (NOT authorized)',
+              '1. Independent ChatGPT changed-files audit against current main and PR #83 compatibility; resolve every P0/P1.',
+              '2. Obtain explicit owner approval for PR #84 and decide PR #83 ordering.',
+              '3. Backup production VM .env, journal and runtime state outside Git; verify account identity and no in-flight orders.',
+              '4. Deploy only after merge authorization, then verify systemd, WebUI and broker read budgets without placing LIVE test orders.',
+              '5. To roll back, restore exact backed-up source and previous .env while safely stopped; never overwrite journal or clear protection obligations.',
+              '', '## Status',
+              '**PENDING INDEPENDENT SAFETY REVIEW — DO NOT MERGE OR DEPLOY.** Offline CI is not a substitute for owner approval, production account/status checks, or an independent review.',
+          ]
+          Path(report_name).write_text('\n'.join(lines)+'\n', encoding='utf-8')
+
+          # PASS means the exact listed behavior was exercised in synthetic
+          # offline tests; not a claim of production broker verification.
+          status = {
+              1:('PASS','test_ac01_ac07_notification_saved_not_falsely_verified'),
+              2:('PASS','test_ac02_ac11_yesbank_legacy_notification_recovery_no_broker_or_journal_edit'),
+              3:('PARTIAL','Schema loop and optional blank-ID repair tests pass; complete production field matrix pending'),
+              4:('PARTIAL','Synthetic lifecycle and owner-stopped AMO tests run; real systemd states not executed'),
+              5:('PARTIAL','Synthetic exact owner-ack holding and higher-fill safety checks; real broker outage not executed'),
+              6:('PARTIAL','Synthetic LIVE consent and Emergency STOP regressions; real LIVE broker operations prohibited'),
+              7:('PARTIAL','Ordinary save category tests show no restart; production restart matrix not executed'),
+              8:('PARTIAL','Synthetic field crash, idempotent replay and rollback fault tests; no real restarts'),
+              9:('PASS','test_ac09_simultaneous_stale_revision_never_loses_update'),
+              10:('PASS','test_ac10_repeat_client_request_no_new_change'),
+              11:('PASS','test_ac02_ac11_yesbank_legacy_notification_recovery_no_broker_or_journal_edit'),
+              12:('PARTIAL','Production response dispatcher mocked fallback, disable checkpoint, activation verification; no live Telegram'),
+              13:('PASS','test_ac13_governor_is_never_touched_for_destination_save'),
+              14:('NOT EXECUTED','Full logs/API/patch/ZIP secret disclosure matrix'),
+              15:('PASS','Combined full existing WebUI regressions and DOM escaping test'),
+              16:('NOT EXECUTED','Global network-denial proof beyond test isolation policy'),
+              17:('PARTIAL','Legacy SQLite and custom file preservation tests; production database migration not executed'),
+              18:('PASS','test_ac12_ac18_without_telegram_ack_do_not_claim_runtime'),
+              19:('PASS',f'python -W error::ResourceWarning -m unittest discover -s tests -p test_*.py ({count} tests)'),
+              20:('PARTIAL','Diff excludes broker order/size/risk modules; actual live broker payload not executed'),
+          }
+          a = [
+              '# UDITBOT WebUI Reliability — Acceptance evidence',
+              f'- Exact candidate: `{HEAD}`', f'- GitHub Actions test run: {count} tests PASS',
+              '- Status applies to offline mocked/synthetic execution only.',
+              '', '| AC | Status | Evidence / missing coverage |', '|---|---|---|',
+          ]
+          a.extend(f'| AC-{i:02d} | {status[i][0]} | {status[i][1]} |' for i in range(1,21))
+          a += ['', '## Editable WebUI field classification',
+                '| WebUI field | Environment key | Type | Secret | Broker gate | Consumer | Policy | Activation verification |',
+                '|---|---|---|---|---|---|---|---|']
+          for form,spec in sorted(REGISTRY.items()):
+              a.append(f'| `{form}` | `{spec.key}` | {spec.value_type} | {spec.secret} | {spec.broker_gate} | {spec.consumer} | {spec.policy} | {spec.verifier} |')
+          a += ['', 'Policy FUTURE_ENTRY and NEXT_START both use safe-save and next-controlled-start activation in this candidate, not simulated process hot-reload.',
+                'Dhan access tokens are deliberately outside the editable registry: managed only by the existing Dhan token coordinator.',
+                '', '## Tested commands',
+                '- `python -m compileall -q src tests`',
+                '- `python -W error::ResourceWarning -m unittest discover -s tests -p "test_*.py"`',
+                f'- Test count from same runner output: {count}; see workflow job log.',
+                '', '## Verdict', '**PENDING INDEPENDENT SAFETY REVIEW — DO NOT MERGE OR DEPLOY**', '']
+          Path(accept_name).write_text('\n'.join(a), encoding='utf-8')
+          artifacts = [zip_name, patch_name, report_name, accept_name]
+          with open(manifest_name,'w', encoding='utf-8') as fh:
+              for name in artifacts:
+                  fh.write(hashlib.sha256(Path(name).read_bytes()).hexdigest() + '  ' + name + '\n')
+          for name in artifacts + [manifest_name]:
+              assert Path(name).is_file() and Path(name).stat().st_size > 0, name
+          print(f'Frozen HEAD: {HEAD}; baseline: {BASE}; {len(names)} changed files; {count} offline tests')
+          print('Files:')
+          for name in artifacts + [manifest_name]:
+              print(f'  {name}: {Path(name).stat().st_size} bytes; SHA256={hashlib.sha256(Path(name).read_bytes()).hexdigest()}')
+          PY
+      - name: Upload immutable audit deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: UDITBOT-WebUI-Reliability-${{ github.event.pull_request.head.sha || github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            UDITBOT_WebUI_Reliability_Final_Gemini_ChangedFiles.zip
+            UDITBOT_WebUI_Reliability_Final.patch
+            UDITBOT_WebUI_Reliability_Audit_Report.md
+            UDITBOT_WebUI_Reliability_Acceptance_Report.md
+            UDITBOT_WebUI_Reliability_SHA256.txt
+
+  pr83-compatibility:
+    name: PR #83 read-governor and watcher compatibility (no GitHub merge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUDITBOT_TEST_ISOLATION: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out the exact PR #84 candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Make a temporary in-run integration tree for PR #83
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin fix/manual-risk-120s-session-supervision
+          test "$(git rev-parse FETCH_HEAD)" = "75d2ae3d3c01f34ba215a25227230275c45f1a9f"
+          git -c user.name=ci -c user.email=ci@local.invalid merge --no-commit --no-ff FETCH_HEAD
+          git diff --cached --check
+          echo "Integration exists only in this CI workspace; neither PR is merged."
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install mock-only test dependencies
+        run: python -m pip install -r requirements.txt -r requirements-test.txt
+      - name: Compile merged tree
+        run: python -m compileall -q src tests
+      - name: R02/R11 integration regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -W error::ResourceWarning -m unittest -v \
+            tests.test_manual_risk_session_polling \
+            tests.test_r02_adaptive_watcher \
+            tests.test_webui_field_reliability \
+            tests.test_webui_integrated_acceptance
+      - name: Full combined offline regression
+        shell: bash
+        run: python -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'

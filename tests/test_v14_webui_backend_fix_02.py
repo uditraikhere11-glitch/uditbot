@@ -51,6 +51,7 @@ from src.engine.protection_watcher import ProtectionWatcher
 from src.journal.db import JournalDB
 from src.models import BrokerReadFailure, OrderRequest, OrderType, ProductType, TransactionType
 from src.setup_app import SETUP_CSRF_TOKEN, app, build_env_and_params_dict
+from src.engine.config_patch import revision
 
 
 def _child_process_try_lock(lock_file: str, lease_file: str, result_queue: multiprocessing.Queue) -> None:
@@ -822,6 +823,12 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
     # =========================================================================
 
     def test_B11_durable_async_submission_readonly_status_and_cancel_deferred(self):
+        # This scenario specifically simulates a RUNNING LIVE process with a
+        # pending broker order. The ordinary offline fixture has no systemd
+        # service, so explicitly inject the lifecycle state under test.
+        running_state = patch("src.engine.webui_update._safe_state", return_value=ServiceOperatingState.RUNNING)
+        running_state.start()
+        self.addCleanup(running_state.stop)
         client = TestClient(app)
         old_cwd = os.getcwd()
         os.chdir(self.tmp_dir.name)
@@ -846,6 +853,9 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
                     "dhan_client_id": "1113731536",
                     "equity_budget_inr": 300.0,
                     "csrf_token": SETUP_CSRF_TOKEN,
+                    "expected_revision": revision(
+                        Path(self.env_path).read_text(encoding="utf-8")
+                    ),
                     "spawn_worker": False,
                 },
             )

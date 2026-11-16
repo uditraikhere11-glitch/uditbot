@@ -68,6 +68,8 @@ async def configure_dhan_response_group(
     signal_source_ids: Iterable[int],
     reporter: Any,
     loop: Any,
+    data_dir: str = "data",
+    config_version_hash: str = "",
 ) -> Optional[Callable[[str], bool]]:
     """Bind the existing watcher and outbox to a verified Telegram destination.
 
@@ -76,20 +78,29 @@ async def configure_dhan_response_group(
     """
     if reporter is not None:
         reporter.dhan_response_enabled = False
-    if not group_name:
-        logger.info("Dhan Response group not configured; response mirroring disabled.")
-        return None
-    if reporter is None:
-        logger.warning("Dhan Response group unavailable; execution reporter is not initialized.")
-        return None
+    # Use the exact resolver consumed by the production run.py entry point.
+    # This writes an activation acknowledgement even for an intentional disable
+    # or an unresolved destination; neither case interferes with trade signals.
+    from src.notifier.response_activation import resolve_with_fallback
     try:
-        entity = await asyncio.wait_for(
-            resolve_dhan_response_group(
-                client, group_name, forbidden_chat_ids=signal_source_ids
-            ), timeout=15.0,
+        entity, active_name, verified = await asyncio.wait_for(
+            resolve_with_fallback(
+                client, group_name, signal_source_ids, data_dir,
+                config_version_hash=config_version_hash,
+            ),
+            timeout=30.0,
         )
     except Exception as exc:
-        logger.warning("Dhan Response group unavailable; mirroring disabled: %s", exc)
+        logger.warning("Dhan Response activation unavailable; mirroring disabled: %s", type(exc).__name__)
+        return None
+    if entity is None:
+        if group_name:
+            logger.warning("Dhan Response group unavailable; no verified fallback exists")
+        else:
+            logger.info("Dhan Response group intentionally disabled")
+        return None
+    if reporter is None:
+        logger.warning("Dhan Response group resolved but execution reporter is missing")
         return None
 
     def dispatch_dhan_response(message: str) -> bool:
@@ -106,5 +117,5 @@ async def configure_dhan_response_group(
             return False
 
     reporter.dhan_response_enabled = True
-    logger.info("Dhan final response group resolved uniquely: %s", group_name)
+    logger.info("Dhan final response destination verified: %s (requested_verified=%s)", active_name, verified)
     return dispatch_dhan_response

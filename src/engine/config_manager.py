@@ -207,6 +207,21 @@ def is_isolated_test_environment() -> bool:
     )
 
 
+def _fsync_directory(parent_dir: str) -> None:
+    """Durably publish atomic rename on filesystems supporting directory fsync."""
+    fd = None
+    try:
+        fd = os.open(parent_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(fd)
+    except OSError:
+        # File fsync and atomic replace still succeeded. Unsupported directory
+        # durability must not be misreported as a failed file replacement.
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def write_env_atomic(env_path: str, content: str) -> None:
     """Writes .env atomically with strict 0600 permissions."""
     parent_dir = os.path.dirname(os.path.abspath(env_path))
@@ -224,6 +239,7 @@ def write_env_atomic(env_path: str, content: str) -> None:
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, env_path)
         os.chmod(env_path, 0o600)
+        _fsync_directory(parent_dir)
     except Exception:
         if os.path.exists(tmp_path):
             try:
@@ -250,6 +266,7 @@ def write_json_atomic(file_path: str, data: Dict[str, Any], mode: int = 0o600) -
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, file_path)
         os.chmod(file_path, mode)
+        _fsync_directory(parent_dir)
     except Exception:
         if os.path.exists(tmp_path):
             try:
@@ -586,7 +603,7 @@ def human_readable_state_label(
     if op == OperationState.READY_TO_APPLY.value:
         return "Order Resolved — Ready to Apply"
     if st == ConfigApplyState.SAVED_FOR_NEXT_START.value:
-        return "Settings Saved — Bot Not Running"
+        return "Settings Saved — Awaiting Next Controlled Start"
     if st == ConfigApplyState.WAITING_FOR_SAFE_APPLY.value or op == OperationState.WAITING_FOR_ORDER.value:
         if blocked_reason in ("LIVE_ORDER_IN_PROGRESS", "UNPROTECTED_POSITION") or "order" in str(blocked_reason).lower():
             return "Waiting for Existing LIVE Order"
@@ -751,6 +768,13 @@ class ConfigChangeRecord:
     pre_restart_pid: int = 0
     pre_restart_starttime: Optional[int] = None
     observed_systemd_state: str = ""
+    # Additive WebUI field-scoped metadata (never includes unredacted secrets).
+    changed_fields: List[str] = field(default_factory=list)
+    application_method: str = ""
+    broker_checks_required: bool = False
+    client_request_id: str = ""
+    previous_file_revision: str = ""
+    requested_file_revision: str = ""
 
     @property
     def step_status(self) -> Dict[str, str]:
@@ -2769,6 +2793,52 @@ class ConfigChangeTracker:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
 
+            # F-02: Manual-risk acknowledgement is narrowly tied to a single
+            # terminal filled parent order. It is never a generic protection
+            # waiver, and it must not suppress pending entries or broker errors.
+            from src.config import parse_env_dict
+            current_account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip()
+            manual_risk_by_parent: Dict[str, Dict[str, Any]] = {}
+            try:
+                for row in cur.execute(
+                    "SELECT parent_order_id, correlation_id, account_id, "
+                    "security_id, quantity, status, acknowledged_at "
+                    "FROM manual_risk_acknowledgements"
+                ).fetchall():
+                    item = dict(row)
+                    parent = str(item.get("parent_order_id") or "").strip()
+                    if parent and str(item.get("status") or "").upper() == "UNPROTECTED_MANUAL_RISK":
+                        manual_risk_by_parent[parent] = item
+            except sqlite3.OperationalError:
+                # Older journals without the acknowledgement table remain
+                # subject to ordinary verified-protection requirements.
+                pass
+
+            def _owner_accepted_manual_risk(
+                parent_order_id: str, correlation_id: str, security_id: str,
+                filled_qty: int, state: str,
+            ) -> bool:
+                # Only an already terminal, fully filled parent can be
+                # assigned to manual monitoring; never pending/partial orders.
+                if str(state or "").upper() != "TRADED":
+                    return False
+                parent = str(parent_order_id or "").strip()
+                ack = manual_risk_by_parent.get(parent)
+                if not ack or not current_account_id or int(filled_qty or 0) <= 0:
+                    return False
+                if str(ack.get("account_id") or "").strip() != current_account_id:
+                    return False
+                if str(ack.get("security_id") or "").strip() != str(security_id or "").strip():
+                    return False
+                cid = str(correlation_id or "").strip()
+                if cid and str(ack.get("correlation_id") or "").strip() != cid:
+                    return False
+                try:
+                    return (int(ack.get("quantity") or 0) >= int(filled_qty)
+                            and float(ack.get("acknowledged_at") or 0) > 0)
+                except (TypeError, ValueError):
+                    return False
+
             # 1. Load watcher_orders map (by order_id and correlation_id)
             watcher_map: Dict[str, Dict[str, Any]] = {}
             all_watcher_records: List[Dict[str, Any]] = []
@@ -2877,22 +2947,57 @@ class ConfigChangeTracker:
                         ):
                             non_term_orders.append(orow)
                         if o_mode == "LIVE" and (o_st == "TRADED" or int(odict.get("filled_quantity") or 0) > 0):
-                            has_filled_live_orders = True
+                            o_filled = int(odict.get("filled_quantity") or odict.get("quantity") or 0)
+                            if not _owner_accepted_manual_risk(
+                                odict.get("broker_order_id"), odict.get("correlation_id"),
+                                odict.get("security_id"), o_filled, o_st,
+                            ):
+                                has_filled_live_orders = True
             except sqlite3.OperationalError:
                 pass
 
             has_watcher_protective_obligations = any(
-                int(w.get("filled_qty") or 0) > 0
-                or int(w.get("protected_qty") or 0) > 0
-                or bool(w.get("_is_terminal_col"))
+                (
+                    int(w.get("filled_qty") or 0) > 0
+                    or int(w.get("protected_qty") or 0) > 0
+                    or bool(w.get("_is_terminal_col"))
+                )
+                and not (
+                    _owner_accepted_manual_risk(
+                        w.get("order_id"), w.get("correlation_id"),
+                        w.get("security_id"), int(w.get("filled_qty") or 0),
+                        w.get("state"),
+                    )
+                    and not w.get("pending_oco")
+                    and not w.get("retry_reserved")
+                    and not w.get("retry_eligible")
+                )
                 for w in all_watcher_records
             )
 
-            # F03-03 Requirement 8: Avoid unnecessary broker queries when a safe state has already been independently established!
+            # An owner-acknowledged terminal filled parent remains explicitly
+            # visible to monitoring, but is NOT an unresolved broker mutation.
+            # Avoid consuming Dhan ReadGovernor budget for only those settled
+            # test holdings; still verify all other watcher/protection activity.
+            actionable_watcher_records = [
+                w for w in all_watcher_records
+                if not (
+                    _owner_accepted_manual_risk(
+                        w.get("order_id"), w.get("correlation_id"),
+                        w.get("security_id"), int(w.get("filled_qty") or 0),
+                        w.get("state"),
+                    )
+                    and not w.get("pending_oco")
+                    and not w.get("retry_reserved")
+                    and not w.get("retry_eligible")
+                )
+            ]
+            # F03-03 Requirement 8: no broker GET for independently verified
+            # idle state, including narrowly acknowledged manual-risk holdings.
             has_any_activity = bool(
                 non_term_intents
                 or non_term_orders
-                or all_watcher_records
+                or actionable_watcher_records
                 or all_active_prot_orders
                 or has_filled_live_orders
                 or has_unresolved_prot_attempts
@@ -3447,6 +3552,24 @@ class ConfigChangeTracker:
                         if isinstance(st_d, dict):
                             w_filled = max(w_filled, int(st_d.get("filledQty") or st_d.get("tradedQuantity") or 0))
                     if w_filled > 0:
+                        if (
+                            _owner_accepted_manual_risk(
+                                w_oid, w_cid, w_rec.get("security_id"),
+                                w_filled, w_rec.get("state"),
+                            )
+                            and not w_rec.get("pending_oco")
+                            and not w_rec.get("retry_reserved")
+                            and not w_rec.get("retry_eligible")
+                            and (
+                                not isinstance(order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid), dict)
+                                or str(
+                                    (order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid)).get("orderStatus") or ""
+                                ).strip().upper() == "TRADED"
+                            )
+                        ):
+                            reconciled_status_by_key[w_oid] = "TRADED"
+                            reconciled_status_by_key[w_cid] = "TRADED"
+                            continue
                         ver_q, b_err = _compute_verified_protection_qty(
                             corr_id=w_cid,
                             b_oid=w_oid,
@@ -3488,6 +3611,14 @@ class ConfigChangeTracker:
                         else:
                             b_filled = int(odict.get("filled_quantity") or 0)
                         if b_filled > 0:
+                            if _owner_accepted_manual_risk(
+                                o_boid, o_cid, odict.get("security_id") or (st_d or {}).get("securityId"),
+                                b_filled, o_st,
+                            ) and (
+                                not isinstance(st_d, dict)
+                                or str(st_d.get("orderStatus") or "").strip().upper() == "TRADED"
+                            ):
+                                continue
                             ver_q, b_err = _compute_verified_protection_qty(
                                 corr_id=o_cid,
                                 b_oid=o_boid or o_cid,
@@ -3616,6 +3747,50 @@ class ConfigChangeTracker:
                 con.row_factory = sqlite3.Row
                 cur = con.cursor()
 
+                from src.config import parse_env_dict
+                current_account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip()
+
+                def _manual_risk_parent_matches(parent_id: str, watcher_rec: Optional[dict] = None) -> bool:
+                    """Only a fully filled, terminal order with an exact owner ack.
+
+                    Never accept a manual-risk designation for a pending order,
+                    another account/security or less than the filled quantity.
+                    """
+                    if not parent_id or not current_account_id:
+                        return False
+                    try:
+                        row = cur.execute(
+                            "SELECT a.account_id, a.correlation_id, a.security_id, "
+                            "a.quantity AS ack_qty, a.status AS ack_state, a.acknowledged_at, "
+                            "o.correlation_id AS order_cid, o.security_id AS order_sec, "
+                            "o.status AS order_state, o.filled_quantity, o.quantity "
+                            "FROM manual_risk_acknowledgements a "
+                            "JOIN orders o ON o.broker_order_id=a.parent_order_id "
+                            "WHERE a.parent_order_id=? LIMIT 1", (str(parent_id),),
+                        ).fetchone()
+                        if row is None or str(row["ack_state"] or "").upper() != "UNPROTECTED_MANUAL_RISK":
+                            return False
+                        filled = int(row["filled_quantity"] or row["quantity"] or 0)
+                        if not filled or str(row["order_state"] or "").upper() != "TRADED":
+                            return False
+                        if (str(row["account_id"] or "") != current_account_id
+                                or str(row["security_id"] or "") != str(row["order_sec"] or "")
+                                or str(row["correlation_id"] or "") != str(row["order_cid"] or "")
+                                or int(row["ack_qty"] or 0) < filled
+                                or float(row["acknowledged_at"] or 0) <= 0):
+                            return False
+                        if watcher_rec:
+                            if (str(watcher_rec.get("state") or "").upper() != "TRADED"
+                                    or str(watcher_rec.get("security_id") or "") != str(row["order_sec"] or "")
+                                    or int(watcher_rec.get("filled_qty") or 0) > int(row["ack_qty"] or 0)
+                                    or watcher_rec.get("pending_oco")
+                                    or watcher_rec.get("retry_reserved")
+                                    or watcher_rec.get("retry_eligible")):
+                                return False
+                        return True
+                    except (sqlite3.Error, TypeError, ValueError):
+                        return False
+
                 # Check 1: All non-terminal order intents
                 cur.execute(
                     """
@@ -3680,7 +3855,10 @@ class ConfigChangeTracker:
                     cur.execute(
                         "SELECT parent_order_id, status FROM protection_orders WHERE status IN ('UNPROTECTED', 'UNVERIFIED');"
                     )
-                    unprot_rows = cur.fetchall()
+                    unprot_rows = [
+                        row for row in cur.fetchall()
+                        if not _manual_risk_parent_matches(row["parent_order_id"])
+                    ]
                     if unprot_rows:
                         con.close()
                         return (
@@ -3696,6 +3874,20 @@ class ConfigChangeTracker:
                 try:
                     cur.execute("SELECT order_id, record_json FROM watcher_orders WHERE is_terminal = 0;")
                     w_pending = cur.fetchall()
+                    # Acknowledged manual-risk holdings remain visible to the
+                    # watcher but no longer masquerade as unresolved broker
+                    # orders when only a settled terminal parent remains.
+                    w_actionable = []
+                    for wrow in w_pending:
+                        try:
+                            wdata = json.loads(wrow["record_json"] or "{}")
+                        except (TypeError, ValueError):
+                            wdata = None
+                        if not isinstance(wdata, dict) or not _manual_risk_parent_matches(
+                            str(wrow["order_id"] or "").strip(), wdata,
+                        ):
+                            w_actionable.append(wrow)
+                    w_pending = w_actionable
                     if w_pending:
                         # V14_MANUAL_CANCEL_GATE
                         # Local watcher rows alone do not prove a broker order is active.
@@ -4323,6 +4515,13 @@ class ConfigChangeTracker:
             "completed_stop": None,
         }
 
+        # First recover field-scoped save transactions. Otherwise a crash
+        # after atomic .env replacement but before status persistence can be
+        # incorrectly converted to APPLY_FAILED by the legacy 15-second timer.
+        # This is local journal recovery only (no broker or service actions).
+        from src.engine.webui_update import recover_field_transactions
+        outcomes["field_recovery"] = recover_field_transactions(self)
+
         # 0. Explicit gate recovery inside authorized coordinator (F02-06)
         self.reconcile_and_recover_transition_gate()
 
@@ -4623,6 +4822,7 @@ class ConfigChangeTracker:
         verify_delay_sec: float = 0.05,
         broker: Optional[Any] = None,
         spawn_worker: bool = True,
+        webui_request: Optional[Dict[str, str]] = None,
     ) -> ConfigChangeRecord:
         """
         B11 & F02-03: Durably persists the configuration request (`15% RECEIVED`) and queues it in
@@ -4654,7 +4854,21 @@ class ConfigChangeTracker:
                 "db_path": abs_db_path,
                 "created_at": time.time(),
             }
+            if webui_request:
+                op_payload["webui_request_id"] = str(webui_request["request_id"])
+                op_payload["webui_payload_sha256"] = str(webui_request["payload_sha256"])
             write_json_atomic(self.pending_op_file, op_payload)
+            if webui_request:
+                # Persist the idempotency association under the same operation
+                # lock and BEFORE returning to Setup. A crash immediately
+                # after enqueue cannot cause an identical request to be replayed.
+                # The queued envelope itself contains fallback provenance when
+                # a crash interrupts the small gap between atomic file writes.
+                write_json_atomic(webui_request["index_path"], {
+                    "request_id": webui_request["request_id"],
+                    "payload_sha256": webui_request["payload_sha256"],
+                    "change_id": init_rec.change_id,
+                })
 
         if spawn_worker:
             self.start_coordinator_daemon(
@@ -5592,7 +5806,8 @@ def execute_configuration_update(
                 existing_change_id=existing_change_id,
             )
 
-        repair_and_export_sqlite_session(data_dir=tracker.data_dir, env_path=env_path)
+        # Telegram session schema repair and credential exports are explicit
+        # maintenance operations, never side effects of configuration saves.
 
         previous_env_raw = ctx["previous_env_raw"]
         combined_new_params = ctx["combined_new_params"]
