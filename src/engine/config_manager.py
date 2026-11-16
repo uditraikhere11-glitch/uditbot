@@ -3720,6 +3720,50 @@ class ConfigChangeTracker:
                 con.row_factory = sqlite3.Row
                 cur = con.cursor()
 
+                from src.config import parse_env_dict
+                current_account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip()
+
+                def _manual_risk_parent_matches(parent_id: str, watcher_rec: Optional[dict] = None) -> bool:
+                    """Only a fully filled, terminal order with an exact owner ack.
+
+                    Never accept a manual-risk designation for a pending order,
+                    another account/security or less than the filled quantity.
+                    """
+                    if not parent_id or not current_account_id:
+                        return False
+                    try:
+                        row = cur.execute(
+                            "SELECT a.account_id, a.correlation_id, a.security_id, "
+                            "a.quantity AS ack_qty, a.status AS ack_state, a.acknowledged_at, "
+                            "o.correlation_id AS order_cid, o.security_id AS order_sec, "
+                            "o.status AS order_state, o.filled_quantity, o.quantity "
+                            "FROM manual_risk_acknowledgements a "
+                            "JOIN orders o ON o.broker_order_id=a.parent_order_id "
+                            "WHERE a.parent_order_id=? LIMIT 1", (str(parent_id),),
+                        ).fetchone()
+                        if row is None or str(row["ack_state"] or "").upper() != "UNPROTECTED_MANUAL_RISK":
+                            return False
+                        filled = int(row["filled_quantity"] or row["quantity"] or 0)
+                        if not filled or str(row["order_state"] or "").upper() != "TRADED":
+                            return False
+                        if (str(row["account_id"] or "") != current_account_id
+                                or str(row["security_id"] or "") != str(row["order_sec"] or "")
+                                or str(row["correlation_id"] or "") != str(row["order_cid"] or "")
+                                or int(row["ack_qty"] or 0) < filled
+                                or float(row["acknowledged_at"] or 0) <= 0):
+                            return False
+                        if watcher_rec:
+                            if (str(watcher_rec.get("state") or "").upper() != "TRADED"
+                                    or str(watcher_rec.get("security_id") or "") != str(row["order_sec"] or "")
+                                    or int(watcher_rec.get("filled_qty") or 0) > int(row["ack_qty"] or 0)
+                                    or watcher_rec.get("pending_oco")
+                                    or watcher_rec.get("retry_reserved")
+                                    or watcher_rec.get("retry_eligible")):
+                                return False
+                        return True
+                    except (sqlite3.Error, TypeError, ValueError):
+                        return False
+
                 # Check 1: All non-terminal order intents
                 cur.execute(
                     """
@@ -3784,7 +3828,10 @@ class ConfigChangeTracker:
                     cur.execute(
                         "SELECT parent_order_id, status FROM protection_orders WHERE status IN ('UNPROTECTED', 'UNVERIFIED');"
                     )
-                    unprot_rows = cur.fetchall()
+                    unprot_rows = [
+                        row for row in cur.fetchall()
+                        if not _manual_risk_parent_matches(row["parent_order_id"])
+                    ]
                     if unprot_rows:
                         con.close()
                         return (
@@ -3800,6 +3847,20 @@ class ConfigChangeTracker:
                 try:
                     cur.execute("SELECT order_id, record_json FROM watcher_orders WHERE is_terminal = 0;")
                     w_pending = cur.fetchall()
+                    # Acknowledged manual-risk holdings remain visible to the
+                    # watcher but no longer masquerade as unresolved broker
+                    # orders when only a settled terminal parent remains.
+                    w_actionable = []
+                    for wrow in w_pending:
+                        try:
+                            wdata = json.loads(wrow["record_json"] or "{}")
+                        except (TypeError, ValueError):
+                            wdata = None
+                        if not isinstance(wdata, dict) or not _manual_risk_parent_matches(
+                            str(wrow["order_id"] or "").strip(), wdata,
+                        ):
+                            w_actionable.append(wrow)
+                    w_pending = w_actionable
                     if w_pending:
                         # V14_MANUAL_CANCEL_GATE
                         # Local watcher rows alone do not prove a broker order is active.
