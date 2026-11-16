@@ -95,7 +95,7 @@ async def configure_dhan_response_group(
         return None
     if entity is None:
         if group_name:
-            logger.warning("Dhan Response target unavailable and no verified fallback exists")
+            logger.warning("Dhan Response group unavailable; no verified fallback exists")
         else:
             logger.info("Dhan Response group intentionally disabled")
         return None
