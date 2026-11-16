@@ -104,7 +104,6 @@ if [[ "$MODE" == --rollback ]]; then
     exit 0
 fi
 
-[[ ! -e "$OVERRIDE" ]] || fail 'Managed override already exists. Inspect instead of overwriting.'
 "$ROOT/venv/bin/python3" -c 'from src.webui_password import password_configured; raise SystemExit(0 if password_configured() else 1)' \
     || fail 'Provision a private password first: ./venv/bin/python3 -m src.webui_password provision'
 [[ -d "$ROOT/data" && ! -L "$ROOT/data" ]] || fail 'Auth data directory must be real, not a symlink.'
@@ -112,6 +111,63 @@ fi
 
 STATE="$("$SYSTEMCTL" is-active auditbot-web.service 2>/dev/null || true)"
 [[ "$STATE" == active || "$STATE" == inactive || "$STATE" == failed ]] || fail "Uncertain WebUI service state: $STATE"
+
+# Refuse to start an authenticated service under a different/privileged Unix
+# account: the locally provisioned password verifier would not match.
+SERVICE_USER="$("$SYSTEMCTL" show auditbot-web.service -p User --value)"
+[[ -n "$SERVICE_USER" && "$SERVICE_USER" == "$(id -un)" ]] ||
+    fail "WebUI service must run as current non-root operator (observed User=${SERVICE_USER:-UNSET})."
+
+check_http() {
+    local url="$1" expected="$2" got attempt
+    # systemctl restart can return before uvicorn has bound port 80.
+    # Retry only connection/startup failures; never accept HTTP 200 at /.
+    for attempt in 1 2 3 4 5; do
+        if got="$("$CURL" --noproxy '*' --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1${url}")"; then
+            [[ "$got" == "$expected" ]] || { echo "Unexpected HTTP status for ${url}: $got (expected $expected)" >&2; return 1; }
+            return 0
+        fi
+        sleep 1
+    done
+    echo "WebUI did not become reachable for ${url} after bounded retries" >&2
+    return 1
+}
+
+# Repeat runs must not restart the WebUI or overwrite the existing, reviewed
+# override. Verify that the selected security mode actually matches.
+if [[ -e "$OVERRIDE" ]]; then
+    [[ -f "$OVERRIDE" && ! -L "$OVERRIDE" ]] || fail 'Managed override path is not a regular file.'
+    grep -Fxq '# UDITBOT_GITHUB_WEBUI_MIGRATION_V1' "$OVERRIDE" || fail 'Existing override is not owned by this migration.'
+    grep -Fxq "ExecStart=$ROOT/venv/bin/python3 -m src.control_center_entry --host $HOST --port 80" "$OVERRIDE" ||
+        fail 'Existing migration mode/path differs. Explicit rollback and review required.'
+    EXPECTED_INSECURE=""
+    if [[ "$PUBLIC" == 1 ]]; then EXPECTED_INSECURE="I_ACCEPT_PLAINTEXT_PASSWORD_AND_SESSION_RISK"; fi
+    grep -Fxq "Environment=UDITBOT_WEBUI_ALLOW_INSECURE_PUBLIC_HTTP=$EXPECTED_INSECURE" "$OVERRIDE" ||
+        fail 'Existing migration transport setting differs. Explicit rollback and review required.'
+    EFFECTIVE="$("$SYSTEMCTL" show auditbot-web.service -p ExecStart --value)"
+    [[ "$EFFECTIVE" == *"-m src.control_center_entry --host $HOST --port 80"* && "$EFFECTIVE" != *"-m src.setup_app"* ]] ||
+        fail 'Existing managed override is not the effective service entrypoint.'
+    if [[ "$STATE" == active ]]; then
+        check_http / 303 && check_http /setup 303 && check_http /login 200 ||
+            fail 'Existing WebUI does not pass unauthenticated login checks; service was not touched.'
+    fi
+    printf 'ALREADY_APPLIED: Authenticated WebUI migration is verified; no restart or file changes.\n'
+    exit 0
+fi
+
+# The WebUI's existing startup coordinator can act on a durable Owner Stop.
+# Warn rather than silently claiming WebUI restart is operationally inert.
+"$ROOT/venv/bin/python3" - <<'PY'
+import json
+from pathlib import Path
+p = Path('data/service_control_state.json')
+try:
+    state = json.loads(p.read_text()) if p.exists() else {}
+    if isinstance(state, dict) and state.get("deferred_stop_pending"):
+        print("WARNING: A deferred Owner Stop exists. WebUI startup may resume existing service-control work.")
+except (OSError, ValueError):
+    print("WARNING: Service-control state unreadable. Review it before migrating.")
+PY
 
 mkdir -p "$BACKUP_ROOT"
 chmod 0700 "$BACKUP_ROOT"
@@ -172,20 +228,6 @@ EFFECTIVE="$("$SYSTEMCTL" show auditbot-web.service -p ExecStart --value)"
 if [[ "$STATE" == active ]]; then
     "$SUDO" "$SYSTEMCTL" restart auditbot-web.service
     [[ "$("$SYSTEMCTL" is-active auditbot-web.service)" == active ]] || fail 'WebUI did not become active.'
-    check_http() {
-        local url="$1" expected="$2" got attempt
-        # systemctl restart can return before uvicorn has bound port 80.
-        # Retry only connection/startup failures, never an unexpected HTTP 200.
-        for attempt in 1 2 3 4 5; do
-            if got="$("$CURL" --noproxy '*' --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1${url}")"; then
-                [[ "$got" == "$expected" ]] || { echo "Unexpected HTTP status for ${url}: $got (expected $expected)" >&2; return 1; }
-                return 0
-            fi
-            sleep 1
-        done
-        echo "WebUI did not become reachable for ${url} after bounded retries" >&2
-        return 1
-    }
     check_http / 303 || fail 'Unauthenticated root did not redirect to login.'
     check_http /setup 303 || fail 'Unauthenticated Setup did not redirect to login.'
     check_http /login 200 || fail 'Login page is unavailable.'
@@ -195,7 +237,8 @@ else
 fi
 COMPLETE=1
 printf 'SUCCESS: Authenticated WebUI service configuration installed.\nBackup: %s\n' "$BACKUP"
-printf 'UNCHANGED: trading_bot.service, token timer, .env, journal, Telegram session, emergency STOP, order state.\n'
+printf 'No direct trading-service, timer, .env, journal, Telegram, or broker mutations by this migration.\n'
+printf 'NOTE: Existing WebUI coordinator may process previously pending Owner Stop/configuration work on startup.\n'
 if [[ "$PUBLIC" == 1 ]]; then
     printf 'WARNING: Public HTTP is unencrypted. Migrate to HTTPS/private access.\n'
 fi
