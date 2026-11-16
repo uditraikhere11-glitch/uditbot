@@ -324,18 +324,19 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
         except Exception:
             return _json({"error": "Malformed JSON"}, 400)
         allowed = {"enabled", "csrf_token", "expected_revision", "request_id"}
-        if not isinstance(body, dict) or not {"enabled", "csrf_token", "expected_revision"}.issubset(body) or set(body) - allowed:
+        if not isinstance(body, dict) or "enabled" not in body or "csrf_token" not in body or set(body) - allowed:
             return _json({"error": "Only enabled, csrf_token, expected_revision and request_id are permitted"}, 400)
         if body.get("csrf_token") != csrf_token or not isinstance(body.get("csrf_token"), str):
             return _json({"error": "Invalid CSRF token"}, 403)
         if type(body["enabled"]) is not bool:
             return _json({"error": "enabled must be a JSON boolean"}, 422)
+        if not isinstance(body.get("expected_revision"), str) or not re.fullmatch(r"[0-9a-f]{64}", body["expected_revision"]):
+            return _json({"error": "Missing or invalid configuration revision; refresh the Control Center"}, 409)
         try:
-            env_path = os.path.abspath(".env")
+            cfg, env_path, data_dir = _config_and_paths()
             if not os.path.isfile(env_path) or os.path.islink(env_path):
                 return _json({"error": "Configuration file must be a regular file"}, 409)
-            raw_settings = parse_env_dict(env_path)
-            tracker = ConfigChangeTracker(data_dir=os.path.abspath(raw_settings.get("DATA_DIR") or "data"))
+            tracker = ConfigChangeTracker(data_dir=data_dir)
             rec = submit_webui_patch(
                 tracker, {form_key: body["enabled"]}, env_path=env_path,
                 expected_revision=body.get("expected_revision"),
