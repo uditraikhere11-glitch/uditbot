@@ -75,6 +75,10 @@ for LAST; do :; done
 if [ "${FAKE_CURL_HTTP_FAIL:-}" = 1 ]; then
     printf '200'; exit 0
 fi
+if [ "${FAKE_CURL_CONNECTION_REFUSED_ONCE:-}" = 1 ] && [ ! -e "$AUDITBOT_SYSTEMD_DIR/curl-tried" ]; then
+    touch "$AUDITBOT_SYSTEMD_DIR/curl-tried"
+    exit 7
+fi
 case "$LAST" in
   */login) printf '200' ;;
   *) printf '303' ;;
@@ -156,6 +160,15 @@ esac
         self.assertFalse(self.override.exists())
         self.assert_active(False)
         self.assertIn('src.setup_app', self.unit.read_text())
+
+    def test_bounded_retry_tolerates_uvicorn_bind_delay(self):
+        (self.root / 'data/webui_password.json').touch()
+        env = dict(self.env, FAKE_CURL_CONNECTION_REFUSED_ONCE='1')
+        res = self.run_cmd('--apply', env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assert_active()
+        self.assertTrue(self.override.exists())
+        self.assertTrue((self.root / 'systemd/curl-tried').exists())
 
     def test_wrong_effective_entrypoint_fails_closed(self):
         (self.root / 'data/webui_password.json').touch()
