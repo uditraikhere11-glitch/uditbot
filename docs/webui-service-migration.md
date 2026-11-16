@@ -22,6 +22,13 @@ changing any trading logic.
   `./venv/bin/python3 -m src.webui_password provision`.
 - Ensure `data` is private (0700), and the password verifier is private (0600).
   Never commit passwords, .env, SQLite journals or sessions to GitHub.
+- The currently installed systemd unit must run as the same **non-root operator**
+  who provisioned the password; the migration checks `systemctl show -p User`.
+  If the service is configured as root or another user, correct its ownership
+  and credentials in an independent, reviewed change.
+- Before restarting a WebUI that has an outstanding deferred Owner Stop, review
+  `data/service_control_state.json` and any pending configuration state.
+  The migration does not cancel, modify or supersede those obligations.
 
 ## Safe default (recommended)
 
@@ -56,20 +63,28 @@ repository at `~/uditbot-backups/webui-service-migrations/`. It preserves
 the old unit and existing `10-original-access.conf`, then adds a higher-priority,
 GitHub-managed `99-github-authenticated-control.conf` drop-in.
 
-It checks the effective systemd ExecStart and requires these results from
-unauthenticated loopback requests before reporting success:
+It checks the effective systemd ExecStart and service identity, and requires
+these results from unauthenticated loopback requests before reporting success:
 
 - `GET /`: HTTP 303 redirect to password login
 - `GET /setup`: HTTP 303 redirect to password login
 - `GET /login`: HTTP 200 (password form itself)
 
-Only `auditbot-web.service` is restarted, and only if it was already active.
-The trading bot, token timer, emergency STOP, .env, SQLite journal, and broker
-orders are not touched. A stopped WebUI stays stopped.
+Only `auditbot-web.service` is directly restarted by this migration, and
+only if it was already active. Existing trading and token timer unit files,
+emergency STOP, .env, SQLite journal and broker order records are not edited.
+A stopped WebUI stays stopped. **The WebUI itself runs an existing background
+coordinator on startup**. If a deferred Owner Stop or transition already
+exists, this coordinator may resume the previously requested service-control
+operation, including read-only Dhan safety checks. Check the existing control
+state and broker obligations before restarting the WebUI; the migration warns
+when it detects a pending Owner Stop.
 
 On verification failure, the migration removes its managed drop-in and leaves
 the WebUI **stopped**. It never silently brings the old unauthenticated public
-Setup application back online.
+Setup application back online. Running `--apply` again with the same security
+mode verifies the existing deployment without restarting services; a different
+mode requires deliberate rollback and review.
 
 ## Rollback
 
@@ -97,5 +112,6 @@ WebUI systemd unit already exists.
 AUDITBOT_TEST_ISOLATION=1 python -m unittest -v tests.test_webui_service_migration
 ~~~
 
-The tests mock sudo, systemd, HTTP, and filesystem service paths and make no
-Dhan, Telegram, or production VM calls.
+The tests mock sudo, systemd, HTTP, and filesystem service paths, exercise
+idempotent repeat runs and mismatched service identities, and make no Dhan,
+Telegram, or production VM calls.
