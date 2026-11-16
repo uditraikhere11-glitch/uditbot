@@ -314,6 +314,9 @@ def submit_webui_patch(
             )
         if os.path.exists(tracker.pending_op_file):
             raise ConfigurationConflict("Existing durable configuration operation needs coordinator recovery")
+        control_rec = tracker.get_service_control_record()
+        if isinstance(control_rec, dict) and control_rec.get("deferred_stop_pending"):
+            raise ConfigurationConflict("Owner Stop is pending; configuration updates must not supersede it")
         raw = _read_env(env_path)
         new_content, changed = patch_env(raw, form_data, expected_revision=expected_revision)
         validate_effective_config(new_content)
