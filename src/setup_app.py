@@ -2202,6 +2202,7 @@ def get_change_status(change_id: str):
                 and ack.get("pid") == running.get("pid")
                 and ack.get("process_starttime") is not None
                 and ack.get("process_starttime") == running.get("process_starttime")
+                and ack.get("config_version_hash") == running.get("version_hash")
                 and isinstance(ack.get("acknowledged_at"), (int, float))
                 and isinstance(running.get("acknowledged_at"), (int, float))
                 and ack["acknowledged_at"] >= running["acknowledged_at"]
