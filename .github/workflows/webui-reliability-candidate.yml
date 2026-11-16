@@ -59,7 +59,7 @@ jobs:
           names = [x for x in git('diff','--name-only',BASE,'HEAD').splitlines() if x]
           assert names, 'No changes to package'
           allowed = ('src/', 'tests/', '.github/workflows/webui-reliability-candidate.yml')
-          assert all(name.startswith(('src/','tests/')) or name == allowed[2] for name in names), names
+          assert all(name.startswith(('src/','tests/')) or name in (allowed[2], 'run.py') for name in names), names
           forbidden = ('src/parsers/', 'src/engine/risk_manager.py', 'src/engine/protection_watcher.py',
                        'src/broker/dhan_client.py', 'src/broker/read_governor.py', 'src/journal/db.py')
           assert not any(any(name.startswith(pre) for pre in forbidden) for name in names), 'Trading BRAIN or broker behavior changed'
@@ -108,6 +108,10 @@ jobs:
                'Use effective field changes under shared cross-process lock and refuse stale browser revisions.'),
           ]
           reasons = {
+              'run.py':'Production Telegram Dhan Response dispatcher activation and runtime hash',
+              'src/notifier/dhan_response.py':'Verified fallback routing in the actual production dispatcher',
+              'src/notifier/response_activation.py':'Validated source/target acknowledgment and intentional disable checkpoint',
+              'tests/test_pr84_gemini_remediation.py':'Synthetic F02 F03 F05 F06 F08 F09 F10 adversarial tests',
               'src/engine/config_patch.py':'New editable-field schema; strict patching, CAS and validation',
               'src/engine/webui_update.py':'Field-aware coordinator with backups, idempotency and legacy recovery',
               'src/engine/config_manager.py':'Durable rename, additive status metadata and decoupled session repair',
@@ -160,7 +164,7 @@ jobs:
               '4. Deploy only after merge authorization, then verify systemd, WebUI and broker read budgets without placing LIVE test orders.',
               '5. To roll back, restore exact backed-up source and previous .env while safely stopped; never overwrite journal or clear protection obligations.',
               '', '## Status',
-              '**NOT READY — CRITICAL DEFECTS REMAIN** until all AC criteria and PR #83 integration have an evidenced pass.',
+              '**PENDING INDEPENDENT SAFETY REVIEW — DO NOT MERGE OR DEPLOY.** Offline CI is not a substitute for owner approval, production account/status checks, or an independent review.',
           ]
           Path(report_name).write_text('\n'.join(lines)+'\n', encoding='utf-8')
 
@@ -206,7 +210,7 @@ jobs:
                 '- `python -m compileall -q src tests`',
                 '- `python -W error::ResourceWarning -m unittest discover -s tests -p "test_*.py"`',
                 f'- Test count from same runner output: {count}; see workflow job log.',
-                '', '## Verdict', '**NOT READY — CRITICAL DEFECTS REMAIN**', '']
+                '', '## Verdict', '**PENDING INDEPENDENT SAFETY REVIEW — DO NOT MERGE OR DEPLOY**', '']
           Path(accept_name).write_text('\n'.join(a), encoding='utf-8')
           artifacts = [zip_name, patch_name, report_name, accept_name]
           with open(manifest_name,'w', encoding='utf-8') as fh:
