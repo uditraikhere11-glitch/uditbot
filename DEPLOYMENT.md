@@ -40,6 +40,20 @@ python3 -m src.setup_app
 ```
 Connect via SSH local port forwarding (`ssh -L 8080:localhost:8080 user@vm-ip`) and open `http://localhost:8080` in your browser.
 
+
+### 2.3 Existing-VM WebUI authentication migration
+
+The systemd service for an **existing** VM is intentionally preserved by the
+fresh-VM installer, which can leave the older, unauthenticated `src.setup_app`
+entrypoint running after a GitHub update. Use the documented, opt-in,
+backup-first migration in [WebUI service migration](docs/webui-service-migration.md)
+to switch that service to password-protected `src.control_center_entry`.
+
+The default is private localhost. Retaining public HTTP requires explicit
+acknowledgment that passwords and sessions are transmitted unencrypted. The
+migration never starts/restarts the trading bot and stops the WebUI rather than
+restoring an unauthenticated listener if verification fails.
+
 ---
 
 ## 3. Visual Telegram Log Notification Format
