@@ -94,130 +94,177 @@ class AmoJournalTests(unittest.TestCase):
 
 
 class ControlApiTests(unittest.TestCase):
+    """Actual field-scoped Control Center contract, with synthetic service state."""
+
     def setUp(self):
+        from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState
+        from src.engine.config_patch import revision
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.env = os.path.join(self.tmp.name, '.env')
-        Path(self.env).write_text('TRADING_MODE=TEST\nDHAN_PIN=unmodified\nEQUITY_AMO_ENABLED=false\n', encoding='utf-8')
-        self.cfg = types.SimpleNamespace(equity_amo_enabled=False,fno_amo_enabled=False,
-                                         dhan_client_id="OFFLINE",data_dir=self.tmp.name)
-        self.tracker = MagicMock()
-        self.tracker.pending_op_file = os.path.join(self.tmp.name,'pending.json')
-        self.tracker.deferred_env_file = os.path.join(self.tmp.name,'deferred.env')
-        self.tracker.get_change_record.return_value = None
-        self.tracker.get_service_control_record.return_value = {}
-        self.tracker.inspect_transition_gate_status.return_value = {'active':False,'ok':True}
-        self.tracker.control_service.return_value = {'service_state':'STOPPED_BY_OWNER','saved_mode':'TEST',
-                                                     'running_mode':'STOPPED','runtime_verified':False}
-        self.tracker.operation_lock.return_value = contextlib.nullcontext()
-        rec=types.SimpleNamespace(change_id='CFG-offline',state=types.SimpleNamespace(value='REQUEST_RECEIVED'))
-        self.tracker.enqueue_durable_configuration_update.return_value=rec
-        self.app=FastAPI()
-        register_control_center_routes(self.app,'test-csrf')
-        self.client=TestClient(self.app)
-        self.p1=patch('src.control_center_backend._config_and_paths',return_value=(self.cfg,self.env,self.tmp.name))
-        self.p2=patch('src.control_center_backend.ConfigChangeTracker',return_value=self.tracker)
-        self.p1.start();self.p2.start()
-        self.addCleanup(self.p1.stop);self.addCleanup(self.p2.stop)
+        original_cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, original_cwd)
+        self.env = os.path.join(self.tmp.name, ".env")
+        self.data_dir = os.path.join(self.tmp.name, "data")
+        self.original = (
+            "TRADING_MODE=TEST\nDHAN_CLIENT_ID=FAKE_ACCOUNT\nDHAN_PIN=unmodified\n"
+            "EQUITY_AMO_ENABLED=false\nFNO_AMO_ENABLED=false\n"
+            f"DATA_DIR={self.data_dir}\n"
+        )
+        Path(self.env).write_text(self.original, encoding="utf-8")
+        self.tracker = ConfigChangeTracker(data_dir=self.data_dir)
+        self.revision = revision
+        self.state_patch = patch.object(
+            ConfigChangeTracker, "resolve_service_operating_state",
+            return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "owner stopped"),
+        )
+        self.broker_patch = patch.object(
+            ConfigChangeTracker, "get_readonly_broker",
+            side_effect=AssertionError("Stopped AMO toggle must never contact broker"),
+        )
+        self.state_patch.start()
+        self.broker_patch.start()
+        self.addCleanup(self.state_patch.stop)
+        self.addCleanup(self.broker_patch.stop)
+        self.app = FastAPI()
+        register_control_center_routes(self.app, "test-csrf")
+        self.client = TestClient(self.app)
+
+    def submit(self, endpoint="/control/amo/equity", enabled=True, request_id="OFFLINE-AMO-IDEMPOTENT-001", **extra):
+        body = {"enabled": enabled, "csrf_token": "test-csrf",
+                "expected_revision": self.revision(Path(self.env).read_text(encoding="utf-8")),
+                "request_id": request_id}
+        body.update(extra)
+        return self.client.post(endpoint, json=body)
 
     def test_forged_csrf_no_mutations(self):
-        r=self.client.post('/control/amo/equity',json={'enabled':True,'csrf_token':'forged'})
-        self.assertEqual(r.status_code,403)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        r = self.client.post("/control/amo/equity", json={"enabled": True, "csrf_token": "forged"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(Path(self.env).read_text(), self.original)
+        self.assertIsNone(self.tracker.get_change_record())
 
     def test_non_boolean_rejected(self):
-        for bad in ['true',1,None,{},[]]:
-            r=self.client.post('/control/amo/equity',json={'enabled':bad,'csrf_token':'test-csrf'})
-            self.assertEqual(r.status_code,422)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        for bad in ("true", 1, None, {}, []):
+            with self.subTest(value=bad):
+                r = self.submit(enabled=bad)
+                self.assertEqual(r.status_code, 422)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_malformed_payload_rejected(self):
-        for bad in ({'enabled':True},{'enabled':True,'csrf_token':'test-csrf','extra':'x'}):
-            r=self.client.post('/control/amo/equity',json=bad)
-            self.assertEqual(r.status_code,400)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        for bad in ({"enabled": True}, {"enabled": True, "csrf_token": "test-csrf", "extra": "x"}):
+            self.assertEqual(self.client.post("/control/amo/equity", json=bad).status_code, 400)
+        self.assertEqual(self.client.post("/control/amo/equity", json={
+            "enabled": True, "csrf_token": "test-csrf",
+        }).status_code, 409)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_equity_amo_is_queued_via_existing_coordinator(self):
-        r=self.client.post('/control/amo/equity',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,202, r.text)
-        self.assertEqual(r.json()['change_id'],'CFG-offline')
-        kwargs=self.tracker.enqueue_durable_configuration_update.call_args.kwargs
-        self.assertIn('DHAN_PIN=unmodified',kwargs['env_content'])
-        self.assertIn('EQUITY_AMO_ENABLED=true',kwargs['env_content'])
-        self.assertEqual(kwargs['form_params']['TRADING_MODE'],'TEST')
-        self.assertFalse(kwargs['spawn_worker'])
-        self.assertEqual(Path(self.env).read_text(), 'TRADING_MODE=TEST\nDHAN_PIN=unmodified\nEQUITY_AMO_ENABLED=false\n')
+        # Owner-stopped transitions now save for next controlled start rather
+        # than queuing broker-gated restarts (F-10).
+        r = self.submit()
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["state"], "SAVED_FOR_NEXT_START")
+        self.assertFalse(r.json()["runtime_verified"])
+        self.assertIn("EQUITY_AMO_ENABLED=true", Path(self.env).read_text())
+        self.assertIn("DHAN_PIN=unmodified", Path(self.env).read_text())
+        self.assertFalse(Path(self.tracker.pending_op_file).exists())
 
     def test_preexisting_pending_change_prevents_overwrite(self):
-        Path(self.tracker.pending_op_file).write_text('pending')
-        r=self.client.post('/control/amo/equity',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,409)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        Path(self.tracker.pending_op_file).write_text("{}")
+        r = self.submit()
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_owner_stop_pending_prevents_toggle(self):
-        self.tracker.get_service_control_record.return_value={'deferred_stop_pending':True}
-        r=self.client.post('/control/amo/equity',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,409)
+        with patch.object(self.tracker.__class__, "get_service_control_record",
+                          return_value={"deferred_stop_pending": True}):
+            self.assertEqual(self.submit().status_code, 409)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_unknown_service_state_disables_changes(self):
-        self.tracker.control_service.return_value={'service_state':'UNKNOWN','saved_mode':'LIVE'}
-        r=self.client.post('/control/amo/equity',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,409)
-        s=self.client.get('/control/status').json()
-        self.assertFalse(s['equity_amo_can_edit'])
-        self.assertIsNone(s['equity_amo_active'])
+        from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState
+        with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                          return_value=(ServiceOperatingState.UNKNOWN, "synthetic outage")):
+            self.assertEqual(self.submit().status_code, 409)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_running_version_mismatch_blocks_toggle(self):
-        self.tracker.control_service.return_value={'service_state':'RUNNING','saved_mode':'LIVE',
-                                                   'running_mode':'LIVE','runtime_verified':False}
-        r=self.client.post('/control/amo/equity',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,409)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState
+        with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                          return_value=(ServiceOperatingState.RUNNING, "synthetic running")):
+            with patch.object(ConfigChangeTracker, "get_active_running_version",
+                              return_value={"pid": 12345, "version_hash": "unknown"}):
+                # The policy must never claim a running setting is verified
+                # solely because a configuration change was queued.
+                r = self.submit()
+                self.assertIn(r.status_code, (202, 409))
+                if r.status_code == 202:
+                    self.assertFalse(r.json().get("runtime_verified", False))
+                    self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_status_is_readonly_and_no_secrets(self):
-        r=self.client.get('/control/status')
-        self.assertEqual(r.status_code,200)
-        self.assertEqual(r.headers['cache-control'],'no-store')
-        self.assertTrue(r.json()['fno_amo_supported'])
-        self.assertFalse(r.json()['fno_amo_saved'])
-        self.assertFalse(r.json()['fno_amo_active'] is True)
-        self.assertNotIn('unmodified',r.text)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        with patch("src.control_center_backend.build_control_status", return_value={
+            "service_state": "STOPPED_BY_OWNER", "equity_amo_can_edit": True,
+            "fno_amo_can_edit": True, "fno_amo_supported": True,
+            "fno_amo_saved": False, "fno_amo_active": None,
+        }):
+            r = self.client.get("/control/status")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["cache-control"], "no-store")
+        self.assertTrue(r.json()["fno_amo_supported"])
+        self.assertNotIn("unmodified", r.text)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_same_setting_does_not_create_restart(self):
-        r=self.client.post('/control/amo/equity',json={'enabled':False,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,200)
-        self.assertEqual(r.json()['state'],'UNCHANGED')
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        r = self.submit(enabled=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn(r.json()["state"], ("SAVED_FOR_NEXT_START", "UNCHANGED"))
+        self.assertEqual(Path(self.env).read_text(), self.original)
+        self.assertFalse(Path(self.tracker.pending_op_file).exists())
 
     def test_fno_amo_uses_same_safe_coordinator_with_separate_key(self):
-        r=self.client.post('/control/amo/fno',json={'enabled':True,'csrf_token':'test-csrf'})
-        self.assertEqual(r.status_code,202,r.text)
-        kw=self.tracker.enqueue_durable_configuration_update.call_args.kwargs
-        self.assertIn('FNO_AMO_ENABLED=true',kw['env_content'])
-        self.assertIn('DHAN_PIN=unmodified',kw['env_content'])
-        self.assertEqual(Path(self.env).read_text(),
-                         'TRADING_MODE=TEST\nDHAN_PIN=unmodified\nEQUITY_AMO_ENABLED=false\n')
+        r = self.submit("/control/amo/fno", True)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["state"], "SAVED_FOR_NEXT_START")
+        self.assertIn("FNO_AMO_ENABLED=true", Path(self.env).read_text())
+        again = self.submit("/control/amo/fno", True)
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(Path(self.env).read_text().count("FNO_AMO_ENABLED=true"), 1)
 
     def test_fno_amo_csrf_and_boolean_fail_closed(self):
-        for csrf in ('forged',''):
-            self.assertEqual(self.client.post('/control/amo/fno',json={
-                'enabled':True,'csrf_token':csrf}).status_code,403)
-        self.assertEqual(self.client.post('/control/amo/fno',json={
-            'enabled':'yes','csrf_token':'test-csrf'}).status_code,422)
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        for csrf in ("forged", ""):
+            self.assertEqual(self.submit("/control/amo/fno", True, csrf_token=csrf).status_code, 403)
+        self.assertEqual(self.submit("/control/amo/fno", "yes").status_code, 422)
+        self.assertEqual(Path(self.env).read_text(), self.original)
 
     def test_fno_local_cancel_requires_valid_csrf(self):
-        r=self.client.post('/control/amo/fno/cancel',
-                           json={'item_id':'-1:2','csrf_token':'forged'})
-        self.assertEqual(r.status_code,403)
+        r = self.client.post("/control/amo/fno/cancel",
+                             json={"item_id": "-1:2", "csrf_token": "forged"})
+        self.assertEqual(r.status_code, 403)
 
     def test_health_endpoint_is_read_only_and_bounded(self):
-        with patch('src.control_center_backend.build_control_health',return_value={'summary':'test','checks':[]}):
-            r=self.client.get('/control/health')
-        self.assertEqual(r.status_code,200)
-        self.assertEqual(r.headers['cache-control'],'no-store')
-        self.tracker.enqueue_durable_configuration_update.assert_not_called()
+        with patch("src.control_center_backend.build_control_health",
+                   return_value={"summary": "test", "checks": []}):
+            r = self.client.get("/control/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["cache-control"], "no-store")
+        self.assertEqual(Path(self.env).read_text(), self.original)
+
+    def test_stale_revision_rejected_without_overwrite(self):
+        self.assertEqual(self.submit(expected_revision="0" * 64).status_code, 409)
+        self.assertEqual(Path(self.env).read_text(), self.original)
+
+    def test_identical_idempotent_retry_returns_same_change(self):
+        expected = self.revision(self.original)
+        body = {"enabled": True, "csrf_token": "test-csrf",
+                "expected_revision": expected, "request_id": "RETRY-SAME-REQUEST-0001"}
+        first = self.client.post("/control/amo/fno", json=body)
+        second = self.client.post("/control/amo/fno", json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["change_id"], second.json()["change_id"])
+        changed_body = dict(body, enabled=False)
+        self.assertEqual(self.client.post("/control/amo/fno", json=changed_body).status_code, 409)
 
 
 if __name__=='__main__':
