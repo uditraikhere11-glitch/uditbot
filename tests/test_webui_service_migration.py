@@ -29,6 +29,7 @@ class WebUIServiceMigrationTests(unittest.TestCase):
         self.script = self.root / 'deploy' / SOURCE.name
         shutil.copy2(SOURCE, self.script)
         (self.root / 'venv/bin/python3').write_text('''#!/bin/sh
+if [ "${1:-}" = "-" ]; then exec /usr/bin/python3 "$@"; fi
 case "$*" in
   *password_configured*) test -f "$PWD/data/webui_password.json" ;;
   *) exit 0 ;;
@@ -60,6 +61,10 @@ case "$1" in
     cat "$D/auditbot-web.service.d/10-original-access.conf"
     if [ -e "$OV" ]; then cat "$OV"; fi ;;
   show)
+    if [ "${4:-}" = User ]; then
+        if [ "${FAKE_WRONG_WEBUI_USER:-}" = 1 ]; then echo root; else id -un; fi
+        exit 0
+    fi
     if [ "${FAKE_EFFECTIVE_OLD:-}" = 1 ]; then
        echo 'argv[]=/usr/bin/python3 -m src.setup_app --host 0.0.0.0 --port 80'
     elif [ -e "$OV" ]; then
@@ -137,8 +142,40 @@ esac
         self.assert_active()
         self.assertTrue(list((self.root / 'test-backups').glob('*/UDITBOT_WEBUI_BACKUP_V1')))
         again = self.run_cmd('--apply')
-        self.assertNotEqual(again.returncode, 0)
-        self.assertIn('already exists', again.stderr)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn('ALREADY_APPLIED', again.stdout)
+        self.assert_active()
+        self.assertEqual(self.unit.read_bytes(), old)
+
+    def test_wrong_service_user_prevents_any_service_changes(self):
+        (self.root / 'data/webui_password.json').touch()
+        result = self.run_cmd('--apply', env=dict(self.env, FAKE_WRONG_WEBUI_USER='1'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('non-root operator', result.stderr)
+        self.assertFalse(self.override.exists())
+        self.assert_active()
+        self.assertFalse((self.root / 'test-backups').exists())
+
+    def test_reapplying_different_transport_mode_fails_without_restart(self):
+        (self.root / 'data/webui_password.json').touch()
+        first = self.run_cmd('--apply')
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        before = self.override.read_bytes()
+        second = self.run_cmd('--apply', '--public-http', '--accept-plaintext-risk')
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn('mode/path differs', second.stderr)
+        self.assertEqual(self.override.read_bytes(), before)
+        self.assert_active()
+
+    def test_pending_owner_stop_is_reported_but_not_modified(self):
+        (self.root / 'data/webui_password.json').touch()
+        state = self.root / 'data/service_control_state.json'
+        original = '{"deferred_stop_pending": true, "last_action": "OWNER_STOP"}'
+        state.write_text(original)
+        result = self.run_cmd('--apply')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('deferred Owner Stop exists', result.stdout)
+        self.assertEqual(state.read_text(), original)
 
     def test_public_requires_two_explicit_flags(self):
         (self.root / 'data/webui_password.json').touch()
