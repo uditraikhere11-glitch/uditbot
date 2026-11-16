@@ -119,17 +119,17 @@ SERVICE_USER="$("$SYSTEMCTL" show auditbot-web.service -p User --value)"
     fail "WebUI service must run as current non-root operator (observed User=${SERVICE_USER:-UNSET})."
 
 check_http() {
-    local url="$1" expected="$2" got attempt
+    local url="$1" expected="$2" method="${3:-GET}" got attempt
     # systemctl restart can return before uvicorn has bound port 80.
-    # Retry only connection/startup failures; never accept HTTP 200 at /.
+    # Retry only connection/startup failures; never accept unexpected HTTP 200.
     for attempt in 1 2 3 4 5; do
-        if got="$("$CURL" --noproxy '*' --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1${url}")"; then
-            [[ "$got" == "$expected" ]] || { echo "Unexpected HTTP status for ${url}: $got (expected $expected)" >&2; return 1; }
+        if got="$("$CURL" --noproxy '*' --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' -X "$method" "http://127.0.0.1${url}")"; then
+            [[ "$got" == "$expected" ]] || { echo "Unexpected ${method} status for ${url}: $got (expected $expected)" >&2; return 1; }
             return 0
         fi
         sleep 1
     done
-    echo "WebUI did not become reachable for ${url} after bounded retries" >&2
+    echo "WebUI did not become reachable for ${method} ${url} after bounded retries" >&2
     return 1
 }
 
@@ -148,8 +148,9 @@ if [[ -e "$OVERRIDE" ]]; then
     [[ "$EFFECTIVE" == *"-m src.control_center_entry --host $HOST --port 80"* && "$EFFECTIVE" != *"-m src.setup_app"* ]] ||
         fail 'Existing managed override is not the effective service entrypoint.'
     if [[ "$STATE" == active ]]; then
-        check_http / 303 && check_http /setup 303 && check_http /login 200 ||
-            fail 'Existing WebUI does not pass unauthenticated login checks; service was not touched.'
+        check_http / 303 && check_http /setup 303 && check_http /control/status 303 && check_http /login 200 &&
+            check_http /setup/submit-async 401 POST && check_http /setup/service-control 401 POST ||
+            fail 'Existing WebUI does not pass unauthenticated read/write access checks; service was not touched.'
     fi
     printf 'ALREADY_APPLIED: Authenticated WebUI migration is verified; no restart or file changes.\n'
     exit 0
@@ -230,8 +231,11 @@ if [[ "$STATE" == active ]]; then
     [[ "$("$SYSTEMCTL" is-active auditbot-web.service)" == active ]] || fail 'WebUI did not become active.'
     check_http / 303 || fail 'Unauthenticated root did not redirect to login.'
     check_http /setup 303 || fail 'Unauthenticated Setup did not redirect to login.'
+    check_http /control/status 303 || fail 'Unauthenticated Control Center status did not redirect to login.'
     check_http /login 200 || fail 'Login page is unavailable.'
-    printf 'Authenticated WebUI verified (root 303, setup 303, login 200).\n'
+    check_http /setup/submit-async 401 POST || fail 'Unauthenticated configuration POST was not blocked.'
+    check_http /setup/service-control 401 POST || fail 'Unauthenticated service-control POST was not blocked.'
+    printf 'Authenticated WebUI verified: GETs redirected and unauthenticated configuration/service POSTs blocked.\n'
 else
     printf 'WebUI was %s before migration and remains STOPPED; no automatic start.\n' "$STATE"
 fi
