@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from src.config import AppConfig, parse_env_dict
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
+from src.engine.webui_update import submit_webui_patch
 from src.engine.config_manager import (
     ConfigApplyState,
     ConfigChangeTracker,
@@ -314,83 +315,51 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
         except Exception:
             return _json({"summary": "AMO journal unavailable", "orders": [], "verified": False}, 503)
 
-    @app.post("/control/amo/equity")
-    async def post_equity_amo(request: Request):
-        # Exactly the same CSRF secret as POST /setup/service-control.
-        # Deploy behind the same trusted operator authentication boundary as Setup.
+    async def _save_amo_toggle(request: Request, form_key: str):
+        """Same transactional CAS/idempotent path as Setup; broker only when RUNNING."""
         if "application/json" not in request.headers.get("content-type", "").lower():
             return _json({"error": "JSON content type required"}, 415)
         try:
             body = await request.json()
         except Exception:
             return _json({"error": "Malformed JSON"}, 400)
-        if not isinstance(body, dict) or not {"enabled", "csrf_token"}.issubset(body) or set(body) - {"enabled", "csrf_token", "expected_revision"}:
-            return _json({"error": "Only enabled, csrf_token and optional expected_revision are permitted"}, 400)
-        if not isinstance(body.get("csrf_token"), str) or body["csrf_token"] != csrf_token:
+        allowed = {"enabled", "csrf_token", "expected_revision", "request_id"}
+        if not isinstance(body, dict) or not {"enabled", "csrf_token", "expected_revision"}.issubset(body) or set(body) - allowed:
+            return _json({"error": "Only enabled, csrf_token, expected_revision and request_id are permitted"}, 400)
+        if body.get("csrf_token") != csrf_token or not isinstance(body.get("csrf_token"), str):
             return _json({"error": "Invalid CSRF token"}, 403)
         if type(body["enabled"]) is not bool:
             return _json({"error": "enabled must be a JSON boolean"}, 422)
-        requested = body["enabled"]
-
-        cfg, env_path, data_dir = _config_and_paths()
-        tracker = ConfigChangeTracker(data_dir=data_dir)
-        if not os.path.isfile(env_path) or os.path.islink(env_path):
-            return _json({"error": "Configuration file is not a regular file"}, 409)
         try:
-            # Acquire the SAME cross-process lock as Setup and coordinator before
-            # reading the existing file or inspecting pending operations.
-            with tracker.operation_lock(operation_type="CONTROL_EQUITY_AMO", timeout_sec=3.0):
-                if _pending(tracker) or _owner_stop_pending(tracker):
-                    return _json({"error": "Another config transition or Owner Stop is pending"}, 409)
-                gate = tracker.inspect_transition_gate_status(read_only=True)
-                if gate.get("active", True) or gate.get("ok") is not True:
-                    return _json({"error": "Safety transition gate not verified inactive"}, 409)
-                status = tracker.control_service(action="status", env_path=env_path)
-                state = str(status.get("service_state") or "UNKNOWN")
-                if state not in _ALLOWED_IDLE:
-                    return _json({"error": "Cannot verify safe bot service state"}, 409)
-                if state == "RUNNING" and status.get("runtime_verified") is not True:
-                    return _json({"error": "Running configuration version cannot be verified"}, 409)
-                with open(env_path, "r", encoding="utf-8", newline="") as fh:
-                    previous = fh.read()
-                if "expected_revision" in body and body["expected_revision"] != revision(previous):
-                    return _json({"error": "Settings changed since the dashboard was loaded; refresh before retrying"}, 409)
-                old_dict = parse_env_content_string(previous)
-                old_value = old_dict.get(_CONFIG_KEY, "false")
-                if str(old_value).strip().lower() not in ("false", "true", "0", "1", "yes", "no", "on", "off"):
-                    return _json({"error": "Existing Equity AMO setting is invalid"}, 409)
-                current_enabled = str(old_value).strip().lower() in ("true", "1", "yes", "on")
-                if current_enabled == requested:
-                    return _json({"ok": True, "state": "UNCHANGED", "message": "Equity AMO setting already saved"})
-                new_content, _ = patch_env(previous, {"equity_amo_enabled": requested})
-                validate_effective_config(new_content)
-                new_params = parse_env_content_string(new_content)
-                # Do not silently rewrite other keys or request service restart on noop.
-                if new_content == previous:
-                    return _json({"ok": True, "state": "UNCHANGED", "message": "Equity AMO setting already saved"})
-                # Persist via established durable coordinator. No direct .env write.
-                read_only_broker = tracker.get_readonly_broker(env_path=env_path)
-                rec = tracker.enqueue_durable_configuration_update(
-                    form_params=new_params,
-                    env_content=new_content,
-                    env_path=env_path,
-                    broker=read_only_broker,
-                    spawn_worker=False,
-                )
-                change_id = rec.change_id
-                state_name = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
-            # Coordinator wakes AFTER releasing outer cross-process lock.
-            try:
-                tracker.start_coordinator_daemon(env_path=env_path, broker=read_only_broker, stop_when_idle=False)
-                message = "Equity AMO update queued for verified safe application"
-            except Exception:
-                message = "Equity AMO queued durably; coordinator wake not confirmed. Verify configuration status before retrying."
-            return _json({"ok": True, "change_id": change_id, "state": state_name,
-                          "message": message}, 202)
-        except (OSError, ValueError, TimeoutError):
-            return _json({"error": "Unable to safely queue Equity AMO change"}, 409)
+            env_path = os.path.abspath(".env")
+            if not os.path.isfile(env_path) or os.path.islink(env_path):
+                return _json({"error": "Configuration file must be a regular file"}, 409)
+            raw_settings = parse_env_dict(env_path)
+            tracker = ConfigChangeTracker(data_dir=os.path.abspath(raw_settings.get("DATA_DIR") or "data"))
+            rec = submit_webui_patch(
+                tracker, {form_key: body["enabled"]}, env_path=env_path,
+                expected_revision=body.get("expected_revision"),
+                request_id=body.get("request_id"),
+                spawn_worker=True,
+            )
+            state = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
+            return _json({
+                "ok": True, "change_id": rec.change_id, "state": state,
+                "runtime_verified": rec.runtime_verified,
+                "message": rec.reason or "Configuration submitted for safe processing",
+            }, 202 if rec.broker_checks_required else 200)
+        except ConfigurationConflict as exc:
+            return _json({"error": str(exc)}, 409)
+        except (ConfigurationRejected, ValueError) as exc:
+            return _json({"error": str(exc)}, 422)
+        except (OSError, TimeoutError):
+            return _json({"error": "Configuration storage or service state unavailable"}, 409)
         except Exception:
-            return _json({"error": "Equity AMO change rejected; configuration unchanged or status unverified"}, 500)
+            return _json({"error": "AMO configuration request could not be verified"}, 503)
+
+    @app.post("/control/amo/equity")
+    async def post_equity_amo(request: Request):
+        return await _save_amo_toggle(request, "equity_amo_enabled")
 
     @app.post("/control/amo/fno/cancel")
     async def post_cancel_staged_fno_amo(request: Request):
@@ -423,85 +392,5 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
 
     @app.post("/control/amo/fno")
     async def post_fno_amo(request: Request):
-        # Exactly the same CSRF secret as POST /setup/service-control.
-        # Deploy behind the same trusted operator authentication boundary as Setup.
-        if "application/json" not in request.headers.get("content-type", "").lower():
-            return _json({"error": "JSON content type required"}, 415)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json({"error": "Malformed JSON"}, 400)
-        if not isinstance(body, dict) or not {"enabled", "csrf_token"}.issubset(body) or set(body) - {"enabled", "csrf_token", "expected_revision"}:
-            return _json({"error": "Only enabled, csrf_token and optional expected_revision are permitted"}, 400)
-        if not isinstance(body.get("csrf_token"), str) or body["csrf_token"] != csrf_token:
-            return _json({"error": "Invalid CSRF token"}, 403)
-        if type(body["enabled"]) is not bool:
-            return _json({"error": "enabled must be a JSON boolean"}, 422)
-        requested = body["enabled"]
-
-        cfg, env_path, data_dir = _config_and_paths()
-        tracker = ConfigChangeTracker(data_dir=data_dir)
-        if not os.path.isfile(env_path) or os.path.islink(env_path):
-            return _json({"error": "Configuration file is not a regular file"}, 409)
-        try:
-            # Acquire the SAME cross-process lock as Setup and coordinator before
-            # reading the existing file or inspecting pending operations.
-            with tracker.operation_lock(operation_type="CONTROL_FNO_AMO", timeout_sec=3.0):
-                if _pending(tracker) or _owner_stop_pending(tracker):
-                    return _json({"error": "Another config transition or Owner Stop is pending"}, 409)
-                gate = tracker.inspect_transition_gate_status(read_only=True)
-                if gate.get("active", True) or gate.get("ok") is not True:
-                    return _json({"error": "Safety transition gate not verified inactive"}, 409)
-                status = tracker.control_service(action="status", env_path=env_path)
-                state = str(status.get("service_state") or "UNKNOWN")
-                if state not in _ALLOWED_IDLE:
-                    return _json({"error": "Cannot verify safe bot service state"}, 409)
-                if state == "RUNNING" and status.get("runtime_verified") is not True:
-                    return _json({"error": "Running configuration version cannot be verified"}, 409)
-                with open(env_path, "r", encoding="utf-8", newline="") as fh:
-                    previous = fh.read()
-                if "expected_revision" in body and body["expected_revision"] != revision(previous):
-                    return _json({"error": "Settings changed since the dashboard was loaded; refresh before retrying"}, 409)
-                old_dict = parse_env_content_string(previous)
-                old_value = old_dict.get("FNO_AMO_ENABLED", "false")
-                if str(old_value).strip().lower() not in ("false", "true", "0", "1", "yes", "no", "on", "off"):
-                    return _json({"error": "Existing F&O AMO setting is invalid"}, 409)
-                current_enabled = str(old_value).strip().lower() in ("true", "1", "yes", "on")
-                if current_enabled == requested:
-                    return _json({"ok": True, "state": "UNCHANGED", "message": "F&O AMO setting already saved"})
-                new_content, _ = patch_env(previous, {"fno_amo_enabled": requested})
-                validate_effective_config(new_content)
-                new_params = parse_env_content_string(new_content)
-                # Do not silently rewrite other keys or request service restart on noop.
-                if new_content == previous:
-                    return _json({"ok": True, "state": "UNCHANGED", "message": "F&O AMO setting already saved"})
-                # IMPORTANT: Do not mutate legacy local F&O AMO queue here.
-                # The settings transaction may still fail to enqueue, defer,
-                # or be cancelled. Operator cancellation is a separate
-                # deliberate /control/amo/fno/cancel action. The legacy queue
-                # has no automatic broker dispatch route in the current BRAIN.
-                # Persist via established durable coordinator. No direct .env write.
-                read_only_broker = tracker.get_readonly_broker(env_path=env_path)
-                rec = tracker.enqueue_durable_configuration_update(
-                    form_params=new_params,
-                    env_content=new_content,
-                    env_path=env_path,
-                    broker=read_only_broker,
-                    spawn_worker=False,
-                )
-                change_id = rec.change_id
-                state_name = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
-            # Coordinator wakes AFTER releasing outer cross-process lock.
-            try:
-                tracker.start_coordinator_daemon(env_path=env_path, broker=read_only_broker, stop_when_idle=False)
-                message = ("F&O AMO setting queued for verified application; no Dhan broker orders or local "
-                           "queued entries were cancelled. Use the separate Cancel action to remove legacy "
-                           "undisbursed entries if needed.")
-            except Exception:
-                message = "F&O AMO queued durably; coordinator wake not confirmed. Verify configuration status before retrying."
-            return _json({"ok": True, "change_id": change_id, "state": state_name,
-                          "message": message}, 202)
-        except (OSError, ValueError, TimeoutError):
-            return _json({"error": "Unable to safely queue F&O AMO change"}, 409)
-        except Exception:
-            return _json({"error": "F&O AMO change rejected; configuration unchanged or status unverified"}, 500)
+        # Configuration only; never cancels existing Dhan or legacy local orders.
+        return await _save_amo_toggle(request, "fno_amo_enabled")
