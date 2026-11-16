@@ -14,7 +14,7 @@ from typing import Any, Iterable, Optional, Tuple
 
 from src.notifier import dhan_response
 from src.notifier.dhan_response import normalize_group_name
-from src.engine.config_manager import write_json_atomic
+from src.engine.config_manager import write_json_atomic, _get_os_process_starttime
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ async def resolve_with_fallback(
             'target_verified': bool(verified),
             'fallback_active': bool(active and active != wanted),
             'reason_code': reason, 'pid': os.getpid(),
+            'process_starttime': _get_os_process_starttime(os.getpid()),
             'acknowledged_at': time.time(),
         }, mode=0o600)
     except OSError:
