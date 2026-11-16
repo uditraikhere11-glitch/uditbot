@@ -140,6 +140,21 @@ class ConfigurationCoordinatorReliabilityTests(unittest.TestCase):
         now = Path(self.path).read_text(encoding="utf-8")
         self.assertEqual(now.replace("DHAN_RESPONSE_GROUP_NAME=-5514889030", "DHAN_RESPONSE_GROUP_NAME=-1234567890  # old destination"), orig)
 
+    def test_ac09_missing_revision_is_rejected_before_disk_or_broker(self):
+        original = Path(self.path).read_bytes()
+        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state",
+                               side_effect=AssertionError("Missing revision must fail before service inspection")), \
+             mock.patch.object(ConfigChangeTracker, "get_readonly_broker",
+                               side_effect=AssertionError("Missing revision must not contact Dhan")):
+            for absent in (None, "", "UNAVAILABLE", "0" * 63):
+                with self.subTest(absent=absent), self.assertRaises(ConfigurationConflict):
+                    submit_webui_patch(
+                        self.tracker, {"dhan_response_group_name": "-5514889030"},
+                        self.path, expected_revision=absent,
+                        request_id="MISSING-REVISION-REQUEST", spawn_worker=False,
+                    )
+        self.assertEqual(Path(self.path).read_bytes(), original)
+
     def test_ac09_stale_form_conflict_and_no_write(self):
         old = Path(self.path).read_text(encoding="utf-8")
         with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state", return_value=(ServiceOperatingState.RUNNING, "mocked")):
