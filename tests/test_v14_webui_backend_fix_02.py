@@ -51,6 +51,7 @@ from src.engine.protection_watcher import ProtectionWatcher
 from src.journal.db import JournalDB
 from src.models import BrokerReadFailure, OrderRequest, OrderType, ProductType, TransactionType
 from src.setup_app import SETUP_CSRF_TOKEN, app, build_env_and_params_dict
+from src.engine.config_patch import revision
 
 
 def _child_process_try_lock(lock_file: str, lease_file: str, result_queue: multiprocessing.Queue) -> None:
@@ -852,6 +853,9 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
                     "dhan_client_id": "1113731536",
                     "equity_budget_inr": 300.0,
                     "csrf_token": SETUP_CSRF_TOKEN,
+                    "expected_revision": revision(
+                        Path(self.env_path).read_text(encoding="utf-8")
+                    ),
                     "spawn_worker": False,
                 },
             )
