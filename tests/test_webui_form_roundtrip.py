@@ -23,6 +23,8 @@ ENV = (
     "TG_API_ID=0\n"
     "LOG_GROUP_ID=0\n"
     "TEST_GROUP_ID=0\n"
+    "EQUITY_BUDGET_INR=125000.5\n"
+    "MIN_TRADE_FUNDS_INR=123456.75\n"
     "FNO_CAPITAL_PER_TRADE=19500.25\n"
     "MAX_ORDER_AMOUNT_INR=50000.75\n"
     "TEST_MODE_PAPER_FUNDS_INR=100000.125\n"
@@ -88,6 +90,8 @@ class SetupFormRoundTripRegression(unittest.TestCase):
                     self.assertEqual(form.get('log_group_id'), '0')
                     self.assertEqual(form.get('test_group_id'), '0')
                     for field, display in (
+                        ('equity_budget_inr', '125000.5'),
+                        ('min_trade_funds_inr', '123456.75'),
                         ('fno_capital_per_trade', '19500.25'),
                         ('max_order_amount_inr', '50000.75'),
                         ('test_mode_paper_funds_inr', '100000.125'),
