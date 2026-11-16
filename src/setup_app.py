@@ -37,7 +37,7 @@ from src.engine.config_manager import (
     check_service_is_active,
 )
 from src.notifier.telegram_notifier import TelegramNotifier
-from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, REGISTRY, revision
+from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, REGISTRY, REQUEST_METADATA, revision
 from src.engine.webui_update import submit_webui_patch, recover_field_transactions
 
 
@@ -686,6 +686,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
         <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
         <input type="hidden" name="full_setup_form" value="1">
+        <label class="toggle-row" style="margin:12px 0;gap:12px;">
+          <input type="checkbox" name="confirm_live" value="true" style="width:18px;height:18px;">
+          I explicitly authorize switching TEST to LIVE. Actual broker orders may be placed.
+        </label>
       
       <!-- 1. Master Execution Mode & Segments -->
       <div class="section-card">
@@ -1783,7 +1787,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--CMP_DARVAS_SEL-->", "selected" if getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") == "DARVAS_HTTP_SUCCESS" else "")
         .replace("<!--CMP_STRICT_SEL-->", "selected" if getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") != "DARVAS_HTTP_SUCCESS" else "")
         # Sizing
-        .replace("<!--EQUITY_BUDGET_INR-->", f"{cfg.equity_budget_inr:g}")
+        .replace("<!--EQUITY_BUDGET_INR-->", str(cfg.equity_budget_inr))
         .replace("<!--CNC_SELECTED-->", "selected" if cfg.equity_product_type.value == "CNC" else "")
         .replace("<!--MTF_SELECTED-->", "selected" if cfg.equity_product_type.value == "MTF" else "")
         .replace("<!--EQUITY_PRICE_MARKUP_PCT-->", str(cfg.equity_price_markup_pct))
@@ -1791,7 +1795,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--FNO_MAX_LOTS-->", str(cfg.fno_max_lots))
         # Risk
         .replace("<!--MAX_ORDER_AMOUNT_INR-->", str(cfg.max_order_amount_inr))
-        .replace("<!--MIN_TRADE_FUNDS_INR-->", f"{cfg.min_trade_funds_inr:g}")
+        .replace("<!--MIN_TRADE_FUNDS_INR-->", str(cfg.min_trade_funds_inr))
         .replace("<!--TEST_MODE_PAPER_FUNDS_INR-->", str(getattr(cfg, "test_mode_paper_funds_inr", 100000.0)))
         .replace("<!--MAX_DAILY_LOSS_INR-->", str(cfg.max_daily_loss_inr))
         .replace("<!--MAX_DAILY_TRADES-->", str(cfg.max_daily_trades))
@@ -2141,8 +2145,11 @@ async def handle_setup_submission_async(request: Request):
         )
         return JSONResponse(status_code=403, content=rec.to_dict())
 
-    cfg = AppConfig.from_env()
-    tracker = ConfigChangeTracker(data_dir=os.path.abspath(getattr(cfg, "data_dir", "data")))
+    # An invalid existing .env must remain editable rather than causing
+    # AppConfig.from_env() to raise HTTP 500 before the repair is attempted.
+    # Read only the data directory; do not load or mutate process os.environ.
+    source_env = parse_env_dict(".env")
+    tracker = ConfigChangeTracker(data_dir=os.path.abspath(source_env.get("DATA_DIR") or "data"))
     try:
         rec = submit_webui_patch(
             tracker, raw_data, env_path=os.path.abspath(".env"),
@@ -2398,6 +2405,9 @@ def handle_setup_submission(
     expected = _extract_val(expected_revision, None)
     if not expected:
         return HTMLResponse(status_code=409, content="Setup page revision missing. Refresh the page before saving.")
+    unknown = set(submitted) - set(REGISTRY) - REQUEST_METADATA - {"dhan_access_token", "daily_trade_limit"}
+    if unknown:
+        return HTMLResponse(status_code=422, content="Unsupported WebUI form fields: " + escape_html(", ".join(sorted(unknown))))
     editable = {k: v for k, v in submitted.items()
                 if k in REGISTRY or k in ("dhan_access_token", "daily_trade_limit")}
     if submitted.get("full_setup_form") == "1":
@@ -2405,8 +2415,8 @@ def handle_setup_submission(
             editable[key] = key in submitted
     if submitted.get("confirm_live") is not None:
         editable["confirm_live"] = submitted["confirm_live"]
-    cfg = AppConfig.from_env()
-    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
+    source_env = parse_env_dict(".env")
+    tracker = ConfigChangeTracker(data_dir=os.path.abspath(source_env.get("DATA_DIR") or "data"))
     try:
         record = submit_webui_patch(
             tracker, editable, env_path=".env",
