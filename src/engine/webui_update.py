@@ -81,9 +81,26 @@ def _remember_request(tracker: ConfigChangeTracker, request_id: str, payload_has
 def _existing_request(tracker: ConfigChangeTracker, request_id: str, payload_hash: str) -> Optional[ConfigChangeRecord]:
     path = _request_path(tracker, request_id)
     if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as fh:
-        old = json.load(fh)
+        # Legacy safety enqueue publishes its durable pending envelope before
+        # its request index. If it crashed between these two atomic writes,
+        # the envelope still identifies the accepted request exactly.
+        if not os.path.exists(tracker.pending_op_file):
+            return None
+        with open(tracker.pending_op_file, "r", encoding="utf-8") as fh:
+            op = json.load(fh)
+        if op.get("webui_request_id") != request_id:
+            return None
+        old = {
+            "payload_sha256": op.get("webui_payload_sha256"),
+            "change_id": op.get("change_id"),
+        }
+        # Recover the missing request index before returning. Never replay.
+        if old["payload_sha256"] != payload_hash:
+            raise ConfigurationConflict("Request ID reused for a different configuration change")
+        _remember_request(tracker, request_id, payload_hash, old["change_id"])
+    else:
+        with open(path, "r", encoding="utf-8") as fh:
+            old = json.load(fh)
     if old.get("payload_sha256") != payload_hash:
         raise ConfigurationConflict("Request ID reused for a different configuration change")
     rec = tracker.get_change_record(old.get("change_id"))
@@ -263,6 +280,15 @@ def submit_webui_patch(
     with tracker.operation_lock(operation_type="FIELD_SCOPED_WEBUI", operation_id=request_id):
         prior_result = _existing_request(tracker, request_id, payload_hash)
         if prior_result is not None:
+            if spawn_worker and os.path.exists(tracker.pending_op_file):
+                # An idempotent retry is also a coordinator wake-up after a
+                # previously accepted request lost its worker to a crash.
+                try:
+                    tracker.start_coordinator_daemon(
+                        env_path=env_path, stop_when_idle=True,
+                    )
+                except Exception:
+                    pass
             return prior_result
         # Reconcile an interrupted save before accepting any NEW request.
         # Unknown disk state is never interpreted as a clean prior version,
@@ -368,6 +394,11 @@ def submit_webui_patch(
                 check_service_fn=check_service_fn,
                 systemctl_restart_fn=systemctl_restart_fn,
                 broker=broker, spawn_worker=False,
+                webui_request={
+                    "request_id": request_id,
+                    "payload_sha256": payload_hash,
+                    "index_path": _request_path(tracker, request_id),
+                },
             )
             rec.changed_fields = sorted(changed)
             rec.application_method = "LEGACY_SAFETY_COORDINATOR"
