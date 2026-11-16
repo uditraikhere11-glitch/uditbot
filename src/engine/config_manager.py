@@ -4654,6 +4654,7 @@ class ConfigChangeTracker:
         verify_delay_sec: float = 0.05,
         broker: Optional[Any] = None,
         spawn_worker: bool = True,
+        webui_request: Optional[Dict[str, str]] = None,
     ) -> ConfigChangeRecord:
         """
         B11 & F02-03: Durably persists the configuration request (`15% RECEIVED`) and queues it in
@@ -4685,7 +4686,21 @@ class ConfigChangeTracker:
                 "db_path": abs_db_path,
                 "created_at": time.time(),
             }
+            if webui_request:
+                op_payload["webui_request_id"] = str(webui_request["request_id"])
+                op_payload["webui_payload_sha256"] = str(webui_request["payload_sha256"])
             write_json_atomic(self.pending_op_file, op_payload)
+            if webui_request:
+                # Persist the idempotency association under the same operation
+                # lock and BEFORE returning to Setup. A crash immediately
+                # after enqueue cannot cause an identical request to be replayed.
+                # The queued envelope itself contains fallback provenance when
+                # a crash interrupts the small gap between atomic file writes.
+                write_json_atomic(webui_request["index_path"], {
+                    "request_id": webui_request["request_id"],
+                    "payload_sha256": webui_request["payload_sha256"],
+                    "change_id": init_rec.change_id,
+                })
 
         if spawn_worker:
             self.start_coordinator_daemon(
