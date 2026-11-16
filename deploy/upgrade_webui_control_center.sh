@@ -173,9 +173,18 @@ if [[ "$STATE" == active ]]; then
     "$SUDO" "$SYSTEMCTL" restart auditbot-web.service
     [[ "$("$SYSTEMCTL" is-active auditbot-web.service)" == active ]] || fail 'WebUI did not become active.'
     check_http() {
-        local url="$1" expected="$2" got
-        got="$("$CURL" --noproxy '*' --max-time 10 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1${url}")" || return 1
-        [[ "$got" == "$expected" ]] || { echo "Unexpected HTTP status for ${url}: $got (expected $expected)" >&2; return 1; }
+        local url="$1" expected="$2" got attempt
+        # systemctl restart can return before uvicorn has bound port 80.
+        # Retry only connection/startup failures, never an unexpected HTTP 200.
+        for attempt in 1 2 3 4 5; do
+            if got="$("$CURL" --noproxy '*' --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1${url}")"; then
+                [[ "$got" == "$expected" ]] || { echo "Unexpected HTTP status for ${url}: $got (expected $expected)" >&2; return 1; }
+                return 0
+            fi
+            sleep 1
+        done
+        echo "WebUI did not become reachable for ${url} after bounded retries" >&2
+        return 1
     }
     check_http / 303 || fail 'Unauthenticated root did not redirect to login.'
     check_http /setup 303 || fail 'Unauthenticated Setup did not redirect to login.'
