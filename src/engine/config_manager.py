@@ -2975,11 +2975,29 @@ class ConfigChangeTracker:
                 for w in all_watcher_records
             )
 
-            # F03-03 Requirement 8: Avoid unnecessary broker queries when a safe state has already been independently established!
+            # An owner-acknowledged terminal filled parent remains explicitly
+            # visible to monitoring, but is NOT an unresolved broker mutation.
+            # Avoid consuming Dhan ReadGovernor budget for only those settled
+            # test holdings; still verify all other watcher/protection activity.
+            actionable_watcher_records = [
+                w for w in all_watcher_records
+                if not (
+                    _owner_accepted_manual_risk(
+                        w.get("order_id"), w.get("correlation_id"),
+                        w.get("security_id"), int(w.get("filled_qty") or 0),
+                        w.get("state"),
+                    )
+                    and not w.get("pending_oco")
+                    and not w.get("retry_reserved")
+                    and not w.get("retry_eligible")
+                )
+            ]
+            # F03-03 Requirement 8: no broker GET for independently verified
+            # idle state, including narrowly acknowledged manual-risk holdings.
             has_any_activity = bool(
                 non_term_intents
                 or non_term_orders
-                or all_watcher_records
+                or actionable_watcher_records
                 or all_active_prot_orders
                 or has_filled_live_orders
                 or has_unresolved_prot_attempts
