@@ -98,6 +98,52 @@ class DestinationActivationAcceptance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((entity, active), ('verified:'+OLD, OLD))
 
 
+    async def test_f01_production_dispatcher_uses_verified_fallback_and_writes_ack(self):
+        import asyncio
+        from types import SimpleNamespace
+        from src.notifier.dhan_response import configure_dhan_response_group
+        from unittest.mock import MagicMock
+
+        stage_destination_change(self.root, OLD, NEW)
+        fallback_entity = object()
+        async def resolve(_client, name, _forbidden):
+            if name == NEW:
+                raise ValueError("New group is not joined")
+            self.assertEqual(name, OLD)
+            return fallback_entity
+
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value=None)
+        reporter = SimpleNamespace(dhan_response_enabled=False)
+        with patch('src.notifier.dhan_response.resolve_dhan_response_group', side_effect=resolve):
+            sender = await configure_dhan_response_group(
+                client, NEW, [], reporter, asyncio.get_running_loop(),
+                data_dir=self.root, config_version_hash="synthetic-runtime-hash",
+            )
+        self.assertTrue(reporter.dhan_response_enabled)
+        self.assertTrue(callable(sender))
+        self.assertTrue(await asyncio.to_thread(sender, "Offline test payload"))
+        client.send_message.assert_awaited_once_with(fallback_entity, "Offline test payload", parse_mode="html")
+        active = read_active_destination(self.root)
+        self.assertEqual(active["active_name"], OLD)
+        self.assertTrue(active["fallback_active"])
+        self.assertEqual(active["config_version_hash"], "synthetic-runtime-hash")
+        self.assertIsNotNone(active.get("process_starttime"))
+
+    async def test_f07_disable_checkpoint_cannot_resurrect_old_group(self):
+        stage_destination_change(self.root, OLD, "")
+        with patch('src.notifier.dhan_response.resolve_dhan_response_group',
+                   side_effect=AssertionError("disabled destination cannot resolve")):
+            _, active, disabled = await resolve_with_fallback(None, "", [], self.root)
+        self.assertEqual((active, disabled), ("", True))
+        stage_destination_change(self.root, "", NEW)
+        with patch('src.notifier.dhan_response.resolve_dhan_response_group',
+                   side_effect=ValueError("new group is not joined")) as resolver:
+            entity, active, verified = await resolve_with_fallback(None, NEW, [], self.root)
+        self.assertEqual((entity, active, verified), (None, "", False))
+        resolver.assert_awaited_once()
+
+
 class DestinationStatusIdentityAcceptance(unittest.TestCase):
     def test_status_requires_process_starttime_and_fresh_ack(self):
         import json
