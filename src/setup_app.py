@@ -2179,7 +2179,13 @@ def get_change_status(change_id: str):
         running = tracker.get_active_running_version(require_live_pid=True)
         if (ack and running
                 and ack.get("requested_name") == saved_name
-                and ack.get("pid") == running.get("pid")):
+                and ack.get("pid") == running.get("pid")
+                and ack.get("process_starttime") is not None
+                and ack.get("process_starttime") == running.get("process_starttime")
+                and isinstance(ack.get("acknowledged_at"), (int, float))
+                and isinstance(running.get("acknowledged_at"), (int, float))
+                and ack["acknowledged_at"] >= running["acknowledged_at"]
+                and ack["acknowledged_at"] >= float(rec.saved_at or rec.requested_at or 0)):
             if ack.get("target_verified") is True and rec.proposed_version_hash == running.get("version_hash"):
                 confirmed, _, _ = tracker.is_active_version_confirmed(
                     expected_hashes={rec.proposed_version_hash},
