@@ -250,7 +250,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin fix/manual-risk-120s-session-supervision
-          test "$(git rev-parse FETCH_HEAD)" = "27a0faf255487762b4aa2b53c841db846a0a01c3"
+          test "$(git rev-parse FETCH_HEAD)" = "75d2ae3d3c01f34ba215a25227230275c45f1a9f"
           git -c user.name=ci -c user.email=ci@local.invalid merge --no-commit --no-ff FETCH_HEAD
           git diff --cached --check
           echo "Integration exists only in this CI workspace; neither PR is merged."
