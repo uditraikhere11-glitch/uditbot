@@ -88,6 +88,53 @@ class ReadGovernor:
 
         return self._run_with_busy_retry(_op)
 
+    def seconds_until_capacity(self, *, required=1, priority='routine'):
+        """Read-only scheduling hint; never reserves or resets a GET admission.
+
+        'routine' keeps a 20% reserve for startup identity, urgent protection
+        and order recovery. 'urgent' may consume the full existing allowance.
+        Concurrent clients can consume slots after this snapshot: admit() is
+        still the final authoritative decision immediately before every GET.
+        An unreadable governor must raise and the watcher must fail closed.
+        """
+        now = float(self.clock())
+        need = int(required)
+        if need < 1 or need > 40:
+            raise ValueError("Invalid required read capacity")
+        if priority not in ('routine', 'urgent'):
+            raise ValueError("Invalid watcher read priority")
+        if not self.path.is_file():
+            return 0.0
+        # Do not modify the durable governor journal, even to prune old reads.
+        with closing(sqlite3.connect(
+            self.path.resolve().as_uri() + '?mode=ro',
+            uri=True, timeout=0.10
+        )) as conn:
+            row = conn.execute('SELECT until FROM cooldown WHERE id=1').fetchone()
+            delay = max(0.0, float(row[0]) - now) if row and row[0] else 0.0
+            for window, limit in self.LIMITS:
+                reserve = int(limit * 0.20) if priority == 'routine' else 0
+                ceiling = limit - reserve
+                if need > ceiling:
+                    raise ValueError("Read requirement exceeds watcher allowance")
+                count = conn.execute(
+                    'SELECT COUNT(*) FROM reads WHERE at > ?', (now - window,)
+                ).fetchone()[0]
+                excess = count + need - ceiling
+                if excess <= 0:
+                    continue
+                # The excess-th oldest admission must age out before there
+                # are enough slots for this full planned supervision pass.
+                oldest_required = conn.execute(
+                    'SELECT at FROM reads WHERE at > ? '
+                    'ORDER BY at ASC LIMIT 1 OFFSET ?',
+                    (now - window, excess - 1),
+                ).fetchone()
+                if oldest_required is None:
+                    raise sqlite3.DatabaseError("Inconsistent governor read window")
+                delay = max(delay, float(oldest_required[0]) + window - now + 0.01)
+            return max(0.0, delay)
+
     def throttled(self, retry_after=None):
         now = float(self.clock())
         delay = None
