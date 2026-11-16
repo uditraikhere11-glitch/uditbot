@@ -98,5 +98,66 @@ class DestinationActivationAcceptance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((entity, active), ('verified:'+OLD, OLD))
 
 
+class DestinationStatusIdentityAcceptance(unittest.TestCase):
+    def test_status_requires_process_starttime_and_fresh_ack(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from src.engine.config_manager import ConfigApplyState, ConfigChangeRecord
+        from src.setup_app import get_change_status
+        from src.notifier.response_activation import read_active_destination
+
+        record = ConfigChangeRecord(
+            change_id="CFG-SAFE-ACK-0001",
+            state=ConfigApplyState.SAVED_FOR_NEXT_START,
+            changed_fields=["DHAN_RESPONSE_GROUP_NAME"],
+            requested_mode="TEST",
+            proposed_version_hash="synthetic-candidate-hash",
+            requested_at=100.0,
+            saved_at=105.0,
+            runtime_verified=False,
+        )
+        running = {
+            "pid": 2255, "process_starttime": 89237,
+            "acknowledged_at": 110.0,
+            "version_hash": "synthetic-candidate-hash",
+        }
+        ack = {
+            "pid": 2255, "process_starttime": 89237,
+            "acknowledged_at": 120.0,
+            "requested_name": "-5514889030",
+            "target_verified": True, "fallback_active": False,
+        }
+        tracker = MagicMock()
+        tracker.data_dir = "SYNTHETIC"
+        tracker.get_change_record.return_value = record
+        tracker.get_active_running_version.return_value = running
+        tracker.is_active_version_confirmed.return_value = (True, running, "VERIFIED")
+
+        with patch("src.setup_app.ConfigChangeTracker", return_value=tracker), \
+             patch("src.setup_app.AppConfig.from_env", return_value=SimpleNamespace(data_dir="SYNTHETIC")), \
+             patch("src.setup_app.parse_env_dict", return_value={"DHAN_RESPONSE_GROUP_NAME": "-5514889030"}), \
+             patch("src.notifier.response_activation.read_active_destination", return_value=ack):
+            good = json.loads(get_change_status(record.change_id).body)
+            self.assertEqual(good["state"], "APPLIED_VERIFIED")
+            self.assertTrue(good["runtime_verified"])
+
+            cases = (
+                {"process_starttime": None},
+                {"process_starttime": 812},
+                {"acknowledged_at": 109.0},
+                {"acknowledged_at": 104.0},
+                {"pid": 2254},
+                {"requested_name": "-1000"},
+            )
+            for override in cases:
+                with self.subTest(override=override):
+                    degraded = dict(ack, **override)
+                    with patch("src.notifier.response_activation.read_active_destination", return_value=degraded):
+                        status = json.loads(get_change_status(record.change_id).body)
+                        self.assertEqual(status["state"], "SAVED_FOR_NEXT_START")
+                        self.assertFalse(status["runtime_verified"])
+
+
 if __name__ == '__main__':
     unittest.main()
