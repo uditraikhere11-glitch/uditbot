@@ -222,6 +222,25 @@ class ManualRiskGateRegression(WebUIRegression):
             )
         self.assertTrue(ok, (reason, code, count))
 
+        # Even with a broker adapter connected, manual-only settled holdings
+        # are not a reason to spend Dhan/ReadGovernor GET budget. Any unrelated
+        # outstanding order still forces authoritative broker reconciliation.
+        from unittest.mock import MagicMock
+        broker = MagicMock()
+        broker.get_order_book.side_effect = AssertionError("No broker GET for acknowledged settled-only holdings")
+        broker.get_forever_orders.side_effect = AssertionError("No OCO GET for acknowledged settled-only holdings")
+        broker.get_super_orders.side_effect = AssertionError("No super-order GET for acknowledged settled-only holdings")
+        with patch.object(tracker, "get_readonly_broker", return_value=broker):
+            accepted, reason, code, count = tracker.evaluate_trading_safety_gate_detailed(
+                db_path=str(db_path), stop_state_path=str(db_path.parent / "emergency_stop.json"),
+                env_path=str(self.path.resolve()), is_service_running=True,
+                is_live_mode=True, target_is_live=False,
+            )
+        self.assertTrue(accepted, (reason, code, count))
+        broker.get_order_book.assert_not_called()
+        broker.get_forever_orders.assert_not_called()
+        broker.get_super_orders.assert_not_called()
+
         # Changing just one share's filled quantity invalidates the waiver,
         # and must fail closed rather than crediting another parent's ack.
         with db._get_conn() as conn:
