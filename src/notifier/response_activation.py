@@ -70,6 +70,7 @@ def read_active_destination(data_dir: str) -> Optional[dict]:
 
 async def resolve_with_fallback(
     client: Any, requested: str, forbidden_chat_ids: Iterable[int], data_dir: str,
+    config_version_hash: str = "",
 ) -> Tuple[Optional[Any], str, bool]:
     """Return (verified entity, active group, requested destination verified).
 
@@ -104,11 +105,15 @@ async def resolve_with_fallback(
             'fallback_active': bool(active and active != wanted),
             'reason_code': reason, 'pid': os.getpid(),
             'process_starttime': _get_os_process_starttime(os.getpid()),
+            'config_version_hash': str(config_version_hash or ''),
             'acknowledged_at': time.time(),
         }, mode=0o600)
     except OSError:
         logger.warning('Dhan Response activation acknowledgement could not be persisted')
-    if verified and wanted:
+    if verified:
+        # A deliberately blank destination is itself a successful activation.
+        # Clear the previous known-good checkpoint so no later failed edit can
+        # resurrect a group the owner deliberately disabled (F-07).
         try:
             write_json_atomic(_pending_file(data_dir), {
                 'previous_name': wanted, 'requested_name': wanted,
