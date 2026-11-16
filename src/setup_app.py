@@ -1593,7 +1593,8 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     # Process-level os.environ can contain stale WebUI secrets/settings
     # unrelated to the current file, which must never be copied back into
     # .env by an ordinary full form submission.
-    cfg = AppConfig.from_env(env=parse_env_dict(".env"), env_file="")
+    raw_cfg_values = parse_env_dict(".env")
+    cfg = AppConfig.from_env(env=raw_cfg_values, env_file="")
 
     # Build real-time system status bar
     from src.engine.config_manager import check_service_is_active, ConfigChangeTracker, ServiceOperatingState
@@ -1786,12 +1787,12 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         .replace("<!--CSRF_TOKEN-->", SETUP_CSRF_TOKEN)
         .replace("<!--CONFIG_REVISION-->", _setup_revision())
         # Telegram (Secret values strictly excluded from HTML responses)
-        .replace("<!--TG_API_ID-->", str(cfg.tg_api_id))
+        .replace("<!--TG_API_ID-->", escape_html(str(raw_cfg_values.get("TG_API_ID", "")), quote=True))
         .replace("<!--TG_API_HASH-->", "")
         .replace("<!--MONITORED_CHANNEL_IDS-->", channels_str)
-        .replace("<!--LOG_GROUP_ID-->", str(cfg.log_group_id))
+        .replace("<!--LOG_GROUP_ID-->", escape_html(str(raw_cfg_values.get("LOG_GROUP_ID", "")), quote=True))
         .replace("<!--DHAN_RESPONSE_GROUP_NAME-->", escape_html(cfg.dhan_response_group_name, quote=True))
-        .replace("<!--TEST_GROUP_ID-->", str(cfg.test_group_id))
+        .replace("<!--TEST_GROUP_ID-->", escape_html(str(raw_cfg_values.get("TEST_GROUP_ID", "")), quote=True))
         # Dhan (Secret values strictly excluded from HTML responses)
         .replace("<!--DHAN_CLIENT_ID-->", escape_html(str(cfg.dhan_client_id or ""), quote=True))
         .replace("<!--DHAN_PIN-->", "")
@@ -2441,7 +2442,7 @@ def handle_setup_submission(
         return HTMLResponse(status_code=409, content=escape_html(str(exc)))
     except (ConfigurationRejected, ValueError) as exc:
         return HTMLResponse(status_code=422, content=escape_html(str(exc)))
-    new_cfg = AppConfig.from_env()
+    new_cfg = AppConfig.from_env(env=parse_env_dict(".env"), env_file="")
     return get_setup_page(saved=True, saved_info={
         "mode": new_cfg.trading_mode.value,
         "operator": new_cfg.operator_name,
