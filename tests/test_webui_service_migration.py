@@ -84,9 +84,14 @@ if [ "${FAKE_CURL_CONNECTION_REFUSED_ONCE:-}" = 1 ] && [ ! -e "$AUDITBOT_SYSTEMD
     touch "$AUDITBOT_SYSTEMD_DIR/curl-tried"
     exit 7
 fi
-case "$LAST" in
-  */login) printf '200' ;;
-  *) printf '303' ;;
+case "$*" in
+  *" -X POST "*)
+    if [ "${FAKE_UNPROTECTED_POST:-}" = 1 ]; then printf '200'; else printf '401'; fi ;;
+  *)
+    case "$LAST" in
+      */login) printf '200' ;;
+      *) printf '303' ;;
+    esac ;;
 esac
 ''')
         self.env = dict(os.environ)
@@ -211,6 +216,14 @@ esac
         self.assert_active()
         self.assertTrue(self.override.exists())
         self.assertTrue((self.root / 'systemd/curl-tried').exists())
+
+    def test_unauthenticated_write_endpoint_bypass_fails_closed(self):
+        (self.root / 'data/webui_password.json').touch()
+        res = self.run_cmd('--apply', env=dict(self.env, FAKE_UNPROTECTED_POST='1'))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('configuration POST was not blocked', res.stderr)
+        self.assertFalse(self.override.exists())
+        self.assert_active(False)
 
     def test_wrong_effective_entrypoint_fails_closed(self):
         (self.root / 'data/webui_password.json').touch()
