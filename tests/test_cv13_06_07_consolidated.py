@@ -846,7 +846,7 @@ class TestCV1306And07Consolidated(unittest.TestCase):
                 "/setup/submit-async",
                 data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000",
                       "csrf_token": SETUP_CSRF_TOKEN,
-                      "expected_revision": revision(Path(".env").read_text(encoding="utf-8"))},
+                      "expected_revision": revision(Path(".env").read_text(encoding="utf-8") if Path(".env").exists() else "")},
             )
             self.assertEqual(r_async_ok.status_code, 200)
 
