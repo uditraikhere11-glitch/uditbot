@@ -214,7 +214,8 @@ class WebuiV2IntegrationTests(unittest.TestCase):
         rec, ctx = self._simulate_running_v2(restart_result=False)
         self.assertEqual(1, ctx["calls"])
         self.assertFalse(rec.runtime_verified)
-        self.assertTrue(rec.restart_performed)
+        self.assertFalse(rec.restart_performed)
+        self.assertEqual("FAILED", rec.operation_state)
         self.assertEqual("ACK_UNCERTAIN", rec.blocked_reason)
         self.assertIn("1000", self.env.read_text())
         barrier = _paths(self.data)[2]

@@ -231,15 +231,16 @@ def submit_v2_webui_patch(
             progress_percent=100 if result.phase in ("VERIFIED", "NO_CHANGE", "SAVED_FOR_NEXT_START") else 90,
             operation_state=(
                 OperationState.APPLIED_VERIFIED.value if result.runtime_verified
-                else OperationState.SAVED_FOR_NEXT_START.value if not running
-                else OperationState.FAILED.value if result.restart_issued
+                else OperationState.SAVED_FOR_NEXT_START.value if result.phase in ("NO_CHANGE", "SAVED_FOR_NEXT_START")
+                else OperationState.FAILED.value if result.phase in ("ACK_UNCERTAIN", "ACTION_REQUIRED")
                 else OperationState.WAITING_FOR_ORDER.value
             ),
             previous_version_hash=old_hash, proposed_version_hash=new_hash,
             effective_version_hash=new_hash if result.runtime_verified else "",
             runtime_verified=result.runtime_verified,
             restart_required=running and bool(changed),
-            restart_performed=result.restart_issued,
+            # An attempted restart is not a verified completed restart.
+            restart_performed=result.runtime_verified,
             application_method="TRACKER_V2_SHARED_FENCE",
             changed_fields=sorted(changed),
             changes_summary=[
