@@ -27,6 +27,10 @@ class BrokerHandoffBlocked(RuntimeError):
     """No broker mutation can be started while evidence is absent or unsafe."""
 
 
+class BrokerMutationNotSubmitted(BrokerHandoffBlocked):
+    """The shared fence rejected mutation before any broker request was sent."""
+
+
 def _paths(data_dir: str | os.PathLike[str]) -> tuple[Path, Path, Path]:
     root = Path(data_dir).resolve()
     return (
@@ -208,13 +212,22 @@ def guarded_request(
     send: Callable[[], Any],
 ) -> Any:
     """One exact transport attempt; do not retry, modify payloads, or fake ACKs."""
-    with broker_mutation(data_dir, account, method) as finish:
-        response = send()
-        status = getattr(response, "status_code", None)
-        # Definite broker responses; auth, 408/429 and server errors remain unknown.
-        known = type(status) is int and (200 <= status < 400 or status in (400, 404, 409, 422))
-        finish(known)
-        return response
+    attempted = False
+    try:
+        with broker_mutation(data_dir, account, method) as finish:
+            # Once this point is reached, the HTTP callback may have sent data.
+            # A subsequent ledger-write failure cannot be called NOT_SUBMITTED.
+            attempted = True
+            response = send()
+            status = getattr(response, "status_code", None)
+            # Definite broker responses; auth, 408/429 and server errors remain unknown.
+            known = type(status) is int and (200 <= status < 400 or status in (400, 404, 409, 422))
+            finish(known)
+            return response
+    except BrokerHandoffBlocked as exc:
+        if not attempted:
+            raise BrokerMutationNotSubmitted(str(exc)) from exc
+        raise
 
 
 def acquire_apply_barrier(

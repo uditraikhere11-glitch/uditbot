@@ -58,7 +58,7 @@ from src.models import (
     TransactionType,
 )
 from src.engine.latency_monitor import GLOBAL_LATENCY_MONITOR
-from src.engine.broker_handoff import BrokerHandoffBlocked
+from src.engine.broker_handoff import BrokerMutationNotSubmitted
 from src.broker.dhan_token import (
     force_login,
     fresh_token,
@@ -2902,7 +2902,7 @@ class DhanClient:
                 return False, None, f"Dhan HTTP {resp.status_code} server error on {corr_id} (outcome UNKNOWN): {resp.text}"
             else:
                 return False, None, f"Dhan order placement rejected ({resp.status_code}): {resp.text}"
-        except BrokerHandoffBlocked as e:
+        except BrokerMutationNotSubmitted as e:
             # Config barrier denied before the broker HTTP call. This is
             # NOT_SUBMITTED, not an unknown Dhan acknowledgement. Never strand
             # an emergency-stop in-flight intent for a request never sent.
@@ -3043,7 +3043,7 @@ class DhanClient:
                     return True, rec_oid, rec_msg
                 return False, None, f"Dhan HTTP {resp.status_code} server error on super order {corr_id} (outcome UNKNOWN): {resp.text}"
             return False, None, f"Dhan super order rejected ({resp.status_code}): {resp.text}"
-        except BrokerHandoffBlocked as e:
+        except BrokerMutationNotSubmitted as e:
             # Config barrier denied before the broker HTTP call. This is
             # NOT_SUBMITTED, not an unknown Dhan acknowledgement. Never strand
             # an emergency-stop in-flight intent for a request never sent.
