@@ -1641,6 +1641,45 @@ class StartupReconciliationGate:
         logger.info("✅ [RECONCILIATION] Invariant checks passed! Gate opened: ACCEPTING_NEW_ENTRIES=True.")
         return True, "Reconciliation successful, system healthy and accepting new trades."
 
+    def schedule_governor_recovery_if_ready(self) -> bool:
+        """Request a bounded full gate recheck only when broker reads are affordable.
+
+        The watcher does not reopen this gate: only run_startup_reconciliation
+        can validate holdings, history, protection, and STOP before entries.
+        Missing/corrupt governor evidence fails closed without network reads.
+        """
+        if self.is_accepting_entries or self.state != ReconciliationState.BLOCKED:
+            return False
+        if self.stop_manager.is_stopped() or not self.db:
+            return False
+        if time.monotonic() < self._historical_background_retry_after:
+            return False
+
+        try:
+            get_governor = getattr(self.broker, "_get_active_read_governor", None)
+            if not callable(get_governor):
+                return False
+            governor = get_governor()
+            if governor is None:
+                return False
+            nonterminal = self.db.get_non_terminal_intents()
+            if not isinstance(nonterminal, list):
+                return False
+            priority = "low" if nonterminal else "normal"
+            # Retain headroom for a full historical/holdings/protection pass.
+            # These slots are *not reserved*: each real GET is admitted again.
+            wait = governor.seconds_until_capacity(
+                required=24, priority=priority,
+            )
+            if wait > 0:
+                return False
+        except Exception:
+            # Do not interpret a missing/corrupt account governor as free quota.
+            return False
+
+        self._schedule_historical_background_recheck()
+        return True
+
     def recheck_and_recover_if_verified(self) -> Tuple[bool, str]:
         """
         Section 3.7: Bounded, serialized runtime recheck so the reconciliation gate can recover
