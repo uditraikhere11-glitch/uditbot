@@ -259,6 +259,7 @@ class R03GovernorReserveTests(unittest.TestCase):
             self.g.admit(priority="identity")
 
     def test_ordinary_funds_reads_cannot_consume_critical_reserve(self):
+        self.g.LIMITS = ((3600, 20),)
         self.g.admit(priority="identity")
         with sqlite3.connect(self.g.path) as db:
             db.executemany("INSERT INTO reads(at) VALUES (?)", [(self.now,)] * 18)
