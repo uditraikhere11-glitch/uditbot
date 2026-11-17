@@ -2534,7 +2534,7 @@ class DhanClient:
                     error=f"Local GET admission deferred for {label}",
                     status_code=status_code,
                 )
-            err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}
+            err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}"
             if self._requires_token_refresh(status_code, err_text):
                 self._log_throttled_broker_auth_error(label, err)
             else:
