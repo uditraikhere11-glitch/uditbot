@@ -98,6 +98,14 @@ def main():
         require(client.post("/control/tracker-v2/recheck",
                 json={"csrf_token":"forged","change_id":two.change_id}).status_code==403,
                 "Forged CSRF accepted")
+        status_ui=client.get("/control/status")
+        require(status_ui.status_code==200 and status_ui.json().get("tracker_v2_late_ack_pending") is True,
+                "Control Center did not expose pending restart recovery")
+        require(status_ui.json().get("equity_amo_can_edit") is False,
+                "Control Center allowed settings while restart was unverified")
+        page=client.get("/")
+        require(page.status_code==200 and 'id="v2-recheck"' in page.text,
+                "User-facing Verify pending restart button missing")
         with patch("src.engine.tracker_v2_integration.inspect_systemd_service_properties",
                    side_effect=lambda unit,check_fn=None:props()), \
              patch.object(ConfigChangeTracker,"dispatch_telegram_update"):

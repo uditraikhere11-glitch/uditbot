@@ -125,6 +125,25 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     saved = bool(cfg.equity_amo_enabled)
     fno_saved = bool(cfg.fno_amo_enabled)
     newest = tracker.get_change_record()
+    v2_blocked = False
+    v2_recheck = False
+    if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+        from src.engine.tracker_v2_safety import read_private_json
+        try:
+            tx = read_private_json(os.path.join(data_dir, "config_restart_v2", "current_transaction.json"), missing_ok=True)
+            fence = read_private_json(os.path.join(data_dir, "config_restart_v2", "apply_barrier.json"), missing_ok=True)
+            if fence is not None and fence.get("active") is not False:
+                v2_blocked = True
+            if tx is not None and tx.get("phase") not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
+                v2_blocked = True
+                v2_recheck = bool(
+                    tx.get("phase") == "ACK_UNCERTAIN"
+                    and fence is not None and fence.get("active") is True
+                    and newest is not None and newest.change_id == tx.get("change_id")
+                )
+        except (ValueError, OSError):
+            v2_blocked = True
+    verified = verified and not v2_blocked
     pending = _pending(tracker)
     stopping = _owner_stop_pending(tracker)
     gate = tracker.inspect_transition_gate_status(read_only=True)
@@ -133,6 +152,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         os.path.isfile(absolute_env)
         and state in _ALLOWED_IDLE
         and not pending
+        and not v2_blocked
         and not stopping
         and gate.get("ok") is True
         and gate.get("active") is False
@@ -151,7 +171,9 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         "saved_mode": str(raw.get("saved_mode") or "UNKNOWN"),
         "running_mode": str(raw.get("running_mode") or "UNKNOWN"),
         "runtime_verified": verified,
-        "warning": "Control requests blocked while configuration/safety gate is unresolved" if pending or stopping else "",
+        "warning": "V2 restart verification pending; use Verify pending restart (never reissues restart)" if v2_blocked else "Control requests blocked while configuration/safety gate is unresolved" if pending or stopping else "",
+        "tracker_v2_apply_blocked": v2_blocked,
+        "tracker_v2_late_ack_pending": v2_recheck,
         "equity_amo_saved": saved,
         "equity_amo_active": active,
         "equity_amo_can_edit": can_edit,
