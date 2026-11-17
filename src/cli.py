@@ -698,8 +698,9 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     after-market readiness check invoked by `dhan-token-refresh.service`.
 
     Exit-Code Contract:
-    - Separates `AUTH_CHECK` (`PASS` / `FAIL`: TOTP refresh, `/v2/profile` account identity,
-      non-expired token, and verified real `/v2/fundlimit` balance) from
+    - Separates `AUTH_CHECK` (`PASS` / `FAIL`: current token independently
+      verified by `/v2/profile` with matching account, non-expired token, and
+      real `/v2/fundlimit` balance) from
       `NEXT_SESSION_READINESS` (`VERIFIED_CHECKS` / `REVIEW_REQUIRED`: `AUTH_CHECK == PASS`
       plus verified token expiration covering the next trading session close at 15:35 IST
       with a verified holiday calendar, fresh scrip master, and inactive Emergency STOP).
@@ -806,13 +807,11 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         else {"is_stopped": True}
     )
     is_stopped = bool(stop_state.get("is_stopped", True))
-    # Identity and token validity are separately verified facts. A failed
-    # funds probe must not erase valid candidate-profile evidence, but neither
-    # may it make AUTH_CHECK or overall next-session readiness pass.
-    auth_verified = bool(
-        identity_ok and not token_expired and
-        (tok_ok or (proof_matches and bool(renewal_evidence.get("token_generated"))))
-    )
+    # A failed *renewal* does not invalidate an independently verified,
+    # still-valid existing token. Identity verification is broker-backed and
+    # always matches the configured account. Post-refresh funds failure is
+    # separately reflected in AUTH_CHECK and next-session readiness.
+    auth_verified = bool(identity_ok and not token_expired)
     unres_intents_cnt = 0
     unprot_pos_cnt = 0
     local_reconciliation_verified = True
