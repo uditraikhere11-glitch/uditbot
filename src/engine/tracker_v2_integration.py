@@ -95,8 +95,8 @@ def submit_v2_webui_patch(
         ctrl = tracker.get_service_control_record()
         if ctrl.get("_corrupted") or ctrl.get("deferred_stop_pending") is True:
             raise ConfigurationConflict("Owner control state unresolved; no configuration restart")
-        if str(ctrl.get("desired_service_state") or "").upper() == "STOPPED":
-            raise ConfigurationConflict("Owner Stop takes priority over configuration updates")
+        owner_stop_requested = str(ctrl.get("desired_service_state") or "").upper() == "STOPPED"
+
         op_state, _ = tracker.resolve_service_operating_state(check_fn=check_service_fn)
         if op_state not in (
             ServiceOperatingState.RUNNING, ServiceOperatingState.STOPPED_OTHER,
@@ -104,6 +104,8 @@ def submit_v2_webui_patch(
         ):
             raise ConfigurationConflict("Service state cannot be verified")
         running = op_state == ServiceOperatingState.RUNNING
+        if owner_stop_requested and op_state != ServiceOperatingState.STOPPED_BY_OWNER:
+            raise ConfigurationConflict("Owner Stop must not be superseded by configuration updates")
         old_hash = compute_config_version(old_cfg)
         new_hash = compute_config_version(new_cfg)
         old_fp = fingerprint(old_cfg, tracker.data_dir)
@@ -128,8 +130,11 @@ def submit_v2_webui_patch(
         v2 = CandidateCoordinator(
             data_dir=tracker.data_dir, env_path=env_path,
             feature_enabled=True, require_external_fence=True,
+            allow_stopped_owner_save=op_state == ServiceOperatingState.STOPPED_BY_OWNER,
         )
-        if not preview_legacy_tracker_migration(tracker.data_dir).allowed:
+        if not preview_legacy_tracker_migration(
+            tracker.data_dir, allow_owner_stopped=op_state == ServiceOperatingState.STOPPED_BY_OWNER,
+        ).allowed:
             raise ConfigurationConflict("Legacy configuration or owner STOP requires reconciliation")
         if running and systemctl_restart_fn is None and is_isolated_test_environment():
             raise ConfigurationConflict("Injected systemd restart required in isolated tests")

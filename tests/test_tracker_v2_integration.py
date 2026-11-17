@@ -79,6 +79,22 @@ class WebuiV2IntegrationTests(unittest.TestCase):
             self.submit()
         self.assertEqual(OLD, self.env.read_text())
 
+    def test_stopped_by_owner_saves_without_restarting_or_clearing_stop(self):
+        self.tracker.record_service_control_intent(
+            desired_service_state="STOPPED", last_action="OWNER_STOP",
+            reason="offline user stop", observed_state="STOPPED_BY_OWNER",
+        )
+        initial_control = (self.data / "service_control_state.json").read_bytes()
+        calls = []
+        with patch.object(self.tracker, "resolve_service_operating_state",
+                          return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "stopped")):
+            rec = self.submit(systemctl_restart_fn=lambda: calls.append("restart") or True)
+        self.assertEqual([], calls)
+        self.assertFalse(rec.runtime_verified)
+        self.assertFalse(rec.restart_performed)
+        self.assertEqual("SAVED_FOR_NEXT_START", rec.state.value)
+        self.assertEqual(initial_control, (self.data / "service_control_state.json").read_bytes())
+
     def test_live_requires_explicit_confirmation(self):
         with self.assertRaises(ConfigurationRejected):
             self.submit(form_data={"trading_mode": "LIVE"})

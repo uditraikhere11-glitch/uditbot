@@ -90,9 +90,11 @@ class CandidateCoordinator:
     process observes the same entry barrier before allowing new order dispatch.
     """
     def __init__(self, data_dir: str | Path, env_path: str | Path, *, feature_enabled: bool = False,
-                 require_external_fence: bool = False):
+                 require_external_fence: bool = False,
+                 allow_stopped_owner_save: bool = False):
         self.feature_enabled = bool(feature_enabled)
         self.require_external_fence = bool(require_external_fence)
+        self.allow_stopped_owner_save = bool(allow_stopped_owner_save)
         self.data_dir = Path(data_dir).resolve()
         self.env_path = Path(env_path).absolute()
         self.txdir = self.data_dir / 'config_restart_v2'
@@ -124,8 +126,11 @@ class CandidateCoordinator:
             # Fail closed if an unexpected error occurs reading safety evidence.
             return SafetyDecision(False, 'STATUS_UNAVAILABLE', 'Safety state could not be inspected', {})
 
-    def _check_legacy(self) -> None:
-        d = preview_legacy_tracker_migration(self.data_dir)
+    def _check_legacy(self, *, service_running: bool = True) -> None:
+        d = preview_legacy_tracker_migration(
+            self.data_dir,
+            allow_owner_stopped=self.allow_stopped_owner_save and not service_running,
+        )
         if not d.allowed:
             raise ChangeBlocked(f'{d.code}: {d.reason}')
         if self.barrier.exists():
@@ -193,7 +198,7 @@ class CandidateCoordinator:
                                         bool(existing.get('restart_issued')), 'Idempotent replay: no second restart')
                 if existing.get('phase') not in ('NO_CHANGE', 'SAVED_FOR_NEXT_START', 'VERIFIED'):
                     raise ChangeBlocked('Previous transaction unresolved; no new restart allowed')
-            self._check_legacy()
+            self._check_legacy(service_running=service_running)
             current = _read_env(self.env_path)
             if _sha(current) != expected_file_revision:
                 raise ChangeBlocked('External .env modification detected (CAS mismatch)')

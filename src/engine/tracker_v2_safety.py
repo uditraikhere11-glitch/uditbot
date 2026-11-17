@@ -211,7 +211,7 @@ def verify_runtime_ack(
     return _result(True, 'RUNTIME_VERIFIED', 'PID/starttime/hash/mode/credentials match running process', pid=pid)
 
 
-def preview_legacy_tracker_migration(data_dir: os.PathLike[str] | str) -> SafetyDecision:
+def preview_legacy_tracker_migration(data_dir: os.PathLike[str] | str, *, allow_owner_stopped: bool = False) -> SafetyDecision:
     """Pure read-only migration preview: never resets Owner Stop or safety gate."""
     p = Path(data_dir)
     try:
@@ -227,8 +227,17 @@ def preview_legacy_tracker_migration(data_dir: os.PathLike[str] | str) -> Safety
         # stale or missing. Never infer permission to restart from it.
         owner_stop = bool(control.get('deferred_stop_pending') is True or desired == 'STOPPED')
         if owner_stop:
-            return _result(False, 'OWNER_STOP_PRIORITY', 'Owner Stop must be honored before tracker migration',
-                           owner_stop_pending=True, pending_operation_present=pending is not None)
+            # A verified STOPPED_BY_OWNER service may save next-start settings
+            # without revoking the owner's STOP intent or starting the unit.
+            # Never permit this exception for deferred STOP or a running unit.
+            safely_stopped = (
+                allow_owner_stopped and desired == 'STOPPED'
+                and control.get('deferred_stop_pending') is not True
+                and observed in ('STOPPED_BY_OWNER', 'STOPPED')
+            )
+            if not safely_stopped:
+                return _result(False, 'OWNER_STOP_PRIORITY', 'Owner Stop must be honored before tracker migration',
+                               owner_stop_pending=True, pending_operation_present=pending is not None)
         if gate is not None and gate.get('active') is not False:
             return _result(False, 'TRANSITION_GATE_REQUIRES_REVIEW', 'An active/ambiguous gate must not be cleared')
         if pending is not None:
