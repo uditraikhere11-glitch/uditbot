@@ -1,0 +1,28 @@
+name: Tracker A01-A11 candidate isolation and regressions
+on:
+  pull_request:
+    paths:
+      - 'src/engine/tracker_*'
+      - 'tests/test_tracker_*'
+      - 'docs/REVIEW_README.md'
+      - '.github/workflows/tracker-a01-a11-review.yml'
+  workflow_dispatch:
+jobs:
+  tracker-isolation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing repository dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Syntax verification
+        run: python -m compileall -q src/engine/tracker_safety_preflight.py src/engine/tracker_v2_candidate.py src/engine/tracker_v2_safety.py src/engine/broker_handoff.py src/engine/tracker_credentials.py src/engine/tracker_v2_integration.py
+      - name: Review-only offline regressions
+        env:
+          AUDITBOT_TEST_ISOLATION: '1'
+        run: |
+          python -m unittest discover -s tests -p 'test_tracker*.py' -v

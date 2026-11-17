@@ -267,6 +267,13 @@ def submit_webui_patch(
     Safety-controlled changes use the existing broker-aware coordinator.
     """
     env_path = os.path.abspath(env_path)
+    if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+        from src.engine.tracker_v2_integration import submit_v2_webui_patch
+        return submit_v2_webui_patch(
+            tracker, form_data, env_path, expected_revision=expected_revision,
+            request_id=request_id, check_service_fn=check_service_fn,
+            systemctl_restart_fn=systemctl_restart_fn, broker=broker,
+        )
     request_id = str(request_id or secrets.token_hex(16))
     if not request_id_valid(request_id):
         raise ConfigurationRejected("Invalid idempotency request ID")
