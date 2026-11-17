@@ -393,7 +393,9 @@ sys.exit(1)
         # reserved identity slot. /profile may use that slot.
         self.assertIsInstance(c.get_holdings(), BrokerReadFailure)
         self.assertEqual(c.session.get.call_count, 9)
-        c.get_authenticated_profile()
+        # Only candidate-token verification is identity-critical. An ordinary
+        # profile poll must not drain the reserved health-check allowance.
+        c.get_authenticated_profile(candidate_token="SYNTH_CANDIDATE")
         self.assertEqual(c.session.get.call_count, 10)
 
     def test_sqlite_contention_has_bounded_wait_and_no_http(self):
