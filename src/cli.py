@@ -237,7 +237,14 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager, *, verific
         for delay in (0, 2, 3, 4):
             if delay:
                 time.sleep(delay)
-            ok_f, bal, msg_f = client.verify_token_authenticated()
+            # A private, single-process client marks only this scheduled
+            # post-refresh funds probe as identity-critical. Ordinary hourly
+            # funds checks do not consume the 5% reserved admission pool.
+            client._identity_verification_context = True
+            try:
+                ok_f, bal, msg_f = client.verify_token_authenticated()
+            finally:
+                client._identity_verification_context = False
             if ok_f:
                 break
             auth_error = str(msg_f or "").lower()
@@ -771,7 +778,10 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
                 token_expiration_str = str(prof_info.get("token_expiration_str") or "").strip()
                 raw_exp_ts = prof_info.get("token_expiration_ts")
                 token_expiration_ts = float(raw_exp_ts) if (raw_exp_ts is not None and float(raw_exp_ts) > 0) else 0.0
-                token_expired = bool(prof_info.get("token_expired", False))
+                token_expired = bool(
+                    prof_info.get("token_expired", False)
+                    or (token_expiration_ts > 0 and token_expiration_ts <= report_now)
+                )
         except Exception:
             identity_status = "UNVERIFIED"
             identity_ok = False
