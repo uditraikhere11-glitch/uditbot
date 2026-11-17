@@ -3884,8 +3884,7 @@ class ProtectionWatcher:
 
             owner_ack_verified = False
             if (
-                manual_risk_candidate and snapshot_complete
-                and broker_net_qty == aggregate_contract_open_qty > 0
+                manual_risk_candidate
                 and self.journal_db is not None
                 and hasattr(self.journal_db, "is_manual_risk_acknowledged")
             ):
@@ -3898,6 +3897,18 @@ class ProtectionWatcher:
                     ) is True
                 except Exception:
                     owner_ack_verified = False
+            manual_risk_ack_unverified = manual_risk_candidate and not owner_ack_verified
+            if manual_risk_ack_unverified:
+                # A stored text label or stale watcher boolean is not an
+                # account-bound, quantity-qualified durable owner ACK.
+                rec["manual_risk_ack_unverified"] = True
+                rec["reconciliation_required"] = True
+                rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(
+                        f"Open holding {oid}: owner manual-risk ACK not independently verified"
+                    )
+                changed = True
             no_protection_conflicts = not any(rec.get(key) for key in (
                 "sl_order_id", "tp_order_id", "exit_order_id",
                 "confirmed_protection_ids", "verified_leg_order_ids",
@@ -4215,7 +4226,7 @@ class ProtectionWatcher:
                         except Exception:
                             pass
                 changed = True
-            elif entry_only_unlinked_reduction or manual_risk_quantity_unverified:
+            elif entry_only_unlinked_reduction or manual_risk_quantity_unverified or manual_risk_ack_unverified:
                 # Never fabricate a SELL or flatten a parent on incomplete proof.
                 rec["confirmed_position_open_qty"] = confirmed_open_qty
                 rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value

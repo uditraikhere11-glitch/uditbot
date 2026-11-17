@@ -125,6 +125,14 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertTrue(item["manual_exit_detected"])
 
+    def test_readable_holdings_without_durable_owner_ack_stays_blocked(self):
+        self.db.is_manual_risk_acknowledged.return_value = False
+        self.healthy()
+        self.w.supervise_open_positions()
+        self.assertTrue(all(r["reconciliation_required"] for r in (self.a, self.b)))
+        self.assertTrue(all(r["position_state"] == "RECONCILIATION_REQUIRED" for r in (self.a, self.b)))
+        self.assertFalse(any(r.get("manual_exit_detected") for r in (self.a, self.b)))
+
     def test_confirmed_manual_reduction_never_makes_fake_sell(self):
         self.healthy(1)
         self.w.supervise_open_positions()

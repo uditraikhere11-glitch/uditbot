@@ -175,8 +175,11 @@ class BrokerSnapshotTests(unittest.TestCase):
                     get_trade_book=Mock(return_value=trades or []),
                     get_positions=Mock(return_value=[]),
                     get_holdings=Mock(return_value=holdings))
-        w = ProtectionWatcher(broker=broker, journal_db=None,
-                              path=str(Path(tmp.name) / 'watcher.json'))
+        w = ProtectionWatcher(
+            broker=broker,
+            journal_db=NS(is_manual_risk_acknowledged=Mock(return_value=True)),
+            path=str(Path(tmp.name) / 'watcher.json'),
+        )
         r = {**holding(), 'protection_route': 'FOREVER_OCO', 'product_type': 'CNC',
              'segment': 'NSE_EQ', 'qty': 1}
         w.terminal_orders = {'O1': r}
