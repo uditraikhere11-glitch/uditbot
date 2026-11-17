@@ -3269,8 +3269,15 @@ class ProtectionWatcher:
             if gate is not None and hasattr(gate, "halt_new_entries"):
                 gate.halt_new_entries(unreadable_msg)
             for rec in open_recs:
+                # Read deferral is uncertainty, NEVER evidence of a manual sale.
+                # Retain historical BUY fills, existing position state and any
+                # previously verified manual-exit evidence unchanged.
                 rec["unreadable_broker_response"] = True
+                rec["reconciliation_required"] = True
                 changed = True
+            # Do not derive broker_net_qty from partial books or perform any
+            # linked-SELL/manual-exit/orphan-leg state transitions on this pass.
+            return changed
 
         if (
             super_book is None
@@ -4340,7 +4347,17 @@ class ProtectionWatcher:
                     continue
                 try:
                     if not self.should_poll(is_market_open_fn):
-                        next_due = 0.0
+                        # A failed startup gate must recover even when there
+                        # are no pending watcher orders or open positions.
+                        # This is read-only preflight; the gate owns its own
+                        # serialized, cooldown-bound authoritative recheck.
+                        now = time.monotonic()
+                        if now >= next_due:
+                            gate = getattr(self.broker, "reconciliation_gate", None)
+                            recover = getattr(gate, "schedule_governor_recovery_if_ready", None)
+                            if callable(recover):
+                                await asyncio.to_thread(recover)
+                            next_due = time.monotonic() + 60.0
                         last_signature = None
                     else:
                         now = time.monotonic()
@@ -4368,11 +4385,12 @@ class ProtectionWatcher:
                                     check_binding = getattr(self.broker, "_get_active_read_governor", None)
                                     if callable(check_binding):
                                         governor = check_binding()
+                                    # The book GETs below are admitted as normal,
+                                    # and pending-order book GETs as low. Urgent
+                                    # *status* must not confer urgent GET quota.
                                     wait = governor.seconds_until_capacity(
                                         required=supervision_read_requirement(len(pending)),
-                                        priority="urgent" if pending or any(
-                                            has_urgent_obligation(r) for r in open_records
-                                        ) else "routine",
+                                        priority="low" if pending else "normal",
                                     )
                                 except Exception as exc:
                                     wait = 60.0
@@ -4408,6 +4426,15 @@ class ProtectionWatcher:
                                     )
                                 else:
                                     next_due = time.monotonic() + (60.0 if one_shot else cadence)
+                                # A verified watcher snapshot is necessary
+                                # but never sufficient to reopen the entry gate.
+                                # Request a separately bounded *full* broker
+                                # reconciliation only when local budget permits.
+                                if completed:
+                                    gate = getattr(self.broker, "reconciliation_gate", None)
+                                    recover = getattr(gate, "schedule_governor_recovery_if_ready", None)
+                                    if callable(recover):
+                                        await asyncio.to_thread(recover)
                                 # Keep the pre-pass signature: a new order or cancellation
                                 # arriving during the worker must not be swallowed by it.
                                 last_signature = signature
