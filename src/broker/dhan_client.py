@@ -1249,7 +1249,10 @@ class DhanClient:
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 }
-                resp = self._governed_get(f"{BASE_URL}/profile", headers=headers, timeout=5)
+                resp = self._governed_get(
+                    f"{BASE_URL}/profile", headers=headers, timeout=5,
+                    priority="identity",
+                )
             else:
                 resp = self._get_with_auth_recovery(
                     f"{BASE_URL}/profile", allow_refresh=allow_refresh
@@ -2321,7 +2324,7 @@ class DhanClient:
             result.headers["Retry-After"] = str(exc.seconds)
         return result
 
-    def _governed_get(self, url, *, headers, timeout):
+    def _governed_get(self, url, *, headers, timeout, priority=None):
         """All Dhan GETs, including candidate-profile and auth retry, share admission."""
         from src.broker.read_governor import ReadDeferred
         governor = self._get_active_read_governor()
@@ -2330,15 +2333,18 @@ class DhanClient:
                 from urllib.parse import urlsplit
                 path = urlsplit(url).path
                 historical = bool(re.fullmatch(r"/v2/trades/\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}/\d+", path))
-                if path in ("/v2/profile", "/v2/fundlimit"):
-                    # Identity and post-refresh funds checks share the existing
-                    # hard cap but may use capacity withheld from routine GETs.
-                    priority = "identity"
+                if priority is not None:
+                    get_priority = priority
+                elif (path == "/v2/fundlimit"
+                      and getattr(self, "_identity_verification_context", False)):
+                    # Only the dedicated post-refresh funds probe can use the
+                    # identity reserve; other routine funds readers cannot.
+                    get_priority = "identity"
                 elif path == "/v2/orders" or path.startswith("/v2/orders/external/"):
-                    priority = "low"
+                    get_priority = "low"
                 else:
-                    priority = "normal"
-                governor.admit(historical=historical, priority=priority)
+                    get_priority = "normal"
+                governor.admit(historical=historical, priority=get_priority)
         except (ReadDeferred, OSError, sqlite3.Error) as exc:
             return self._read_deferral_response(exc)
         # Transport exceptions retain the callers' UNAVAILABLE classification.
