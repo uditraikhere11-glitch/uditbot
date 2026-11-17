@@ -218,6 +218,13 @@ def preview_legacy_tracker_migration(data_dir: os.PathLike[str] | str, *, allow_
         control = read_private_json(p / 'service_control_state.json', missing_ok=True) or {}
         gate = read_private_json(p / 'mode_transition_gate.json', missing_ok=True)
         pending = read_private_json(p / 'pending_config_operation.json', missing_ok=True)
+        # Gemini B07 used this alternate durable pending-operation name.
+        # It must not be silently discarded or overwritten during migration
+        # into PR87's V2 coordinator, even if the old tracker is no longer
+        # importable on the updated GitHub branch.
+        pending_replacement = read_private_json(
+            p / 'pending_tracker_apply.json', missing_ok=True,
+        )
         state = read_private_json(p / 'config_change_state.json', missing_ok=True)
         if control.get('_corrupted'):
             return _result(False, 'CONTROL_STATE_CORRUPT', 'Owner control status corrupt')
@@ -243,6 +250,12 @@ def preview_legacy_tracker_migration(data_dir: os.PathLike[str] | str, *, allow_
         if pending is not None:
             return _result(False, 'PENDING_LEGACY_OPERATION', 'Preserve durable pending legacy operation',
                            pending_operation_present=True)
+        if pending_replacement is not None:
+            return _result(
+                False, 'PENDING_REPLACEMENT_OPERATION',
+                'Preserve prior Gemini tracker pending apply and reconcile before V2 save/restart',
+                pending_operation_present=True,
+            )
         if state and str(state.get('state') or '').upper() in (
             'REQUEST_RECEIVED', 'VALIDATING', 'SAVED', 'SAFETY_CHECK_PENDING',
             'WAITING_FOR_SAFE_APPLY', 'APPLYING',
