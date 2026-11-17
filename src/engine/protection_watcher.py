@@ -529,18 +529,23 @@ class ProtectionWatcher:
                 self.journal_db.save_watcher_state(self.pending, self.terminal_orders)
             self._write_files_strict()
 
-    def _save(self):
+    def _save(self) -> bool:
+        """Persist both watcher copies; callers may require positive readback."""
         with self._lock:
+            success = True
             if self.journal_db and hasattr(self.journal_db, "save_watcher_state"):
                 try:
                     self.journal_db.save_watcher_state(self.pending, self.terminal_orders)
                 except Exception as e:
                     logger.warning(f"[Protection] Could not sync watcher state to SQLite: {e}")
+                    success = False
 
             try:
                 self._write_files_strict()
             except Exception as e:
                 logger.error(f"[Protection] Could not write {self.path}: {e}")
+                success = False
+            return success
 
     def _protection_for_segment(self, segment: str) -> tuple[float, float]:
         """Choose separate Equity or stock-option protection for NEW orders."""
@@ -1460,7 +1465,35 @@ class ProtectionWatcher:
                 logger.warning(f"[Protection] Open-position supervision error: {sup_err}")
 
             if changed:
-                self._save()
+                saved = self._save()
+                recovered_ids = set(getattr(self, "_recovered_manual_risk_ids", set()))
+                self._recovered_manual_risk_ids = set()
+                if recovered_ids and not saved:
+                    # Avoid a green in-memory record when JSON or SQLite failed
+                    # to persist the same verified position lifecycle.
+                    for oid in recovered_ids:
+                        rec = self.terminal_orders.get(oid)
+                        if not isinstance(rec, dict):
+                            continue
+                        rec["reconciliation_required"] = True
+                        rec["persistence_uncertain"] = True
+                        rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                        self._sync_position_lifecycle(rec)
+                    self._save()
+                    if gate is not None and hasattr(gate, "halt_new_entries"):
+                        gate.halt_new_entries("Manual-risk recovery watcher persistence failed")
+                elif recovered_ids and saved and gate is not None:
+                    # Exactly one bounded *independent* full gate recheck is
+                    # queued only after lifecycle AND watcher state persisted.
+                    # The existing gate worker serializes probes, enforces
+                    # emergency STOP and governor admission, and will not
+                    # reopen entries unless every separate invariant passes.
+                    schedule = getattr(gate, "_schedule_historical_background_recheck", None)
+                    if callable(schedule):
+                        try:
+                            schedule()
+                        except Exception as exc:
+                            logger.warning("[Protection] Deferred reconciliation recheck unavailable: %s", type(exc).__name__)
 
             # B07: Trading watcher NEVER restarts its own systemd service!
             # When all pending orders in watcher have resolved, record transition readiness only;
@@ -4209,7 +4242,9 @@ class ProtectionWatcher:
                         "[Protection] Manual-risk recovery verified for order=%s; "
                         "independent entry-gate recheck still required", oid
                     )
-                    rec["_recovery_pending_gate_recheck"] = True
+                    self._recovered_manual_risk_ids = getattr(
+                        self, "_recovered_manual_risk_ids", set()
+                    ) | {oid}
                 changed = True
             elif ambiguous_super_closed and not triggered_leg and sell_qty == 0:
                 # P0-C: Parent CLOSED with both legs PENDING, missing, stale, or contradictory ->
