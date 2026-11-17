@@ -3588,6 +3588,7 @@ class ProtectionWatcher:
             # 2. Collect strictly parent-linked, verified SELL tradebook executions (P0-A, P0-01, P0-03 & P0-09)
             sell_trades: List[Dict[str, Any]] = []
             seen_trade_ids = set()
+            per_order_trade_read_unverified = False
 
             def _verify_parent_sell_trade(tr: Any, expected_oid: Optional[str] = None) -> Tuple[bool, str]:
                 if not isinstance(tr, dict):
@@ -3701,6 +3702,7 @@ class ProtectionWatcher:
                         if t_ord_res is None or "Mock" in type(t_ord_res).__name__:
                             continue
                         if type(t_ord_res).__name__ == "BrokerReadFailure":
+                            per_order_trade_read_unverified = True
                             rec["unreadable_broker_response"] = True
                             if gate is not None and hasattr(gate, "halt_new_entries"):
                                 gate.halt_new_entries(f"Broker get_trades_for_order({l_oid}) failed during exit reconciliation")
@@ -3915,6 +3917,7 @@ class ProtectionWatcher:
                 "verified_leg_map", "pending_oco", "orphaned_legs_detected",
                 "orphaned_legs_manual_intervention_required",
                 "uncommitted_broker_sell_trades", "broker_exit_already_executed",
+                "external_unlinked_sell_observed", "unverified_trade_detected",
                 "persistence_uncertain", "cancel_uncertain", "cancel_requested",
             ))
             # This can repair older falsely labelled records, but never
@@ -3927,6 +3930,7 @@ class ProtectionWatcher:
                 and not rec.get("manual_exit_evidence_reason")
                 and not journal_persistence_failed
                 and owner_ack_verified and no_protection_conflicts
+                and not per_order_trade_read_unverified
                 and sell_qty == 0 and broker_observed_sell_qty == 0
                 and not triggered_leg and not ambiguous_super_closed
                 and not both_legs_dead and resting_protective_qty == 0

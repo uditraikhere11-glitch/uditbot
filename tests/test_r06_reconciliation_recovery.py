@@ -113,6 +113,47 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             self.assertEqual("UNPROTECTED_MANUAL_RISK", item["position_state"])
             self.assertFalse(item["manual_exit_detected"])
 
+    def test_manual_sell_same_security_prevents_stale_flag_clear(self):
+        # Even if an unrelated BUY restores aggregate DP quantity to two,
+        # an observed unlinked manual SELL must not clear a historical warning.
+        for item in (self.a, self.b):
+            item.update(
+                position_state="RECONCILIATION_REQUIRED",
+                reconciliation_required=True, manual_exit_detected=True,
+                unreadable_broker_response=True,
+            )
+        self.healthy()
+        self.broker.get_trade_book.return_value = [{
+            "transactionType": "SELL",
+            "securityId": "11915", "exchangeSegment": "NSE_EQ",
+            "productType": "CNC",
+            "orderId": "OWNER-MANUAL-EXIT-42", "tradedQuantity": 1,
+            "tradedPrice": 19.0, "exchangeTradeId": "OWNER-TRD-42",
+        }]
+        self.w.supervise_open_positions()
+        for item in (self.a, self.b):
+            self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
+            self.assertTrue(item["manual_exit_detected"])
+            self.assertTrue(item.get("external_unlinked_sell_observed"))
+
+    def test_failed_parent_specific_trade_read_prevents_auto_recovery(self):
+        for item in (self.a, self.b):
+            item.update(
+                position_state="RECONCILIATION_REQUIRED",
+                reconciliation_required=True, manual_exit_detected=True,
+                unreadable_broker_response=True,
+            )
+        self.healthy()
+        self.broker.get_trades_for_order = Mock(return_value=BrokerReadFailure(
+            status=BrokerReadStatus.UNAVAILABLE.value,
+            error="synthetic per-order Dhan GET denied",
+            status_code=429,
+        ))
+        self.w.supervise_open_positions()
+        for item in (self.a, self.b):
+            self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
+            self.assertTrue(item["reconciliation_required"])
+
     def test_legacy_flags_never_clear_without_verified_ack(self):
         for item in (self.a, self.b):
             item.update(position_state="RECONCILIATION_REQUIRED",
