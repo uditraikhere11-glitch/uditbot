@@ -3816,8 +3816,10 @@ class ProtectionWatcher:
                         o_sell = max(int(o_rec.get("exit_filled_qty") or 0), int(o_rec.get("broker_observed_exit_filled_qty") or 0))
                         aggregate_contract_open_qty += max(0, o_buy - o_sell)
 
-            manual_risk_candidate = bool(rec.get("manual_risk_acknowledged")) and (
-                prev_pos_state in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
+            manual_risk_candidate = (
+                prev_pos_state == "UNPROTECTED_MANUAL_RISK"
+                or (prev_pos_state == "RECONCILIATION_REQUIRED"
+                    and bool(rec.get("manual_risk_acknowledged")))
             )
             entry_only_unlinked_reduction = (
                 (route == "ENTRY_ONLY_AMO" or manual_risk_candidate)
