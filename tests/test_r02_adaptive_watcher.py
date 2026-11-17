@@ -9,9 +9,10 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 from src.broker.dhan_client import DhanClient
+from src.models import BrokerReadFailure
 from src.broker.read_governor import ReadDeferred, ReadGovernor
 from src.engine.protection_watcher import ProtectionWatcher
-from src.engine.reconciliation import ReconciliationState
+from src.engine.reconciliation import ReconciliationState, StartupReconciliationGate
 from src.engine.watch_poll_policy import (
     watcher_cadence_seconds,
     supervision_read_requirement,
@@ -191,6 +192,30 @@ class R02GovernorPreviewTests(unittest.TestCase):
         other = ReadGovernor(self.tmp.name, "OTHER", clock=lambda: self.now)
         self.assertEqual(other.seconds_until_capacity(required=5), 0)
 
+    def test_pr87_normal_preflight_matches_actual_760_of_800_limit(self):
+        self.g.LIMITS = ((3600, 800),)
+        self.g.admit()
+        with sqlite3.connect(self.g.path) as db:
+            db.executemany(
+                "INSERT INTO reads(at) VALUES (?)",
+                [(self.now,)] * 764,
+            )
+        # 765 used: full-cap 'urgent' preview still passes but NO normal
+        # Dhan holdings/trades/positions requests can be admitted.
+        self.assertEqual(self.g.seconds_until_capacity(required=8, priority="urgent"), 0)
+        self.assertGreater(self.g.seconds_until_capacity(required=8, priority="normal"), 0)
+
+    def test_pr87_low_preflight_matches_actual_720_of_800_limit(self):
+        self.g.LIMITS = ((3600, 800),)
+        self.g.admit()
+        with sqlite3.connect(self.g.path) as db:
+            db.executemany(
+                "INSERT INTO reads(at) VALUES (?)",
+                [(self.now,)] * 724,
+            )
+        self.assertEqual(self.g.seconds_until_capacity(required=8, priority="normal"), 0)
+        self.assertGreater(self.g.seconds_until_capacity(required=8, priority="low"), 0)
+
 
 class R02WatcherRunTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -277,6 +302,123 @@ class R02WatcherRunTests(unittest.IsolatedAsyncioTestCase):
         self.broker._read_governor = None
         await self.drive(4)
         self.assertEqual(self.w.check_once.call_count, 1)
+
+    async def test_pr87_urgent_sticky_record_must_not_bypass_normal_get_ceiling(self):
+        self.g.admit()
+        with sqlite3.connect(self.g.path) as db:
+            db.executemany("INSERT INTO reads(at) VALUES (?)", [(time.time(),)] * 764)
+        self.w.terminal_orders["SYNTH-1"]["reconciliation_required"] = True
+        gate = NS(
+            is_accepting_entries=False,
+            state=ReconciliationState.BLOCKED,
+            halt_new_entries=Mock(),
+            schedule_governor_recovery_if_ready=Mock(),
+        )
+        self.broker.reconciliation_gate = gate
+        await self.drive(6)
+        self.w.check_once.assert_not_called()
+        gate.schedule_governor_recovery_if_ready.assert_not_called()
+
+    async def test_pr87_idle_blocked_gate_requests_one_bounded_recovery(self):
+        gate = NS(
+            state=ReconciliationState.BLOCKED,
+            is_accepting_entries=False,
+            schedule_governor_recovery_if_ready=Mock(return_value=False),
+        )
+        self.broker.reconciliation_gate = gate
+        self.w.should_poll = lambda *_: False
+        await self.drive(5)
+        gate.schedule_governor_recovery_if_ready.assert_called_once()
+        self.w.check_once.assert_not_called()
+
+    async def test_pr87_successful_supervision_requests_full_gate_recheck(self):
+        gate = NS(
+            state=ReconciliationState.BLOCKED,
+            is_accepting_entries=False,
+            schedule_governor_recovery_if_ready=Mock(return_value=True),
+        )
+        self.broker.reconciliation_gate = gate
+        def complete():
+            self.w._supervision_read_complete = True
+        self.w.check_once.side_effect = complete
+        await self.drive(4)
+        gate.schedule_governor_recovery_if_ready.assert_called_once()
+
+
+class R02PR87ReadUncertaintyTests(unittest.TestCase):
+    def test_two_manual_risk_yesbank_shares_are_not_marked_sold_on_429(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fake_failure = BrokerReadFailure(
+            status="UNAVAILABLE", status_code=429, error="local GET budget exhausted"
+        )
+        gate = NS(halt_new_entries=Mock())
+        broker = NS(
+            cfg=NS(dhan_client_id="SYNTH-ACCOUNT"),
+            reconciliation_gate=gate,
+            get_super_orders=Mock(return_value=[]),
+            get_forever_orders=Mock(return_value=[]),
+            get_trade_book=Mock(return_value=fake_failure),
+            get_positions=Mock(return_value=[]),
+            get_holdings=Mock(return_value=[]),
+            get_trades_for_order=Mock(return_value=[]),
+        )
+        watcher = ProtectionWatcher(
+            broker=broker, journal_db=None,
+            path=str(Path(tmp.name) / "watcher.json"),
+        )
+        for oid in ("YESBANK-NOV02", "YESBANK-NOV04"):
+            r = record(oid)
+            r.update(
+                security_id="11915", segment="NSE_EQ", product_type="CNC",
+                protection_route="FOREVER_OCO", manual_exit_detected=False,
+                unreadable_broker_response=False,
+            )
+            watcher.terminal_orders[oid] = r
+
+        self.assertTrue(watcher.supervise_open_positions())
+        for oid in ("YESBANK-NOV02", "YESBANK-NOV04"):
+            r = watcher.terminal_orders[oid]
+            self.assertEqual(r["position_state"], "UNPROTECTED_MANUAL_RISK")
+            self.assertFalse(r["manual_exit_detected"])
+            self.assertTrue(r["unreadable_broker_response"])
+            self.assertEqual(r["filled_qty"], 1)
+        broker.get_trades_for_order.assert_not_called()
+        gate.halt_new_entries.assert_called_once()
+
+
+class R02PR87RecoveryGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = time.time()
+        self.g = ReadGovernor(self.tmp.name, "SYNTH-ACCOUNT", clock=lambda: self.now)
+        self.g.LIMITS = ((3600, 800),)
+        self.broker = NS(_get_active_read_governor=lambda: self.g)
+        self.db = NS(get_non_terminal_intents=lambda: [])
+        self.stop = NS(is_stopped=lambda: False)
+        self.gate = StartupReconciliationGate(self.broker, self.db, None, self.stop)
+        self.gate.state = ReconciliationState.BLOCKED
+        self.gate._schedule_historical_background_recheck = Mock()
+
+    def test_blocked_gate_can_schedule_even_with_zero_intents(self):
+        self.assertTrue(self.gate.schedule_governor_recovery_if_ready())
+        self.gate._schedule_historical_background_recheck.assert_called_once()
+
+    def test_budget_exhaustion_defers_full_recovery_without_get(self):
+        self.g.admit()
+        with sqlite3.connect(self.g.path) as db:
+            db.executemany("INSERT INTO reads(at) VALUES (?)", [(self.now,)] * 746)
+        self.assertFalse(self.gate.schedule_governor_recovery_if_ready())
+        self.gate._schedule_historical_background_recheck.assert_not_called()
+
+    def test_emergency_stop_or_missing_governor_stays_blocked(self):
+        self.stop.is_stopped = lambda: True
+        self.assertFalse(self.gate.schedule_governor_recovery_if_ready())
+        self.stop.is_stopped = lambda: False
+        self.broker._get_active_read_governor = lambda: None
+        self.assertFalse(self.gate.schedule_governor_recovery_if_ready())
+        self.gate._schedule_historical_background_recheck.assert_not_called()
 
 
 class R02GateHaltDedupTests(unittest.TestCase):
