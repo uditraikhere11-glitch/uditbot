@@ -28,10 +28,10 @@ class EligibilityTests(unittest.TestCase):
                 self.assertFalse(manual_risk_only({}, [{**r, field: value}]))
         self.assertFalse(manual_risk_only({'N': {}}, [r]))
 
-    def test_terminal_uncertainty_is_urgent_outside_hours(self):
+    def test_terminal_uncertainty_afterhours_never_exceeds_300s_policy(self):
         r = {**holding(), 'cancel_uncertain': True}
         self.assertEqual(watcher_cadence_seconds(pending={}, open_records=[r], now=1000,
-                                               market_open=False), 10)
+                                               market_open=False), 300)
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
@@ -135,16 +135,40 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             if self.clock == 1010:
                 self.w.terminal_orders['O1']['pending_oco'] = {'state': 'UNKNOWN'}
         await self.drive(32, event)
-        self.assertEqual(self.calls, [1000, 1010, 1020, 1030])
+        self.assertEqual(self.calls, [1000, 1010])
 
-    async def test_terminal_uncertainty_uses_urgent_governor_reserve(self):
+    async def test_stale_amo_reconciliation_uses_only_four_get_cycles_per_15_minutes(self):
+        from src.broker.read_governor import ReadGovernor
+        governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
+        governor.seconds_until_capacity = Mock(return_value=0)
+        self.w.broker._read_governor = governor
+        self.w.terminal_orders = {
+            'AMO-OLD': {**holding(), 'order_id': 'AMO-OLD',
+                'created_at': 1.0, 'is_amo': True,
+                'position_state': 'RECONCILIATION_REQUIRED',
+                'unreadable_broker_response': True,
+                'reconciliation_required': True},
+        }
+        gate = NS(is_accepting_entries=False, state='BLOCKED',
+                  halt_new_entries=Mock())
+        self.w.broker.reconciliation_gate = gate
+        await self.drive(905)
+        self.assertEqual(self.calls, [1000, 1300, 1600, 1900])
+        self.assertEqual(governor.seconds_until_capacity.call_count, 4)
+        for entry in governor.seconds_until_capacity.call_args_list:
+            self.assertEqual(entry.kwargs['priority'], 'routine')
+        gate.halt_new_entries.assert_not_called()
+        self.assertFalse(gate.is_accepting_entries)
+        self.assertTrue(self.w.terminal_orders['AMO-OLD']['reconciliation_required'])
+
+    async def test_closed_terminal_uncertainty_uses_routine_reserve(self):
         from src.broker.read_governor import ReadGovernor
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
         governor.seconds_until_capacity = Mock(return_value=0)
         self.w.broker._read_governor = governor
         self.w.terminal_orders['O1']['cancel_uncertain'] = True
         await self.drive(4)
-        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='urgent')
+        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='routine')
 
     async def test_throttled_closed_session_is_not_consumed(self):
         from src.broker.read_governor import ReadGovernor
