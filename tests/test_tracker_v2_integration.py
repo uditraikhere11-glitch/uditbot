@@ -73,7 +73,8 @@ class WebuiV2IntegrationTests(unittest.TestCase):
 
     def test_owner_stop_priority(self):
         self.tracker.record_service_control_intent(
-            desired_service_state="STOPPED", last_action="OWNER_STOP", reason="offline test", observed_state="STOPPED_BY_OWNER",
+            desired_service_state="STOPPED", last_action="OWNER_STOP", reason="offline test",
+            observed_state="RUNNING", deferred_stop_pending=True,
         )
         with self.assertRaises(ConfigurationConflict):
             self.submit()
