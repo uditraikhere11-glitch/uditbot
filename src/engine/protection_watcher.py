@@ -4222,7 +4222,7 @@ class ProtectionWatcher:
                 changed = True
             elif recovery_candidate:
                 previous = dict(rec)
-                rec["position_state"] = PositionLifecycleState.UNPROTECTED_MANUAL_RISK.value
+                rec["position_state"] = "UNPROTECTED_MANUAL_RISK"
                 rec["confirmed_position_open_qty"] = effective_parent_open_qty
                 rec["manual_exit_detected"] = False
                 rec["reconciliation_required"] = False
