@@ -3273,7 +3273,6 @@ class ProtectionWatcher:
                 # Retain historical BUY fills, existing position state and any
                 # previously verified manual-exit evidence unchanged.
                 rec["unreadable_broker_response"] = True
-                rec["reconciliation_required"] = True
                 changed = True
             # Do not derive broker_net_qty from partial books or perform any
             # linked-SELL/manual-exit/orphan-leg state transitions on this pass.
@@ -3665,6 +3664,7 @@ class ProtectionWatcher:
                         if t_ord_res is None or "Mock" in type(t_ord_res).__name__:
                             continue
                         if type(t_ord_res).__name__ == "BrokerReadFailure":
+                            unreadable_books.add("get_trades_for_order")
                             rec["unreadable_broker_response"] = True
                             if gate is not None and hasattr(gate, "halt_new_entries"):
                                 gate.halt_new_entries(f"Broker get_trades_for_order({l_oid}) failed during exit reconciliation")
@@ -3801,7 +3801,11 @@ class ProtectionWatcher:
                 for h_row in holdings_book:
                     if isinstance(h_row, dict) and str(h_row.get("securityId") or "").strip() == sec_id:
                         try:
-                            raw_hq = h_row.get("totalQty") if h_row.get("totalQty") is not None else h_row.get("availableQty")
+                            raw_hq = h_row.get("totalQty")
+                            if raw_hq is None:
+                                raw_hq = h_row.get("availableQty")
+                            if raw_hq is None:
+                                raw_hq = h_row.get("dpQty")
                             if isinstance(raw_hq, bool) or raw_hq is None:
                                 broker_net_qty = None
                             else:
@@ -3839,9 +3843,18 @@ class ProtectionWatcher:
             if entry_only_unlinked_reduction or manual_risk_quantity_unverified:
                 rec["reconciliation_required"] = True
                 rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
-                rec["manual_exit_detected"] = True
+                if entry_only_unlinked_reduction:
+                    # Only a *readable*, account/contract-matched smaller
+                    # quantity is possible evidence of an unlinked reduction.
+                    rec["manual_exit_detected"] = True
+                # An absent/malformed quantity is an UNKNOWN, not a sale.
                 if gate is not None and hasattr(gate, "halt_new_entries"):
-                    gate.halt_new_entries(f"Open holding {oid}: quantity absent/reduced without complete parent-linked SELL evidence")
+                    gate.halt_new_entries(
+                        f"Open holding {oid}: "
+                        + ("verified broker quantity reduced without linked SELL evidence"
+                           if entry_only_unlinked_reduction
+                           else "broker quantity unavailable; no exit conclusion")
+                    )
                 changed = True
 
             has_orphan_condition = (
