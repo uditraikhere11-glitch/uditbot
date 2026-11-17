@@ -3209,6 +3209,9 @@ class ProtectionWatcher:
           verified orphaned bot-owned exit legs when position is flat.
         """
         now_ts = float(current_time if current_time is not None else self.clock())
+        # Every early return must explicitly leave the pass INCOMPLETE. A
+        # caller must never reuse a previous successful snapshot as current.
+        self._supervision_read_complete = False
         with self._lock:
             open_recs = [
                 rec for rec in list(self.terminal_orders.values()) + [r for r in self.pending.values() if isinstance(r, dict) and r.get("entry_only_amo")]
