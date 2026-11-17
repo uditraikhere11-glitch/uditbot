@@ -50,10 +50,26 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
     open_all = list(open_records or [])
 
     if not market_open:
+        # Closed/DRY historical records are not newly placed live orders.
+        # Ignore them even when they have a recent saved timestamp.
         recent = [
-            rec for rec in pending_records + open_all
+            rec for rec in pending_records
             if is_new_order_window(rec, now)
+            and not str(rec.get("order_id") or "").startswith("DRY-")
         ]
+        for rec in open_all:
+            if not is_new_order_window(rec, now):
+                continue
+            if str(rec.get("order_id") or "").startswith("DRY-"):
+                continue
+            if str(rec.get("position_state") or "").upper() == "POSITION_CLOSED":
+                continue
+            try:
+                active_filled = int(rec.get("filled_qty") or 0) > 0
+            except (TypeError, ValueError, OverflowError):
+                active_filled = False
+            if active_filled:
+                recent.append(rec)
         if recent:
             return 10.0 if any(
                 is_amo_record(rec) or has_urgent_obligation(rec)

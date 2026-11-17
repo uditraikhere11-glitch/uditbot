@@ -169,6 +169,19 @@ class R02CadencePolicyTests(unittest.TestCase):
             pending={}, open_records=[rec], now=100036, market_open=False,
         ), AFTER_HOURS_SECONDS)
 
+    def test_recent_closed_and_dry_records_do_not_accelerate_afterhours(self):
+        bad = [
+            {**record("CLOSED", state="POSITION_CLOSED"), "created_at": 99999,
+             "is_amo": True},
+            {**record("DRY-NEW", state="RECONCILIATION_REQUIRED"), "created_at": 99999,
+             "is_amo": True},
+            {"order_id": "NO-FILL", "created_at": 99999, "filled_qty": 0,
+             "is_amo": True, "position_state": "RECONCILIATION_REQUIRED"},
+        ]
+        self.assertEqual(watcher_cadence_seconds(
+            pending={}, open_records=bad, now=100000, market_open=False,
+        ), AFTER_HOURS_SECONDS)
+
     def test_invalid_or_future_order_created_at_cannot_trigger_burst(self):
         for value in (None, -1, float("inf"), float("nan"), "bad", 100050):
             with self.subTest(created_at=value):
