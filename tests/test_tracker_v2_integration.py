@@ -84,6 +84,108 @@ class WebuiV2IntegrationTests(unittest.TestCase):
             self.submit(form_data={"trading_mode": "LIVE"})
         self.assertEqual(OLD, self.env.read_text())
 
+    def _simulate_running_v2(self, *, restart_result: bool = False):
+        """An actual live-PID handoff, with only the broker GET gate stubbed."""
+        import os
+        import multiprocessing
+        from src.config import AppConfig
+        from src.engine.config_manager import compute_config_version, parse_env_content_string
+        from src.engine.tracker_credentials import fingerprint
+        from src.engine.broker_handoff import register_producer, _paths
+
+        original = OLD + "DHAN_CLIENT_ID=DEMOACCOUNT\n"
+        self.env.write_text(original)
+        cfg = AppConfig.from_env(env=parse_env_content_string(original), env_file="")
+        register_producer(self.data, cfg.dhan_client_id)
+        old_fp = fingerprint(cfg, str(self.data))
+        self.tracker.record_active_running_version(
+            compute_config_version(cfg), trading_mode="TEST",
+            credential_fingerprint=old_fp,
+        )
+        self.assertEqual(os.getpid(), self.tracker.get_active_running_version()["pid"])
+        holder = {"pid": os.getpid(), "calls": 0}
+        release = multiprocessing.Event()
+        child = None
+
+        def child_runner(data_dir, env_path, ready, release_event):
+            from src.config import AppConfig
+            from src.engine.config_manager import ConfigChangeTracker, compute_config_version
+            from src.engine.tracker_credentials import fingerprint
+            from src.engine.broker_handoff import register_producer
+            import os
+            try:
+                cfg_new = AppConfig.from_env(env_file=env_path)
+                register_producer(data_dir, cfg_new.dhan_client_id)
+                ConfigChangeTracker(data_dir=data_dir).record_active_running_version(
+                    compute_config_version(cfg_new), trading_mode="TEST",
+                    credential_fingerprint=fingerprint(cfg_new, data_dir),
+                )
+                ready.put(("OK", os.getpid()))
+                release_event.wait(timeout=5)
+            except BaseException as exc:
+                ready.put(("ERR", str(exc)))
+
+        def restart():
+            nonlocal child
+            holder["calls"] += 1
+            if not restart_result:
+                return False
+            ready = multiprocessing.Queue()
+            child = multiprocessing.Process(
+                target=child_runner,
+                args=(str(self.data), str(self.env), ready, release),
+                daemon=True,
+            )
+            child.start()
+            status, data = ready.get(timeout=5)
+            self.assertEqual("OK", status, data)
+            holder["pid"] = data
+            return True
+
+        def status():
+            return {
+                "ActiveState": "active", "SubState": "running", "Result": "success",
+                "MainPID": holder["pid"], "ExecMainStatus": 0,
+            }
+
+        try:
+            with patch.object(self.tracker, "evaluate_trading_safety_gate_detailed",
+                              return_value=(True, "offline fake GET evidence", "", 0)):
+                rec = self.submit(
+                    expected_revision=revision(original),
+                    systemctl_restart_fn=restart,
+                    check_service_fn=status,
+                )
+            return rec, holder
+        finally:
+            release.set()
+            if child is not None:
+                child.join(timeout=5)
+                if child.is_alive():
+                    child.terminate()
+                    child.join(timeout=5)
+
+    def test_running_restart_unknown_preserves_env_and_barrier(self):
+        from src.engine.broker_handoff import _paths
+        rec, ctx = self._simulate_running_v2(restart_result=False)
+        self.assertEqual(1, ctx["calls"])
+        self.assertFalse(rec.runtime_verified)
+        self.assertTrue(rec.restart_performed)
+        self.assertEqual("ACK_UNCERTAIN", rec.blocked_reason)
+        self.assertIn("1000", self.env.read_text())
+        barrier = _paths(self.data)[2]
+        self.assertTrue(__import__("json").loads(barrier.read_text())["active"])
+
+    def test_running_positive_new_pid_ack_single_restart(self):
+        from src.engine.broker_handoff import _paths
+        rec, ctx = self._simulate_running_v2(restart_result=True)
+        self.assertEqual(1, ctx["calls"])
+        self.assertTrue(rec.runtime_verified)
+        self.assertEqual("APPLIED_VERIFIED", rec.state.value)
+        barrier = _paths(self.data)[2]
+        self.assertFalse(__import__("json").loads(barrier.read_text())["active"])
+
+
 
 if __name__ == "__main__":
     unittest.main()
