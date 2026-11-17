@@ -264,6 +264,47 @@ class ReadBudgetAndAfterHours(unittest.TestCase):
 
 
 class StartupCandidateCoverage(unittest.TestCase):
+    def test_valid_owner_ack_does_not_bypass_unresolved_lifecycle(self):
+        # Reproduces two acknowledged YESBANK BUY parents: even if holdings
+        # sum is 2 and owner ACKs exist, no gate success while a lifecycle
+        # still requires reconciliation. No Dhan HTTP traffic in this test.
+        rows = []
+        for oid in ("221261102657708", "23126110439808"):
+            rows.append({
+                "parent_order_id": oid, "symbol": "YESBANK",
+                "product_type": "CNC", "security_id": "11915",
+                "exchange_segment": "NSE_EQ",
+                "confirmed_open_qty": 1, "entry_qty": 1,
+                "buy_filled_qty": 1, "position_state": "RECONCILIATION_REQUIRED",
+                "manual_exit_detected": True,
+            })
+        broker = NS(
+            cfg=NS(dhan_client_id="TEST"),
+            get_holdings=Mock(return_value=[{"securityId": "11915", "dpQty": 2}]),
+            get_forever_orders=Mock(return_value=[]),
+        )
+        db = NS(
+            get_open_positions_lifecycle=lambda: rows,
+            is_manual_risk_acknowledged=lambda *args, **kw: True,
+        )
+        gate = StartupReconciliationGate(
+            broker=broker, journal_db=db, watcher=None,
+            stop_manager=NS(is_stopped=lambda: False),
+        )
+        ok, reason = gate._verify_bot_owned_holdings_protected([])
+        self.assertFalse(ok)
+        self.assertIn("unresolved", reason.lower())
+        broker.get_holdings.assert_not_called()
+        self.assertEqual(2, len(rows))
+        # A later VERIFIED lifecycle recovery may be considered by startup,
+        # but only after the watcher has durably changed both records.
+        for row in rows:
+            row["position_state"] = "UNPROTECTED_MANUAL_RISK"
+            row["manual_exit_detected"] = False
+        ok, reason = gate._verify_bot_owned_holdings_protected([])
+        self.assertTrue(ok, reason)
+        self.assertTrue(broker.get_holdings.called)
+
     def test_stale_reconciliation_state_is_not_skipped(self):
         row = {
             "parent_order_id": "221261102657708",

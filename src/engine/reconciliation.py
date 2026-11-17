@@ -1126,6 +1126,27 @@ class StartupReconciliationGate:
         if not bot_settled_candidates:
             return True, "No settled bot-owned holdings requiring separate verification"
 
+        # R06: manual-risk acknowledgement does not extinguish a *different*
+        # unresolved reconciliation obligation. In particular, the old
+        # watcher wrote manual_exit_detected=True on an unavailable GET.
+        # Startup may validate that the two BUYs traded, but MUST NOT reopen
+        # new entries until the watcher has independently repaired/persisted
+        # that lifecycle using fresh complete broker books and account-bound
+        # owner ACK. This check is deliberately before the manual-risk bypass
+        # and before any status can be declared healthy.
+        for row in bot_settled_candidates:
+            lifecycle_state = str(row.get("position_state") or "").strip().upper()
+            if lifecycle_state in (
+                "RECONCILIATION_REQUIRED", "PERSISTENCE_UNCERTAIN",
+                "MANUAL_INTERVENTION_REQUIRED", "UNKNOWN",
+            ):
+                return False, (
+                    "Settled bot-owned holding remains unresolved: "
+                    f"orderId={str(row.get('parent_order_id') or '')}, "
+                    f"position_state={lifecycle_state}; "
+                    "fresh watcher reconciliation and durable lifecycle recovery required"
+                )
+
         expected_acct = str(
             getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "")
             or getattr(self.db, "account_id", "")
