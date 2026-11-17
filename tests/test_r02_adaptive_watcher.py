@@ -181,8 +181,13 @@ class R02GovernorPreviewTests(unittest.TestCase):
             self.g.seconds_until_capacity(required=1)
 
     def test_separate_account_has_separate_capacity(self):
-        for _ in range(10):
+        # Routine readers preserve the final 5% for critical identity reads.
+        # Synthetic 10-read limit therefore admits 9 normal + 1 identity.
+        for _ in range(9):
             self.g.admit()
+        with self.assertRaises(ReadDeferred):
+            self.g.admit()
+        self.g.admit(priority="identity")
         other = ReadGovernor(self.tmp.name, "OTHER", clock=lambda: self.now)
         self.assertEqual(other.seconds_until_capacity(required=5), 0)
 

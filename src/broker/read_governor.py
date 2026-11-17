@@ -68,13 +68,20 @@ class ReadGovernor:
                 raise ReadDeferred(float(row[0]) - now, 'shared broker rate-limit cooldown')
             conn.execute('DELETE FROM reads WHERE at <= ?', (now - 86400,))
             prio = str(priority or 'normal').strip().lower()
+            if prio not in ('low', 'normal', 'identity', 'urgent'):
+                raise ValueError('Unsupported Dhan GET admission priority')
             for window, limit in self.LIMITS:
-                # Keep a reserve for supervision/identity/funds instead of history,
-                # and keep a top 10% reserve against low-priority background polling.
+                # Reserve the final 5% of each *local* rolling allowance for
+                # account/profile and funds identity probes and urgent
+                # protection recovery. Ordinary supervision can no longer
+                # exhaust all 800 hourly slots immediately before 17:00.
+                # The full budget remains a hard cap for every priority.
                 if historical and limit > 1:
                     ceiling = max(1, int(limit * 0.8))
                 elif prio == 'low' and limit > 1:
                     ceiling = max(1, int(limit * 0.9))
+                elif prio == 'normal' and limit > 1:
+                    ceiling = max(1, int(limit * 0.95))
                 else:
                     ceiling = limit
                 count, oldest = conn.execute(

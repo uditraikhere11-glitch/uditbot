@@ -88,10 +88,12 @@ class ReadControlTests(unittest.TestCase):
             self.g.admit(historical=True)
         with self.assertRaises(ReadDeferred):
             self.g.admit(historical=True)
-        self.g.admit()
-        self.g.admit()
+        self.g.admit(priority='normal')
         with self.assertRaises(ReadDeferred):
-            self.g.admit()
+            self.g.admit(priority='normal')
+        self.g.admit(priority='identity')
+        with self.assertRaises(ReadDeferred):
+            self.g.admit(priority='identity')
 
     def test_dh904_never_becomes_empty_success(self):
         c = self.client()
@@ -234,16 +236,18 @@ sys.exit(1)
         self.assertTrue(all(results))
 
     def test_low_priority_polling_preserves_top_10_percent_critical_reserve(self):
-        """Finding 3A: Low-priority background polling stops at 90% while normal/critical reads use remaining 10%."""
+        """Low-priority stops at 90%; ordinary reads also preserve identity capacity."""
         self.g.LIMITS = ((3600, 10),)
         for _ in range(9):
             self.g.admit(priority='low')
         with self.assertRaises(ReadDeferred):
             self.g.admit(priority='low')
-        # Normal/critical read still admitted using the reserved 10th slot
-        self.g.admit(priority='normal')
+        # Routine reads cannot exhaust identity and post-refresh funds reserve.
         with self.assertRaises(ReadDeferred):
             self.g.admit(priority='normal')
+        self.g.admit(priority='identity')
+        with self.assertRaises(ReadDeferred):
+            self.g.admit(priority='identity')
 
     def _check_startup_reconciliation_snapshots(self, drop_holdings=False):
         """Finding 3B: Reconciling 2 historical R01 orders inside run_startup_reconciliation refreshes holdings and protection after the watcher pass."""
@@ -385,7 +389,13 @@ sys.exit(1)
             self.assertEqual(c.get_order_book(), [])
         self.assertIsInstance(c.get_order_book(), BrokerReadFailure)
         self.assertEqual(c.session.get.call_count, 9)
-        self.assertEqual(c.get_holdings(), [])
+        # A routine holdings read must defer instead of consuming the final
+        # reserved identity slot. /profile may use that slot.
+        self.assertIsInstance(c.get_holdings(), BrokerReadFailure)
+        self.assertEqual(c.session.get.call_count, 9)
+        # Only candidate-token verification is identity-critical. An ordinary
+        # profile poll must not drain the reserved health-check allowance.
+        c.get_authenticated_profile(candidate_token="SYNTH_CANDIDATE")
         self.assertEqual(c.session.get.call_count, 10)
 
     def test_sqlite_contention_has_bounded_wait_and_no_http(self):

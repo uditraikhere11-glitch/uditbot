@@ -15,6 +15,8 @@ import sys
 import os
 import json
 import time
+import hashlib
+import hmac
 import datetime
 import zoneinfo
 from src.config import AppConfig, resolve_env_path
@@ -180,9 +182,12 @@ def cmd_resume(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencyStopManager, re
     print(f"Reason: {resume_reason}")
 
 
-def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
+def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager, *, verification_sink=None) -> bool:
     """Generates a fresh 24-hour Dhan access token using Client ID, PIN, and TOTP secret via shared lock."""
     from src.broker.dhan_client import DhanClient
+
+    if verification_sink is not None:
+        verification_sink.clear()
 
     print("=======================================================")
     print("         DHAN AUTOMATED TOTP TOKEN REFRESH            ")
@@ -202,6 +207,28 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         # Bind the authenticated candidate returned by the coordinator, even
         # when a test double or alternative implementation does not mutate it.
         client.token = token
+        # Preserve authenticated candidate-profile evidence for this one
+        # scheduled health check; never persist the token or an identity claim
+        # without a successful broker /v2/profile account match.
+        if isinstance(verification_sink, dict):
+            verification_sink["token_generated"] = True
+            att = getattr(client, "_last_candidate_profile_verification", None)
+            if isinstance(att, dict):
+                actual_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                verified_at = float(att.get("verified_at") or 0)
+                profile = att.get("profile")
+                if (
+                    hmac.compare_digest(str(att.get("token_sha256") or ""), actual_digest)
+                    and str(att.get("account_id") or "") == str(cfg.dhan_client_id)
+                    and isinstance(profile, dict)
+                    and profile.get("identity_status") == "VERIFIED"
+                    and profile.get("identity_verified") is True
+                    and str(profile.get("profile_client_id") or "") == str(cfg.dhan_client_id)
+                    and profile.get("token_expired") is False
+                    and 0 <= time.time() - verified_at <= 120
+                ):
+                    verification_sink["token_sha256"] = actual_digest
+                    verification_sink["profile"] = dict(profile)
         # Allow a newly issued access token to become usable before reporting
         # failure. Never generate additional TOTP tokens or restore a stale one.
         # Only retry broker authentication errors, not incorrect credentials,
@@ -210,7 +237,14 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
         for delay in (0, 2, 3, 4):
             if delay:
                 time.sleep(delay)
-            ok_f, bal, msg_f = client.verify_token_authenticated()
+            # A private, single-process client marks only this scheduled
+            # post-refresh funds probe as identity-critical. Ordinary hourly
+            # funds checks do not consume the 5% reserved admission pool.
+            client._identity_verification_context = True
+            try:
+                ok_f, bal, msg_f = client.verify_token_authenticated()
+            finally:
+                client._identity_verification_context = False
             if ok_f:
                 break
             auth_error = str(msg_f or "").lower()
@@ -218,6 +252,16 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager) -> bool:
                 "dh-901", "auth error", "401", "invalid authentication",
             )):
                 break
+        if isinstance(verification_sink, dict):
+            verification_sink["funds_attempted"] = True
+            verification_sink["funds_ok"] = bool(
+                ok_f and not getattr(client, "last_funds_is_fallback", False)
+            )
+            verification_sink["funds_balance"] = bal
+            verification_sink["funds_message"] = str(msg_f or "")[:300]
+            verification_sink["funds_fallback"] = bool(
+                getattr(client, "last_funds_is_fallback", False)
+            )
         if not ok_f:
             print(f"\n❌ Post-refresh broker verification failed: {msg_f}")
             print("[!] The newly generated token is retained for later verification; no unsafe rollback or extra login was attempted.")
@@ -242,6 +286,7 @@ def format_morning_health_report(
     now_ts: float,
     token_verified: bool,
     funds_verified: bool,
+    token_renewed=None,
     fallback_funds: bool,
     available_balance: float,
     master_loaded: bool,
@@ -413,7 +458,9 @@ def format_morning_health_report(
         and int(unprotected_positions_count or 0) == 0
     )
     token_line = "✅ VERIFIED" if auth_ok else "❌ FAILED"
-    if raw_id_status == "VERIFIED" and auth_ok:
+    if raw_id_status == "VERIFIED" and not effective_expired:
+        # Identity is a distinct broker-profile fact, not a synonym for
+        # the outcome of the scheduled refresh or the funds probe.
         identity_line = f"✅ VERIFIED (<code>{account}</code>)"
     elif raw_id_status.startswith("MISMATCH"):
         identity_line = f"❌ MISMATCH (<code>{account}</code>)"
@@ -446,6 +493,12 @@ def format_morning_health_report(
         f"🚦 Next trading session readiness: {readiness_line}",
         f"📊 <b>Overall result: {overall_line}</b>",
     )
+    if token_renewed is not None:
+        renewal_line = (
+            "🔄 Token renewal: ✅ SUCCESS"
+            if token_renewed else "🔄 Token renewal: ❌ NOT CONFIRMED"
+        )
+        lines = lines[:3] + (renewal_line,) + lines[3:]
     if not (reconciliation_ok and int(unresolved_intents_count or 0) == 0
             and int(unprotected_positions_count or 0) == 0):
         detail = str(reconciliation_summary or "").strip()
@@ -645,8 +698,9 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     after-market readiness check invoked by `dhan-token-refresh.service`.
 
     Exit-Code Contract:
-    - Separates `AUTH_CHECK` (`PASS` / `FAIL`: TOTP refresh, `/v2/profile` account identity,
-      non-expired token, and verified real `/v2/fundlimit` balance) from
+    - Separates `AUTH_CHECK` (`PASS` / `FAIL`: current token independently
+      verified by `/v2/profile` with matching account, non-expired token, and
+      real `/v2/fundlimit` balance) from
       `NEXT_SESSION_READINESS` (`VERIFIED_CHECKS` / `REVIEW_REQUIRED`: `AUTH_CHECK == PASS`
       plus verified token expiration covering the next trading session close at 15:35 IST
       with a verified holiday calendar, fresh scrip master, and inactive Emergency STOP).
@@ -661,13 +715,35 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     print("     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          ")
     print("=======================================================")
 
-    tok_ok = cmd_refresh_token(cfg, stop_mgr)
-    # The scheduled refresh already attempted the single intended TOTP login.
-    # Do not implicitly generate another token while gathering the report.
+    renewal_evidence = {}
+    tok_ok = cmd_refresh_token(cfg, stop_mgr, verification_sink=renewal_evidence)
+    # Candidate identity was already verified BEFORE the new token was
+    # published, then /fundlimit was checked after publication. Reuse that
+    # account-bound evidence instead of repeating both GETs at 17:00.
+    # Fall back to independent reads if proof is absent, stale or belongs to
+    # a different token (e.g. another process rotated it).
     client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
-    ok_funds, avail_bal, funds_msg = client.get_fund_limits(retry=False)
-
     report_now = time.time()
+    bound_profile = renewal_evidence.get("profile")
+    fingerprint = str(renewal_evidence.get("token_sha256") or "")
+    client_token = str(getattr(client, "token", "") or "")
+    proof_matches = bool(
+        fingerprint and isinstance(bound_profile, dict) and client_token
+        and hmac.compare_digest(
+            fingerprint, hashlib.sha256(client_token.encode("utf-8")).hexdigest()
+        )
+        and str(bound_profile.get("profile_client_id") or "") == str(cfg.dhan_client_id)
+        and bound_profile.get("identity_verified") is True
+        and bound_profile.get("token_expired") is False
+        and renewal_evidence.get("funds_attempted") is True
+    )
+    if proof_matches:
+        ok_funds = bool(renewal_evidence.get("funds_ok"))
+        avail_bal = renewal_evidence.get("funds_balance", 0.0)
+        funds_msg = str(renewal_evidence.get("funds_message") or "")
+        client.last_funds_is_fallback = bool(renewal_evidence.get("funds_fallback"))
+    else:
+        ok_funds, avail_bal, funds_msg = client.get_fund_limits(retry=False)
     identity_status = "UNVERIFIED"
     identity_ok = False
     profile_client_id = ""
@@ -675,16 +751,23 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     token_expiration_ts = 0.0
     token_expired = False
     verify_fn = getattr(client, "verify_profile_and_token_expiry", None)
-    if callable(verify_fn):
+    if proof_matches or callable(verify_fn):
         try:
-            prof_info = verify_fn(allow_refresh=False, now_ts=report_now)
+            prof_info = (
+                bound_profile if proof_matches
+                else verify_fn(allow_refresh=False, now_ts=report_now)
+            )
             if isinstance(prof_info, dict):
                 raw_id_st = str(prof_info.get("identity_status") or "").strip().upper()
                 profile_client_id = str(prof_info.get("profile_client_id") or "").strip()
                 if raw_id_st == "MISMATCH" or prof_info.get("identity_mismatch"):
                     identity_status = "MISMATCH"
                     identity_ok = False
-                elif raw_id_st == "VERIFIED" and bool(prof_info.get("identity_verified", False)) and tok_ok:
+                elif (
+                    raw_id_st == "VERIFIED"
+                    and bool(prof_info.get("identity_verified", False))
+                    and profile_client_id == str(cfg.dhan_client_id)
+                ):
                     identity_status = "VERIFIED"
                     identity_ok = True
                 elif raw_id_st == "EXPIRED" or prof_info.get("token_expired"):
@@ -696,7 +779,10 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
                 token_expiration_str = str(prof_info.get("token_expiration_str") or "").strip()
                 raw_exp_ts = prof_info.get("token_expiration_ts")
                 token_expiration_ts = float(raw_exp_ts) if (raw_exp_ts is not None and float(raw_exp_ts) > 0) else 0.0
-                token_expired = bool(prof_info.get("token_expired", False))
+                token_expired = bool(
+                    prof_info.get("token_expired", False)
+                    or (token_expiration_ts > 0 and token_expiration_ts <= report_now)
+                )
         except Exception:
             identity_status = "UNVERIFIED"
             identity_ok = False
@@ -721,7 +807,11 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         else {"is_stopped": True}
     )
     is_stopped = bool(stop_state.get("is_stopped", True))
-    auth_verified = bool(tok_ok and identity_ok and not token_expired)
+    # A failed *renewal* does not invalidate an independently verified,
+    # still-valid existing token. Identity verification is broker-backed and
+    # always matches the configured account. Post-refresh funds failure is
+    # separately reflected in AUTH_CHECK and next-session readiness.
+    auth_verified = bool(identity_ok and not token_expired)
     unres_intents_cnt = 0
     unprot_pos_cnt = 0
     local_reconciliation_verified = True
@@ -742,6 +832,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         cfg,
         now_ts=report_now,
         token_verified=auth_verified,
+        token_renewed=bool(renewal_evidence.get("token_generated", tok_ok)),
         funds_verified=funds_verified,
         fallback_funds=fallback_funds,
         available_balance=avail_bal,
@@ -771,7 +862,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     summary = (
         f"AUTH_CHECK={auth_check_label}, "
         f"NEXT_SESSION_READINESS={readiness_label}, "
-        f"token_refresh={'OK' if auth_verified else 'FAIL'}, "
+        f"token_refresh={'OK' if renewal_evidence.get('token_generated', tok_ok) else 'FAIL'}, "
         f"account_identity={identity_status}, "
         f"token_expiration={token_expiration_str or 'UNVERIFIED'}, "
         f"funds={'OK' if funds_verified else 'UNVERIFIED'} ({avail_bal:,.2f} INR: {funds_msg}), "
