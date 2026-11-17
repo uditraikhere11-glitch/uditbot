@@ -4370,9 +4370,12 @@ class ProtectionWatcher:
                                         governor = check_binding()
                                     wait = governor.seconds_until_capacity(
                                         required=supervision_read_requirement(len(pending)),
-                                        priority="urgent" if pending or any(
-                                            has_urgent_obligation(r) for r in open_records
-                                        ) else "routine",
+                                        # Every collection GET inside
+                                        # check_once() uses NORMAL admission.
+                                        # Requesting urgent PREVIEW here while
+                                        # transmitting NORMAL caused 5 locally
+                                        # generated HTTP-429 errors per poll.
+                                        priority="normal",
                                     )
                                 except Exception as exc:
                                     wait = 60.0

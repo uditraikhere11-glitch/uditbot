@@ -28,10 +28,10 @@ class EligibilityTests(unittest.TestCase):
                 self.assertFalse(manual_risk_only({}, [{**r, field: value}]))
         self.assertFalse(manual_risk_only({'N': {}}, [r]))
 
-    def test_terminal_uncertainty_is_urgent_outside_hours(self):
+    def test_terminal_uncertainty_is_bounded_outside_hours(self):
         r = {**holding(), 'cancel_uncertain': True}
         self.assertEqual(watcher_cadence_seconds(pending={}, open_records=[r], now=1000,
-                                               market_open=False), 10)
+                                               market_open=False), 300)
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):

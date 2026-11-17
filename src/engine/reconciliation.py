@@ -1117,11 +1117,11 @@ class StartupReconciliationGate:
             row for row in open_lifecycle_rows
             if str(row.get("product_type") or "").strip().upper() in ("CNC", "MTF")
             and int(row.get("confirmed_open_qty") or 0) > 0
-            and str(row.get("security_id") or "").strip() not in intraday_sec_ids
-            and (
-                str(row.get("parent_order_id") or "") in self.last_historical_reconciled_ids
-                or str(row.get("position_state") or "").upper() in ("UNPROTECTED", "UNPROTECTED_MANUAL_RISK")
-            )
+            # Never skip a persisted RECONCILIATION_REQUIRED or otherwise
+            # open bot-owned settled position merely because its historical
+            # fill is already TRADED (or the current intraday book has a row).
+            and bool(str(row.get("parent_order_id") or "").strip())
+            and bool(str(row.get("security_id") or "").strip())
         ]
         if not bot_settled_candidates:
             return True, "No settled bot-owned holdings requiring separate verification"
@@ -1137,12 +1137,13 @@ class StartupReconciliationGate:
         has_holdings_api = False
         if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_holdings is not None:
             has_holdings_api = True
-            for h in self._active_pass_holdings:
-                if isinstance(h, dict):
-                    s_id = str(h.get("securityId") or "").strip()
-                    t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
-                    if s_id:
-                        holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+            try:
+                from src.engine.holding_quantity import aggregate_holdings
+                holdings_by_sec = aggregate_holdings(
+                    self._active_pass_holdings, account_id=expected_acct
+                )
+            except ValueError as exc:
+                return False, f"Broker holdings snapshot malformed: {exc}"
         elif hasattr(self.broker, "get_holdings"):
             try:
                 h_res = self.broker.get_holdings()
@@ -1153,12 +1154,10 @@ class StartupReconciliationGate:
                     has_holdings_api = True
                     if getattr(self, "_in_startup_reconciliation_pass", False):
                         self._active_pass_holdings = list(h_res)
-                    for h in h_res:
-                        if isinstance(h, dict):
-                            s_id = str(h.get("securityId") or "").strip()
-                            t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
-                            if s_id:
-                                holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+                    from src.engine.holding_quantity import aggregate_holdings
+                    holdings_by_sec = aggregate_holdings(
+                        list(h_res), account_id=expected_acct
+                    )
             except Exception as exc:
                 return False, f"Broker holdings query failed while verifying settled bot positions: {exc}"
 

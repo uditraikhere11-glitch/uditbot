@@ -108,7 +108,7 @@ class ReadGovernor:
         need = int(required)
         if need < 1 or need > 40:
             raise ValueError("Invalid required read capacity")
-        if priority not in ('routine', 'urgent'):
+        if priority not in ('routine', 'normal', 'low', 'urgent'):
             raise ValueError("Invalid watcher read priority")
         if not self.path.is_file():
             return 0.0
@@ -120,8 +120,12 @@ class ReadGovernor:
             row = conn.execute('SELECT until FROM cooldown WHERE id=1').fetchone()
             delay = max(0.0, float(row[0]) - now) if row and row[0] else 0.0
             for window, limit in self.LIMITS:
-                reserve = int(limit * 0.20) if priority == 'routine' else 0
-                ceiling = limit - reserve
+                # The preflight and final Dhan GET admission must use
+                # compatible ceilings. Watcher GET transport is NORMAL (95%),
+                # not URGENT (100%). Keep the separate conservative routine
+                # and low-priority reserve hints for their own callers.
+                fraction = {'routine': 0.80, 'normal': 0.95, 'low': 0.90, 'urgent': 1.0}[priority]
+                ceiling = max(1, int(limit * fraction))
                 if need > ceiling:
                     raise ValueError("Read requirement exceeds watcher allowance")
                 count = conn.execute(

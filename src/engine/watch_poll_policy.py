@@ -19,6 +19,21 @@ IDLE_MARKET_SECONDS = 90.0
 def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
     """Return a scheduled GET cycle interval; never suppress an open record."""
     pending_records = list((pending or {}).values())
+    # Closed market: an old reconciliation flag, unreadable GET, stale cancel or
+    # AMO must never override the five-minute GET cadence. The entry gate
+    # remains fail-closed independently of this read-only scheduling policy.
+    # A trusted original order creation time permits only a 45-second burst.
+    if not market_open:
+        for rec in pending_records:
+            if not isinstance(rec, dict) or not str(rec.get("order_id") or ""):
+                continue
+            try:
+                created = float(rec.get("created_at") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(created) and created > 0 and 0 <= now - created < NEW_ORDER_FAST_WINDOW_SECONDS:
+                return POLL_HEARTBEAT_SECONDS
+        return AFTER_HOURS_SECONDS
     if any(has_urgent_obligation(rec) for rec in pending_records + list(open_records or [])):
         return 10.0
     if pending_records:
@@ -31,8 +46,6 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
                 created = 0
             if math.isfinite(created) and created > 0 and 0 <= now - created <= NEW_ORDER_FAST_WINDOW_SECONDS:
                 return POLL_HEARTBEAT_SECONDS
-        if not market_open:
-            return AFTER_HOURS_SECONDS
         # Repeated stale pending reads are never allowed to consume the
         # entire hourly budget just because their status is unresolved.
         return max(STALE_PENDING_SECONDS, supervision_read_requirement(len(pending_records)) * 7.5)

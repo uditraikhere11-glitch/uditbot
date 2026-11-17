@@ -61,7 +61,7 @@ class R02CadencePolicyTests(unittest.TestCase):
     def test_manual_risk_does_not_override_a_pending_order(self):
         self.assertEqual(
             watcher_cadence_seconds(
-                pending={"NEW": {"created_at": 99999}},
+                pending={"NEW": {"order_id": "NEW", "created_at": 99999}},
                 open_records=[record()],
                 now=100000,
             ), 2.0
@@ -111,7 +111,7 @@ class R02CadencePolicyTests(unittest.TestCase):
             ), 300.0
         )
 
-    def test_uncertain_cancel_or_protection_never_waits_five_minutes(self):
+    def test_stale_uncertain_cancel_or_protection_waits_five_minutes_after_hours(self):
         for fields in (
             {"cancel_uncertain": True},
             {"cancel_requested": True},
@@ -127,7 +127,7 @@ class R02CadencePolicyTests(unittest.TestCase):
                     watcher_cadence_seconds(
                         pending={"UNRESOLVED": {"created_at": 1, **fields}},
                         open_records=[], now=100000, market_open=False,
-                    ), 10.0
+                    ), 300.0
                 )
 
     def test_read_requirement_is_bounded(self):

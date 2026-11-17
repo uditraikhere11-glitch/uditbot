@@ -2525,7 +2525,16 @@ class DhanClient:
                 )
 
             err_text = str(getattr(resp, "text", "") or "")
-            err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}"
+            # X-AuditBot-Local-Deferral denotes a SYNTHETIC 429: no Dhan
+            # request was sent. Return an unavailable sentinel without
+            # mislabelling it as a broker throttle or spamming 5 errors.
+            if str(getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") or "") == "1":
+                return BrokerReadFailure(
+                    status=BrokerReadStatus.UNAVAILABLE.value,
+                    error=f"Local GET admission deferred for {label}",
+                    status_code=status_code,
+                )
+            err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}
             if self._requires_token_refresh(status_code, err_text):
                 self._log_throttled_broker_auth_error(label, err)
             else:
