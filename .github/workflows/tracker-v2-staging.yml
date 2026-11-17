@@ -58,6 +58,8 @@ jobs:
       - name: Actual systemd PID, single restart, late-ACK route
         env:
           UDITBOT_TRACKER_V2_ENABLE: '1'
+        env:
+          PYTHONPATH: .
         run: python -u tests/staging/tracker_v2_real_systemd.py "$UDITBOT_V2_TEST_DIR"
       - name: Remove disposable service
         if: always()
