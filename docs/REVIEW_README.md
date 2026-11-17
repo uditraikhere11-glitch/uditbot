@@ -1,78 +1,34 @@
-# UditBot tracker V2 — disabled-by-default review candidate
+# UditBot Configuration Tracker V2 — PR #87 candidate
 
-**Baseline:** `bd594af2e80b92f7ff0349971ba2f2f34150ab4d` (GitHub PR #86).
+**Baseline GitHub main:** bd594af2e80b92f7ff0349971ba2f2f34150ab4d (PR #86).
 
-## Scope
+**Status:** DRAFT, DISABLED BY DEFAULT. Do not merge or activate on the LIVE VM before independent review, staging and owner approval.
 
-This is a **new isolated implementation**, not a replacement for the existing
-running coordinator. It introduces these additive review modules:
+## What this PR implements
 
-- `src/engine/tracker_safety_preflight.py`: independent read-only evidence validator.
-- `src/engine/tracker_v2_safety.py`: strict JSON readers, process/barrier/ACK
-  evidence checking, active broker-mutation handoff and legacy migration preview.
-- `src/engine/tracker_v2_candidate.py`: off-by-default single-save coordinator with
-  optimistic CAS, private atomic backup, exclusive lock, idempotency key, at-most-once
-  restart intent, explicit ACK uncertainty and late ACK recovery.
-- `tests/test_tracker_safety_preflight.py`, `tests/test_tracker_v2_review.py`:
-  offline positive and negative cases.
+- Existing authenticated Setup/Control Center entrypoint and CSRF remain intact.
+- The current save handler delegates to the V2 coordinator **only** when environment variable UDITBOT_TRACKER_V2_ENABLE=1 is deliberately set. Otherwise the PR84/PR85 coordinator continues unchanged.
+- V2 performs field-scoped compare-and-swap, single durable request, private atomic backup, lock-serialized config save, at-most-once restart intent, and strict running-process verification (PID, starttime, canonical config hash, mode, HMAC credential fingerprint).
+- The actual trading pipeline registers its PID with a durable broker handoff. Seven real Dhan order POST/PUT/DELETE send sites share a cross-process flock with the restart apply barrier.
+- A request denied before HTTP is classified NOT_SUBMITTED. A request sent before an error, unknown response, or local ledger failure remains uncertain. A historic unresolved mutation blocks configuration restart without preventing independently valid protective broker calls.
+- A new process may adopt a dead previous producer identity, preserving any interrupted operations as unresolved; a second simultaneously living trader is blocked.
+- Owner STOP is never cleared. A verified stopped bot can save next-start values without launching the service; a pending STOP blocks.
+- Existing Dhan response-group fallback staging remains before any new configuration is saved. Existing parser, trading BRAIN, risk calculations, order payloads, SL/target policies, PR86 Dhan token fixes, and WebUI password/CSRF code are unchanged.
 
-The candidate coordinator itself never imports a live broker or starts services.
-An **additional opt-in broker mutation interlock** is now present in
-`src/engine/broker_handoff.py`, the seven actual Dhan order POST/PUT/DELETE
-send sites, and the real trading pipeline registration. It is deliberately
-inactive unless `UDITBOT_TRACKER_V2_ENABLE=1` is explicitly configured; the
-current WebUI still does not activate or consume the coordinator. Direct Dhan
-price-feed and authentication POSTs are excluded from broker mutation guards.
+## Changed modules
 
-**Off by default:** `CandidateCoordinator(data_dir, env_path)` rejects `submit`
-and `recover_late_ack`; unit tests instantiate with `feature_enabled=True` and
-inject **fake** operation-gate, systemd restart and runtime ACK callbacks.
-There is **no enabled WebUI save/restart integration** in this submission.
-The new broker mutation guard is off by default and must not be enabled on
-LIVE without full coordinator handoff and recovery validation. It must **not** be enabled on a LIVE VM until the independent
-review and separate integration/VM staging tests pass.
+Source: src/engine/tracker_v2_candidate.py, tracker_v2_integration.py, tracker_v2_safety.py, tracker_safety_preflight.py, tracker_credentials.py, broker_handoff.py; narrowly scoped hooks in src/engine/webui_update.py, config_manager.py, src/main.py, src/broker/dhan_client.py.
 
-## Why this scope
+Regression tests: tests/test_tracker_v2_review.py, test_tracker_v2_integration.py, test_tracker_safety_preflight.py, test_tracker_credentials.py, test_tracker_broker_handoff.py. Dedicated .github/workflows/tracker-a01-a11-review.yml.
 
-The requested previous candidate archive and independent audit were absent from
-accessible materials. Full GitHub source cannot be locally cloned in this
-sandbox because outbound DNS/network is disabled. We confirmed the latest
-branch and key blob hashes through GitHub read-only connector, then created
-strictly additive new paths to avoid overwriting PR #84, #85 and #86 fixes.
-The existing `src/engine/webui_update.py` still owns live saves; nothing here
-replaces its behavior.
+## Important release limitations
 
-## Required work before an owner-approved integration PR
+The flag is NOT turned on by this PR. No service override, automatic activation, VM modification, or broker order is included.
 
-1. Reproduce full repository checkout at pinned latest HEAD; refresh SHA if
-   `main` moves. Verify all new paths are absent from repo and apply patch.
-2. Integrate the coordinator behind an **environment switch off by default**
-   into existing authenticated routes and the shared transaction lock. Preserve
-   FastAPI's exact form/CSRF/password handling and existing AMO controls.
-3. Implement the trading-process participation in the entry fence (not just
-   a WebUI-side file), PID starttime, credential fingerprint, and verifiable
-   broker-operation handoff. Until then running restarts must fail closed.
-4. Confirm the expected hash is derived from canonical `compute_config_version`
-   of the newly effective settings; callback assertions alone are insufficient.
-5. Resolve the exact owner-stop and legacy transaction migration schemas,
-   manual-risk/protection watcher evidence and START/STOP transitions.
-6. Exercise actual service restarts only in controlled TEST staging with fake
-   Dhan/Telegram and a disposable `systemd` unit.
-7. Run the complete GitHub repository's PR83–PR86 regression CI with true
-   network isolation. Never claim the isolated 63 tests are the full suite.
-8. Return a full GitHub tree inventory and verified `git apply --check` against
-   latest upstream. This package includes a critical-file subset, not a complete
-   repository inventory.
+Production activation must be simultaneous in the WebUI and trading processes with the same private DATA_DIR and persistent HMAC key. Unknown or incompatible states deliberately fail closed.
 
-## Safety limitations
+All four workflows (Combined Release, AMO Offline, Telegram Designer, tracker-specific) must pass at the FINAL head; earlier passing runs do not certify later commits.
 
-- No automatic existing-trade SL/target/OCO/Super Order changes.
-- No automatic Dhan orders or order cancellations.
-- The in-memory fake injected into unit tests is **not** a runtime handoff.
-- A process restart whose outcome is uncertain is not reissued, and the file
-  is not rolled back as if the process reverted.
-- A late ACK may only release a matching entry fence after exact identity,
-  configuration hash, mode, credential fingerprint and Owner Stop checks.
-- Any mismatch or ambiguous state requires operator review; no TTL expiry.
+Remaining: independent source audit, authenticated WebUI save/refresh smoke in TEST, a disposable systemd service with real process restart/kill (fake Dhan/Telegram), full fail-injection and rollback testing, confirmation of the YESBANK/manual-risk protection evidence, and an owner-reviewed path to recover an ACK_UNCERTAIN journal safely without another restart.
 
-**No GitHub branch or PR created, no VM updated, no service restarted.**
+**Never merge, deploy, or set UDITBOT_TRACKER_V2_ENABLE=1 on the LIVE VM without a separate owner approval.**
