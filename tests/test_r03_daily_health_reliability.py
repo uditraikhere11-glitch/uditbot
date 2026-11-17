@@ -203,16 +203,47 @@ class R03DailyEvidenceTests(unittest.TestCase):
         self.assertIn("token_refresh=OK", out)
         self.assertIn("AUTH_CHECK=FAIL", out)
 
-    def test_original_token_identity_can_be_verified_when_refresh_failed(self):
+    def test_existing_token_is_authenticated_even_when_renewal_fails(self):
+        # Today's TOTP renewal can fail transiently while yesterday's token
+        # is genuinely valid until tomorrow. Don't report it as auth failure.
         profile = identity_proof("ORIGINAL")["profile"]
         rc, out, client, report = self._run_daily(
             refresh_success=False, sink_data={}, token="ORIGINAL", profile=profile,
         )
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["token_verified"])
+        self.assertFalse(report["token_renewed"])
+        client.verify_profile_and_token_expiry.assert_called_once()
+        client.get_fund_limits.assert_called_once()
+        self.assertIn("AUTH_CHECK=PASS", out)
+        self.assertIn("token_refresh=FAIL", out)
+        self.assertIn("account_identity=VERIFIED", out)
+
+    def test_failed_renewal_and_profile_mismatch_remain_blocked(self):
+        profile = dict(identity_proof("WRONG_ACCOUNT")["profile"])
+        profile.update(
+            identity_status="MISMATCH", identity_verified=False,
+            profile_client_id="9999888877", identity_mismatch=True,
+        )
+        rc, out, client, report = self._run_daily(
+            refresh_success=False, sink_data={}, token="WRONG_ACCOUNT", profile=profile,
+        )
         self.assertEqual(rc, 1)
         self.assertFalse(report["token_verified"])
         self.assertFalse(report["token_renewed"])
-        self.assertIn("token_refresh=FAIL", out)
-        self.assertIn("account_identity=VERIFIED", out)
+        self.assertIn("AUTH_CHECK=FAIL", out)
+        self.assertIn("account_identity=MISMATCH", out)
+
+    def test_failed_renewal_and_expired_existing_token_remain_blocked(self):
+        profile = dict(identity_proof("EXPIRED")["profile"])
+        profile.update(token_expiration_ts=1.0, token_expired=False)
+        rc, out, client, report = self._run_daily(
+            refresh_success=False, sink_data={}, token="EXPIRED", profile=profile,
+        )
+        self.assertEqual(rc, 1)
+        self.assertFalse(report["token_verified"])
+        self.assertFalse(report["token_renewed"])
+        self.assertIn("AUTH_CHECK=FAIL", out)
 
     def test_format_displays_identity_independently_without_green_readiness(self):
         with patch("src.engine.market.load_holidays_verified", return_value=(False, None, "not loaded")):
