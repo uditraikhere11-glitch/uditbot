@@ -85,6 +85,9 @@ def main():
     try:
         os.chdir(stage)
         os.environ["UDITBOT_WEBUI_AUTH_DIR"]=str(stage/"auth")
+        # FastAPI TestClient is a synthetic peer, permitted ONLY in isolated
+        # route tests. All real systemd restart checks above were non-isolated.
+        os.environ["AUDITBOT_TEST_ISOLATION"]="1"
         auth.provision(PASSWORD)
         client=TestClient(app,base_url="https://control.example",follow_redirects=False)
         data_req={"csrf_token":SETUP_CSRF_TOKEN,"change_id":two.change_id}
