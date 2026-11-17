@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax verification
-        run: python -m compileall -q src/engine/tracker_safety_preflight.py src/engine/tracker_v2_candidate.py src/engine/tracker_v2_safety.py src/engine/broker_handoff.py
+        run: python -m compileall -q src/engine/tracker_safety_preflight.py src/engine/tracker_v2_candidate.py src/engine/tracker_v2_safety.py src/engine/broker_handoff.py src/engine/tracker_credentials.py
       - name: Review-only offline regressions
         env:
           AUDITBOT_TEST_ISOLATION: '1'

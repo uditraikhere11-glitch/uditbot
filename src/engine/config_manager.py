@@ -1482,8 +1482,9 @@ class ConfigChangeTracker:
         version_hash: str,
         trading_mode: str = "TEST",
         pid: Optional[int] = None,
+        credential_fingerprint: str = "",
     ) -> None:
-        """Invoked by the running trading bot process upon initialization to declare its active version and PID identity."""
+        """Only runtime callers should publish their active process identity."""
         actual_pid = int(pid if pid is not None else os.getpid())
         proc_starttime = _get_os_process_starttime(actual_pid)
         now = time.time()
@@ -1495,6 +1496,8 @@ class ConfigChangeTracker:
             "process_starttime": proc_starttime,
             "acknowledged_at": now,
         }
+        if credential_fingerprint:
+            data["credential_fingerprint"] = credential_fingerprint
         try:
             write_json_atomic(self.active_version_file, data)
         except Exception as e:

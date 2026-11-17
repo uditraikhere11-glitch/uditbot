@@ -159,9 +159,12 @@ class TradingBotPipeline:
         try:
             from src.engine.config_manager import ConfigChangeTracker, compute_config_version
             tracker = ConfigChangeTracker(data_dir=config.data_dir)
+            from src.engine.tracker_credentials import fingerprint
+            fp = fingerprint(config, config.data_dir) if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1" else ""
             tracker.record_active_running_version(
                 version_hash=compute_config_version(config),
                 trading_mode=config.trading_mode.value,
+                credential_fingerprint=fp,
             )
         except Exception as e:
             logger.warning(f"Could not record active running config version: {e}")
@@ -186,9 +189,12 @@ class TradingBotPipeline:
             try:
                 from src.engine.config_manager import ConfigChangeTracker, compute_config_version
                 tracker = ConfigChangeTracker(data_dir=self.cfg.data_dir)
+                from src.engine.tracker_credentials import fingerprint
+                fp = fingerprint(self.cfg, self.cfg.data_dir) if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1" else ""
                 tracker.record_active_running_version(
                     version_hash=compute_config_version(self.cfg),
                     trading_mode=self.cfg.trading_mode.value,
+                    credential_fingerprint=fp,
                 )
             except Exception:
                 pass
