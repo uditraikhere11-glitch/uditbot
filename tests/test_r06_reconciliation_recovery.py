@@ -324,7 +324,10 @@ class StartupCandidateCoverage(unittest.TestCase):
         )
         ok, _ = gate._verify_bot_owned_holdings_protected([])
         self.assertFalse(ok)
-        self.assertTrue(broker.get_holdings.called)
+        # The pending lifecycle itself is authoritative negative evidence.
+        # Reject immediately; do NOT burn another Dhan GET or let a valid
+        # old owner ACK override the unresolved position state.
+        broker.get_holdings.assert_not_called()
 
 
 if __name__ == "__main__":

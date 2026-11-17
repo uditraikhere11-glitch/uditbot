@@ -44,7 +44,9 @@ class ReviewTests(unittest.TestCase):
 
     def put(self, name, obj):
         path = self.data/name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # Force private fixture directories regardless of operator umask
+        # (e.g. 0002 on a Debian VM). Never relax production's 0700 check.
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.write_text(json.dumps(obj), encoding='utf-8')
         path.chmod(0o600)
         return path
@@ -356,10 +358,25 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(inspect_apply_barrier(self.co.barrier).code,'BARRIER_OWNER_MISSING')
 
     def test_corrupt_transaction_journal_blocks(self):
-        self.co.txdir.mkdir()
-        self.co.journal.write_text('{broken')
-        with self.assertRaises(ValueError):self.changed_stopped()
-        self.assertEqual(self.env.read_bytes(),OLD)
+        # Reproduce a malformed JSON journal, NOT an accidentally insecure
+        # temporary directory/file caused by the host VM's umask=0002.
+        self.co.txdir.mkdir(mode=0o700)
+        self.co.journal.write_text('{broken', encoding='utf-8')
+        self.co.journal.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'malformed'):
+            self.changed_stopped()
+        self.assertEqual(self.env.read_bytes(), OLD)
+
+    def test_insecure_transaction_directory_stays_fail_closed(self):
+        self.co.txdir.mkdir(mode=0o700)
+        self.co.txdir.chmod(0o770)
+        try:
+            with self.assertRaisesRegex(ChangeBlocked, 'insecure'):
+                self.changed_stopped()
+            self.assertEqual(self.env.read_bytes(), OLD)
+            self.assertFalse(self.co.journal.exists())
+        finally:
+            self.co.txdir.chmod(0o700)
 
     def test_external_writer_conflict_is_not_overwritten(self):
         self.changed_stopped()
