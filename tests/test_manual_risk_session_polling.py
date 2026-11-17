@@ -130,21 +130,23 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await self.drive(302)
         self.assertEqual(self.calls, [1000, 1300])
 
-    async def test_terminal_protection_uncertainty_wakes_urgent_check(self):
+    async def test_terminal_protection_uncertainty_uses_300s_after_hours(self):
         def event():
             if self.clock == 1010:
                 self.w.terminal_orders['O1']['pending_oco'] = {'state': 'UNKNOWN'}
         await self.drive(32, event)
-        self.assertEqual(self.calls, [1000, 1010, 1020, 1030])
+        # One change-signature wake is allowed, then next routine poll
+        # waits five minutes even while the entry gate is blocked.
+        self.assertEqual(self.calls, [1000, 1010])
 
-    async def test_terminal_uncertainty_uses_urgent_governor_reserve(self):
+    async def test_terminal_uncertainty_previews_normal_transport_allowance(self):
         from src.broker.read_governor import ReadGovernor
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
         governor.seconds_until_capacity = Mock(return_value=0)
         self.w.broker._read_governor = governor
         self.w.terminal_orders['O1']['cancel_uncertain'] = True
         await self.drive(4)
-        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='urgent')
+        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='normal')
 
     async def test_throttled_closed_session_is_not_consumed(self):
         from src.broker.read_governor import ReadGovernor
