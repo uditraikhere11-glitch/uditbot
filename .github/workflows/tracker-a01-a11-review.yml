@@ -26,3 +26,9 @@ jobs:
           AUDITBOT_TEST_ISOLATION: '1'
         run: |
           python -m unittest discover -s tests -p 'test_tracker*.py' -v
+      - name: VM-like permissive umask 0002 tracker regression
+        env:
+          AUDITBOT_TEST_ISOLATION: '1'
+        run: |
+          umask 0002
+          python -m unittest -q tests.test_tracker_v2_review tests.test_tracker_v2_stress_matrix
