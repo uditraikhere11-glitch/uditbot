@@ -98,8 +98,9 @@ class ReadGovernor:
     def seconds_until_capacity(self, *, required=1, priority='routine'):
         """Read-only scheduling hint; never reserves or resets a GET admission.
 
-        'routine' keeps a 20% reserve for startup identity, urgent protection
-        and order recovery. 'urgent' may consume the full existing allowance.
+        'routine' retains the old 20% scheduling reserve. 'normal' (95%) and
+        'low' (90%) preview the same per-window ceilings as admit(). Only
+        a GET actually admitted as urgent may use the full hard cap.
         Concurrent clients can consume slots after this snapshot: admit() is
         still the final authoritative decision immediately before every GET.
         An unreadable governor must raise and the watcher must fail closed.
@@ -108,7 +109,7 @@ class ReadGovernor:
         need = int(required)
         if need < 1 or need > 40:
             raise ValueError("Invalid required read capacity")
-        if priority not in ('routine', 'urgent'):
+        if priority not in ('routine', 'urgent', 'normal', 'low'):
             raise ValueError("Invalid watcher read priority")
         if not self.path.is_file():
             return 0.0
@@ -120,8 +121,16 @@ class ReadGovernor:
             row = conn.execute('SELECT until FROM cooldown WHERE id=1').fetchone()
             delay = max(0.0, float(row[0]) - now) if row and row[0] else 0.0
             for window, limit in self.LIMITS:
-                reserve = int(limit * 0.20) if priority == 'routine' else 0
-                ceiling = limit - reserve
+                # Use exactly the same ceiling as the downstream GET admission.
+                # 'routine' intentionally retains its conservative 20% reserve.
+                if priority == 'routine':
+                    ceiling = limit - int(limit * 0.20)
+                elif priority == 'normal':
+                    ceiling = max(1, int(limit * 0.95)) if limit > 1 else limit
+                elif priority == 'low':
+                    ceiling = max(1, int(limit * 0.90)) if limit > 1 else limit
+                else:
+                    ceiling = limit
                 if need > ceiling:
                     raise ValueError("Read requirement exceeds watcher allowance")
                 count = conn.execute(
