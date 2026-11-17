@@ -177,6 +177,58 @@ class ReviewTests(unittest.TestCase):
                     'desired_service_state':'STOPPED','observed_state':'RUNNING'})
         self.assertEqual(preview_legacy_tracker_migration(self.data).code,'OWNER_STOP_PRIORITY')
 
+    def test_gemini_b07_previous_pending_tracker_apply_blocks_and_preserves(self):
+        path = self.put('pending_tracker_apply.json', {
+            'change_id': 'LEGACY-B07', 'state': 'WAITING_FOR_SAFE_APPLY',
+            'target_version': HASH,
+        })
+        before = path.read_bytes()
+        self.assertEqual(
+            preview_legacy_tracker_migration(self.data).code,
+            'PENDING_REPLACEMENT_OPERATION',
+        )
+        with self.assertRaises(ChangeBlocked):
+            self.changed_stopped()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.env.read_bytes(), OLD)
+
+    def test_gemini_b07_corrupt_pending_tracker_apply_fails_closed(self):
+        path = self.data/'pending_tracker_apply.json'
+        path.write_text('{invalid', encoding='utf-8')
+        path.chmod(0o600)
+        decision = preview_legacy_tracker_migration(self.data)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, 'LEGACY_STATE_UNREADABLE')
+        self.assertEqual(path.read_text(), '{invalid')
+        self.assertEqual(self.env.read_bytes(), OLD)
+
+    def test_gemini_b03_disk_revision_changes_after_ack_no_fence_release(self):
+        # Simulated external writer between correct runtime ACK and fence
+        # release: fail closed without inventing applied verification.
+        def changed_disk_then_ack():
+            self.env.write_bytes(b'TRADING_MODE=TEST\nEQUITY_BUDGET_INR=9999\n')
+            return (
+                {'pid': PID+1, 'process_starttime': START+1,
+                 'version_hash': HASH, 'trading_mode': 'TEST',
+                 'credential_fingerprint': FP, 'acknowledged_at': time.time()+10},
+                {'ActiveState': 'active', 'MainPID': PID+1, 'Result': 'success'},
+            )
+        result = self.running(ack_probe=changed_disk_then_ack)
+        self.assertEqual(result.phase, 'ACTION_REQUIRED')
+        self.assertFalse(result.runtime_verified)
+        self.assertTrue(result.restart_issued)
+        self.assertEqual(self.calls.count('restart'), 1)
+        self.assertEqual(self.calls.count('release'), 0)
+        journal = read_private_json(self.co.journal, missing_ok=False)
+        self.assertEqual(journal['phase'], 'ACTION_REQUIRED')
+        with self.assertRaises(ChangeBlocked):
+            self.co.recover_late_ack(
+                ack_probe=changed_disk_then_ack,
+                starttime_reader=lambda pid: START+1,
+                release_fence=lambda cid: self.calls.append('release') or True,
+            )
+        self.assertEqual(self.calls.count('release'), 0)
+
     def test_transition_gate_active_never_deleted(self):
         p=self.put('mode_transition_gate.json',{'active':True,'created_at':1})
         with self.assertRaises(ChangeBlocked):self.changed_stopped()

@@ -327,6 +327,19 @@ class CandidateCoordinator:
                 _json_write(self.journal, base)
                 return SubmitResult('ACK_UNCERTAIN', cid, False, True,
                                     'Restart issued; running configuration unverified; entry fence retained')
+            # Gemini B03/B05: a correct process ACK alone is not enough.
+            # Another process may have changed .env after the atomic save.
+            # Recheck the exact durable file revision before opening broker
+            # admission; never silently mark that different disk state green.
+            try:
+                current_revision_ok = _sha(_read_env(self.env_path)) == new_revision
+            except (OSError, ValueError, UnicodeError):
+                current_revision_ok = False
+            if not current_revision_ok:
+                base.update(phase='ACTION_REQUIRED', reason='Saved .env changed after restart ACK')
+                _json_write(self.journal, base)
+                return SubmitResult('ACTION_REQUIRED', cid, False, True,
+                                    'Runtime ACK valid, but saved configuration revision changed; entry fence retained')
             # Owner Stop could arrive during restart; do not release fence.
             ctrl = read_private_json(self.data_dir / 'service_control_state.json', missing_ok=True) or {}
             if ctrl.get('deferred_stop_pending') or (
@@ -409,6 +422,20 @@ class CandidateCoordinator:
                 _json_write(self.journal, tx)
                 return SubmitResult('ACTION_REQUIRED', tx['change_id'], False, True,
                                     'Owner Stop has priority; barrier retained')
+            # Recheck persisted .env immediately before a late-ACK gate
+            # release as well; the initial recovery preflight can race an
+            # external writer. The restart is never retried automatically.
+            try:
+                current_revision_ok = (
+                    _sha(_read_env(self.env_path)) == tx['requested_file_revision']
+                )
+            except (OSError, ValueError, UnicodeError):
+                current_revision_ok = False
+            if not current_revision_ok:
+                tx.update(phase='ACTION_REQUIRED', reason='Saved .env changed before late-ACK barrier release')
+                _json_write(self.journal, tx)
+                return SubmitResult('ACTION_REQUIRED', tx['change_id'], False, True,
+                                    'Late ACK cannot release barrier; disk revision changed')
             if not release_fence(tx['change_id']):
                 tx.update(phase='ACTION_REQUIRED', reason='Entry barrier release unverified')
                 _json_write(self.journal, tx)
