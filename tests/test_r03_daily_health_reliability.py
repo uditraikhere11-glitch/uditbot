@@ -134,12 +134,12 @@ class R03DailyEvidenceTests(unittest.TestCase):
         def format_report(_cfg, **kwargs):
             captured.update(kwargs)
             if kwargs["token_verified"] and kwargs["funds_verified"]:
-                return "Next trading session readiness: ✅ VERIFIED CHECKS\\nOverall result: ✅ SUCCESS"
-            return "Next trading session readiness: ⚠️ REVIEW REQUIRED\\nOverall result: ❌ ACTION REQUIRED"
-        with patch("src.cli.cmd_refresh_token", side_effect=refresh), \\
-             patch("src.broker.dhan_client.DhanClient", return_value=c), \\
-             patch("src.instruments.resolver.InstrumentResolver.load_dhan_master", return_value=True), \\
-             patch("src.cli.format_morning_health_report", side_effect=format_report), \\
+                return "Next trading session readiness: ✅ VERIFIED CHECKS\nOverall result: ✅ SUCCESS"
+            return "Next trading session readiness: ⚠️ REVIEW REQUIRED\nOverall result: ❌ ACTION REQUIRED"
+        with patch("src.cli.cmd_refresh_token", side_effect=refresh), \
+             patch("src.broker.dhan_client.DhanClient", return_value=c), \
+             patch("src.instruments.resolver.InstrumentResolver.load_dhan_master", return_value=True), \
+             patch("src.cli.format_morning_health_report", side_effect=format_report), \
              patch("src.cli.dispatch_morning_health_report_once", return_value="DELIVERED"):
             out = io.StringIO()
             with redirect_stdout(out):
