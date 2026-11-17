@@ -851,6 +851,10 @@ class DhanClient:
     def _perform_totp_http_login(self) -> Tuple[bool, str, str]:
         """Executes raw TOTP HTTP call against Dhan auth endpoint and validates account identity."""
         self.last_auth_account_mismatch = False
+        # Evidence from a candidate /v2/profile response is valid only for
+        # the exact freshly issued token and only in this login process.
+        # Never publish an unverified candidate or persist these details.
+        self._last_candidate_profile_verification = None
         if not self.cfg.dhan_client_id or not self.cfg.dhan_pin or not self.cfg.dhan_totp_secret:
             return False, "", "Missing DHAN_CLIENT_ID, DHAN_PIN, or DHAN_TOTP_SECRET in config"
         try:
@@ -936,6 +940,19 @@ class DhanClient:
                             False, "",
                             "Dhan /v2/profile candidate token identity unverified; token not published",
                         )
+                    self._last_candidate_profile_verification = {
+                        "token_sha256": hashlib.sha256(new_token.encode("utf-8")).hexdigest(),
+                        "account_id": expected_id,
+                        "verified_at": time.time(),
+                        "profile": {
+                            k: prof.get(k) for k in (
+                                "identity_status", "identity_verified",
+                                "identity_mismatch", "profile_client_id",
+                                "token_expiration_ts", "token_expiration_str",
+                                "token_expired",
+                            )
+                        },
+                    }
                     return True, new_token, "Token generated and account-verified"
                 return False, "", f"Token missing in Dhan response: {resp.text}"
             return False, "", f"Dhan auth rejected TOTP ({resp.status_code}): {resp.text}"
@@ -1222,6 +1239,8 @@ class DhanClient:
         """Read-only Dhan /v2/profile call returning the full profile payload dict on HTTP 200."""
         if getattr(self.cfg, "trading_mode", None) == TradingMode.TEST and not bypass_test_mode:
             return None
+        self._last_profile_local_deferral = False
+        self._last_profile_http_status = None
         try:
             if candidate_token is not None:
                 headers = {
@@ -1235,8 +1254,21 @@ class DhanClient:
                 resp = self._get_with_auth_recovery(
                     f"{BASE_URL}/profile", allow_refresh=allow_refresh
                 )
+            self._last_profile_http_status = int(resp.status_code)
             if resp.status_code != 200:
-                logger.warning("Dhan profile identity check returned HTTP %s", resp.status_code)
+                self._last_profile_local_deferral = (
+                    str(resp.headers.get("X-AuditBot-Local-Deferral", "")) == "1"
+                )
+                if self._last_profile_local_deferral:
+                    logger.warning(
+                        "Dhan profile identity check locally deferred (HTTP %s); "
+                        "no broker identity conclusion possible", resp.status_code
+                    )
+                else:
+                    logger.warning(
+                        "Dhan profile identity check broker HTTP %s; "
+                        "account identity remains unverified", resp.status_code
+                    )
                 return None
             payload = resp.json()
             return payload if isinstance(payload, dict) else None
@@ -2298,7 +2330,14 @@ class DhanClient:
                 from urllib.parse import urlsplit
                 path = urlsplit(url).path
                 historical = bool(re.fullmatch(r"/v2/trades/\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}/\d+", path))
-                priority = "low" if path == "/v2/orders" or path.startswith("/v2/orders/external/") else "normal"
+                if path in ("/v2/profile", "/v2/fundlimit"):
+                    # Identity and post-refresh funds checks share the existing
+                    # hard cap but may use capacity withheld from routine GETs.
+                    priority = "identity"
+                elif path == "/v2/orders" or path.startswith("/v2/orders/external/"):
+                    priority = "low"
+                else:
+                    priority = "normal"
                 governor.admit(historical=historical, priority=priority)
         except (ReadDeferred, OSError, sqlite3.Error) as exc:
             return self._read_deferral_response(exc)
