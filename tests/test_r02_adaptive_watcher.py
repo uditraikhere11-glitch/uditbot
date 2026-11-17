@@ -386,6 +386,21 @@ class R02PR87ReadUncertaintyTests(unittest.TestCase):
         broker.get_trades_for_order.assert_not_called()
         gate.halt_new_entries.assert_called_once()
 
+        # Later broker data is fully readable again. The transient 429 marker
+        # may clear, but we do not invent a SELL or rewrite historical BUYs.
+        broker.get_trade_book.return_value = []
+        broker.get_holdings.return_value = [
+            {"securityId": "11915", "totalQty": 2, "dpQty": 2}
+        ]
+        watcher.supervise_open_positions()
+        self.assertTrue(watcher._supervision_read_complete)
+        for oid in ("YESBANK-NOV02", "YESBANK-NOV04"):
+            r = watcher.terminal_orders[oid]
+            self.assertFalse(r.get("unreadable_broker_response"))
+            self.assertFalse(r["manual_exit_detected"])
+            self.assertEqual(r["position_state"], "UNPROTECTED_MANUAL_RISK")
+            self.assertEqual(r["filled_qty"], 1)
+
 
 class R02PR87RecoveryGateTests(unittest.TestCase):
     def setUp(self):
