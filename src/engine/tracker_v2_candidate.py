@@ -89,8 +89,10 @@ class CandidateCoordinator:
     Production requires a reviewed integration that proves the running trading
     process observes the same entry barrier before allowing new order dispatch.
     """
-    def __init__(self, data_dir: str | Path, env_path: str | Path, *, feature_enabled: bool = False):
+    def __init__(self, data_dir: str | Path, env_path: str | Path, *, feature_enabled: bool = False,
+                 require_external_fence: bool = False):
         self.feature_enabled = bool(feature_enabled)
+        self.require_external_fence = bool(require_external_fence)
         self.data_dir = Path(data_dir).resolve()
         self.env_path = Path(env_path).absolute()
         self.txdir = self.data_dir / 'config_restart_v2'
@@ -248,11 +250,23 @@ class CandidateCoordinator:
                     base.update(phase='ACTION_REQUIRED', reason='Entry fence owner identity unverified')
                     _json_write(self.journal, base)
                     raise ChangeBlocked('Owner identity unavailable; entry fence retained; no restart')
-                _json_write(self.barrier, {
-                    'active': True, 'owner_pid': os.getpid(),
-                    'owner_starttime': owner_identity,
-                    'change_id': cid, 'created_at': time.time(),
-                })
+                if self.require_external_fence:
+                    installed = read_private_json(self.barrier, missing_ok=False)
+                    if (installed.get('active') is not True or
+                            installed.get('change_id') != cid or
+                            installed.get('owner_pid') != os.getpid() or
+                            installed.get('owner_starttime') != owner_identity):
+                        base.update(phase='ACTION_REQUIRED', reason='Shared broker apply fence is unverified')
+                        _json_write(self.journal, base)
+                        raise ChangeBlocked('Shared broker apply fence not durably verified')
+                else:
+                    # Existing review tests use a fake callback; production
+                    # must explicitly choose the shared interlock above.
+                    _json_write(self.barrier, {
+                        'active': True, 'owner_pid': os.getpid(),
+                        'owner_starttime': owner_identity,
+                        'change_id': cid, 'created_at': time.time(),
+                    })
             # Revalidate optimistic CAS right before the atomic replacement;
             # noncooperating writers remain an external operational risk.
             if _sha(_read_env(self.env_path)) != expected_file_revision:
@@ -322,7 +336,15 @@ class CandidateCoordinator:
                 _json_write(self.journal, base)
                 return SubmitResult('ACTION_REQUIRED', cid, False, True,
                                     'Runtime ACK valid but barrier release unverified')
-            _json_write(self.barrier, {'active': False, 'change_id': cid, 'released_at': time.time()})
+            if self.require_external_fence:
+                released = read_private_json(self.barrier, missing_ok=False)
+                if released.get('active') is not False or released.get('change_id') != cid:
+                    base.update(phase='ACTION_REQUIRED', reason='Shared barrier release readback failed')
+                    _json_write(self.journal, base)
+                    return SubmitResult('ACTION_REQUIRED', cid, False, True,
+                                        'Barrier release not durably verified')
+            else:
+                _json_write(self.barrier, {'active': False, 'change_id': cid, 'released_at': time.time()})
             base.update(phase='VERIFIED', reason='Runtime ACK, systemd identity and entry fence verified')
             _json_write(self.journal, base)
             return SubmitResult('VERIFIED', cid, True, True, 'New running configuration verified')
@@ -387,7 +409,15 @@ class CandidateCoordinator:
                 _json_write(self.journal, tx)
                 return SubmitResult('ACTION_REQUIRED', tx['change_id'], False, True,
                                     'Late ACK valid, but barrier release unverified')
-            _json_write(self.barrier, {'active':False, 'change_id':tx['change_id'], 'released_at':time.time()})
+            if self.require_external_fence:
+                released = read_private_json(self.barrier, missing_ok=False)
+                if released.get('active') is not False or released.get('change_id') != tx['change_id']:
+                    tx.update(phase='ACTION_REQUIRED', reason='Shared barrier release readback failed')
+                    _json_write(self.journal, tx)
+                    return SubmitResult('ACTION_REQUIRED', tx['change_id'], False, True,
+                                        'Barrier release not durably verified')
+            else:
+                _json_write(self.barrier, {'active':False, 'change_id':tx['change_id'], 'released_at':time.time()})
             tx.update(phase='VERIFIED', reason='Late ACK matched actual process; no second restart')
             _json_write(self.journal, tx)
             return SubmitResult('VERIFIED', tx['change_id'], True, True,

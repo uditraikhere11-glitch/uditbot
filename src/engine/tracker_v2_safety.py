@@ -149,6 +149,11 @@ def evaluate_active_broker_operation_gate(
         active = mutation.get('active')
         if not isinstance(active, list):
             return _result(False, 'MUTATION_SCHEMA_UNKNOWN', 'Mutation list is invalid')
+        unresolved = mutation.get('unresolved', [])
+        if not isinstance(unresolved, list):
+            return _result(False, 'UNRESOLVED_SCHEMA_UNKNOWN', 'Unresolved mutation list invalid')
+        if unresolved:
+            return _result(False, 'UNRESOLVED_BROKER_MUTATION', 'Unknown mutation outcome requires broker reconciliation', count=len(unresolved))
         if active:
             return _result(False, 'BROKER_MUTATION_ACTIVE', 'Broker mutation is active', count=len(active))
         # File presence alone is insufficient: production must also verify the

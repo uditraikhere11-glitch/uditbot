@@ -14,8 +14,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing repository dependencies
+        run: python -m pip install -r requirements.txt
       - name: Syntax verification
-        run: python -m compileall -q src/engine/tracker_safety_preflight.py src/engine/tracker_v2_candidate.py src/engine/tracker_v2_safety.py src/engine/broker_handoff.py src/engine/tracker_credentials.py
+        run: python -m compileall -q src/engine/tracker_safety_preflight.py src/engine/tracker_v2_candidate.py src/engine/tracker_v2_safety.py src/engine/broker_handoff.py src/engine/tracker_credentials.py src/engine/tracker_v2_integration.py
       - name: Review-only offline regressions
         env:
           AUDITBOT_TEST_ISOLATION: '1'
