@@ -102,64 +102,67 @@ class WebuiV2IntegrationTests(unittest.TestCase):
         self.assertEqual(OLD, self.env.read_text())
 
     def _simulate_running_v2(self, *, restart_result: bool = False):
-        """An actual live-PID handoff, with only the broker GET gate stubbed."""
-        import os
+        """Two real isolated process identities: old unit exits before new.
+
+        Only the broker GET and systemd process-restart transport are mocked;
+        PID/starttime identity, ledger registration, ACK, .env and HMAC are real.
+        """
         import multiprocessing
-        from src.config import AppConfig
-        from src.engine.config_manager import compute_config_version, parse_env_content_string
-        from src.engine.tracker_credentials import fingerprint
-        from src.engine.broker_handoff import register_producer, _paths
+        from src.engine.config_patch import revision
 
         original = OLD + "DHAN_CLIENT_ID=DEMOACCOUNT\n"
         self.env.write_text(original)
-        cfg = AppConfig.from_env(env=parse_env_content_string(original), env_file="")
-        register_producer(self.data, cfg.dhan_client_id)
-        old_fp = fingerprint(cfg, str(self.data))
-        self.tracker.record_active_running_version(
-            compute_config_version(cfg), trading_mode="TEST",
-            credential_fingerprint=old_fp,
-        )
-        self.assertEqual(os.getpid(), self.tracker.get_active_running_version()["pid"])
-        holder = {"pid": os.getpid(), "calls": 0}
-        release = multiprocessing.Event()
-        child = None
+        holder = {"pid": 0, "calls": 0}
+        old_release = multiprocessing.Event()
+        new_release = multiprocessing.Event()
 
-        def child_runner(data_dir, env_path, ready, release_event):
+        def run_trader(data_dir, env_path, ready, release_event):
             from src.config import AppConfig, parse_env_dict
             from src.engine.config_manager import ConfigChangeTracker, compute_config_version
             from src.engine.tracker_credentials import fingerprint
             from src.engine.broker_handoff import register_producer
             import os
             try:
-                # A child forked by the full test suite inherits unrelated
-                # os.environ values from earlier tests. Model the isolated
-                # systemd service's actual .env snapshot, not test pollution.
-                cfg_new = AppConfig.from_env(env=parse_env_dict(env_path), env_file="")
-                register_producer(data_dir, cfg_new.dhan_client_id)
+                # The simulated service uses an isolated .env snapshot, not
+                # arbitrary environment mutations left by earlier tests.
+                cfg = AppConfig.from_env(env=parse_env_dict(env_path), env_file="")
+                register_producer(data_dir, cfg.dhan_client_id)
                 ConfigChangeTracker(data_dir=data_dir).record_active_running_version(
-                    compute_config_version(cfg_new), trading_mode="TEST",
-                    credential_fingerprint=fingerprint(cfg_new, data_dir),
+                    compute_config_version(cfg), trading_mode="TEST",
+                    credential_fingerprint=fingerprint(cfg, data_dir),
                 )
                 ready.put(("OK", os.getpid()))
-                release_event.wait(timeout=5)
+                release_event.wait(timeout=10)
             except BaseException as exc:
                 ready.put(("ERR", str(exc)))
 
-        def restart():
-            nonlocal child
-            holder["calls"] += 1
-            if not restart_result:
-                return False
+        def start_trader(release):
             ready = multiprocessing.Queue()
             child = multiprocessing.Process(
-                target=child_runner,
-                args=(str(self.data), str(self.env), ready, release),
+                target=run_trader, args=(str(self.data), str(self.env), ready, release),
                 daemon=True,
             )
             child.start()
-            status, data = ready.get(timeout=5)
-            self.assertEqual("OK", status, data)
-            holder["pid"] = data
+            status, value = ready.get(timeout=5)
+            self.assertEqual("OK", status, value)
+            return child, value
+
+        old, old_pid = start_trader(old_release)
+        holder["pid"] = old_pid
+        new = None
+
+        def restart():
+            nonlocal new
+            holder["calls"] += 1
+            if not restart_result:
+                # systemctl failure: old process may still be alive; keep
+                # the fence and refuse any implicit rollback or retry.
+                return False
+            old_release.set()
+            old.join(timeout=5)
+            self.assertFalse(old.is_alive(), "Old systemd MainPID must exit")
+            new, pid = start_trader(new_release)
+            holder["pid"] = pid
             return True
 
         def status():
@@ -178,12 +181,14 @@ class WebuiV2IntegrationTests(unittest.TestCase):
                 )
             return rec, holder
         finally:
-            release.set()
-            if child is not None:
-                child.join(timeout=5)
-                if child.is_alive():
-                    child.terminate()
+            old_release.set()
+            new_release.set()
+            for child in (new, old):
+                if child is not None:
                     child.join(timeout=5)
+                    if child.is_alive():
+                        child.terminate()
+                        child.join(timeout=5)
 
     def test_running_restart_unknown_preserves_env_and_barrier(self):
         from src.engine.broker_handoff import _paths
