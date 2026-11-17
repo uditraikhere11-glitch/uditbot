@@ -163,6 +163,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_afterhours_amo_burst_does_not_spend_urgent_reserve(self):
         from src.broker.read_governor import ReadGovernor
+        # The policy and loop must use the same deterministic wall clock.
+        self.w.clock = lambda: self.clock
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
         governor.seconds_until_capacity = Mock(return_value=0)
         self.w.broker._read_governor = governor
