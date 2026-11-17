@@ -258,6 +258,53 @@ class R03GovernorReserveTests(unittest.TestCase):
         with self.assertRaises(ReadDeferred):
             self.g.admit(priority="identity")
 
+    def test_ordinary_funds_reads_cannot_consume_critical_reserve(self):
+        self.g.admit(priority="identity")
+        with sqlite3.connect(self.g.path) as db:
+            db.executemany("INSERT INTO reads(at) VALUES (?)", [(self.now,)] * 18)
+
+        c = DhanClient.__new__(DhanClient)
+        c.cfg = NS(dhan_client_id=ACCOUNT)
+        c._get_active_read_governor = Mock(return_value=self.g)
+        c._halt_for_read_deferral = Mock()
+        c._is_rate_limited_response = Mock(return_value=False)
+        valid = requests.Response()
+        valid.status_code = 200
+        valid._content = b'{"availableBalance": 100.0}'
+        c.session = Mock()
+        c.session.get.return_value = valid
+
+        url = "https://api.dhan.co/v2/fundlimit"
+        # The 20-slot synthetic limit holds one remaining slot exclusively
+        # for a scheduled post-renewal identity-critical probe.
+        normal = c._governed_get(url, headers={}, timeout=1)
+        self.assertEqual(normal.status_code, 429)
+        self.assertEqual(normal.headers.get("X-AuditBot-Local-Deferral"), "1")
+        c.session.get.assert_not_called()
+
+        c._identity_verification_context = True
+        critical = c._governed_get(url, headers={}, timeout=1)
+        self.assertEqual(critical.status_code, 200)
+        self.assertEqual(c.session.get.call_count, 1)
+        with sqlite3.connect(self.g.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM reads").fetchone()[0], 20)
+
+    def test_candidate_profile_uses_critical_capacity_without_bypass(self):
+        c = DhanClient.__new__(DhanClient)
+        c.cfg = NS(trading_mode=TradingMode.LIVE, dhan_client_id=ACCOUNT)
+        c._governed_get = Mock()
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"dhanClientId": "9000000001"}'
+        c._governed_get.return_value = response
+        self.assertEqual(
+            c.get_authenticated_profile(candidate_token="SYNTH"),
+            {"dhanClientId": ACCOUNT},
+        )
+        self.assertEqual(
+            c._governed_get.call_args.kwargs["priority"], "identity"
+        )
+
     def test_local_profile_429_is_distinguished_from_broker_429(self):
         def fake_client(local):
             c = DhanClient.__new__(DhanClient)
