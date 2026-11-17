@@ -178,14 +178,28 @@ def submit_v2_webui_patch(
                 return bool(systemctl_restart_fn())
             return bool(tracker._invoke_systemctl("restart", "trading_bot.service"))
         def ack_probe():
-            ack = tracker.get_active_running_version(require_live_pid=False)
-            props = inspect_systemd_service_properties(
-                "trading_bot.service", check_fn=check_service_fn,
+            # systemctl may return before a new Python worker has recorded its
+            # version. Poll only read-only evidence; NEVER issue another restart.
+            deadline = time.monotonic() + (
+                0.5 if is_isolated_test_environment() else 15.0
             )
-            if isinstance(ack, dict):
-                last_ack.clear()
-                last_ack.update(ack)
-            return ack, props
+            while True:
+                ack = tracker.get_active_running_version(require_live_pid=False)
+                props = inspect_systemd_service_properties(
+                    "trading_bot.service", check_fn=check_service_fn,
+                )
+                if isinstance(ack, dict):
+                    last_ack.clear()
+                    last_ack.update(ack)
+                    if (
+                        ack.get("pid") != previous_pid
+                        and ack.get("pid") == props.get("MainPID")
+                        and str(props.get("ActiveState") or "").lower() == "active"
+                    ):
+                        return ack, props
+                if time.monotonic() >= deadline:
+                    return ack, props
+                time.sleep(0.1)
         def release(cid: str) -> bool:
             pid = last_ack.get("pid")
             stamp = last_ack.get("process_starttime")
@@ -259,3 +273,93 @@ def submit_v2_webui_patch(
             raise ConfigurationConflict("Tracker UI status record cannot be verified")
         tracker.dispatch_telegram_update(rec)
         return rec
+
+
+def recover_v2_late_ack(
+    tracker: ConfigChangeTracker, env_path: str, *,
+    requested_change_id: str, check_service_fn: Any = None,
+) -> ConfigChangeRecord:
+    """Owner-triggered verify/release of an existing restart, NEVER retry it.
+
+    Requires the same authentication/CSRF as saving (enforced at the route).
+    It does not clear emergency stop, legacy gates or broker uncertainty.
+    """
+    if not enabled():
+        raise ConfigurationConflict("Tracker V2 is disabled")
+    if not isinstance(requested_change_id, str) or not re.fullmatch(r"V2-[0-9a-f]{16}", requested_change_id):
+        raise ConfigurationConflict("Invalid tracker change ID")
+    from src.engine.tracker_v2_safety import read_private_json
+    env_path = os.path.abspath(env_path)
+    with tracker.operation_lock(operation_type="TRACKER_V2_RECOVER", operation_id=requested_change_id):
+        coordinator = CandidateCoordinator(
+            data_dir=tracker.data_dir, env_path=env_path,
+            feature_enabled=True, require_external_fence=True,
+        )
+        tx = read_private_json(coordinator.journal, missing_ok=False)
+        if tx.get("change_id") != requested_change_id:
+            raise ConfigurationConflict("An unrelated tracker transaction is active")
+        if tx.get("phase") not in ("RESTART_ISSUED", "VERIFYING", "ACK_UNCERTAIN"):
+            raise ConfigurationConflict("Change is not awaiting an uncertain restart ACK")
+        if tx.get("restart_issued") is not True:
+            raise ConfigurationConflict("No restart invocation to recover")
+        cfg = _app_config(_read_env(env_path))
+        # The transaction's stored expectations, not a user-supplied version,
+        # are authoritative. Require current file/config/credential parity.
+        if tx.get("expected_runtime_hash") != compute_config_version(cfg):
+            raise ConfigurationConflict("Effective configuration hash differs from staged transaction")
+        if tx.get("credential_fingerprint") != fingerprint(cfg, tracker.data_dir):
+            raise ConfigurationConflict("Credential fingerprint differs from staged transaction")
+        prior = tracker.get_change_record(requested_change_id)
+        if prior is None or prior.change_id != requested_change_id:
+            raise ConfigurationConflict("Original tracker UI record unavailable; manual review required")
+        latest: dict[str, Any] = {}
+        def probe():
+            ack = tracker.get_active_running_version(require_live_pid=False)
+            props = inspect_systemd_service_properties(
+                "trading_bot.service", check_fn=check_service_fn,
+            )
+            if isinstance(ack, dict):
+                latest.clear()
+                latest.update(ack)
+            return ack, props
+        def release(cid: str) -> bool:
+            pid = latest.get("pid")
+            stamp = latest.get("process_starttime")
+            if type(pid) is not int or type(stamp) is not int:
+                return False
+            try:
+                return release_apply_barrier(
+                    tracker.data_dir, cfg.dhan_client_id, cid, pid, stamp,
+                )
+            except BrokerHandoffBlocked:
+                return False
+        try:
+            outcome = coordinator.recover_late_ack(
+                ack_probe=probe, starttime_reader=proc_starttime,
+                release_fence=release,
+            )
+        except (ChangeBlocked, BrokerHandoffBlocked, OSError, ValueError) as exc:
+            raise ConfigurationConflict("Late-ACK recheck blocked: " + str(exc)) from None
+        prior.reason = outcome.message
+        prior.blocked_reason = (
+            "" if outcome.runtime_verified else outcome.phase
+        )
+        prior.runtime_verified = outcome.runtime_verified
+        prior.restart_performed = outcome.runtime_verified
+        prior.state = _RESTART_STATE[outcome.phase]
+        prior.operation_state = (
+            OperationState.APPLIED_VERIFIED.value if outcome.runtime_verified
+            else OperationState.FAILED.value
+        )
+        prior.progress_percent = 100 if outcome.runtime_verified else 90
+        prior.current_step = "VERIFIED" if outcome.runtime_verified else "APPLYING"
+        if outcome.runtime_verified:
+            prior.effective_version_hash = tx["expected_runtime_hash"]
+            prior.running_mode = tx["target_mode"]
+            prior.verified_at = time.time()
+        tracker.save_change_record(prior)
+        readback = tracker.get_change_record(requested_change_id)
+        if readback is None or readback.state != prior.state:
+            raise ConfigurationConflict("Recovered state failed durable readback")
+        tracker.dispatch_telegram_update(prior)
+        return prior

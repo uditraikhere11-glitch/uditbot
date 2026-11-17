@@ -395,3 +395,36 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
     async def post_fno_amo(request: Request):
         # Configuration only; never cancels existing Dhan or legacy local orders.
         return await _save_amo_toggle(request, "fno_amo_enabled")
+
+    @app.post("/control/tracker-v2/recheck")
+    async def recheck_tracker_v2(request: Request):
+        """Password-authenticated outer Control Center + CSRF; no restart."""
+        if "application/json" not in request.headers.get("content-type", "").lower():
+            return _json({"ok": False, "error": "JSON request required"}, 415)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"ok": False, "error": "Malformed JSON"}, 400)
+        if (not isinstance(body, dict) or set(body) != {"csrf_token", "change_id"}
+                or body.get("csrf_token") != csrf_token):
+            return _json({"ok": False, "error": "Invalid request/CSRF token"}, 403)
+        try:
+            cfg, env_path, data_dir = _config_and_paths()
+            tracker = ConfigChangeTracker(data_dir=data_dir)
+            from src.engine.tracker_v2_integration import recover_v2_late_ack
+            result = recover_v2_late_ack(
+                tracker, env_path, requested_change_id=body.get("change_id"),
+            )
+            return _json({
+                "ok": result.runtime_verified,
+                "change_id": result.change_id,
+                "state": result.state.value,
+                "runtime_verified": result.runtime_verified,
+                "message": result.reason,
+            }, 200 if result.runtime_verified else 409)
+        except ConfigurationConflict as exc:
+            return _json({"ok": False, "error": str(exc)}, 409)
+        except (OSError, ValueError):
+            return _json({"ok": False, "error": "Safety evidence unreadable"}, 409)
+        except Exception:
+            return _json({"ok": False, "error": "Late-ACK verification unavailable"}, 503)
