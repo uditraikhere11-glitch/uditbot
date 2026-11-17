@@ -27,13 +27,13 @@ jobs:
           git diff --check bd594af2e80b92f7ff0349971ba2f2f34150ab4d HEAD
       - name: Focused safety regressions
         run: |
-          python -W error::ResourceWarning -m unittest -q             tests.test_r02_adaptive_watcher             tests.test_r02_read_governor             tests.test_historical_zero_trade_id_r01             tests.test_historical_fill_reconciliation_h01_h17
+          python -W error::ResourceWarning -m unittest -q tests.test_r02_adaptive_watcher tests.test_r02_read_governor tests.test_manual_risk_session_polling tests.test_pr87_governor_recovery tests.test_historical_zero_trade_id_r01 tests.test_historical_fill_reconciliation_h01_h17
       - name: Full offline regression suite
         shell: bash
         run: |
           set -o pipefail
           python -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py' 2>&1 | tee pr87-test-results.txt
-      - name: Package six full changed source/test files and patch
+      - name: Package complete PR87 source/test files and patch
         shell: bash
         run: |
           python - <<'PY'
@@ -45,7 +45,9 @@ jobs:
             'src/broker/read_governor.py',
             'src/engine/protection_watcher.py',
             'src/engine/reconciliation.py',
-            'tests/test_r02_adaptive_watcher.py'
+            'tests/test_r02_adaptive_watcher.py',
+            'tests/test_manual_risk_session_polling.py',
+            'tests/test_pr87_governor_recovery.py'
           }
           assert set(names)==required, f'Unexpected PR87 file changes: {names}'
           result=pathlib.Path('pr87-test-results.txt').read_text()
