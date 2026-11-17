@@ -180,7 +180,8 @@ class WebuiV2IntegrationTests(unittest.TestCase):
         from src.engine.broker_handoff import _paths
         rec, ctx = self._simulate_running_v2(restart_result=True)
         self.assertEqual(1, ctx["calls"])
-        self.assertTrue(rec.runtime_verified)
+        journal = self.data / "config_restart_v2" / "current_transaction.json"
+        self.assertTrue(rec.runtime_verified, (rec.reason, journal.read_text() if journal.exists() else "no journal"))
         self.assertEqual("APPLIED_VERIFIED", rec.state.value)
         barrier = _paths(self.data)[2]
         self.assertFalse(__import__("json").loads(barrier.read_text())["active"])
