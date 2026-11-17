@@ -153,12 +153,27 @@ def register_producer(data_dir: str | os.PathLike[str], account: str) -> None:
                     not isinstance(previous.get("active"), list) or
                     not isinstance(previous.get("unresolved"), list)):
                 raise BrokerHandoffBlocked("Existing broker ledger cannot be trusted")
-            if previous["active"] or previous["unresolved"]:
-                raise BrokerHandoffBlocked("Unresolved broker mutation persists across restart")
+            old_pid, old_start = previous.get("producer_pid"), previous.get("producer_starttime")
+            if type(old_pid) is not int or type(old_start) is not int:
+                raise BrokerHandoffBlocked("Previous broker producer identity malformed")
+            if (old_pid, old_start) != (pid, start) and proc_starttime(old_pid) == old_start:
+                raise BrokerHandoffBlocked("A second live trading process owns broker handoff")
+            active = list(previous["active"])
+            unresolved = list(previous["unresolved"])
+            # An old process died with transport mutations in flight.
+            # Preserve them as UNKNOWN; never claim broker cancellation.
+            if (old_pid, old_start) != (pid, start) and active:
+                unresolved.extend({
+                    "id": item.get("id"), "method": item.get("method"),
+                    "at": time.time(), "reason": "PRIOR_PROCESS_EXITED_IN_FLIGHT",
+                } for item in active if isinstance(item, dict))
+                active = []
+        else:
+            active, unresolved = [], []
         _write(ledger, {
             "schema_version": 2, "handoff_verified": True,
             "producer_pid": pid, "producer_starttime": start,
-            "account_id": account, "active": [], "unresolved": [],
+            "account_id": account, "active": active, "unresolved": unresolved,
             "registered_at": time.time(),
         })
 
@@ -183,8 +198,9 @@ def broker_mutation(data_dir: str | os.PathLike[str], account: str, kind: str) -
         _barrier_clear(barrier)
         data = _read(ledger)
         _validate_ledger(data, account, require_self=True)
-        if data["unresolved"]:
-            raise BrokerHandoffBlocked("Previous broker mutation outcome unresolved")
+        # Unresolved historical outcomes block configuration restarts, but
+        # must NOT disable fresh independently validated protective OCO/cancel
+        # work. Dhan duplicate/retry policy remains with the existing BRAIN.
         entry = {"id": mutation_id, "method": kind, "started_at": time.time()}
         data["active"].append(entry)
         _write(ledger, data)

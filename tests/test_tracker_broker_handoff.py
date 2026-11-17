@@ -44,6 +44,27 @@ class BrokerHandoffTests(unittest.TestCase):
             self.dir, self.acc, "CHG", os.getpid(), proc_starttime(os.getpid())
         ))
 
+    def test_unresolved_mutation_still_allows_independent_protection(self):
+        class Response:
+            status_code = 500
+        guarded_request(self.dir, self.acc, "POST", Response)
+        class ProtectedResponse:
+            status_code = 202
+        protected = guarded_request(self.dir, self.acc, "DELETE", ProtectedResponse)
+        self.assertEqual(202, protected.status_code)
+        self.assertEqual(1, len(self.ledger()["unresolved"]))
+        self.assertFalse(acquire_apply_barrier(
+            self.dir, self.acc, "RESTART", os.getpid(), proc_starttime(os.getpid())
+        ))
+
+    def test_same_process_re_register_never_clears_uncertainty(self):
+        class Response:
+            status_code = 500
+        guarded_request(self.dir, self.acc, "POST", Response)
+        prior = self.ledger()["unresolved"]
+        register_producer(self.dir, self.acc)
+        self.assertEqual(prior, self.ledger()["unresolved"])
+
     def test_network_timeout_preserves_unknown(self):
         def timeout():
             raise TimeoutError("simulated")
