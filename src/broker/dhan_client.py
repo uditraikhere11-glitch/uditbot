@@ -1157,6 +1157,21 @@ class DhanClient:
             "Accept": "application/json",
         }
 
+    def _broker_mutating_http(self, method: str, url: str, **kwargs):
+        """Opt-in durable handoff around actual Dhan order POST/PUT/DELETE.
+
+        Disabled by default. Price-feed POST and auth POST are not order
+        mutations and continue through their original transport unmodified.
+        """
+        fn = getattr(self.session, method.lower())
+        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
+            return fn(url, **kwargs)
+        from src.engine.broker_handoff import guarded_request
+        return guarded_request(
+            self.cfg.data_dir, self.cfg.dhan_client_id, method,
+            lambda: fn(url, **kwargs),
+        )
+
     def is_token_error(self, status_code: int, response_text: str) -> bool:
         """Detects Dhan expired or invalid token errors."""
         return _shared_is_token_error(status_code, response_text)
@@ -2835,7 +2850,7 @@ class DhanClient:
         self.last_order_http_latency_ms = None
         t_order_start_ns = time.perf_counter_ns()
         try:
-            resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 data = resp.json() if resp.text else {}
@@ -2981,7 +2996,7 @@ class DhanClient:
         self.last_order_http_latency_ms = None
         t_order_start_ns = time.perf_counter_ns()
         try:
-            resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 try:
@@ -3061,7 +3076,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/super/orders/{order_id}"
         try:
-            resp = self.session.put(url, headers=self._headers(), json=body, timeout=5)
+            resp = self._broker_mutating_http("PUT", url, headers=self._headers(), json=body, timeout=5)
             if resp.status_code not in (200, 202):
                 st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code == 408) else "REJECTED"
                 msg = f"Failed to modify {leg_clean} ({resp.status_code}): {resp.text}"
@@ -3133,7 +3148,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/super/orders/{order_id_clean}/{leg_name}"
         try:
-            resp = self.session.delete(url, headers=self._headers(), timeout=5)
+            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
             if resp.status_code in (200, 202):
                 return True, f"Super order {leg_name} cancellation accepted (HTTP {resp.status_code}) for {order_id_clean}"
             return False, f"Failed to cancel super order {leg_name} ({resp.status_code}): {resp.text}"
@@ -3153,7 +3168,7 @@ class DhanClient:
 
         url = f"{BASE_URL}/orders/{order_id_clean}"
         try:
-            resp = self.session.delete(url, headers=self._headers(), timeout=5)
+            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
             if resp.status_code == 202:
                 return True, f"Order cancellation request accepted by broker (HTTP 202) for {order_id_clean}"
             elif resp.status_code == 200:
@@ -3257,7 +3272,7 @@ class DhanClient:
         }
 
         try:
-            resp = self.session.post(url, headers=self._headers(), json=payload, timeout=5)
+            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
             if resp.status_code in (200, 201):
                 data = resp.json()
                 order_status = str(data.get("orderStatus", "PENDING")).upper()
@@ -3284,7 +3299,7 @@ class DhanClient:
             return True, f"TEST mode: simulated Forever order cancel accepted (HTTP 202) for {oid_clean}"
         url = f"{BASE_URL}/forever/orders/{oid_clean}"
         try:
-            resp = self.session.delete(url, headers=self._headers(), timeout=5)
+            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
             if resp.status_code in (200, 202):
                 return True, f"Forever order cancellation accepted (HTTP {resp.status_code}) for {oid_clean}"
             return False, f"Failed to cancel Forever order ({resp.status_code}): {resp.text}"

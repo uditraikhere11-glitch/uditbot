@@ -123,6 +123,12 @@ class TradingBotPipeline:
         )
         self.risk_manager = RiskManager(config, stop_manager=self.stop_manager)
         self.broker = DhanClient(config, stop_manager=self.stop_manager)
+        # Opt-in tracker V2: register the real trading process, never a WebUI
+        # status reader. Corrupt/unknown prior broker mutations fail startup
+        # closed; no automatic cleanup of broker evidence is permitted.
+        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+            from src.engine.broker_handoff import register_producer
+            register_producer(config.data_dir, config.dhan_client_id)
         self.notifier = TelegramNotifier(config)
         self.watcher = ProtectionWatcher(
             broker=self.broker,

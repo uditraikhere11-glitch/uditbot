@@ -16,14 +16,20 @@ running coordinator. It introduces these additive review modules:
 - `tests/test_tracker_safety_preflight.py`, `tests/test_tracker_v2_review.py`:
   offline positive and negative cases.
 
-It does **not** import any broker, Telegram, systemctl, WebUI application or
-trading BRAIN modules. No production entrypoint imports these new modules.
+The candidate coordinator itself never imports a live broker or starts services.
+An **additional opt-in broker mutation interlock** is now present in
+`src/engine/broker_handoff.py`, the seven actual Dhan order POST/PUT/DELETE
+send sites, and the real trading pipeline registration. It is deliberately
+inactive unless `UDITBOT_TRACKER_V2_ENABLE=1` is explicitly configured; the
+current WebUI still does not activate or consume the coordinator. Direct Dhan
+price-feed and authentication POSTs are excluded from broker mutation guards.
 
 **Off by default:** `CandidateCoordinator(data_dir, env_path)` rejects `submit`
 and `recover_late_ack`; unit tests instantiate with `feature_enabled=True` and
 inject **fake** operation-gate, systemd restart and runtime ACK callbacks.
-There is **no deployable WebUI feature flag** or production callback wiring in
-this submission. It must **not** be enabled on a LIVE VM until the independent
+There is **no enabled WebUI save/restart integration** in this submission.
+The new broker mutation guard is off by default and must not be enabled on
+LIVE without full coordinator handoff and recovery validation. It must **not** be enabled on a LIVE VM until the independent
 review and separate integration/VM staging tests pass.
 
 ## Why this scope
