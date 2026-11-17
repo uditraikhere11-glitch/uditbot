@@ -161,6 +161,22 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(gate.is_accepting_entries)
         self.assertTrue(self.w.terminal_orders['AMO-OLD']['reconciliation_required'])
 
+    async def test_new_afterhours_amo_burst_does_not_spend_urgent_reserve(self):
+        from src.broker.read_governor import ReadGovernor
+        governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
+        governor.seconds_until_capacity = Mock(return_value=0)
+        self.w.broker._read_governor = governor
+        self.w.terminal_orders = {
+            'AMO-NEW': {**holding(), 'order_id': 'AMO-NEW',
+                'created_at': 995.0, 'is_amo': True,
+                'position_state': 'RECONCILIATION_REQUIRED',
+                'unreadable_broker_response': True},
+        }
+        await self.drive(13)
+        self.assertEqual(self.calls, [1000, 1010])
+        for entry in governor.seconds_until_capacity.call_args_list:
+            self.assertEqual(entry.kwargs['priority'], 'routine')
+
     async def test_closed_terminal_uncertainty_uses_routine_reserve(self):
         from src.broker.read_governor import ReadGovernor
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')

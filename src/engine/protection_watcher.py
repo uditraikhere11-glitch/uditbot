@@ -4392,8 +4392,13 @@ class ProtectionWatcher:
                                         governor = check_binding()
                                     wait = governor.seconds_until_capacity(
                                         required=supervision_read_requirement(len(pending)),
+                                        # Only market-hours urgency can consume
+                                        # the governor's urgent reserve. Even a
+                                        # fresh after-hours AMO is routine: its
+                                        # short verification window must not
+                                        # starve later protective broker reads.
                                         priority="urgent" if (
-                                            cadence < AFTER_HOURS_SECONDS and (
+                                            lifecycle_now and (
                                                 pending or any(
                                                     has_urgent_obligation(r) for r in open_records
                                                 )
