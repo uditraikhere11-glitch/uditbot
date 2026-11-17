@@ -80,6 +80,25 @@ class WebuiV2IntegrationTests(unittest.TestCase):
             self.submit()
         self.assertEqual(OLD, self.env.read_text())
 
+    def test_telegram_destination_fallback_staged_before_save(self):
+        with patch("src.notifier.response_activation.stage_destination_change") as stage:
+            with patch.object(self.tracker, "resolve_service_operating_state",
+                              return_value=(ServiceOperatingState.STOPPED_OTHER, "stopped")):
+                rec = self.submit(form_data={"dhan_response_group_name": "Test Notifications"})
+        stage.assert_called_once_with(
+            str(self.data), "", "Test Notifications"
+        )
+        self.assertFalse(rec.runtime_verified)
+
+    def test_telegram_destination_stage_failure_does_not_write_env(self):
+        with patch("src.notifier.response_activation.stage_destination_change",
+                   side_effect=OSError("storage unavailable")):
+            with patch.object(self.tracker, "resolve_service_operating_state",
+                              return_value=(ServiceOperatingState.STOPPED_OTHER, "stopped")):
+                with self.assertRaises(ConfigurationConflict):
+                    self.submit(form_data={"dhan_response_group_name": "Test Notifications"})
+        self.assertEqual(OLD, self.env.read_text())
+
     def test_stopped_by_owner_saves_without_restarting_or_clearing_stop(self):
         self.tracker.record_service_control_intent(
             desired_service_state="STOPPED", last_action="OWNER_STOP",

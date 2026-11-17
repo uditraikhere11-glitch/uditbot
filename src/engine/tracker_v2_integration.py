@@ -106,6 +106,20 @@ def submit_v2_webui_patch(
         running = op_state == ServiceOperatingState.RUNNING
         if owner_stop_requested and op_state != ServiceOperatingState.STOPPED_BY_OWNER:
             raise ConfigurationConflict("Owner Stop must not be superseded by configuration updates")
+        # Preserve PR84's verified Telegram response-group handoff. Never
+        # mutate Telethon sessions or send Telegram from the WebUI process.
+        if "DHAN_RESPONSE_GROUP_NAME" in changed:
+            from src.notifier.response_activation import stage_destination_change
+            try:
+                stage_destination_change(
+                    tracker.data_dir,
+                    old_parsed.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                    new_parsed.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                )
+            except OSError:
+                raise ConfigurationConflict(
+                    "Cannot stage Telegram destination fallback; configuration unchanged"
+                ) from None
         old_hash = compute_config_version(old_cfg)
         new_hash = compute_config_version(new_cfg)
         old_fp = fingerprint(old_cfg, tracker.data_dir)
