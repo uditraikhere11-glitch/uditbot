@@ -7,6 +7,8 @@ The random seed and enumeration are frozen for reproducible CI failure cases.
 from __future__ import annotations
 
 import hashlib
+import os
+import time
 import json
 from pathlib import Path
 import random
@@ -235,6 +237,103 @@ class DurableCoordinatorMatrixTests(unittest.TestCase):
                     co.submit(**{**args, "new_env": old})
                 self.assertEqual(env.read_bytes(), new)
         print("STRESS VERIFIED 300 persisted stopped saves and safe replays", flush=True)
+
+    def test_1000_running_restart_stop_ack_and_disk_races(self):
+        from src.engine.tracker_v2_safety import SafetyDecision, read_private_json
+        for i in range(1000):
+            family = i % 10
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                data = root / "data"
+                data.mkdir()
+                env = root / ".env"
+                old = b"TRADING_MODE=TEST\nEQUITY_BUDGET_INR=500\n"
+                new = b"TRADING_MODE=TEST\nEQUITY_BUDGET_INR=1000\n"
+                env.write_bytes(old)
+                co = CandidateCoordinator(data, env, feature_enabled=True)
+                calls = []
+                def operation_gate():
+                    allowed = family != 1
+                    return SafetyDecision(
+                        allowed, "NO_ACTIVE_BROKER_OPERATION" if allowed else "BROKER_MUTATION_ACTIVE",
+                        "synthetic", {"producer_pid": 40001, "producer_starttime": 701}
+                    )
+                def restart():
+                    calls.append("restart")
+                    return family != 3
+                def ack_probe():
+                    if family == 4:
+                        p = data / "service_control_state.json"
+                        p.write_text(json.dumps({
+                            "desired_service_state": "STOPPED",
+                            "observed_state": "STOPPED_BY_OWNER",
+                            "deferred_stop_pending": False
+                        }))
+                        p.chmod(0o600)
+                    elif family == 5:
+                        env.write_bytes(b"TRADING_MODE=TEST\nEQUITY_BUDGET_INR=1337\n")
+                    elif family == 9:
+                        p = data / "service_control_state.json"
+                        p.write_text("{invalid")
+                        p.chmod(0o600)
+                    ack = {
+                        "pid": 40001 if family == 8 else 40002,
+                        "process_starttime": 701 if family == 8 else 702,
+                        "version_hash": "f"*64 if family == 2 else "a"*64,
+                        "trading_mode": "TEST",
+                        "credential_fingerprint": "f"*64 if family == 7 else "b"*64,
+                        "acknowledged_at": time.time()+10,
+                    }
+                    systemd = {"ActiveState": "active",
+                               "MainPID": 40003 if family == 6 else ack["pid"],
+                               "Result": "success"}
+                    return ack, systemd
+                args = dict(
+                    request_id="running-%06d" % i,
+                    expected_file_revision=hashlib.sha256(old).hexdigest(),
+                    new_env=new, previous_mode="TEST", target_mode="TEST",
+                    service_running=True, pre_runtime_verified=True,
+                    before_pid=40001, before_starttime=701,
+                    operation_gate=operation_gate,
+                    entry_fence=lambda c: calls.append("fence") or True,
+                    restart_callback=restart,
+                    ack_probe=ack_probe, expected_runtime_hash="a"*64,
+                    credential_fingerprint="b"*64,
+                    starttime_reader=lambda pid: (
+                        701 if pid == 40001 else
+                        702 if pid == 40002 else
+                        703
+                    ),
+                    release_fence=lambda c: calls.append("release") or True,
+                )
+                if family == 1:
+                    with self.assertRaises(ChangeBlocked):
+                        co.submit(**args)
+                    self.assertEqual(env.read_bytes(), old, i)
+                    self.assertEqual(calls.count("restart"), 0)
+                    self.assertEqual(calls.count("release"), 0)
+                    continue
+                result = co.submit(**args)
+                expected = (
+                    "VERIFIED" if family == 0
+                    else "ACTION_REQUIRED" if family in (4, 5, 9)
+                    else "ACK_UNCERTAIN"
+                )
+                self.assertEqual(result.phase, expected, (i, family, result))
+                self.assertEqual(calls.count("restart"), 1, i)
+                self.assertEqual(calls.count("release"), 1 if family == 0 else 0, i)
+                self.assertEqual(result.runtime_verified, family == 0, i)
+                if family != 5:
+                    self.assertEqual(env.read_bytes(), new, i)
+                if family == 0:
+                    replay = co.submit(**args)
+                    self.assertEqual(replay.phase, "VERIFIED", i)
+                    self.assertEqual(calls.count("restart"), 1, i)
+                else:
+                    journal = read_private_json(co.journal, missing_ok=False)
+                    self.assertEqual(journal["phase"], expected)
+                    self.assertTrue(read_private_json(co.barrier)["active"])
+        print("STRESS VERIFIED 1000 running restart/STOP/ACK/disk races", flush=True)
 
     def test_300_legacy_pending_apply_states_never_discarded(self):
         for i in range(300):

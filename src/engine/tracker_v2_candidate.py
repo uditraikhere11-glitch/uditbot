@@ -340,15 +340,19 @@ class CandidateCoordinator:
                 _json_write(self.journal, base)
                 return SubmitResult('ACTION_REQUIRED', cid, False, True,
                                     'Runtime ACK valid, but saved configuration revision changed; entry fence retained')
-            # Owner Stop could arrive during restart; do not release fence.
-            ctrl = read_private_json(self.data_dir / 'service_control_state.json', missing_ok=True) or {}
-            if ctrl.get('deferred_stop_pending') or (
-                    str(ctrl.get('desired_service_state') or '').upper() == 'STOPPED'
-                    and str(ctrl.get('observed_state') or '').upper() in ('RUNNING', 'STOPPING', 'UNKNOWN')):
-                base.update(phase='ACTION_REQUIRED', reason='Owner Stop has priority')
+            # Owner STOP and legacy safety changes can arrive while systemd
+            # restarts the worker or while an acknowledgement is being read.
+            # In particular, desired=STOPPED with observed=STOPPED_BY_OWNER
+            # is *still* a STOP intent. Previously this rare interleaving
+            # could release the broker fence after an apparently good ACK.
+            # Never interpret a corrupt state file as permission to resume.
+            post_restart_safety = preview_legacy_tracker_migration(self.data_dir)
+            if not post_restart_safety.allowed:
+                base.update(phase='ACTION_REQUIRED',
+                            reason='Post-restart safety gate: ' + post_restart_safety.code)
                 _json_write(self.journal, base)
                 return SubmitResult('ACTION_REQUIRED', cid, False, True,
-                                    'Owner Stop pending; cannot release entry fence')
+                                    'Owner Stop or legacy safety state changed after runtime ACK; entry fence retained')
             if not release_fence(cid):
                 base.update(phase='ACTION_REQUIRED', reason='Entry barrier release unverified')
                 _json_write(self.journal, base)

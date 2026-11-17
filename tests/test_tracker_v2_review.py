@@ -390,6 +390,61 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(r.phase,'ACTION_REQUIRED')
         self.assertNotIn('release',self.calls)
 
+    def test_owner_stop_after_valid_ack_blocks_for_all_observed_states(self):
+        for observed in ('RUNNING', 'STOPPING', 'UNKNOWN', 'STOPPED', 'STOPPED_BY_OWNER', ''):
+            with self.subTest(observed=observed), tempfile.TemporaryDirectory() as td:
+                data = Path(td) / 'data'
+                env = Path(td) / '.env'
+                data.mkdir()
+                env.write_bytes(OLD)
+                co = CandidateCoordinator(data, env, feature_enabled=True)
+                calls = []
+                def probe():
+                    p = data / 'service_control_state.json'
+                    p.write_text(json.dumps({
+                        'desired_service_state': 'STOPPED', 'observed_state': observed,
+                        'deferred_stop_pending': False
+                    }), encoding='utf-8')
+                    p.chmod(0o600)
+                    return ({'pid': PID+1, 'process_starttime': START+1,
+                             'version_hash': HASH, 'trading_mode': 'TEST',
+                             'credential_fingerprint': FP,
+                             'acknowledged_at': time.time()+10},
+                            {'ActiveState': 'active', 'MainPID': PID+1, 'Result': 'success'})
+                ok = SafetyDecision(True, 'NO_ACTIVE_BROKER_OPERATION', 'test',
+                                    {'producer_pid': PID, 'producer_starttime': START})
+                result = co.submit(
+                    request_id='stopafter-12345', expected_file_revision=digest(OLD),
+                    new_env=NEW, previous_mode='TEST', target_mode='TEST',
+                    service_running=True, pre_runtime_verified=True,
+                    before_pid=PID, before_starttime=START,
+                    operation_gate=lambda: ok,
+                    entry_fence=lambda c: calls.append('fence') or True,
+                    restart_callback=lambda: calls.append('restart') or True,
+                    ack_probe=probe, expected_runtime_hash=HASH,
+                    credential_fingerprint=FP,
+                    starttime_reader=lambda pid: START if pid == PID else START+1,
+                    release_fence=lambda c: calls.append('release') or True,
+                )
+                self.assertEqual(result.phase, 'ACTION_REQUIRED')
+                self.assertEqual(calls.count('restart'), 1)
+                self.assertEqual(calls.count('release'), 0)
+                self.assertTrue(read_private_json(co.barrier)['active'])
+
+    def test_corrupt_owner_stop_record_after_ack_never_releases_fence(self):
+        def corrupt_status():
+            p = self.data/'service_control_state.json'
+            p.write_text('{invalid', encoding='utf-8')
+            p.chmod(0o600)
+            return ({'pid': PID+1, 'process_starttime': START+1,
+                     'version_hash': HASH, 'trading_mode': 'TEST',
+                     'credential_fingerprint': FP, 'acknowledged_at': time.time()+10},
+                    {'ActiveState': 'active', 'MainPID': PID+1, 'Result': 'success'})
+        r = self.running(ack_probe=corrupt_status)
+        self.assertEqual(r.phase, 'ACTION_REQUIRED')
+        self.assertEqual(self.calls.count('release'), 0)
+        self.assertTrue(read_private_json(self.co.barrier)['active'])
+
     def test_no_prod_imports_or_network_calls(self):
         import src.engine.tracker_v2_candidate as mod
         self.assertNotIn('dhan_client',mod.__dict__)
