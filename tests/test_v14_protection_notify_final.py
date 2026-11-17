@@ -498,6 +498,7 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
             _active_super_order_record("SUP-MAN-1", "11915", "NSE_EQ", "CNC", 50, 15.05, 16.05)
         ]
         broker.get_trade_book.return_value = []
+        broker.get_forever_orders.return_value = []  # verified no unrelated OCO
         broker.get_positions.return_value = [
             {"securityId": "11915", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 50}
         ]
