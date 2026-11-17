@@ -4264,11 +4264,21 @@ class ProtectionWatcher:
         # A changed-state return value is not evidence of a successful read.
         # Only a completed pass with all required books readable consumes the
         # one-shot closed-session allowance.
-        self._supervision_read_complete = not unreadable_books and all(
+        complete = not unreadable_books and all(
             book is not None for book in (
                 super_book, forever_book, trade_book, positions_book, holdings_book
             )
         )
+        if complete:
+            # The *transport-unavailable* marker alone is transient. Only a
+            # full readable snapshot may clear it. Never clear separately
+            # persisted manual_exit_detected or reconciliation_required:
+            # those require a broker-attested lifecycle reconciliation.
+            for rec in open_recs:
+                if rec.get("unreadable_broker_response"):
+                    rec["unreadable_broker_response"] = False
+                    changed = True
+        self._supervision_read_complete = complete
         return changed
 
     def should_poll(self, is_market_open_fn: Optional[Callable[[], bool]] = None) -> bool:
