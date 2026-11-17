@@ -1120,7 +1120,10 @@ class StartupReconciliationGate:
             and str(row.get("security_id") or "").strip() not in intraday_sec_ids
             and (
                 str(row.get("parent_order_id") or "") in self.last_historical_reconciled_ids
-                or str(row.get("position_state") or "").upper() in ("UNPROTECTED", "UNPROTECTED_MANUAL_RISK")
+                or str(row.get("position_state") or "").upper() in (
+                    "UNPROTECTED", "UNPROTECTED_MANUAL_RISK",
+                    "RECONCILIATION_REQUIRED",
+                )
             )
         ]
         if not bot_settled_candidates:
@@ -1626,6 +1629,35 @@ class StartupReconciliationGate:
                 self.last_error = f"Unresolved protection attempt(s) present: {len(unres_att)} attempt(s) awaiting broker verification"
                 logger.critical(f"[RECONCILIATION] {self.last_error}")
                 return False, self.last_error
+
+        # 7b. A successfully read broker portfolio is not sufficient to
+        # clear persisted watcher uncertainty. In particular, PR86-era 429
+        # failures can leave manual-risk holdings in RECONCILIATION_REQUIRED.
+        # Do not silently reopen entries while those rows still need an
+        # audited, broker-attested lifecycle repair.
+        if self.watcher:
+            records = (
+                list((getattr(self.watcher, "terminal_orders", None) or {}).values())
+                + list((getattr(self.watcher, "pending", None) or {}).values())
+            )
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                if str(rec.get("order_id") or "").startswith("DRY-"):
+                    continue
+                if int(rec.get("filled_qty") or 0) <= int(rec.get("exit_filled_qty") or 0):
+                    continue
+                if (
+                    rec.get("reconciliation_required")
+                    or rec.get("unreadable_broker_response")
+                    or str(rec.get("position_state") or "").upper() == "RECONCILIATION_REQUIRED"
+                ):
+                    return self._fail_reconciliation_locked(
+                        f"Unresolved watcher position evidence for "
+                        f"{rec.get('symbol') or 'UNKNOWN'} ({rec.get('order_id') or 'UNKNOWN'}): "
+                        "verified lifecycle repair required",
+                        starting_halt_generation,
+                    )
 
         # 8. Invariant check passed -> open the gate
         with self._entry_state_lock:
