@@ -108,13 +108,16 @@ class WebuiV2IntegrationTests(unittest.TestCase):
         child = None
 
         def child_runner(data_dir, env_path, ready, release_event):
-            from src.config import AppConfig
+            from src.config import AppConfig, parse_env_dict
             from src.engine.config_manager import ConfigChangeTracker, compute_config_version
             from src.engine.tracker_credentials import fingerprint
             from src.engine.broker_handoff import register_producer
             import os
             try:
-                cfg_new = AppConfig.from_env(env_file=env_path)
+                # A child forked by the full test suite inherits unrelated
+                # os.environ values from earlier tests. Model the isolated
+                # systemd service's actual .env snapshot, not test pollution.
+                cfg_new = AppConfig.from_env(env=parse_env_dict(env_path), env_file="")
                 register_producer(data_dir, cfg_new.dhan_client_id)
                 ConfigChangeTracker(data_dir=data_dir).record_active_running_version(
                     compute_config_version(cfg_new), trading_mode="TEST",
