@@ -192,7 +192,7 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
 
 
 def _annotate_terminal_v2_supersession(
-    data_dir: Path, before_rev: str, after_rev: str,
+    data_dir: Path, before_rev: str, after_rev: str, *, commit: bool = True,
 ) -> None:
     """Trust explicit old/new checksums, not a blanket historic-journal reset.
 
@@ -216,6 +216,8 @@ def _annotate_terminal_v2_supersession(
     }
     if before_rev not in previously_accepted:
         raise ConfigurationConflict("V2 journal and current settings differ; do not overwrite unknown edits")
+    if not commit:
+        return
     updated = dict(tx)
     updated["direct_save_from_revision"] = before_rev
     updated["direct_save_to_revision"] = after_rev
@@ -325,6 +327,11 @@ def apply_settings(
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
         if state == "active" and _owner_stop_requested(path, old_values):
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
+        # Validate completed-V2 journal compatibility before any broker fence
+        # or file write; do not claim a successor until the file is committed.
+        _annotate_terminal_v2_supersession(
+            data_root, actual_revision, revision(proposed), commit=False,
+        )
         # Production: cannot restart a LIVE watcher just because systemd
         # reports active; prove old PID/hash and no in-flight/UNKNOWN broker
         # mutation. Isolated tests inject the systemd state/restart.

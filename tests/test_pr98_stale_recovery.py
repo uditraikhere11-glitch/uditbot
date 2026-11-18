@@ -268,6 +268,43 @@ class DirectBrokerRestartTests(unittest.TestCase):
             "EXTERNAL_ENV_WRITER",
         )
 
+    def test_amotoggle_admission_runs_under_shared_save_lock(self):
+        calls = []
+        def admission():
+            calls.append("admitted")
+        result = direct.apply_settings(
+            {"equity_amo_enabled": True}, env_path=self.env,
+            expected_revision=revision(self.before),
+            state_reader=lambda: "inactive", admission_check=admission,
+        )
+        self.assertEqual(result.status, "SAVED_STOPPED")
+        self.assertEqual(calls, ["admitted"])
+
+    def test_amotoggle_denied_admission_keeps_env_intact(self):
+        def admission():
+            raise ConfigurationConflict("Concurrent STOP")
+        with self.assertRaises(ConfigurationConflict):
+            direct.apply_settings(
+                {"equity_amo_enabled": True}, env_path=self.env,
+                expected_revision=revision(self.before),
+                state_reader=lambda: "inactive", admission_check=admission,
+            )
+        self.assertEqual(self.env.read_text(), self.before)
+
+    def test_stop_race_before_env_commit_reports_failure(self):
+        reads = iter(("active", "inactive"))
+        with patch.object(direct, "is_isolated_test_environment", return_value=False), \\
+             patch.object(direct, "_positive_running_restart_proof",
+                          return_value=dict(self.proof)), \\
+             patch.object(direct, "acquire_apply_barrier", return_value=True):
+            with self.assertRaises(ConfigurationConflict):
+                direct.apply_settings(
+                    {"equity_amo_enabled": True}, env_path=self.env,
+                    expected_revision=revision(self.before),
+                    state_reader=lambda: next(reads), restart=lambda: self.fail("No restart"),
+                )
+        self.assertEqual(self.env.read_text(), self.before)
+
     def test_exact_noop_retry_does_not_restart_again(self):
         first = direct.apply_settings(
             {"equity_amo_enabled": True}, env_path=self.env,
