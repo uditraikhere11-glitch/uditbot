@@ -39,11 +39,17 @@ class DhanCategoryTransportTests(unittest.TestCase):
 
     def test_order_book_get_is_non_trading_not_order_daily_limit(self):
         url='https://api.dhan.co/v2/orders'
-        for _ in range(20):
+        # Routine order-book polling retains two short-window slots for
+        # urgent safety probes. There is no artificial daily GET ceiling.
+        for _ in range(18):
             self.assertEqual(self.c._governed_get(url,headers={},timeout=1).status_code,200)
         blocked=self.c._governed_get(url,headers={},timeout=1)
         self.assertEqual(blocked.status_code,429)
         self.assertEqual(blocked.headers['X-AuditBot-Local-Deferral'],'1')
+        self.assertEqual(self.c.session.get.call_count,18)
+        for _ in range(2):
+            self.assertEqual(self.c._governed_get(url,headers={},timeout=1,priority='urgent').status_code,200)
+        self.assertEqual(self.c._governed_get(url,headers={},timeout=1,priority='urgent').status_code,429)
         self.assertEqual(self.c.session.get.call_count,20)
         self.now+=1.02
         self.assertEqual(self.c._governed_get(url,headers={},timeout=1).status_code,200)
