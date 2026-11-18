@@ -56,7 +56,7 @@ class TrackerV2AuthenticatedAcceptance(unittest.TestCase):
         )
         status = patch.object(
             ConfigChangeTracker, "resolve_service_operating_state",
-            return_value=(ServiceOperatingState.STOPPED_OTHER, "offline staging"),
+            return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "owner-stopped offline staging"),
         )
         status.start()
         self.addCleanup(status.stop)
