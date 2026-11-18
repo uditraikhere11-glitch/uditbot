@@ -1159,19 +1159,47 @@ class DhanClient:
         }
 
     def _broker_mutating_http(self, method: str, url: str, **kwargs):
-        """Opt-in durable handoff around actual Dhan order POST/PUT/DELETE.
+        """Account-scoped Dhan ORDER admission, then original V2 broker handoff.
 
-        Disabled by default. Price-feed POST and auth POST are not order
-        mutations and continue through their original transport unmodified.
+        A local 429 is returned BEFORE the network mutation; never retry an
+        ambiguous response or bypass the protection handoff for a real send.
+        The rate category is determined by verb and path, not caller priority.
         """
+        from src.broker.read_governor import ReadGovernor, ReadDeferred
+        category = ReadGovernor.classify(method, url)
+        if category != "ORDER":
+            raise ValueError("Order mutation requested on a non-order API route")
+        governor = self._get_active_read_governor()
+        if governor is not None:
+            try:
+                governor.admit(
+                    category="ORDER",
+                    priority="urgent" if method.upper() in ("DELETE", "PUT") else "normal",
+                    modification_order_id=ReadGovernor.modification_order_id(method, url),
+                )
+            except (ReadDeferred, OSError, sqlite3.Error) as exc:
+                return self._read_deferral_response(exc)
         fn = getattr(self.session, method.lower())
         if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
-            return fn(url, **kwargs)
-        from src.engine.broker_handoff import guarded_request
-        return guarded_request(
-            self.cfg.data_dir, self.cfg.dhan_client_id, method,
-            lambda: fn(url, **kwargs),
-        )
+            result = fn(url, **kwargs)
+        else:
+            from src.engine.broker_handoff import guarded_request
+            result = guarded_request(
+                self.cfg.data_dir, self.cfg.dhan_client_id, method,
+                lambda: fn(url, **kwargs),
+            )
+        if governor is not None and getattr(result, "headers", {}).get("X-AuditBot-Local-Deferral") != "1":
+            try:
+                if self._is_rate_limited_response(result):
+                    governor.throttled(
+                        getattr(result, "headers", {}).get("Retry-After"),
+                        category="ORDER",
+                    )
+                elif int(getattr(result, "status_code", 0) or 0) in (200, 201, 202):
+                    governor.record_success(category="ORDER")
+            except (OSError, sqlite3.Error):
+                self._halt_for_read_deferral()
+        return result
 
     def is_token_error(self, status_code: int, response_text: str) -> bool:
         """Detects Dhan expired or invalid token errors."""
@@ -2122,6 +2150,26 @@ class DhanClient:
             return True, q.price, f"LTP retrieved via Yahoo Finance ({q.ticker}, age={age_label}, policy={q.cmp_policy})"
         return False, 0.0, q.failure_reason
 
+    def _governed_quote_post(self, url: str, *, headers, json_payload):
+        """Use the documented Quote API 1/s bucket, distinct from trading GETs."""
+        from src.broker.read_governor import ReadDeferred
+        governor = self._get_active_read_governor()
+        if governor is not None:
+            try:
+                governor.admit(category="QUOTE", priority="normal")
+            except (ReadDeferred, OSError, sqlite3.Error) as exc:
+                return self._read_deferral_response(exc)
+        result = self.session.post(url, headers=headers, json=json_payload, timeout=5)
+        if governor is not None:
+            try:
+                if self._is_rate_limited_response(result):
+                    governor.throttled(getattr(result, "headers", {}).get("Retry-After"), category="QUOTE")
+                elif 200 <= int(getattr(result, "status_code", 0) or 0) < 300:
+                    governor.record_success(category="QUOTE")
+            except (OSError, sqlite3.Error):
+                self._halt_for_read_deferral()
+        return result
+
     def get_ltp(
         self,
         exchange_segment: str,
@@ -2177,7 +2225,7 @@ class DhanClient:
         try:
             t_req_start = time.time()
             sent_headers = self._headers()
-            resp = self.session.post(url, headers=sent_headers, json=payload, timeout=5)
+            resp = self._governed_quote_post(url, headers=sent_headers, json_payload=payload)
             http_elapsed = max(0.0, time.time() - t_req_start)
             eval_utc = (float(now_utc) + (http_elapsed if http_elapsed >= 0.05 else 0.0)) if now_utc is not None else time.time()
             max_age = float(max_quote_age_sec) if max_quote_age_sec is not None else float(getattr(self.cfg, "max_quote_age_sec", 2.0))
@@ -2360,7 +2408,9 @@ class DhanClient:
                     get_priority = "low"
                 else:
                     get_priority = "normal"
-                governor.admit(historical=historical, priority=get_priority)
+                from src.broker.read_governor import ReadGovernor
+                category = ReadGovernor.classify("GET", url)
+                governor.admit(historical=historical, priority=get_priority, category=category)
         except (ReadDeferred, OSError, sqlite3.Error) as exc:
             return self._read_deferral_response(exc)
         # Transport exceptions retain the callers' UNAVAILABLE classification.
@@ -2369,7 +2419,7 @@ class DhanClient:
             self._halt_for_read_deferral()
             if governor is not None:
                 try:
-                    governor.throttled(getattr(response, "headers", {}).get("Retry-After"))
+                    governor.throttled(getattr(response, "headers", {}).get("Retry-After"), category=category)
                 except (OSError, sqlite3.Error) as exc:
                     return self._read_deferral_response(exc)
             if int(response.status_code) != 429:
@@ -2380,7 +2430,7 @@ class DhanClient:
         elif governor is not None and hasattr(governor, "record_success"):
             status_code = int(getattr(response, "status_code", 0) or 0)
             if 200 <= status_code < 300:
-                governor.record_success()
+                governor.record_success(category=category)
         return response
 
     def _get_with_auth_recovery(
