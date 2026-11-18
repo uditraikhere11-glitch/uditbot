@@ -44,9 +44,19 @@ class TrackerV2AuthenticatedAcceptance(unittest.TestCase):
         auth.provision(PASSWORD)
         auth._failures.clear()
         auth._sessions.clear()
+        # Synthetic TEST service is intentionally owner-stopped. This is a
+        # test fixture, not a bypass of the production dual-service guard.
+        ConfigChangeTracker(str(self.data_dir)).record_service_control_intent(
+            desired_service_state="STOPPED",
+            last_action="OWNER_STOP",
+            reason="Synthetic owner-approved stop in disposable TEST staging",
+            requested_mode="TEST",
+            observed_state=ServiceOperatingState.STOPPED_BY_OWNER.value,
+            deferred_stop_pending=False,
+        )
         status = patch.object(
             ConfigChangeTracker, "resolve_service_operating_state",
-            return_value=(ServiceOperatingState.STOPPED_OTHER, "offline staging"),
+            return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "owner-stopped offline staging"),
         )
         status.start()
         self.addCleanup(status.stop)
