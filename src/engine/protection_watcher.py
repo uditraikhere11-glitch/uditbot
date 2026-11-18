@@ -51,7 +51,7 @@ from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
-from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only, has_urgent_obligation
+from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only, has_urgent_obligation, supervision_preflight_priority
 
 logger = logging.getLogger(__name__)
 
@@ -4415,7 +4415,11 @@ class ProtectionWatcher:
             if not isinstance(rec, dict):
                 continue
             rec["_schedule_ack_verified"] = False
-            if account and rec.get("position_state") == "UNPROTECTED_MANUAL_RISK" and self.journal_db:
+            if account and self.journal_db and (
+                rec.get("position_state") == "UNPROTECTED_MANUAL_RISK"
+                or (rec.get("position_state") == "RECONCILIATION_REQUIRED"
+                    and rec.get("manual_risk_acknowledged") is True)
+            ):
                 try:
                     security = str(rec.get("security_id") or "")
                     rec["_schedule_ack_verified"] = bool(security) and (
@@ -4507,7 +4511,9 @@ class ProtectionWatcher:
                                         # Requesting urgent PREVIEW here while
                                         # transmitting NORMAL caused 5 locally
                                         # generated HTTP-429 errors per poll.
-                                        priority="normal",
+                                        priority=supervision_preflight_priority(
+                                            pending, open_records
+                                        ),
                                     )
                                 except Exception as exc:
                                     wait = 60.0
