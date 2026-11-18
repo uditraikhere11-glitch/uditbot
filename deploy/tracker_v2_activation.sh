@@ -152,6 +152,24 @@ remove_ours() {
   sudo systemctl daemon-reload
 }
 
+webui_login_ready() {
+  # systemctl Type=simple may report active before port 80 accepts a socket.
+  # Retry only connection failures; never accept 200/5xx as a login guard.
+  local attempt status
+  for attempt in {1..15}; do
+    stopped_now || block 'Trading started during WebUI readiness probe.'
+    [[ $(systemctl show "$WEB" -p ActiveState --value) == active ]] || block 'WebUI service stopped during readiness probe.'
+    status=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 3 -o /dev/null -w '%{http_code}' http://127.0.0.1/ 2>/dev/null) || status='000'
+    case "$status" in
+      303) return 0 ;;
+      000) ;;
+      *) block "WebUI login protection smoke-check unexpected HTTP ($status)" ;;
+    esac
+    if (( attempt < 15 )); then sleep 1; fi
+  done
+  block 'WebUI never produced HTTP 303 during bounded readiness check.'
+}
+
 case "$mode" in
   --plan)
     say 'V2 release flow: owner-approved STOP (broker safe) -> fresh private backup -> staged dual-service activation -> WebUI restart -> owner-approved START -> V2 running verification.'
@@ -234,9 +252,18 @@ flag = process_flag(pid)  # unprivileged Python; sudo -n cat only if /proc denie
 if flag != 'ON':
     raise SystemExit(f'WebUI V2 process flag not verified ({flag})')
 PY
-    # Confirm no login bypass on the public surface. Do not send credentials.
-    status=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 6 -o /dev/null -w '%{http_code}' http://127.0.0.1/)
-    [[ "$status" == 303 ]] || block "WebUI login protection smoke-check unexpected ($status)"
+    # Readiness may lag a systemd active flag. Fail closed unless HTTP 303
+    # is observed within the fixed bound; never accept 200 or server errors.
+    webui_login_ready
+    stopped_now || block 'Trading started during WebUI activation checks.'
+    # The process may have restarted during readiness; check the current PID.
+    PYTHONDONTWRITEBYTECODE=1 ./venv/bin/python3 - <<'PY'
+from deploy.tracker_v2_preflight import process_flag, run
+pid = int(run(['systemctl','show','auditbot-web.service','-p','MainPID','--value']))
+flag = process_flag(pid)
+if flag != 'ON':
+    raise SystemExit(f'WebUI V2 process flag changed during readiness ({flag})')
+PY
     completed=1
     say '===== STAGED V2 ACTIVATION VERIFIED ====='
     say 'WebUI V2 flag ON; trading process is intentionally STOPPED.'
