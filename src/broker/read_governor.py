@@ -17,6 +17,9 @@ The existing legacy SQLite records (all historically GET admissions) are
 migrated in place to NON_TRADING without deleting history or cooling counters.
 """
 from contextlib import closing
+import fcntl
+import os
+import stat
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -114,6 +117,38 @@ class ReadGovernor:
         return tuple(override) if override is not None else self.CATEGORY_LIMITS[category]
 
     def _connect(self):
+        """Serialize schema initialization across processes before opening SQLite.
+
+        SQLite WAL locks protect transactions but not the first file header:
+        a second process could previously observe a nonzero file before the
+        first initializer had created tables and misreport database corruption.
+        Keep the old persisted-table audit once this schema lock is held.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self.path.with_name(self.path.name + ".schema.lock")
+        fd = os.open(
+            lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
+        try:
+            mode = os.fstat(fd)
+            if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o077:
+                raise sqlite3.DatabaseError("Untrusted governor schema initialization lock")
+            for attempt in range(30):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt == 29:
+                        raise sqlite3.OperationalError("database is locked during schema initialization")
+                    time.sleep(0.02)
+            try:
+                return self._connect_initialized()
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _connect_initialized(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         persisted = self.path.is_file() and self.path.stat().st_size > 0
         conn = sqlite3.connect(self.path, timeout=0.07)
