@@ -102,6 +102,10 @@ TERMINAL_STATES = {
 
 def _is_ambiguous_message(msg: str) -> bool:
     m = str(msg or "").lower()
+    # A locally refused mutation never reached Dhan, even if a local error
+    # string mentions HTTP 503, timeout, or unknown state.
+    if "mutation not_submitted" in m or "mutation not submitted" in m:
+        return False
     return any(
         k in m
         for k in (
@@ -2522,7 +2526,23 @@ class ProtectionWatcher:
                         )
                         return True
                 else:
-                    if _is_ambiguous_message(msg) or (success and not oco_id):
+                    if ("mutation not_submitted" in str(msg).lower()
+                            or "mutation not submitted" in str(msg).lower()):
+                        # A locally rejected admission/fence is proven no-send,
+                        # never an unresolved broker outcome or Dhan rejection.
+                        rec["pending_oco"] = None
+                        if self.journal_db and hasattr(self.journal_db, "update_protection_attempt"):
+                            try:
+                                self.journal_db.update_protection_attempt(
+                                    attempt_id, state="NOT_SUBMITTED",
+                                    error_msg=str(msg), now=self.clock(),
+                                )
+                            except Exception:
+                                # The persistence failure must not be mistaken
+                                # for a broker response. Keep new entries halted.
+                                if gate is not None and hasattr(gate, "halt_new_entries"):
+                                    gate.halt_new_entries("Cannot persist locally refused protection attempt")
+                    elif _is_ambiguous_message(msg) or (success and not oco_id):
                         rec["pending_oco"]["state"] = "UNKNOWN"
                         if self.journal_db and hasattr(self.journal_db, "update_protection_attempt"):
                             try:
