@@ -18,7 +18,7 @@ OUT="$HOME/uditbot-backups/pre-pr93-$STAMP"
 [[ ! -e "$OUT" ]] || { echo 'ABORT: backup destination already exists'; exit 1; }
 mkdir -m 0700 -p "$OUT"
 TMP="$(mktemp -d)"
-trap 'rm -rf -- "$TMP"' EXIT
+trap 'rc=$?; rm -rf -- "$TMP"; if (( rc != 0 )); then rm -f -- "$OUT/runtime-online.tar.gz.gpg.incomplete"; echo "Backup/staging did NOT complete; do not restore from partial files." >&2; fi' EXIT
 mkdir -p "$TMP/runtime/data" "$TMP/runtime/secrets" "$TMP/runtime/services"
 
 printf '%s\n' '===== STEP 1: LIVE-SAFE ONLINE BACKUP (NO SERVICE CHANGES) ====='
@@ -94,8 +94,30 @@ git rev-parse HEAD > "$TMP/runtime/source-head.txt"
 git status --porcelain > "$TMP/runtime/source-status.txt"
 git bundle create "$OUT/source-before-update.bundle" --all
 
-tar -czf - -C "$TMP" runtime | gpg --symmetric --cipher-algo AES256 --output "$OUT/runtime-online.tar.gz.gpg"
-gpg --decrypt "$OUT/runtime-online.tar.gz.gpg" | tar -tzf - >/dev/null
+# GPG pinentry cannot open a terminal in some SSH/web consoles. Read the
+# passphrase invisibly from the controlling terminal and pass it via an
+# anonymous file descriptor; do not use command-line values or a disk file.
+set +x
+if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    echo 'ABORT: No interactive controlling terminal for encrypted backup passphrase.' >&2
+    exit 2
+fi
+IFS= read -r -s -p 'Enter new backup encryption passphrase (hidden): ' _UDIT_GPG_PASS </dev/tty || exit 2
+printf '\n' >/dev/tty
+IFS= read -r -s -p 'Confirm backup encryption passphrase (hidden): ' _UDIT_GPG_CONFIRM </dev/tty || exit 2
+printf '\n' >/dev/tty
+if [[ ${#_UDIT_GPG_PASS} -lt 16 || "$_UDIT_GPG_PASS" != "$_UDIT_GPG_CONFIRM" ]]; then
+    echo 'ABORT: Passphrase must be at least 16 characters and both entries must match.' >&2
+    unset _UDIT_GPG_PASS _UDIT_GPG_CONFIRM
+    exit 2
+fi
+unset _UDIT_GPG_CONFIRM
+ARCHIVE_PART="$OUT/runtime-online.tar.gz.gpg.incomplete"
+# The incomplete file is deliberately NOT given the final backup filename.
+tar -czf - -C "$TMP" runtime | gpg --batch --yes --pinentry-mode loopback --no-symkey-cache --passphrase-fd 3 --symmetric --cipher-algo AES256 --output "$ARCHIVE_PART" 3<<< "$_UDIT_GPG_PASS"
+gpg --batch --pinentry-mode loopback --no-symkey-cache --passphrase-fd 3 --decrypt "$ARCHIVE_PART" 3<<< "$_UDIT_GPG_PASS" | tar -tzf - >/dev/null
+unset _UDIT_GPG_PASS
+mv -- "$ARCHIVE_PART" "$OUT/runtime-online.tar.gz.gpg"
 [[ -s "$OUT/runtime-online.tar.gz.gpg" && -s "$OUT/source-before-update.bundle" ]] || { echo 'ABORT: backup incomplete'; exit 1; }
 git bundle verify "$OUT/source-before-update.bundle" >/dev/null
 sha256sum "$OUT/runtime-online.tar.gz.gpg" "$OUT/source-before-update.bundle" > "$OUT/SHA256SUMS"
