@@ -113,6 +113,22 @@ class OutboxTests(TestCase):
         self.assertEqual(db.deferred,[(1,190)])
 
 
+class WatcherAmbiguityTests(TestCase):
+    def test_local_no_send_cannot_become_unknown_oco(self):
+        # The changed-files ZIP carries the watcher as an exact unified patch;
+        # the full repository checkout exercises its actual source in CI.
+        if not (ROOT/'src/engine/protection_watcher.py').is_file():
+            self.skipTest('Full watcher source is available in PR95 checkout')
+        ns={}
+        exec(extracted('src/engine/protection_watcher.py',
+                       functions=('_is_ambiguous_message',)),ns)
+        classify=ns['_is_ambiguous_message']
+        for msg in ('MUTATION NOT_SUBMITTED (local admission): HTTP 503 unknown',
+                    'MUTATION NOT_SUBMITTED (config fence): connection timeout'):
+            self.assertFalse(classify(msg))
+        self.assertTrue(classify('Dhan HTTP 503 outcome UNKNOWN'))
+
+
 class PollTests(TestCase):
     def test_stale_reconciliation_does_not_loop_every_10_seconds_when_closed(self):
         p=ROOT/'src/engine/watch_poll_policy.py';spec=importlib.util.spec_from_file_location('policy_pr93_test',p)
