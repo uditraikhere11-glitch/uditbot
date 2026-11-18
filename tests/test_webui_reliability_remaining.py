@@ -281,7 +281,7 @@ class ControlCenterFnoAmoTransactionAudit(unittest.TestCase):
                 }
                 with patch.object(FnoAmoQueue, 'cancel_all_queued',
                                   side_effect=AssertionError('Queue cancellation requires deliberate action')) as cancelled, \
-                     patch('src.control_center_backend.submit_webui_patch',
+                     patch('src.control_center_backend.apply_settings',
                            side_effect=OSError('Injected transaction failure')):
                     failed = client.post('/control/amo/fno', json=payload)
                     self.assertIn(failed.status_code, (409, 503))
