@@ -39,6 +39,55 @@ def is_amo_record(rec):
     )
 
 
+def acknowledged_settled_manual_risk_only(pending, records):
+    """Read-only scheduling classification; NEVER validates gate or protection.
+
+    A stale historical GET failure on a fully acknowledged, already settled,
+    unprotected CNC/MTF holding is not an active broker order/cancel.  Keep
+    monitoring at a bounded rate, but never make the position HEALTHY here.
+    Any active protection/exit leg or verified sell reverts to urgent cadence.
+    """
+    if pending:
+        return False
+    opened = [
+        r for r in (records or []) if isinstance(r, dict)
+        and not str(r.get("order_id") or "").startswith("DRY-")
+        and int(r.get("filled_qty") or 0) > 0
+        and str(r.get("position_state") or "") != "POSITION_CLOSED"
+    ]
+    if not opened:
+        return False
+    dangerous = (
+        "sl_order_id", "tp_order_id", "exit_order_id",
+        "confirmed_protection_ids", "verified_leg_order_ids",
+        "verified_leg_map", "orphaned_leg_cancel_states",
+        "pending_oco", "cancel_uncertain", "cancel_requested",
+        "entry_timeout_elapsed", "retry_reserved", "persistence_uncertain",
+        "manual_exit_evidence_verified", "manual_exit_evidence_reason",
+        "external_unlinked_sell_observed", "uncommitted_broker_sell_trades",
+        "broker_exit_already_executed", "unverified_trade_detected",
+        "orphaned_legs_detected", "orphaned_legs_manual_intervention_required",
+    )
+    for r in opened:
+        state = str(r.get("position_state") or "")
+        if (
+            r.get("_schedule_ack_verified") is not True
+            or str(r.get("product_type") or "").upper() not in ("CNC", "MTF")
+            or state not in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
+            or (state == "RECONCILIATION_REQUIRED"
+                and not r.get("unreadable_broker_response"))
+            or any(r.get(k) for k in dangerous)
+        ):
+            return False
+    return True
+
+
+def supervision_preflight_priority(pending, open_records):
+    """Save a 20% routine capacity reserve when no active broker leg exists."""
+    if acknowledged_settled_manual_risk_only(pending, open_records):
+        return "routine"
+    return "normal"
+
 def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
     """Schedule broker GETs, independently of the fail-closed entry gate.
 
@@ -77,7 +126,10 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
             ) else POLL_HEARTBEAT_SECONDS
         return AFTER_HOURS_SECONDS
 
-    # Existing urgent market-hours supervision is deliberately unchanged.
+    # Durable, account-bound owner manual-risk ACK is a scheduling hint only.
+    # Never use it to clear unresolved reconciliation or protection flags.
+    if acknowledged_settled_manual_risk_only(pending, open_all):
+        return MANUAL_RISK_OPEN_SECONDS
     if any(has_urgent_obligation(rec) for rec in pending_records + open_all):
         return 10.0
     if pending_records:
