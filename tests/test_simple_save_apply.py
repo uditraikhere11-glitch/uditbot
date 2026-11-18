@@ -84,6 +84,28 @@ class SimpleSaveApplyTests(unittest.TestCase):
         self.assertEqual(self.env.read_text(), before)
         self.assertEqual(self.restarts, 0)
 
+    def test_owner_stop_winning_race_is_never_restarted(self):
+        readings = iter(("active", "inactive"))
+        result = apply_settings(
+            {"equity_budget_inr": "801"}, env_path=self.env,
+            expected_revision=revision(self.env.read_text()),
+            state_reader=lambda: next(readings), restart=self.restart,
+        )
+        self.assertEqual(result.status, "SAVED_STOPPED")
+        self.assertEqual(self.restarts, 0)
+
+    def test_real_systemd_restart_only_targets_already_running_service(self):
+        from src.engine import simple_save_apply as module
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        with patch.object(module.subprocess, "run",
+                          return_value=CompletedProcess([], 0, "", "")) as called:
+            module.restart_trading_service()
+        self.assertEqual(
+            called.call_args.args[0],
+            ["sudo", "-n", "/usr/bin/systemctl", "try-restart", "trading_bot.service"],
+        )
+
     def test_restart_exception_does_not_falsely_claim_success(self):
         def failed_restart():
             raise ConfigurationConflict("systemctl failed")
