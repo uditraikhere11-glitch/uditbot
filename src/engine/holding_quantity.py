@@ -102,6 +102,14 @@ def observed_open_quantity(
         # A negative intraday position can indicate a same-day manual SELL,
         # even while old DP quantities remain in the holdings book.
         return None, "NEGATIVE_CNC_POSITION_REVIEW"
+    if net > 0 and settled == 0:
+        # Dhan documents /positions as the *current-day* open position book;
+        # /holdings contains stock from prior trading sessions. A filled CNC
+        # BUY placed today may correctly appear only in /positions. This is
+        # verified current-day exposure, NOT evidence of settled legacy stock.
+        return net, "VERIFIED_POSITIONS"
     if net > 0 and net != settled:
+        # When both books show nonzero quantities, don't guess whether
+        # broker totals overlap or represent distinct lots.
         return None, "CNC_POSITIONS_HOLDINGS_CONTRADICT"
     return settled, "VERIFIED_SETTLED_HOLDINGS"
