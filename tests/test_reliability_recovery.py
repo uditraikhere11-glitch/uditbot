@@ -180,6 +180,10 @@ class ManualRiskBindingTests(unittest.TestCase):
                            expected_security_id="TEST-SECURITY", required_qty=1)
             self.assertTrue(db.is_manual_risk_acknowledged(
                 "SYNTH-PARENT-1", "SYNTH-CORR-1", **options))
+            # Settled holdings can use the broker parent ID as a sentinel
+            # correlation when their original watcher row is absent.
+            self.assertTrue(db.is_manual_risk_acknowledged(
+                "SYNTH-PARENT-1", "SYNTH-PARENT-1", **options))
             self.assertFalse(db.is_manual_risk_acknowledged(
                 "SYNTH-PARENT-2", "SYNTH-CORR-1", **options))
             self.assertFalse(db.is_manual_risk_acknowledged(
