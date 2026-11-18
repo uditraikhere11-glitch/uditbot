@@ -1137,14 +1137,35 @@ class StartupReconciliationGate:
             row for row in open_lifecycle_rows
             if str(row.get("product_type") or "").strip().upper() in ("CNC", "MTF")
             and int(row.get("confirmed_open_qty") or 0) > 0
-            and str(row.get("security_id") or "").strip() not in intraday_sec_ids
-            and (
-                str(row.get("parent_order_id") or "") in self.last_historical_reconciled_ids
-                or str(row.get("position_state") or "").upper() in ("UNPROTECTED", "UNPROTECTED_MANUAL_RISK")
-            )
+            # Never skip a persisted RECONCILIATION_REQUIRED or otherwise
+            # open bot-owned settled position merely because its historical
+            # fill is already TRADED (or the current intraday book has a row).
+            and bool(str(row.get("parent_order_id") or "").strip())
+            and bool(str(row.get("security_id") or "").strip())
         ]
         if not bot_settled_candidates:
             return True, "No settled bot-owned holdings requiring separate verification"
+
+        # R06: manual-risk acknowledgement does not extinguish a *different*
+        # unresolved reconciliation obligation. In particular, the old
+        # watcher wrote manual_exit_detected=True on an unavailable GET.
+        # Startup may validate that the two BUYs traded, but MUST NOT reopen
+        # new entries until the watcher has independently repaired/persisted
+        # that lifecycle using fresh complete broker books and account-bound
+        # owner ACK. This check is deliberately before the manual-risk bypass
+        # and before any status can be declared healthy.
+        for row in bot_settled_candidates:
+            lifecycle_state = str(row.get("position_state") or "").strip().upper()
+            if lifecycle_state in (
+                "RECONCILIATION_REQUIRED", "PERSISTENCE_UNCERTAIN",
+                "MANUAL_INTERVENTION_REQUIRED", "UNKNOWN",
+            ):
+                return False, (
+                    "Settled bot-owned holding remains unresolved: "
+                    f"orderId={str(row.get('parent_order_id') or '')}, "
+                    f"position_state={lifecycle_state}; "
+                    "fresh watcher reconciliation and durable lifecycle recovery required"
+                )
 
         expected_acct = str(
             getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "")
@@ -1157,12 +1178,13 @@ class StartupReconciliationGate:
         has_holdings_api = False
         if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_holdings is not None:
             has_holdings_api = True
-            for h in self._active_pass_holdings:
-                if isinstance(h, dict):
-                    s_id = str(h.get("securityId") or "").strip()
-                    t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
-                    if s_id:
-                        holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+            try:
+                from src.engine.holding_quantity import aggregate_holdings
+                holdings_by_sec = aggregate_holdings(
+                    self._active_pass_holdings, account_id=expected_acct
+                )
+            except ValueError as exc:
+                return False, f"Broker holdings snapshot malformed: {exc}"
         elif hasattr(self.broker, "get_holdings"):
             try:
                 h_res = self.broker.get_holdings()
@@ -1173,12 +1195,10 @@ class StartupReconciliationGate:
                     has_holdings_api = True
                     if getattr(self, "_in_startup_reconciliation_pass", False):
                         self._active_pass_holdings = list(h_res)
-                    for h in h_res:
-                        if isinstance(h, dict):
-                            s_id = str(h.get("securityId") or "").strip()
-                            t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
-                            if s_id:
-                                holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+                    from src.engine.holding_quantity import aggregate_holdings
+                    holdings_by_sec = aggregate_holdings(
+                        list(h_res), account_id=expected_acct
+                    )
             except Exception as exc:
                 return False, f"Broker holdings query failed while verifying settled bot positions: {exc}"
 
@@ -1427,9 +1447,19 @@ class StartupReconciliationGate:
         #    but NEVER open the entry gate when Emergency STOP is active!)
         stop_active_at_start = bool(self.stop_manager.is_stopped())
 
-        # 2. Verify broker connection and fund limits
+        # 2. Verify broker connection and fund limits.  The startup gate may
+        # use the small reserved identity tier (still under the hard governor
+        # limits); ordinary signal-side funds checks remain NORMAL.  Inspect
+        # the concrete type so permissive Mock objects cannot fabricate this
+        # capability and silently bypass the established test contract.
         try:
-            ok, avail, msg = self.broker.get_fund_limits()
+            startup_funds_method = getattr(
+                type(self.broker), "get_reconciliation_fund_limits", None
+            )
+            if callable(startup_funds_method):
+                ok, avail, msg = startup_funds_method(self.broker)
+            else:
+                ok, avail, msg = self.broker.get_fund_limits()
             if not ok:
                 self.state = ReconciliationState.BLOCKED
                 self.last_error = f"Broker funds check failed: {msg}"

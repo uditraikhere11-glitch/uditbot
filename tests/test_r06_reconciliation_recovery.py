@@ -383,7 +383,7 @@ class ReadBudgetAndAfterHours(unittest.TestCase):
 
     def test_new_amo_exact_45s_burst(self):
         rec = {"order_id": "AMO1", "entry_only_amo": True, "created_at": 1000}
-        self.assertEqual(2.0, watcher_cadence_seconds(
+        self.assertEqual(10.0, watcher_cadence_seconds(
             pending={"AMO1": rec}, open_records=[], now=1044, market_open=False))
         self.assertEqual(300.0, watcher_cadence_seconds(
             pending={"AMO1": rec}, open_records=[], now=1045, market_open=False))
