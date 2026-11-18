@@ -227,6 +227,12 @@ def apply_settings(
     with _short_lock(data_root):
         if path.is_symlink():
             raise ConfigurationConflict("Configuration symlinked during save")
+        if not is_isolated_test_environment():
+            # Single direct-save entry point also repairs proven stale
+            # config/status records; broker barriers are never blindly reset.
+            ConfigChangeTracker(
+                data_dir=str(data_root),
+            ).reconcile_stale_control_records(str(path))
         with path.open("r", encoding="utf-8", newline="") as fh:
             existing = fh.read()
         actual_revision = revision(existing)
