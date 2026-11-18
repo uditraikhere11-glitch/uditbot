@@ -4084,6 +4084,35 @@ class ProtectionWatcher:
                         rec["orphaned_legs_manual_intervention_required"] = False
                 changed = True
 
+            # Restore a stale local-GET reconciliation failure ONLY with
+            # fresh broker quantity evidence and a durable account-bound owner
+            # acknowledgement. No risk acknowledgement is fabricated here.
+            manual_risk_recovery_ok = False
+            if (
+                prev_pos_state == PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                and rec.get("reconciliation_required")
+                and confirmed_open_qty > 0 and sell_qty == 0
+                and broker_net_qty is not None
+                and broker_net_qty == aggregate_contract_open_qty
+                and resting_protective_qty == 0 and not triggered_leg
+                and not any(rec.get(key) for key in (
+                    "pending_oco", "cancel_uncertain", "persistence_uncertain",
+                    "orphaned_legs_detected", "sl_order_id", "tp_order_id",
+                    "exit_order_id", "verified_leg_order_ids",
+                ))
+                and self.journal_db is not None
+                and hasattr(self.journal_db, "is_manual_risk_acknowledged")
+            ):
+                try:
+                    account = str(getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "") or "")
+                    manual_risk_recovery_ok = bool(account) and self.journal_db.is_manual_risk_acknowledged(
+                        oid, str(rec.get("correlation_id") or ""),
+                        expected_account_id=account, expected_security_id=sec_id,
+                        required_qty=confirmed_open_qty,
+                    ) is True
+                except Exception:
+                    manual_risk_recovery_ok = False
+
             # 4. Update position lifecycle state and emit notifications (P0-01, P0-C, P0-03 & P0-07)
             buy_vwap = float(rec.get("buy_vwap") or rec.get("original_market_price") or 0.0)
             rec["triggered_leg"] = triggered_leg if triggered_leg else ""
@@ -4219,6 +4248,21 @@ class ProtectionWatcher:
                             buy_vwap=buy_vwap,
                         )
                     changed = True
+            elif manual_risk_recovery_ok:
+                # Unprotected OPEN holdings stay open. New-entry gate recovery
+                # remains the responsibility of independent reconciliation.
+                rec["position_state"] = "UNPROTECTED_MANUAL_RISK"
+                rec["manual_risk_acknowledged"] = True
+                rec["reconciliation_required"] = False
+                rec["unreadable_broker_response"] = False
+                rec["manual_exit_detected"] = False
+                rec["confirmed_position_open_qty"] = confirmed_open_qty
+                if not self._sync_position_lifecycle(rec):
+                    rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                    rec["reconciliation_required"] = True
+                    if gate is not None and hasattr(gate, "halt_new_entries"):
+                        gate.halt_new_entries(f"Manual risk recovery persistence failed for {oid}")
+                changed = True
             elif both_legs_dead and confirmed_open_qty > 0 and (broker_net_qty is None or broker_net_qty > 0):
                 rec["position_state"] = PositionLifecycleState.UNPROTECTED.value
                 self._record_unprotected_and_halt(
