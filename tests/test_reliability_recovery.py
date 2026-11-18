@@ -158,3 +158,33 @@ class AdmissionRecoveryTests(unittest.TestCase):
                 db.execute("DROP TABLE order_modifications")
             with self.assertRaises(sqlite3.DatabaseError):
                 g.admit(category="ORDER", modification_order_id="123")
+
+class ManualRiskBindingTests(unittest.TestCase):
+    def test_owner_ack_cannot_transfer_to_another_order_or_correlation(self):
+        # Parent and correlation are both required identities; the DB
+        # discovery helper historically uses OR and must not authorize a
+        # different position even when account/security/quantity coincide.
+        with TemporaryDirectory() as tmp:
+            db = JournalDB(str(Path(tmp) / "journal.db"))
+            db.acknowledge_manual_risk_holding(
+                parent_order_id="SYNTH-PARENT-1",
+                correlation_id="SYNTH-CORR-1",
+                account_id="TEST-ACCOUNT",
+                symbol="TEST-EQUITY",
+                security_id="TEST-SECURITY",
+                quantity=1,
+                acknowledged_by="test-owner",
+                reason="explicit synthetic manual risk acknowledgement",
+            )
+            options = dict(expected_account_id="TEST-ACCOUNT",
+                           expected_security_id="TEST-SECURITY", required_qty=1)
+            self.assertTrue(db.is_manual_risk_acknowledged(
+                "SYNTH-PARENT-1", "SYNTH-CORR-1", **options))
+            self.assertFalse(db.is_manual_risk_acknowledged(
+                "SYNTH-PARENT-2", "SYNTH-CORR-1", **options))
+            self.assertFalse(db.is_manual_risk_acknowledged(
+                "SYNTH-PARENT-1", "SYNTH-CORR-2", **options))
+            self.assertFalse(db.is_manual_risk_acknowledged(
+                "SYNTH-PARENT-1", "SYNTH-CORR-1",
+                expected_account_id="WRONG-ACCOUNT",
+                expected_security_id="TEST-SECURITY", required_qty=1))
