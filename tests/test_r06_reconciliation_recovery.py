@@ -217,6 +217,26 @@ class YesbankTwoParentRecovery(unittest.TestCase):
         # The record was already blocked before this pass, so another gate
         # halt event is not required. Persisted unresolved state is decisive.
 
+    def test_intraday_buy_cannot_replace_settled_evidence_for_old_yesbank(self):
+        for item in (self.a, self.b):
+            item.update(
+                position_state="RECONCILIATION_REQUIRED",
+                reconciliation_required=True,
+                manual_exit_detected=True,
+                unreadable_broker_response=True,
+            )
+        self.broker.get_holdings.return_value = []
+        self.broker.get_positions.return_value = [{
+            "securityId": "11915", "exchangeSegment": "NSE_EQ",
+            "productType": "CNC", "netQty": 2,
+            "dhanClientId": "SYNTHETIC",
+        }]
+        self.w.supervise_open_positions()
+        for item in (self.a, self.b):
+            self.assertTrue(item["reconciliation_required"])
+            self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
+            self.assertTrue(item["manual_exit_detected"])
+
     def test_legacy_flags_never_clear_without_verified_ack(self):
         for item in (self.a, self.b):
             item.update(position_state="RECONCILIATION_REQUIRED",
@@ -288,6 +308,30 @@ class YesbankTwoParentRecovery(unittest.TestCase):
 
 
 class HoldingsQuantityContract(unittest.TestCase):
+    def test_current_day_cnc_buy_before_dematerialized_holding(self):
+        # Dhan /positions includes current-day CNC BUY; /holdings lists stock
+        # bought in previous sessions. This evidence is valid for today's
+        # positive position, not for legacy settled-position recovery.
+        qty, provenance = observed_open_quantity(
+            [{"securityId": "11915", "exchangeSegment": "NSE_EQ",
+              "productType": "CNC", "netQty": 1, "dhanClientId": "TEST"}],
+            [],
+            security_id="11915", segment="NSE_EQ", product="CNC",
+            account_id="TEST",
+        )
+        self.assertEqual((1, "VERIFIED_POSITIONS"), (qty, provenance))
+
+    def test_current_day_and_settled_quantities_require_separate_proof(self):
+        qty, provenance = observed_open_quantity(
+            [{"securityId": "11915", "exchangeSegment": "NSE_EQ",
+              "productType": "CNC", "netQty": 3, "dhanClientId": "TEST"}],
+            [{"securityId": "11915", "totalQty": 2}],
+            security_id="11915", segment="NSE_EQ", product="CNC",
+            account_id="TEST",
+        )
+        self.assertIsNone(qty)
+        self.assertEqual("CNC_POSITIONS_HOLDINGS_CONTRADICT", provenance)
+
     def test_zero_positions_with_dp_shares(self):
         result, source = observed_open_quantity(
             [{"securityId": "11915", "exchangeSegment": "NSE_EQ",
