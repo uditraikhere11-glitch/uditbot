@@ -57,8 +57,9 @@ class TestSetupApp(unittest.TestCase):
                 from unittest.mock import patch
                 from pathlib import Path
                 Path(".env").write_text("")
+                original_apply = simple.apply_settings
                 with patch("src.engine.simple_save_apply.apply_settings",
-                           side_effect=lambda *args, **kw: simple.apply_settings(
+                           side_effect=lambda *args, **kw: original_apply(
                                *args, **kw, state_reader=lambda: "inactive")):
                     resp = self.client.post("/setup", data=data)
                 self.assertEqual(resp.status_code, 200)
