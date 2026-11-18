@@ -120,6 +120,9 @@ class ReadGovernor:
         try:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=FULL')
+            # Serialize first-time schema creation and the persisted integrity
+            # check: concurrent starters must not see an uncommitted schema.
+            conn.execute('BEGIN IMMEDIATE')
             if persisted:
                 tables = {row[0] for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")}
