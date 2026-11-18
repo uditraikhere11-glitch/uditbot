@@ -87,7 +87,7 @@ def trading_service_state() -> str:
 
 def restart_trading_service() -> None:
     result = subprocess.run(
-        ["sudo", "-n", "/usr/bin/systemctl", "restart", "trading_bot.service"],
+        ["sudo", "-n", "/usr/bin/systemctl", "try-restart", "trading_bot.service"],
         capture_output=True, text=True, timeout=30, check=False,
     )
     if result.returncode != 0:
@@ -142,6 +142,14 @@ def apply_settings(
             return SaveApplyResult(
                 "SAVED_STOPPED",
                 "Settings saved. Trading remains stopped; use Control Center Start Bot when ready.",
+                True, False, new_revision, keys,
+            )
+        # Never resurrect a bot that stopped between saving and restart.
+        # try-restart is also no-op if Owner STOP wins this race.
+        if state_reader() != "active":
+            return SaveApplyResult(
+                "SAVED_STOPPED",
+                "Settings saved; bot stopped during apply and was not restarted.",
                 True, False, new_revision, keys,
             )
         try:
