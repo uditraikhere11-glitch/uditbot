@@ -47,6 +47,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             get_super_orders=Mock(return_value=[]),
             get_forever_orders=Mock(return_value=[]),
             get_trade_book=Mock(return_value=[]),
+            get_trades_for_order=Mock(return_value=[]),
             get_positions=Mock(return_value=[]),
             get_holdings=Mock(return_value=[{"securityId": "11915", "totalQty": 2}]),
             reconciliation_gate=NS(halt_new_entries=Mock()),
@@ -57,8 +58,8 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             broker=self.broker, journal_db=self.db,
             path=str(self.root / "watcher.json"),
         )
-        self.a = record("221261102657708")
-        self.b = record("23126110439808")
+        self.a = record("910000000000001")
+        self.b = record("910000000000002")
         self.w.terminal_orders = {
             self.a["order_id"]: self.a,
             self.b["order_id"]: self.b,
@@ -297,6 +298,22 @@ class YesbankTwoParentRecovery(unittest.TestCase):
         self.assertTrue(any(x.get("reconciliation_required") for x in (self.a, self.b)))
         self.assertFalse(any(x.get("manual_exit_detected") for x in (self.a, self.b)))
 
+    def test_recovery_readback_requires_sqlite_files_and_lifecycle_to_agree(self):
+        from src.journal.db import JournalDB
+        db = JournalDB(str(self.root / "proof.sqlite"), account_id="SYNTHETIC")
+        self.w.journal_db = db
+        self.a["confirmed_position_open_qty"] = 1
+        self.assertTrue(self.w._sync_position_lifecycle(self.a))
+        self.assertTrue(self.w._save())
+        ids = [self.a["order_id"]]
+        self.assertTrue(self.w._verify_recovery_saved(ids))
+        self.w._write_files_strict()
+        db.save_watcher_state({}, {})
+        self.assertFalse(self.w._verify_recovery_saved(ids))
+        self.assertTrue(self.w._save())
+        Path(self.w.path + ".terminal.json").write_text("{}")
+        self.assertFalse(self.w._verify_recovery_saved(ids))
+
     def test_persistence_failure_never_reports_recovery(self):
         self.unreadable()
         self.w.supervise_open_positions()
@@ -368,7 +385,7 @@ class HoldingsQuantityContract(unittest.TestCase):
 
 
 class ReadBudgetAndAfterHours(unittest.TestCase):
-    def test_old_urgent_flags_never_override_300s_after_hours(self):
+    def test_stale_reads_slow_after_hours_but_uncertain_mutations_remain_urgent(self):
         for flags in (
             {"reconciliation_required": True},
             {"unreadable_broker_response": True},
@@ -376,7 +393,8 @@ class ReadBudgetAndAfterHours(unittest.TestCase):
             {"pending_oco": {"state": "UNKNOWN"}},
         ):
             with self.subTest(flags=flags):
-                self.assertEqual(300.0, watcher_cadence_seconds(
+                expected = 10.0 if ("cancel_uncertain" in flags or "pending_oco" in flags) else 300.0
+                self.assertEqual(expected, watcher_cadence_seconds(
                     pending={"O": {"order_id": "O", "created_at": 1, **flags}},
                     open_records=[], now=100000, market_open=False,
                 ))
@@ -403,7 +421,7 @@ class ReadBudgetAndAfterHours(unittest.TestCase):
                 gov.admit(priority="normal")
             self.assertGreater(gov.seconds_until_capacity(required=8, priority="normal"), 0)
             with self.assertRaises(ReadDeferred):
-                gov.admit(priority="normal") if False else self._fill_to_limit(gov)
+                self._fill_to_limit(gov)
 
     @staticmethod
     def _fill_to_limit(gov):
@@ -417,7 +435,7 @@ class StartupCandidateCoverage(unittest.TestCase):
         # sum is 2 and owner ACKs exist, no gate success while a lifecycle
         # still requires reconciliation. No Dhan HTTP traffic in this test.
         rows = []
-        for oid in ("221261102657708", "23126110439808"):
+        for oid in ("910000000000001", "910000000000002"):
             rows.append({
                 "parent_order_id": oid, "symbol": "YESBANK",
                 "product_type": "CNC", "security_id": "11915",
@@ -453,9 +471,32 @@ class StartupCandidateCoverage(unittest.TestCase):
         self.assertTrue(ok, reason)
         self.assertTrue(broker.get_holdings.called)
 
+    def test_protected_day_position_only_explains_its_own_distinct_fills(self):
+        contract = dict(securityId="11915", exchangeSegment="NSE_EQ", productType="CNC")
+        row = dict(parent_order_id="A", security_id="11915", exchange_segment="NSE_EQ",
+                   product_type="CNC", confirmed_open_qty=2, position_state="PROTECTED")
+        broker = NS(cfg=NS(dhan_client_id="TEST"), get_holdings=Mock(return_value=[]))
+        gate = StartupReconciliationGate(broker=broker, journal_db=NS(get_open_positions_lifecycle=lambda: [row]),
+                                         watcher=None, stop_manager=NS(is_stopped=lambda: False))
+        fill = dict(contract, orderId="A", transactionType="BUY", exchangeTradeId="10", tradedQuantity=1)
+        positions = [dict(contract, netQty=2)]
+        for fills in ([fill, fill], [dict(fill, orderId="B", tradedQuantity=2)]):
+            self.assertFalse(gate._verify_bot_owned_holdings_protected(positions, fills)[0])
+        self.assertTrue(gate._verify_bot_owned_holdings_protected(positions, [fill, dict(fill, exchangeTradeId="11")])[0])
+        row["manual_exit_detected"] = True
+        self.assertFalse(gate._verify_bot_owned_holdings_protected(positions, [dict(fill, tradedQuantity=2)])[0])
+
+    def test_ambiguous_holdings_do_not_establish_ownership(self):
+        self.assertIsNone(observed_open_quantity([{"securityId": "1", "netQty": 2}],
+            [{"securityId": "1", "totalQty": 2}], security_id="1", segment="NSE_EQ", product="CNC", account_id="")[0])
+        for rows in ([{"securityId": "1", "availableQty": 0}],
+                     [{"securityId": "1", "dpQty": 1}] * 2):
+            with self.assertRaises(QuantityUnverified):
+                aggregate_holdings(rows)
+
     def test_stale_reconciliation_state_is_not_skipped(self):
         row = {
-            "parent_order_id": "221261102657708",
+            "parent_order_id": "910000000000001",
             "symbol": "YESBANK", "product_type": "CNC",
             "security_id": "11915", "exchange_segment": "NSE_EQ",
             "confirmed_open_qty": 1, "entry_qty": 1, "buy_filled_qty": 1,

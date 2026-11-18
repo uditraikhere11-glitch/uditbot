@@ -504,7 +504,7 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         ]
         # A settled CNC manual-exit inference requires fresh holdings
         # evidence as well as an intraday positions snapshot.
-        broker.get_holdings.return_value = [{"securityId": "11915", "totalQty": 50}]
+        broker.get_holdings.return_value = []  # current-day purchase is in positions
 
         watcher = ProtectionWatcher(broker=broker, path=self.pending_path, dry_run=False, journal_db=self.db, clock=lambda: 1000.0)
         watcher.track(

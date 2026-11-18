@@ -32,7 +32,7 @@ def _quantity(value: object, *, signed: bool = False) -> int:
 def aggregate_holdings(
     rows: List[dict], *, account_id: str = "",
 ) -> Dict[str, int]:
-    """Choose totalQty, then dpQty, then availableQty for each security row.
+    """Use the owned quantity, including unsettled shares when reported.
 
     Dhan may supply availableQty lower than totalQty because shares are blocked.
     A nonzero dpQty next to zero totalQty is contradictory and needs review;
@@ -55,10 +55,12 @@ def aggregate_holdings(
             if dp is not None and amount < _quantity(dp):
                 raise QuantityUnverified("totalQty smaller than dpQty")
         elif dp is not None:
-            amount = _quantity(dp)
+            amount = _quantity(dp) + _quantity(row.get("t1Qty", 0))
         else:
-            amount = _quantity(row.get("availableQty"))
-        totals[sid] = totals.get(sid, 0) + amount
+            raise QuantityUnverified("Missing owned quantity")
+        if sid in totals:
+            raise QuantityUnverified("Duplicate holdings security")
+        totals[sid] = amount
     return totals
 
 
@@ -89,7 +91,9 @@ def observed_open_quantity(
             matches.append(_quantity(row.get("netQty"), signed=True))
         except QuantityUnverified:
             return None, "POSITIONS_QUANTITY_MALFORMED"
-    net = sum(matches) if matches else 0
+    if len(matches) > 1:
+        return None, "DUPLICATE_POSITION_CONTRACT"
+    net = matches[0] if matches else 0
     if str(product).upper() not in ("CNC", "MTF"):
         return max(0, net), "VERIFIED_POSITIONS" if net >= 0 else "NEGATIVE_NET_POSITION_REVIEW"
     if not isinstance(holdings, list):
@@ -108,7 +112,7 @@ def observed_open_quantity(
         # BUY placed today may correctly appear only in /positions. This is
         # verified current-day exposure, NOT evidence of settled legacy stock.
         return net, "VERIFIED_POSITIONS"
-    if net > 0 and net != settled:
+    if net > 0 and settled > 0:
         # When both books show nonzero quantities, don't guess whether
         # broker totals overlap or represent distinct lots.
         return None, "CNC_POSITIONS_HOLDINGS_CONTRADICT"

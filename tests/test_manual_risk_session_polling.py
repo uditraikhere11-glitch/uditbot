@@ -28,10 +28,10 @@ class EligibilityTests(unittest.TestCase):
                 self.assertFalse(manual_risk_only({}, [{**r, field: value}]))
         self.assertFalse(manual_risk_only({'N': {}}, [r]))
 
-    def test_terminal_uncertainty_is_bounded_outside_hours(self):
+    def test_terminal_uncertainty_is_urgent_outside_hours(self):
         r = {**holding(), 'cancel_uncertain': True}
         self.assertEqual(watcher_cadence_seconds(pending={}, open_records=[r], now=1000,
-                                               market_open=False), 300)
+                                               market_open=False), 10)
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
@@ -130,14 +130,12 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await self.drive(302)
         self.assertEqual(self.calls, [1000, 1300])
 
-    async def test_terminal_protection_uncertainty_uses_300s_after_hours(self):
+    async def test_terminal_protection_uncertainty_wakes_urgent_check(self):
         def event():
             if self.clock == 1010:
                 self.w.terminal_orders['O1']['pending_oco'] = {'state': 'UNKNOWN'}
         await self.drive(32, event)
-        # One change-signature wake is allowed, then next routine poll
-        # waits five minutes even while the entry gate is blocked.
-        self.assertEqual(self.calls, [1000, 1010])
+        self.assertEqual(self.calls, [1000, 1010, 1020, 1030])
 
     async def test_terminal_uncertainty_previews_normal_transport_allowance(self):
         from src.broker.read_governor import ReadGovernor
@@ -170,6 +168,7 @@ class BrokerSnapshotTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         gate = NS(halt_new_entries=Mock())
         broker = NS(cfg=NS(dhan_client_id='ACCOUNT'), reconciliation_gate=gate,
+                    get_trades_for_order=Mock(return_value=[]),
                     get_super_orders=Mock(return_value=[]),
                     get_forever_orders=Mock(return_value=[]),
                     get_trade_book=Mock(return_value=trades or []),

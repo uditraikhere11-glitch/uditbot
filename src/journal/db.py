@@ -1250,6 +1250,14 @@ class JournalDB:
                 (time.time(), outbox_id),
             )
 
+    def defer_outbox(self, outbox_id: int, until: float) -> None:
+        """Reschedule an explicitly rate-limited delivery without consuming a failure attempt."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE outbox SET status='PENDING', next_retry_at=?, last_error='Telegram flood control' "
+                "WHERE id=? AND status='CLAIMING'", (until, outbox_id)
+            )
+
     def mark_outbox_retry(self, outbox_id: int, error_msg: str = "", max_retries: int = 5, now: Optional[float] = None) -> str:
         """16-C & P0-08: Increments retry count with exponential backoff or marks DEAD_LETTER with system event alert."""
         current_ts = now if now is not None else time.time()
@@ -2979,9 +2987,11 @@ class JournalDB:
                 """
                 UPDATE positions_lifecycle
                 SET position_state = 'UNPROTECTED_MANUAL_RISK', updated_at = ?
-                WHERE parent_order_id = ?
+                WHERE parent_order_id = ? AND security_id = ? AND confirmed_open_qty = ?
+                  AND protected_qty = 0 AND manual_exit_detected = 0 AND orphaned_legs_detected = 0
+                  AND position_state IN ('OPEN', 'UNPROTECTED', 'UNPROTECTED_MANUAL_RISK')
                 """,
-                (ts, p_oid),
+                (ts, p_oid, eff_sec, eff_qty),
             )
             # Update watcher_orders record_json if present
             w_row = conn.execute(
@@ -2992,7 +3002,12 @@ class JournalDB:
                 try:
                     w_data = json.loads(w_row["record_json"])
                     if isinstance(w_data, dict):
-                        w_data["position_state"] = "UNPROTECTED_MANUAL_RISK"
+                        if (w_data.get("position_state") in ("OPEN", "UNPROTECTED", "UNPROTECTED_MANUAL_RISK")
+                                and not any(w_data.get(k) for k in ("manual_exit_detected", "orphaned_legs_detected",
+                                                                    "reconciliation_required", "unreadable_broker_response"))
+                                and str(w_data.get("security_id")) == eff_sec
+                                and w_data.get("confirmed_position_open_qty") == eff_qty):
+                            w_data["position_state"] = "UNPROTECTED_MANUAL_RISK"
                         w_data["manual_risk_acknowledged"] = True
                         w_data["manual_risk_acknowledged_by"] = actor
                         w_data["manual_risk_reason"] = reas
@@ -3086,6 +3101,19 @@ class JournalDB:
     ) -> bool:
         ack = self.get_manual_risk_acknowledgement(parent_order_id, correlation_id)
         if not isinstance(ack, dict):
+            return False
+        # The legacy lookup accepts parent ID OR correlation ID for discovery.
+        # Recovery authorisation is stricter: both supplied identities must
+        # refer to the SAME acknowledged order. Otherwise another order with
+        # the same account/security/quantity could inherit a risk waiver.
+        if parent_order_id and str(ack.get("parent_order_id") or "").strip() != str(parent_order_id).strip():
+            return False
+        # The settled-holdings verifier passes parent ID as a sentinel
+        # correlation when the original intent is no longer in its watcher
+        # snapshot. In that case the exact parent ID remains authoritative.
+        req_cid = str(correlation_id or "").strip()
+        req_parent = str(parent_order_id or "").strip()
+        if req_cid and req_cid != req_parent and str(ack.get("correlation_id") or "").strip() != req_cid:
             return False
         if str(ack.get("status") or "").upper() != "UNPROTECTED_MANUAL_RISK":
             return False

@@ -26,6 +26,7 @@ ACCOUNT = "9000000001"
 
 
 def identity_proof(token):
+    expires = time.time() + 2 * 86400  # Dynamic synthetic expiry; never test against an already expired clock.
     return {
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "verified_at": time.time(),
@@ -35,8 +36,8 @@ def identity_proof(token):
             "identity_verified": True,
             "identity_mismatch": False,
             "profile_client_id": ACCOUNT,
-            "token_expiration_str": "18/11/2026 17:00",
-            "token_expiration_ts": 1795001400.0,
+            "token_expiration_str": time.strftime("%d/%m/%Y %H:%M", time.gmtime(expires)),
+            "token_expiration_ts": expires,
             "token_expired": False,
         }
     }
@@ -314,8 +315,12 @@ class R03GovernorReserveTests(unittest.TestCase):
         self.assertEqual(normal.headers.get("X-AuditBot-Local-Deferral"), "1")
         c.session.get.assert_not_called()
 
-        c._identity_verification_context = True
-        critical = c._governed_get(url, headers={}, timeout=1)
+        from src.broker.read_governor import RECONCILIATION_PACING
+        token = RECONCILIATION_PACING.set(True)
+        try:
+            critical = c._governed_get(url, headers={}, timeout=1)
+        finally:
+            RECONCILIATION_PACING.reset(token)
         self.assertEqual(critical.status_code, 200)
         self.assertEqual(c.session.get.call_count, 1)
         with sqlite3.connect(self.g.path) as db:

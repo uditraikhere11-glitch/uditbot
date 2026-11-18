@@ -136,6 +136,11 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         self.stop_mgr = EmergencyStopManager(self.stop_path, expected_account_id=FAKE_ACCT)
         self.stop_mgr.provision_initial_clean_state("OperatorTest", FAKE_ACCT)
         self.client = DhanClient(self.cfg, stop_manager=self.stop_mgr, auto_generate_token=False)
+        # Synthetic reconciliation exercises many reads without real latency.
+        # Advance a dedicated admission clock to keep each one-second Dhan
+        # NON_TRADING window within the documented 20/s ceiling.
+        self._mock_admissions = iter(range(100000))
+        self.client._read_governor.clock = lambda: time.time() + 0.11 * next(self._mock_admissions)
         self.watcher = ProtectionWatcher(
             self.client,
             path=self.watcher_path,

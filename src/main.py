@@ -73,6 +73,8 @@ def _is_transport_uncertainty(msg: str) -> bool:
     exceptions whose broker outcome is UNKNOWN.
     """
     m = (msg or "").lower()
+    if "mutation not_submitted" in m or "mutation not submitted" in m:
+        return False
     return any(
         k in m
         for k in (
@@ -1793,18 +1795,13 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
         if response_entity is not None:
             loop = asyncio.get_running_loop()
 
+            from src.notifier.dhan_response import send_telethon_notification
+
             def _send_dhan_response(message: str) -> bool:
-                """Uses the already authenticated Telegram client from the outbox thread."""
-                future = asyncio.run_coroutine_threadsafe(
-                    client.send_message(response_entity, message, parse_mode="html"), loop
+                """Preserve TelegramRetryAfter for durable outbox rescheduling."""
+                return send_telethon_notification(
+                    client, response_entity, message, loop, timeout=12.0
                 )
-                try:
-                    future.result(timeout=12)
-                    return True
-                except Exception as exc:
-                    future.cancel()
-                    logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
-                    return False
 
             dhan_response_dispatch_fn = _send_dhan_response
             if response_reporter is not None:
@@ -1822,7 +1819,7 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         outbox_worker = OutboxWorker(
             journal_db=pipeline.db,
-            dispatch_fn=pipeline.notifier.send_log_message,
+            dispatch_fn=lambda text: pipeline.notifier.send_log_message(text, outbox=True),
             dhan_response_dispatch_fn=dhan_response_dispatch_fn,
         )
         asyncio.create_task(outbox_worker.run())

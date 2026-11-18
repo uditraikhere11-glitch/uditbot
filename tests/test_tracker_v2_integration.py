@@ -132,8 +132,12 @@ class WebuiV2IntegrationTests(unittest.TestCase):
         original = OLD + "DHAN_CLIENT_ID=DEMOACCOUNT\n"
         self.env.write_text(original)
         holder = {"pid": 0, "calls": 0}
-        old_release = multiprocessing.Event()
-        new_release = multiprocessing.Event()
+        # These integration fixtures intentionally use a nested child target.
+        # Python 3.14 defaults to forkserver, which cannot pickle it; use a
+        # consistent Linux fork context for the isolated process simulation.
+        mp_ctx = multiprocessing.get_context("fork")
+        old_release = mp_ctx.Event()
+        new_release = mp_ctx.Event()
 
         def run_trader(data_dir, env_path, ready, release_event):
             from src.config import AppConfig, parse_env_dict
@@ -156,8 +160,8 @@ class WebuiV2IntegrationTests(unittest.TestCase):
                 ready.put(("ERR", str(exc)))
 
         def start_trader(release):
-            ready = multiprocessing.Queue()
-            child = multiprocessing.Process(
+            ready = mp_ctx.Queue()
+            child = mp_ctx.Process(
                 target=run_trader, args=(str(self.data), str(self.env), ready, release),
                 daemon=True,
             )

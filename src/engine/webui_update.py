@@ -267,6 +267,18 @@ def submit_webui_patch(
     Safety-controlled changes use the existing broker-aware coordinator.
     """
     env_path = os.path.abspath(env_path)
+    # PR-V2-ACTIVATE: a mixed legacy WebUI / V2 trading worker must never
+    # save configuration through the wrong coordinator or bypass its fence.
+    from src.engine.tracker_v2_dual_service import (
+        assert_consistent_save_route, DualServiceMismatch,
+    )
+    try:
+        assert_consistent_save_route(
+            tracker.data_dir,
+            web_v2=os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1",
+        )
+    except DualServiceMismatch as exc:
+        raise ConfigurationConflict("V2 routing safety gate: " + str(exc)) from None
     if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
         from src.engine.tracker_v2_integration import submit_v2_webui_patch
         return submit_v2_webui_patch(
