@@ -84,6 +84,29 @@ class SimpleSaveApplyTests(unittest.TestCase):
         self.assertEqual(self.env.read_text(), before)
         self.assertEqual(self.restarts, 0)
 
+    def test_pending_owner_stop_blocks_restart_without_config_change(self):
+        import json
+        state = self.env.parent / "data"
+        state.mkdir()
+        (state / "service_control_state.json").write_text(json.dumps({
+            "desired_service_state": "STOPPED",
+            "observed_state": "RUNNING",
+            "deferred_stop_pending": True,
+        }))
+        previous = self.env.read_text()
+        with self.assertRaises(ConfigurationConflict):
+            self.save({"equity_budget_inr": "801"}, state="active")
+        self.assertEqual(previous, self.env.read_text())
+        self.assertEqual(self.restarts, 0)
+
+    def test_corrupted_owner_stop_record_is_not_permission_to_restart(self):
+        state = self.env.parent / "data"
+        state.mkdir()
+        (state / "service_control_state.json").write_text("{garbled")
+        with self.assertRaises(ConfigurationConflict):
+            self.save({"equity_budget_inr": "802"}, state="active")
+        self.assertEqual(self.restarts, 0)
+
     def test_owner_stop_winning_race_is_never_restarted(self):
         readings = iter(("active", "inactive"))
         result = apply_settings(

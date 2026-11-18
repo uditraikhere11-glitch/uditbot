@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -85,6 +86,34 @@ def trading_service_state() -> str:
     return state
 
 
+def _owner_stop_requested(env_file: Path, cfg: Mapping[str, str]) -> bool:
+    """Read the independent Owner STOP record; do not replay any tracker flow."""
+    directory = Path(cfg.get("DATA_DIR") or "data").expanduser()
+    if not directory.is_absolute():
+        directory = env_file.parent / directory
+    control = directory / "service_control_state.json"
+    try:
+        if control.is_symlink():
+            raise ConfigurationConflict("Owner STOP record is a symlink")
+        if not control.exists():
+            return False
+        if control.stat().st_size > 65536:
+            raise ConfigurationConflict("Owner STOP record is unexpectedly large")
+        data = json.loads(control.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Owner STOP record must be an object")
+        if data.get("_corrupted"):
+            raise ValueError("Owner STOP record marked corrupted")
+        return (
+            data.get("deferred_stop_pending") is True
+            or str(data.get("desired_service_state") or "").upper() == "STOPPED"
+        )
+    except (OSError, ValueError) as exc:
+        raise ConfigurationConflict(
+            "Owner STOP state unreadable; cannot restart trading"
+        ) from exc
+
+
 def restart_trading_service() -> None:
     result = subprocess.run(
         ["sudo", "-n", "/usr/bin/systemctl", "try-restart", "trading_bot.service"],
@@ -135,6 +164,8 @@ def apply_settings(
         state = state_reader()
         if state not in ("active", "inactive"):
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
+        if state == "active" and _owner_stop_requested(path, old_values):
+            raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
         _atomic_env_write(path, proposed)
         new_revision = revision(proposed)
         keys = tuple(sorted(changed))
