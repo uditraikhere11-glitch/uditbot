@@ -367,14 +367,16 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             # barriers and Owner STOP instructions remain independent.
             tracker = ConfigChangeTracker(data_dir=data_dir)
             with tracker.operation_lock(
-                operation_type="AMO_DIRECT_SAVE", operation_id=form_key,
+                operation_type="AMO_STALE_RECORD_RECOVERY", operation_id=form_key,
             ):
                 tracker.reconcile_stale_control_records(env_path)
-                result = apply_settings(
-                    {form_key: body["enabled"]}, env_path=env_path,
-                    expected_revision=body["expected_revision"],
-                    confirm_live=body.get("confirm_live") is True,
-                )
+            # apply_settings independently acquires the same global flock.
+            # Do not nest it inside operation_lock (two FDs would deadlock).
+            result = apply_settings(
+                {form_key: body["enabled"]}, env_path=env_path,
+                expected_revision=body["expected_revision"],
+                confirm_live=body.get("confirm_live") is True,
+            )
             return _json({
                 "ok": True,
                 "state": (
