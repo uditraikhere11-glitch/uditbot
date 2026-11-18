@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, revision
 from src.engine.simple_save_apply import apply_settings
