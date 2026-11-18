@@ -618,7 +618,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
         self.assertIn('name="csrf_token"', HTML_TEMPLATE)
         self.assertIn('name="expected_revision"', HTML_TEMPLATE)
         routes = {(r.path, tuple(sorted(getattr(r, "methods", ())))) for r in setup_app.routes}
-        self.assertTrue(any(path == "/setup/submit-async" and "POST" in methods for path, methods in routes))
+        self.assertTrue(any(path == "/setup/save-apply" and "POST" in methods for path, methods in routes))
         self.assertTrue(any(path == "/setup/service-control" and "POST" in methods for path, methods in routes))
         self.assertTrue(any(path == "/setup/change-status/{change_id}" and "GET" in methods for path, methods in routes))
 

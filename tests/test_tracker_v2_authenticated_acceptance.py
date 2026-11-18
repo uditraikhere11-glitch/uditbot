@@ -80,7 +80,7 @@ class TrackerV2AuthenticatedAcceptance(unittest.TestCase):
             "equity_budget_inr": "750",
         }
         params.update(values)
-        return self.client.post("/setup/submit-async", json=params)
+        return self.client.post("/setup/save-apply", data=params)
 
     def test_password_required_for_every_v2_write(self):
         for path in (
@@ -105,13 +105,9 @@ class TrackerV2AuthenticatedAcceptance(unittest.TestCase):
         saved = self._save()
         self.assertEqual(200, saved.status_code, saved.text)
         body = saved.json()
-        self.assertEqual("SAVED_FOR_NEXT_START", body["state"])
+        self.assertEqual("SAVED_STOPPED", body["status"])
         self.assertFalse(body["restart_performed"])
-        self.assertFalse(body["runtime_verified"])
         self.assertIn("EQUITY_BUDGET_INR=750", self.config_path.read_text())
-        status = self.client.get(f"/setup/change-status/{body['change_id']}")
-        self.assertEqual(200, status.status_code)
-        self.assertFalse(status.json()["runtime_verified"])
         active = self.client.get("/control/status")
         self.assertEqual(200, active.status_code)
         amo = self.client.post("/control/amo/fno", json={
@@ -124,7 +120,7 @@ class TrackerV2AuthenticatedAcceptance(unittest.TestCase):
 
     def test_live_needs_explicit_confirmation(self):
         self._login()
-        resp = self._save(trading_mode="LIVE")
+        resp = self._save(is_live_mode="true")
         self.assertEqual(422, resp.status_code)
         self.assertEqual(self.initial, self.config_path.read_text())
 

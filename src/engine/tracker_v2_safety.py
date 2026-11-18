@@ -286,9 +286,24 @@ def inspect_transaction_recovery(data_dir: os.PathLike[str] | str, env_path: os.
         if ep.is_symlink():
             return _result(False, 'ENV_SYMLINK', 'Configuration file is symlinked')
         actual = sha256(ep.read_bytes()).hexdigest()
-        if actual not in (expected, previous):
-            return _result(False, 'EXTERNAL_ENV_WRITER', 'External .env update detected; preserve file', file_sha256=actual)
         status = str(tx.get('phase') or '')
+        if actual not in (expected, previous):
+            # A completed V2 transaction may have been superseded by the
+            # reviewed direct-save path. Require its exact old/new checksum
+            # annotation AND an inactive broker apply barrier. Arbitrary
+            # external .env changes still fail closed.
+            if (status in ('VERIFIED', 'SAVED_FOR_NEXT_START', 'NO_CHANGE')
+                    and actual in (
+                        tx.get('direct_save_from_revision'),
+                        tx.get('direct_save_to_revision'),
+                    )):
+                barrier = inspect_apply_barrier(p.parent / 'apply_barrier.json')
+                if not barrier.allowed:
+                    return _result(False, 'DIRECT_SAVE_BARRIER_ACTIVE',
+                                   'Prior broker apply barrier remains unresolved')
+                return _result(True, 'DIRECT_SAVE_SUPERSEDED',
+                               'Historical V2 transaction superseded by verified direct-save checksum')
+            return _result(False, 'EXTERNAL_ENV_WRITER', 'External .env update detected; preserve file', file_sha256=actual)
         if status in ('RESTART_ISSUED', 'VERIFYING', 'ACK_UNCERTAIN'):
             return _result(False, 'RESTART_OUTCOME_UNCERTAIN',
                            'Never restore old .env or restart twice; inspect live runtime and late ACK',

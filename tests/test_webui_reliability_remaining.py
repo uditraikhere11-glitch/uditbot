@@ -242,8 +242,9 @@ class WebUIFullMatrix(unittest.TestCase):
         for p in (Path(self.tracker.data_dir) / 'config_field_backups').glob('*.env'):
             self.assertEqual(p.stat().st_mode & 0o077, 0)
         from src.setup_app import HTML_TEMPLATE
-        self.assertIn('changesList.replaceChildren()', HTML_TEMPLATE)
-        self.assertIn('row.textContent', HTML_TEMPLATE)
+        self.assertIn('id="simpleSaveStatus"', HTML_TEMPLATE)
+        self.assertIn("status.textContent = result.message", HTML_TEMPLATE)
+        self.assertNotIn('changesList.replaceChildren()', HTML_TEMPLATE)
 
     def test_ac17_legacy_sqlite_not_touched_by_notification_save(self):
         db = Path(self.tracker.data_dir) / 'trade_journal.db'
@@ -280,7 +281,7 @@ class ControlCenterFnoAmoTransactionAudit(unittest.TestCase):
                 }
                 with patch.object(FnoAmoQueue, 'cancel_all_queued',
                                   side_effect=AssertionError('Queue cancellation requires deliberate action')) as cancelled, \
-                     patch('src.control_center_backend.submit_webui_patch',
+                     patch('src.control_center_backend.apply_settings',
                            side_effect=OSError('Injected transaction failure')):
                     failed = client.post('/control/amo/fno', json=payload)
                     self.assertIn(failed.status_code, (409, 503))

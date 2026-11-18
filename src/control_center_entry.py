@@ -14,7 +14,6 @@ from src.control_center_backend import register_control_center_routes
 from src.control_center_ui import render_control_center
 from src.setup_app import (
     SETUP_CSRF_TOKEN,
-    _on_webui_startup,
     app as legacy_setup_app,
     get_setup_page,
 )
@@ -111,16 +110,6 @@ async def logout(request: Request):
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(auth.cookie_name(), path="/")
     return response
-
-
-@app.on_event("startup")
-def start_legacy_coordinator_once() -> None:
-    """Mounted sub-app lifespan is not invoked automatically by Starlette."""
-    # The V2 coordinator owns the transaction journal while explicitly
-    # enabled. Do not concurrently spawn the legacy pending-op coordinator.
-    if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
-        return
-    _on_webui_startup()
 
 
 @app.get("/", response_class=HTMLResponse)

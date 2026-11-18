@@ -280,6 +280,15 @@ def submit_webui_patch(
     except DualServiceMismatch as exc:
         raise ConfigurationConflict("V2 routing safety gate: " + str(exc)) from None
     if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+        # Keep V2 interface for compatibility. Reconcile stale *legacy* status
+        # records from systemd before entering the V2 coordinator. This does
+        # not clear a V2 broker barrier or replay an uncertain restart.
+        with tracker.operation_lock(
+            operation_type="V2_COMPAT_STATUS_RECOVERY", operation_id="recover",
+        ):
+            tracker.reconcile_stale_control_records(
+                env_path, check_service_fn=check_service_fn,
+            )
         from src.engine.tracker_v2_integration import submit_v2_webui_patch
         return submit_v2_webui_patch(
             tracker, form_data, env_path, expected_revision=expected_revision,
@@ -323,6 +332,7 @@ def submit_webui_patch(
         # Do not supersede a safety-critical pending transition in the legacy
         # single-record coordinator. Independent, non-restart changes would be
         # possible in a multi-record tracker, but not by overwriting its gate.
+        tracker.reconcile_stale_control_records(env_path, check_service_fn=check_service_fn)
         prior = tracker.get_change_record()
         if prior is not None and prior.state == ConfigApplyState.WAITING_FOR_SAFE_APPLY:
             if recover_legacy_notification_deferred(tracker, env_path):
@@ -331,7 +341,7 @@ def submit_webui_patch(
             raise ConfigurationConflict(
                 "Another configuration change is pending. Review or cancel it before resubmitting"
             )
-        if os.path.exists(tracker.pending_op_file):
+        if tracker.has_unresolved_pending_operation():
             raise ConfigurationConflict("Existing durable configuration operation needs coordinator recovery")
         control_rec = tracker.get_service_control_record()
         if isinstance(control_rec, dict) and control_rec.get("deferred_stop_pending"):

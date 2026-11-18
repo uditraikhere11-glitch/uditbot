@@ -269,6 +269,44 @@ def acquire_apply_barrier(
         return True
 
 
+
+def release_aborted_apply_barrier(
+    data_dir: str | os.PathLike[str], account: str, change_id: str,
+    expected_old_pid: int, expected_old_starttime: int,
+    *, service_stopped: Callable[[], bool],
+) -> bool:
+    """Cancel only a pre-commit fence when the old service is proven stopped.
+
+    Caller must first prove the .env is still the exact old revision.
+    This is NOT recovery of an unknown broker request or an issued restart.
+    """
+    with _locked(data_dir) as (ledger, barrier):
+        data = _read(ledger)
+        if (data.get("schema_version") != 2 or
+                data.get("handoff_verified") is not True or
+                data.get("account_id") != str(account) or
+                data.get("producer_pid") != expected_old_pid or
+                data.get("producer_starttime") != expected_old_starttime or
+                not isinstance(data.get("active"), list) or
+                not isinstance(data.get("unresolved"), list) or
+                data["active"] or data["unresolved"]):
+            return False
+        state = _read(barrier)
+        if (state.get("active") is not True or
+                state.get("change_id") != change_id or
+                state.get("account_id") != str(account)):
+            return False
+        # Observe systemd inside the broker interlock. A new producer cannot
+        # register or start mutations while the fence is still held.
+        if not service_stopped():
+            return False
+        state["active"] = False
+        state["released_at"] = time.time()
+        state["release_reason"] = "ABORTED_BEFORE_ENV_COMMIT_SYSTEMD_STOPPED"
+        _write(barrier, state)
+        return True
+
+
 def release_apply_barrier(
     data_dir: str | os.PathLike[str], account: str, change_id: str,
     expected_new_pid: int, expected_new_starttime: int,

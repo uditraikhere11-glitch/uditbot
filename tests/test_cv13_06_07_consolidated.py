@@ -808,7 +808,7 @@ class TestCV1306And07Consolidated(unittest.TestCase):
     def test_15_defect3_csrf_enforced_on_all_settings_post_routes(self):
         """
         Defect 3 Regression Test:
-        Verifies that both POST /setup/submit-async and POST /setup reject requests with
+        Verifies that both POST /setup/save-apply and POST /setup reject requests with
         a missing CSRF token, an empty CSRF token, or an invalid CSRF token (HTTP 403),
         and accept requests only when the valid SETUP_CSRF_TOKEN is supplied.
         """
@@ -820,16 +820,16 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         os.chdir(self.tmp_dir.name)
         try:
             # 1. Async endpoint: missing csrf_token -> 403
-            r_async_missing = client.post("/setup/submit-async", json={"equity_budget_inr": 30000.0})
+            r_async_missing = client.post("/setup/save-apply", data={"equity_budget_inr": 30000.0})
             self.assertEqual(r_async_missing.status_code, 403)
-            self.assertEqual(r_async_missing.json()["state"], "REJECTED")
+            self.assertFalse(r_async_missing.json()["ok"])
 
             # 2. Async endpoint: empty csrf_token -> 403
-            r_async_empty = client.post("/setup/submit-async", data={"equity_budget_inr": "30000", "csrf_token": ""})
+            r_async_empty = client.post("/setup/save-apply", data={"equity_budget_inr": "30000", "csrf_token": ""})
             self.assertEqual(r_async_empty.status_code, 403)
 
             # 3. Async endpoint: wrong csrf_token -> 403
-            r_async_wrong = client.post("/setup/submit-async", json={"equity_budget_inr": 30000.0, "csrf_token": " forged_token "})
+            r_async_wrong = client.post("/setup/save-apply", data={"equity_budget_inr": 30000.0, "csrf_token": " forged_token "})
             self.assertEqual(r_async_wrong.status_code, 403)
 
             # 4. Legacy POST /setup endpoint: missing csrf_token -> 403
@@ -842,8 +842,9 @@ class TestCV1306And07Consolidated(unittest.TestCase):
 
             # 6. Both endpoints succeed (200) when valid SETUP_CSRF_TOKEN is provided
             from src.engine.config_patch import revision
+            Path(".env").write_text("TRADING_MODE=TEST\nDHAN_CLIENT_ID=1113731536\n")
             r_async_ok = client.post(
-                "/setup/submit-async",
+                "/setup/save-apply",
                 data={"dhan_client_id": "1113731536", "equity_budget_inr": "30000",
                       "csrf_token": SETUP_CSRF_TOKEN,
                       "expected_revision": revision(Path(".env").read_text(encoding="utf-8") if Path(".env").exists() else "")},

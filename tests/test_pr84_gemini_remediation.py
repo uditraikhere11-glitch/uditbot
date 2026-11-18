@@ -55,7 +55,7 @@ class WebUIRegression(unittest.TestCase):
                           return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "mocked")), \
              patch.object(ConfigChangeTracker, "get_readonly_broker",
                           side_effect=AssertionError("stopped repair cannot contact broker")):
-            response = self.client.post("/setup/submit-async", json={
+            response = self.client.post("/setup/save-apply", data={
                 "equity_sl_pct": 3.0,
                 "expected_revision": revision(invalid),
                 "csrf_token": SETUP_CSRF_TOKEN,

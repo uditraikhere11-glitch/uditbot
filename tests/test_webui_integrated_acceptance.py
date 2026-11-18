@@ -73,12 +73,12 @@ class FieldRegistryAudit(unittest.TestCase):
 
     def test_ac14_dom_never_injects_change_descriptions_as_html(self):
         from src.setup_app import HTML_TEMPLATE
-        self.assertIn("changesList.replaceChildren()", HTML_TEMPLATE)
-        self.assertIn("row.textContent = '• ' + String(change)", HTML_TEMPLATE)
+        self.assertIn('id="simpleSaveStatus"', HTML_TEMPLATE)
+        self.assertIn("status.textContent = result.message", HTML_TEMPLATE)
+        self.assertIn("fetch('/setup/save-apply'", HTML_TEMPLATE)
+        self.assertNotIn("changesList.replaceChildren()", HTML_TEMPLATE)
+        self.assertNotIn("modalApplicationFacts", HTML_TEMPLATE)
         self.assertNotIn("rec.changes_summary.map(c => '<div>• ' + c", HTML_TEMPLATE)
-        self.assertIn('id="modalApplicationFacts"', HTML_TEMPLATE)
-        self.assertIn('Broker safety check:', HTML_TEMPLATE)
-        self.assertIn("rec.runtime_verified === true && rec.effective_version_hash", HTML_TEMPLATE)
 
 
 class CoordinatorIntegrationAudit(unittest.TestCase):

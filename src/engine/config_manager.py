@@ -2053,6 +2053,171 @@ class ConfigChangeTracker:
             except Exception as e:
                 logger.error(f"Failed to persist configuration change record: {e}")
 
+    def reconcile_stale_control_records(
+        self, env_path: str = ".env",
+        check_service_fn: Optional[Callable[[], Any]] = None,
+    ) -> Dict[str, Any]:
+        """Repair stale *display/control* states from positive systemd evidence.
+
+        Never deletes an operation, changes the owner DESIRED state, clears a
+        broker/transition barrier, or asserts broker-position reconciliation.
+        A live process requires PID/starttime, config hash and an empty,
+        account-scoped, registered broker mutation handoff.
+        """
+        from src.config import AppConfig, parse_env_dict
+        from src.engine.tracker_v2_safety import (
+            evaluate_active_broker_operation_gate, read_private_json,
+        )
+        from src.engine.config_patch import revision
+        result: Dict[str, Any] = {"resolved": False, "reason": "No eligible stale state"}
+        try:
+            cfg = AppConfig.from_env(
+                env=parse_env_dict(env_path), env_file="",
+            )
+            mode = str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper()
+            current_hash = compute_config_version(cfg)
+            with open(env_path, "r", encoding="utf-8", newline="") as f:
+                file_revision = revision(f.read())
+            props = inspect_systemd_service_properties(
+                "trading_bot.service", check_fn=check_service_fn,
+            )
+            state = str(props.get("ActiveState") or "").lower()
+            main_pid = props.get("MainPID")
+            if type(main_pid) is not int:
+                try:
+                    main_pid = int(main_pid or 0)
+                except (ValueError, TypeError):
+                    return {"resolved": False, "reason": "Untrusted MainPID"}
+            stopped = state == "inactive" and main_pid == 0
+            verified = False
+            if state == "active" and main_pid > 0:
+                valid, ack, _ = self.is_active_version_confirmed(
+                    expected_hashes={current_hash}, expected_mode=mode,
+                    check_service_fn=check_service_fn, require_systemd_active=True,
+                )
+                gate = evaluate_active_broker_operation_gate(
+                    self.data_dir, require_handoff=True,
+                )
+                ledger = read_private_json(
+                    os.path.join(self.data_dir, "active_broker_mutations.json"),
+                    missing_ok=True,
+                )
+                verified = bool(
+                    valid and isinstance(ack, dict) and gate.allowed
+                    and gate.code == "NO_ACTIVE_BROKER_OPERATION"
+                    and isinstance(ledger, dict)
+                    and ledger.get("account_id") == cfg.dhan_client_id
+                    and gate.evidence.get("producer_pid") == main_pid
+                    and gate.evidence.get("producer_starttime") == ack.get("process_starttime")
+                )
+            if not stopped and not verified:
+                return {"resolved": False, "reason": "Systemd/ACK/broker handoff not positively verified"}
+
+            # The caller holds the configuration operation lock. These updates
+            # are monotonic evidence reconciliation, not a second restart.
+            record = self.get_change_record()
+            busy = {
+                "STARTING", "APPLYING", "WAITING_FOR_ACTIVE_OPERATION",
+                "VERIFYING", "SAFETY_CHECK_PENDING",
+                "WAITING_FOR_SAFE_APPLY",
+            }
+            if record is not None and (
+                str(record.state.value).upper() in busy
+                or str(record.operation_state).upper() in busy
+            ):
+                # Never certify a different .env or a different requested version.
+                if (
+                    record.requested_file_revision == file_revision
+                    and record.proposed_version_hash == current_hash
+                ):
+                    record.state = (
+                        ConfigApplyState.SAVED_FOR_NEXT_START if stopped
+                        else ConfigApplyState.APPLIED_VERIFIED
+                    )
+                    record.operation_state = (
+                        OperationState.SAVED_FOR_NEXT_START.value if stopped
+                        else OperationState.APPLIED_VERIFIED.value
+                    )
+                    record.runtime_verified = verified
+                    record.restart_performed = verified and bool(record.restart_required)
+                    record.running_mode = "STOPPED" if stopped else mode
+                    record.service_state = (
+                        ServiceOperatingState.STOPPED_OTHER.value if stopped
+                        else ServiceOperatingState.RUNNING.value
+                    )
+                    record.saved_mode = mode
+                    record.blocked_reason = ""
+                    record.reason = (
+                        "Previous save reconciled to stopped service; no restart issued"
+                        if stopped else "Prior restart verified against current systemd PID and broker handoff"
+                    )
+                    record.progress_percent = 100
+                    record.current_step = "PERSISTED" if stopped else "VERIFIED"
+                    if verified:
+                        record.effective_version_hash = current_hash
+                        record.verified_at = time.time()
+                    self.save_change_record(record)
+                    check = self.get_change_record(record.change_id)
+                    if check is None or check.state != record.state:
+                        return {"resolved": False, "reason": "Configuration reconciliation readback failed"}
+                    result["configuration"] = record.state.value
+                    result["resolved"] = True
+
+            control = self.get_service_control_record()
+            if control.get("_corrupted"):
+                return {"resolved": False, "reason": "Owner control record corrupted"}
+            desired = str(control.get("desired_service_state") or "").upper()
+            observed = str(control.get("observed_state") or "").upper()
+            stale_control = observed in {
+                "STARTING", "APPLYING", "WAITING_FOR_ACTIVE_OPERATION",
+            }
+            # Owner STOP priority: never change a STOPPED intention to RUNNING.
+            if stale_control and (stopped or (verified and desired != "STOPPED")):
+                updated = dict(control)
+                updated["observed_state"] = (
+                    "STOPPED_BY_OWNER" if stopped and desired == "STOPPED"
+                    else "STOPPED_OTHER" if stopped else "RUNNING"
+                )
+                if stopped:
+                    updated["deferred_stop_pending"] = False
+                    updated["stop_ready_to_apply"] = False
+                updated["reconciled_at"] = time.time()
+                write_json_atomic(self.service_control_file, updated)
+                check = self.get_service_control_record()
+                if check.get("observed_state") != updated["observed_state"]:
+                    return {"resolved": False, "reason": "Owner state reconciliation readback failed"}
+                result["service"] = updated["observed_state"]
+                result["resolved"] = True
+
+            # Never infer completion of a V2 restart from service state alone.
+            # In particular, ACK_UNCERTAIN and in-flight phases retain their
+            # durable evidence and require the V2 recovery coordinator.
+            return result
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Stale tracker state not reconciled: %s", type(exc).__name__)
+            return {"resolved": False, "reason": "Safety evidence unreadable"}
+
+
+    def has_unresolved_pending_operation(self) -> bool:
+        """A terminal saved change is not a forever-blocking old queue file.
+
+        Preserve a pending envelope for a different change and fail closed on
+        corrupt/unreadable pending metadata; never delete safety evidence.
+        """
+        if not os.path.exists(self.pending_op_file):
+            return False
+        try:
+            from src.engine.tracker_v2_safety import read_private_json
+            pending = read_private_json(self.pending_op_file, missing_ok=False)
+            rec = self.get_change_record()
+            return not bool(
+                rec is not None
+                and rec.state == ConfigApplyState.SAVED_FOR_NEXT_START
+                and pending.get("change_id") == rec.change_id
+            )
+        except (OSError, ValueError, TypeError):
+            return True
+
     def get_change_record(self, change_id: Optional[str] = None) -> Optional[ConfigChangeRecord]:
         """Loads change record from disk."""
         with self._lock:
@@ -4995,6 +5160,7 @@ class ConfigChangeTracker:
             }
 
         with self.operation_lock(operation_type=f"SERVICE_{act_clean.upper()}", operation_id=f"SVC-{act_clean.upper()}"):
+            self.reconcile_stale_control_records(env_path, check_service_fn=check_service_fn)
             svc_state, svc_detail = self.resolve_service_operating_state(check_fn=check_service_fn)
             live_ver = self.get_active_running_version(require_live_pid=True) or {}
             running_mode = str(live_ver.get("trading_mode") or "UNKNOWN").upper() if svc_state == ServiceOperatingState.RUNNING else "STOPPED"

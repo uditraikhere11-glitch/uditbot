@@ -87,10 +87,7 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
     <button id="health" type="button">♡ Health Check</button>
   </div>
   <div id="info" class="status-note" role="status" aria-live="polite">Read-only status is loading. No action has been taken.</div>
-  <div id="v2-recovery-tools" class="status-note" hidden>
-    <button id="v2-recheck" type="button">Verify pending restart</button>
-    <span id="v2-recovery-feedback" role="status" aria-live="polite">Verification only. No second restart will be issued.</span>
-  </div>
+
 </section>
 <section aria-label="After market order controls">
   <h2>After Market Order Settings</h2>
@@ -141,7 +138,6 @@ async function refreshStatus(){
     setText('mode',mode);
     setText('mode-detail',s.runtime_verified===true?'Active running configuration verified':'Saved mode: '+safeStatus(s.saved_mode));
     $('start').disabled=!['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
-    $('v2-recovery-tools').hidden=!(s.tracker_v2_late_ack_pending===true && typeof s.latest_change_id==='string');
     $('stop').disabled=state!=='RUNNING';
     $('equity-amo').checked=s.equity_amo_saved===true;
     $('equity-amo').disabled=s.equity_amo_can_edit!==true;
@@ -153,7 +149,7 @@ async function refreshStatus(){
       ' · F&O runtime: '+(s.fno_amo_active===true?'ON':s.fno_amo_active===false?'OFF':'UNVERIFIED')+
       ' · F&O route: broker native AMO /orders (entry only)');
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
-  }catch(err){current=null;$('v2-recovery-tools').hidden=true;$('start').disabled=true;$('stop').disabled=true;
+  }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;
     $('equity-amo').disabled=true;$('fno-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
     setText('info','Cannot verify bot state: '+err.message+' (controls disabled)')}
 }
@@ -195,22 +191,12 @@ $('health').addEventListener('click',async()=>{
 $('equity-amo').addEventListener('change',async()=>{
   const requested=$('equity-amo').checked;
   if(!current){$('equity-amo').checked=!requested;return}
-  $('equity-amo').disabled=true;setText('amo-feedback','Saving Equity AMO request through safe configuration coordinator…');
+  $('equity-amo').disabled=true;setText('amo-feedback','Saving Equity AMO settings…');
   try{
     const r=await requestJSON('/control/amo/equity',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:requested,csrf_token:csrf,expected_revision:current.config_file_revision,request_id:(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():'AMO-'+Date.now()+'-'+Math.random().toString(36).slice(2))})});
-    setText('amo-feedback',r.message||('Request received: '+String(r.state||'PENDING')));
-    if(r.change_id){
-      const requestedChangeId=encodeURIComponent(String(r.change_id));
-      // Poll the authoritative coordinator result; a queued request is not applied.
-      for(let i=0;i<15;i++){
-        await new Promise(resolve=>setTimeout(resolve,1500));
-        const rec=await requestJSON('/setup/change-status/'+requestedChangeId);
-        const st=String(rec.state||'UNKNOWN');
-        setText('amo-feedback','Equity AMO configuration: '+st+' · '+String(rec.reason||''));
-        if(['APPLIED_VERIFIED','SAVED_FOR_NEXT_START','REJECTED','APPLY_FAILED'].includes(st))break;
-      }
-    }
+      body:JSON.stringify({enabled:requested,confirm_live:current.saved_mode==='LIVE'&&confirm('Restart LIVE bot to apply this AMO setting?'),csrf_token:csrf,expected_revision:current.config_file_revision,request_id:(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():'AMO-'+Date.now()+'-'+Math.random().toString(36).slice(2))})});
+    setText('amo-feedback',r.message);
+    if (r.state !== 'UNCHANGED') window.alert(r.message);
   }catch(err){setText('amo-feedback','Equity AMO change/status verification failed: '+err.message)}
   await refreshStatus();
 });
@@ -220,21 +206,12 @@ $('fno-amo').addEventListener('change',async()=>{
   if(requested&&!confirm('Enable broker-native F&O AMO? Eligible NSE stock option orders will be sent to Dhan after hours. Dhan will return a real Order ID if acknowledged. NO automatic SL or target will protect a filled position.')) {
     $('fno-amo').checked=false;return;
   }
-  $('fno-amo').disabled=true;setText('amo-feedback','Requesting F&O AMO setting through safety coordinator…');
+  $('fno-amo').disabled=true;setText('amo-feedback','Saving F&O AMO settings…');
   try{
     const r=await requestJSON('/control/amo/fno',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:requested,csrf_token:csrf,expected_revision:current.config_file_revision,request_id:(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():'AMO-'+Date.now()+'-'+Math.random().toString(36).slice(2))})});
-    setText('amo-feedback',r.message||('Requested: '+String(r.state||'PENDING')));
-    if(r.change_id){
-      const id=encodeURIComponent(String(r.change_id));
-      for(let i=0;i<15;i++){
-        await new Promise(resolve=>setTimeout(resolve,1500));
-        const rec=await requestJSON('/setup/change-status/'+id);
-        const st=String(rec.state||'UNKNOWN');
-        setText('amo-feedback','F&O AMO configuration: '+st+' · '+String(rec.reason||''));
-        if(['APPLIED_VERIFIED','SAVED_FOR_NEXT_START','REJECTED','APPLY_FAILED'].includes(st))break;
-      }
-    }
+      body:JSON.stringify({enabled:requested,confirm_live:current.saved_mode==='LIVE'&&confirm('Restart LIVE bot to apply this AMO setting?'),csrf_token:csrf,expected_revision:current.config_file_revision,request_id:(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():'AMO-'+Date.now()+'-'+Math.random().toString(36).slice(2))})});
+    setText('amo-feedback',r.message);
+    if (r.state !== 'UNCHANGED') window.alert(r.message);
   }catch(err){setText('amo-feedback','F&O AMO change not verified: '+err.message)}
   await refreshStatus();
 });
@@ -277,22 +254,6 @@ async function refreshOrders(){
   }catch(err){setText('order-counts','Cannot verify AMO orders: '+err.message)}
   $('refresh-orders').disabled=false;
 }
-$('v2-recheck').addEventListener('click', async()=>{
-  if(!current || current.tracker_v2_late_ack_pending!==true || typeof current.latest_change_id!=='string')return;
-  const id=current.latest_change_id;
-  const button=$('v2-recheck');button.disabled=true;
-  setText('v2-recovery-feedback','Checking saved configuration, systemd PID and broker fence (no restart)…');
-  try{
-    const result=await requestJSON('/control/tracker-v2/recheck',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({csrf_token:csrf,change_id:id})
-    });
-    setText('v2-recovery-feedback',result.runtime_verified===true?
-      'New running configuration verified. Entry barrier released.' :
-      'Runtime still unverified. Entry barrier retained.');
-  }catch(err){setText('v2-recovery-feedback','Recheck blocked: '+err.message)}
-  finally{button.disabled=false;await refreshStatus()}
-});
 $('refresh-orders').addEventListener('click',refreshOrders);
 refreshStatus();refreshOrders();
 setInterval(refreshStatus,20000);

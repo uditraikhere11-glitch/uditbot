@@ -491,9 +491,8 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
                       "fno_capital_per_trade", "dhan_response_group_name"):
             self.assertIn('name="' + field + '"', HTML_TEMPLATE)
         registered = {(r.path, tuple(sorted(getattr(r, "methods", ())))) for r in setup_app.routes}
-        for endpoint, method in (("/setup", "POST"), ("/setup/submit-async", "POST"),
+        for endpoint, method in (("/setup", "POST"), ("/setup/save-apply", "POST"),
                                  ("/setup/service-control", "POST"),
-                                 ("/setup/cancel-deferred", "POST"),
                                  ("/setup/change-status/{change_id}", "GET")):
             self.assertTrue(any(p == endpoint and method in methods for p, methods in registered))
 
