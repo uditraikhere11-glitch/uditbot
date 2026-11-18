@@ -3101,7 +3101,12 @@ class JournalDB:
         # the same account/security/quantity could inherit a risk waiver.
         if parent_order_id and str(ack.get("parent_order_id") or "").strip() != str(parent_order_id).strip():
             return False
-        if correlation_id and str(ack.get("correlation_id") or "").strip() != str(correlation_id).strip():
+        # The settled-holdings verifier passes parent ID as a sentinel
+        # correlation when the original intent is no longer in its watcher
+        # snapshot. In that case the exact parent ID remains authoritative.
+        req_cid = str(correlation_id or "").strip()
+        req_parent = str(parent_order_id or "").strip()
+        if req_cid and req_cid != req_parent and str(ack.get("correlation_id") or "").strip() != req_cid:
             return False
         if str(ack.get("status") or "").upper() != "UNPROTECTED_MANUAL_RISK":
             return False
