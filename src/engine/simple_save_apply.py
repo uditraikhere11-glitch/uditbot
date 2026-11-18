@@ -263,6 +263,20 @@ def apply_settings(
         new_values, _ = parse_env_strict(proposed)
         if old_values.get("DHAN_CLIENT_ID") and old_values.get("DHAN_CLIENT_ID") != new_values.get("DHAN_CLIENT_ID"):
             raise ConfigurationRejected("Dhan account migration is not a settings restart")
+        # Preserve the existing last-known-good Telegram response destination
+        # handoff on settings changes. No Telegram API call or session mutation.
+        if "DHAN_RESPONSE_GROUP_NAME" in changed:
+            from src.notifier.response_activation import stage_destination_change
+            try:
+                stage_destination_change(
+                    str(data_root),
+                    old_values.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                    new_values.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                )
+            except OSError as exc:
+                raise ConfigurationConflict(
+                    "Cannot stage Telegram response fallback; configuration unchanged"
+                ) from exc
         old_mode = old_values.get("TRADING_MODE", "TEST")
         new_mode = new_values.get("TRADING_MODE", old_mode)
         if old_mode != "LIVE" and new_mode == "LIVE" and not confirm_live:
