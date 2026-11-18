@@ -123,11 +123,14 @@ class R02CadencePolicyTests(unittest.TestCase):
             {"pending_oco": {"state": "SUBMITTING"}},
         ):
             with self.subTest(fields=fields):
+                # Stale read-only reconciliation can use 300s outside hours.
+                # Genuine uncertain cancellation/protection retains 10s.
+                expected = 300.0 if fields == {"reconciliation_required": True} else 10.0
                 self.assertEqual(
                     watcher_cadence_seconds(
                         pending={"UNRESOLVED": {"created_at": 1, **fields}},
                         open_records=[], now=100000, market_open=False,
-                    ), 10.0
+                    ), expected
                 )
 
     def test_read_requirement_is_bounded(self):

@@ -143,7 +143,7 @@ Quotes fetched from the market feed are timestamped in memory. If a quote's age 
   - `TRANSIT`: Order received by broker, routing to exchange.
   - `PENDING`: Order resting on exchange order book.
   - `TRADED`: Order fully executed.
-  - `PARTIALLY_TRADED`: Order partially executed, balance resting.
+  - `PART_TRADED`: Order partially executed, balance resting.
   - `CANCELLED`: Order cancelled by user or system.
   - `REJECTED`: Order rejected by broker risk management or exchange.
   - `EXPIRED`: Order expired at market close.
@@ -157,26 +157,8 @@ Quotes fetched from the market feed are timestamped in memory. If a quote's age 
 
 ## 6. Forever Orders (OCO Protection Legs)
 
-Once an entry buy order executes (status `TRADED` or `PARTIALLY_TRADED`), the bot reads the official `averageTradedPrice` and immediately places a Dhan **Forever Order** in **OCO** mode for the exact filled quantity.
+For an entry assigned to the Forever OCO route, the protection watcher verifies fills and computes the uncovered quantity. The client submits a SELL OCO to `POST /v2/forever/orders`. The stop leg uses `price`, `triggerPrice` and `quantity`. The target leg uses `price1`, `triggerPrice1` and `quantity1`. A placement acknowledgement alone does not establish that both legs are active.
 
-- **Endpoint**: `POST https://api.dhan.co/v2/forever/orders`
-- **Payload Specification**:
-  ```json
-  {
-    "dhanClientId": "1000000000",
-    "correlationId": "BOT-OCO-20261027-001",
-    "orderFlag": "OCO",
-    "transactionType": "SELL",
-    "exchangeSegment": "NSE_EQ",
-    "productType": "CNC",
-    "securityId": "11536",
-    "quantity": 10,
-    "price": 3626.10,
-    "triggerPrice": 3414.90,
-    "targetPrice": 3626.10,
-    "stopLossPrice": 3414.90
-  }
-  ```
 - **Safety Properties**:
   - Forever orders persist on Dhan's servers independently of the bot VM.
   - If target price is hit, Dhan places a limit sell order and cancels the stop-loss leg.
@@ -186,8 +168,23 @@ Once an entry buy order executes (status `TRADED` or `PARTIALLY_TRADED`), the bo
 
 ## 7. Account Balances & Margin Inquiries
 
-- **Funds Endpoint**: `GET https://api.dhan.co/v2/funds`
+- **Funds Endpoint**: `GET https://api.dhan.co/v2/fundlimit`
   - Returns `availabelBalance`, `sodLimit`, `collateralAmount`, `utilizedAmount`.
   - Polled prior to live order generation to enforce `MIN_TRADE_FUNDS_INR` and verify sufficient liquidity.
 - **Margin Calculator Endpoint**: `POST https://api.dhan.co/v2/margincalculator`
   - Returns required margin for equity delivery, MTF, or options buying.
+
+## Request scheduling and recovery
+
+| Category | Second | Minute | Hour | Day |
+|---|---:|---:|---:|---:|
+| Order | 10 | 250 | 1,000 | 7,000 |
+| Data | 5 | Unspecified | Unspecified | 100,000 |
+| Quote | 1 | Unlimited | Unlimited | Unlimited |
+| Non-trading | 20 | Unlimited | Unlimited | Unlimited |
+
+The broker client assigns account reads to non-trading, LTP requests to quote, and order writes to order. The official table gives category limits without a complete endpoint mapping. The client retains a local reserve for routine watcher checks and lower-priority reads. Broker throttles impose a durable quiet period. Counters coordinate processes sharing the same account database. Modification reservations made by this version count toward 25 per order, including requests whose outcome is uncertain. Existing modifications made elsewhere are unknown locally.
+
+On restart, reconciliation checks the day’s order book, then uses the correlation endpoint or the known broker order ID for missing evidence. Historical trade lookup starts at page zero. An unclear submission stays unresolved until verified. Never infer a fill from the presence of a holding alone.
+
+Official references: [limits](https://dhanhq.co/docs/v2/), [orders](https://dhanhq.co/docs/v2/orders/), [portfolio](https://dhanhq.co/docs/v2/portfolio/), [funds](https://dhanhq.co/docs/v2/funds/), [history](https://dhanhq.co/docs/v2/statements/), [Forever](https://dhanhq.co/docs/v2/forever/).

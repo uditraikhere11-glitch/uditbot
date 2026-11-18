@@ -86,13 +86,23 @@ class DhanCategoryTransportTests(unittest.TestCase):
         self.assertEqual(result.status_code,429)
         self.assertEqual(self.c.session.put.call_count,25)
 
-    def test_failed_admission_never_invokes_v2_broker_handoff(self):
+    def test_failed_admission_finalizes_registered_v2_fence_without_network(self):
+        # V2 verifies the broker mutation fence before debiting rate limits.
+        # Inject an admitted fence; local exhaustion then finalizes known-no-send.
+        from contextlib import contextmanager
         for _ in range(10):self.g.admit(category='ORDER')
-        with patch('src.engine.broker_handoff.guarded_request') as handoff:
+        finalized=[]
+        @contextmanager
+        def admitted_fence(*args):
+            yield lambda known: finalized.append(known)
+        with patch('src.engine.broker_handoff.broker_mutation', side_effect=admitted_fence) as handoff:
             with patch.dict('os.environ', {'UDITBOT_TRACKER_V2_ENABLE':'1'}):
                 response_local=self.c._broker_mutating_http('POST','https://api.dhan.co/v2/orders')
             self.assertEqual(response_local.status_code,429)
-            handoff.assert_not_called()
+            self.assertEqual(response_local.headers['X-AuditBot-Local-Deferral'],'1')
+            handoff.assert_called_once()
+            self.assertEqual(finalized,[True])
+            self.c.session.post.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()

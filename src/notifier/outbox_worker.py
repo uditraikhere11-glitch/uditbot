@@ -3,7 +3,7 @@ Durable Outbox Worker for Asynchronous Log & Signal Notifications.
 Implements STEP 16 (16-A through 16-E) + V12-14 Non-Blocking I/O + P0-08 Atomic Claiming:
 - Separates broker order execution from Telegram network latency.
 - Uses atomic cross-process claiming (`claim_pending_outbox`) when supported by `JournalDB` so
-  concurrent workers/processes never send duplicate Telegram notifications.
+  concurrent workers cannot claim the same unexpired row. Delivery is at least once.
 - Offloads synchronous SQLite and HTTP dispatch work to `asyncio.to_thread` in `run()` so the
   event loop is never blocked.
 - Bounded retries with exponential backoff and dead-letter escalation on repeated 429/500/timeout (`OUTBOX-01`).
@@ -42,6 +42,12 @@ def redact_secrets(text: str) -> str:
     return redacted
 
 
+class TelegramRetryAfter(Exception):
+    def __init__(self, seconds):
+        self.seconds = seconds
+        super().__init__(f"Telegram flood control: retry after {seconds}s")
+
+
 class OutboxWorker:
     def __init__(
         self,
@@ -66,23 +72,22 @@ class OutboxWorker:
         Marks processed atomically upon verified delivery, or schedules exponential backoff on failure.
         """
         with self._lock:
-            current_ts = now if now is not None else time.time()
-            if hasattr(self.db, "claim_pending_outbox"):
-                try:
-                    pending = self.db.claim_pending_outbox(limit=limit, now=current_ts)
-                except TypeError:
-                    pending = self.db.claim_pending_outbox(limit=limit)
-            else:
-                try:
-                    pending = self.db.fetch_pending_outbox(limit=limit, now=current_ts)
-                except TypeError:
-                    pending = self.db.fetch_pending_outbox(limit=limit)
-
-            if not pending:
-                return 0
-
             dispatched_count = 0
-            for item in pending:
+            for _ in range(limit):
+                current_ts = now if now is not None else time.time()
+                if hasattr(self.db, "claim_pending_outbox"):
+                    claim = self.db.claim_pending_outbox
+                else:
+                    claim = self.db.fetch_pending_outbox
+                try:
+                    pending = claim(limit=1, now=current_ts)
+                except TypeError as exc:
+                    if "unexpected keyword argument 'now'" not in str(exc):
+                        raise
+                    pending = claim(limit=1)
+                if not pending:
+                    break
+                item = pending[0]
                 out_id = item["id"]
                 payload_raw = item["payload"]
                 try:
@@ -109,6 +114,10 @@ class OutboxWorker:
                                 max_retries=self.max_retries,
                                 now=current_ts,
                             )
+                except TelegramRetryAfter as exc:
+                    retry_from = now if now is not None else time.time()
+                    self.db.defer_outbox(out_id, retry_from + exc.seconds)
+                    break  # Telegram flood wait applies to the whole send batch.
                 except Exception as e:
                     safe_err = redact_secrets(str(e))
                     logger.error(f"[Outbox] Exception processing outbox item {out_id}: {safe_err}")

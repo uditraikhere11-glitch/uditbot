@@ -26,6 +26,7 @@ ACCOUNT = "9000000001"
 
 
 def identity_proof(token):
+    expires = time.time() + 2 * 86400  # Dynamic synthetic expiry; never test against an already expired clock.
     return {
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "verified_at": time.time(),
@@ -35,8 +36,8 @@ def identity_proof(token):
             "identity_verified": True,
             "identity_mismatch": False,
             "profile_client_id": ACCOUNT,
-            "token_expiration_str": "18/11/2026 17:00",
-            "token_expiration_ts": 1795001400.0,
+            "token_expiration_str": time.strftime("%d/%m/%Y %H:%M", time.gmtime(expires)),
+            "token_expiration_ts": expires,
             "token_expired": False,
         }
     }

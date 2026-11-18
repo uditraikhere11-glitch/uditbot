@@ -16,7 +16,10 @@ No successful broker response is cached or fabricated, and no watcher sleeps.
 The existing legacy SQLite records (all historically GET admissions) are
 migrated in place to NON_TRADING without deleting history or cooling counters.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
+import fcntl
+import os
+from contextvars import ContextVar
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -28,8 +31,12 @@ import time
 from urllib.parse import urlsplit
 
 
+RECONCILIATION_PACING = ContextVar("reconciliation_pacing", default=False)
+
+
 class ReadDeferred(RuntimeError):
-    def __init__(self, seconds, reason):
+    def __init__(self, seconds, reason, *, short_window=False):
+        self.short_window = short_window
         self.seconds = max(1, math.ceil(seconds))
         super().__init__(f'Dhan API deferred locally for {self.seconds}s: {reason}')
 
@@ -113,7 +120,34 @@ class ReadGovernor:
         override = self.__dict__.get('LIMITS')
         return tuple(override) if override is not None else self.CATEGORY_LIMITS[category]
 
+    @contextmanager
+    def _schema_initialization_lock(self):
+        """Coordinate first use across workers before the DB file exists.
+
+        Inspecting SQLite's file-size marker without a cross-process lock can
+        mistake another worker's uncommitted initial schema for corruption.
+        This separate owner-only lock protects initialization only; the SQLite
+        transaction continues to protect each individual admission.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = str(self.path) + ".schema.lock"
+        fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def _connect(self):
+        with self._schema_initialization_lock():
+            return self._connect_unlocked()
+
+    def _connect_unlocked(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         persisted = self.path.is_file() and self.path.stat().st_size > 0
         conn = sqlite3.connect(self.path, timeout=0.07)
@@ -135,6 +169,8 @@ class ReadGovernor:
             cols = {row[1] for row in conn.execute('PRAGMA table_info(reads)')}
             if 'at' not in cols:
                 raise sqlite3.DatabaseError('Invalid governor reads schema')
+            if 'category' in cols and persisted and not {'category_cooldown', 'order_modifications'} <= tables:
+                raise sqlite3.DatabaseError('Persisted category governor tables missing')
             if 'category' not in cols:
                 # Legacy DB contains ONLY GET admissions. Existing rows remain
                 # present and now count against per-second non-trading policy;
@@ -207,7 +243,7 @@ class ReadGovernor:
                 ).fetchone()
                 if count >= ceiling:
                     delay = max(.001, (float(oldest)+window-now) if oldest is not None else window)
-                    raise ReadDeferred(delay, f'{cat} {window}s category budget exhausted')
+                    raise ReadDeferred(delay, f'{cat} {window}s category budget exhausted', short_window=window == 1)
             if modification_order_id is not None:
                 if cat != 'ORDER' or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', str(modification_order_id)):
                     raise ValueError('Invalid order modification admission')

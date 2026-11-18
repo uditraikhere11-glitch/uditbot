@@ -307,6 +307,37 @@ class StartupReconciliationGate:
         if exp_oid and got_oid != exp_oid:
             return False, f"Broker orderId mismatch ({got_oid} != {exp_oid})"
 
+        if st.get("correlationId") and str(st["correlationId"]) != corr_id:
+            return False, "Broker correlationId mismatch"
+        status = str(st.get("orderStatus") or "").upper()
+        if status not in {"TRANSIT", "PENDING", "PART_TRADED", "TRADED", "REJECTED",
+                          "CANCELLED", "EXPIRED", "TRIGGERED"}:
+            return False, "Unrecognized broker order status"
+        filled = st.get("filledQty")
+        if filled is None and status == "REJECTED":
+            # Dhan RMS rejections can omit filledQty: a rejected entry has
+            # no executed BUY; do not infer zero from a PART_TRADED order.
+            filled = 0
+        elif filled is None and status in {"CANCELLED", "EXPIRED"}:
+            # Cancellation may follow a partial fill. Only accept omitted
+            # quantity when an associated pre-fill intent proves zero filled.
+            previous = (intent or {}).get("filled_qty", (intent or {}).get("filledQty"))
+            if previous is None or str(previous) != "0":
+                return False, "Cancelled/expired broker order missing fill evidence"
+            filled = 0
+        if filled is not None or status in {"PART_TRADED", "TRADED"}:
+            if not str(filled).isascii() or not str(filled).isdecimal():
+                return False, "Missing or invalid broker filledQty"
+            quantity = (intent or {}).get("quantity")
+            if quantity is not None and int(filled) > int(quantity):
+                return False, "Broker fill exceeds intent quantity"
+            if quantity is not None and status == "TRADED" and int(filled) != int(quantity):
+                return False, "Terminal fill does not match intent quantity"
+            if quantity is not None and status == "PART_TRADED" and int(filled) >= int(quantity):
+                return False, "Partial fill does not leave a remainder"
+            if status in {"TRADED", "PART_TRADED"} and not int(filled):
+                return False, "Filled status without an executed quantity"
+
         expected_acct = str(
             (intent or {}).get("account_id")
             or getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "")
@@ -339,6 +370,8 @@ class StartupReconciliationGate:
 
             if st.get("quantity") is not None and intent.get("quantity") is not None:
                 try:
+                    if not str(st["quantity"]).isascii() or not str(st["quantity"]).isdecimal():
+                        return False, "Invalid broker order quantity"
                     if int(st["quantity"]) != int(intent["quantity"]):
                         return False, f"Broker order quantity mismatch ({st['quantity']} != {intent['quantity']})"
                 except (ValueError, TypeError):
@@ -353,38 +386,39 @@ class StartupReconciliationGate:
         order_book: List[Dict[str, Any]],
         intent: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        candidates: List[Dict[str, Any]] = []
-        if hasattr(self.broker, "get_order_by_correlation_id"):
-            try:
-                res = self.broker.get_order_by_correlation_id(corr_id)
-                if isinstance(res, dict) and res.get("orderId"):
-                    candidates.append(res)
-            except Exception:
-                pass
+        def matches(row):
+            if not isinstance(row, dict) or not row.get("orderId"):
+                return False
+            ok, reason = self._validate_broker_order_matches_intent(row, intent, corr_id, broker_oid)
+            if not ok:
+                logger.warning("Rejected reconciliation candidate for %s: %s", corr_id, reason)
+            return ok
 
-        if order_book:
-            for ob_row in order_book:
-                if isinstance(ob_row, dict) and (
-                    ob_row.get("correlationId") == corr_id
-                    or (broker_oid and str(ob_row.get("orderId")) == str(broker_oid))
-                ):
-                    candidates.append(ob_row)
-                    break
+        rows = [row for row in order_book if isinstance(row, dict) and
+                (row.get("correlationId") == corr_id or
+                 (broker_oid and str(row.get("orderId")) == str(broker_oid)))]
+        if len(rows) > 1:
+            logger.error("[RECONCILIATION] Duplicate broker correlation/order rows for %s", corr_id)
+            return None
+        if len(rows) == 1:
+            return rows[0] if matches(rows[0]) else None
 
-        if hasattr(self.broker, "order_status"):
-            target_id = broker_oid or corr_id
-            try:
-                res = self.broker.order_status(target_id)
-                if isinstance(res, dict) and res.get("orderId"):
-                    candidates.append(res)
-            except Exception:
-                pass
-
-        for cand in candidates:
-            ok_match, reason = self._validate_broker_order_matches_intent(cand, intent, corr_id, broker_oid)
-            if ok_match:
-                return cand
-            logger.error(f"[RECONCILIATION] Rejected broker order candidate for {corr_id}: {reason}")
+        # When the journal has no broker order ID, legacy brokers can look up
+        # the correlation key directly. Validate the returned broker payload
+        # before accepting it; duplicates in the order book are still fatal.
+        for method, key in (("get_order_by_correlation_id", corr_id), ("order_status", broker_oid or corr_id)):
+            lookup = getattr(self.broker, method, None)
+            if key and callable(lookup):
+                try:
+                    row = lookup(key)
+                except Exception:
+                    continue
+                if matches(row):
+                    return row
+                # A real but contradictory correlation lookup is not permission
+                # to resolve a different order by an unrelated point request.
+                if isinstance(row, dict) and row.get("orderId"):
+                    return None
         return None
 
     def _compute_verified_oco_for_order(
@@ -873,6 +907,8 @@ class StartupReconciliationGate:
             else:
                 return 0
         except Exception:
+            if self.state != ReconciliationState.BLOCKED:
+                self.halt_new_entries("Runtime reconciliation could not read the intent journal")
             return 0
         if not unknowns:
             return 0
@@ -893,16 +929,18 @@ class StartupReconciliationGate:
                 order_status = str(st.get("orderStatus", "PENDING")).upper()
                 resolved_broker_id = str(st.get("orderId"))
                 filled_qty = int(st.get("filledQty") or 0)
+                if order_status not in ("CANCELLED", "REJECTED", "EXPIRED") or filled_qty > 0:
+                    self._track_or_merge_intent_in_watcher(intent, resolved_broker_id, st)
                 self.db.update_order_intent(corr_id, state=order_status, broker_order_id=resolved_broker_id)
                 if hasattr(self.stop_manager, "deregister_in_flight"):
                     self.stop_manager.deregister_in_flight(corr_id)
-                if order_status not in ("CANCELLED", "REJECTED", "EXPIRED") or filled_qty > 0:
-                    self._track_or_merge_intent_in_watcher(intent, resolved_broker_id, st)
                 resolved_count += 1
-            elif str(intent.get("state") or "").upper() != "UNKNOWN" and broker_oid:
+            else:
                 still_unresolved.append(intent)
 
         if still_unresolved:
+            if self.state != ReconciliationState.BLOCKED:
+                self.halt_new_entries("Runtime order intent requires fresh broker evidence")
             # History pagination can take many seconds; never run it inside
             # ProtectionWatcher.check_once(). Schedule a serialized, bounded
             # full gate recheck instead. It remains fail-closed during recovery.
@@ -1374,9 +1412,12 @@ class StartupReconciliationGate:
             self._in_startup_reconciliation_pass = True
             self._active_pass_holdings = None
             self._active_pass_forever_orders = None
+            from src.broker.read_governor import RECONCILIATION_PACING
+            pacing_token = RECONCILIATION_PACING.set(True)
             try:
                 return self._run_startup_reconciliation_inner(starting_halt_generation)
             finally:
+                RECONCILIATION_PACING.reset(pacing_token)
                 self._in_startup_reconciliation_pass = False
                 self._active_pass_holdings = None
                 self._active_pass_forever_orders = None
@@ -1529,9 +1570,6 @@ class StartupReconciliationGate:
                         order_status = str(st.get("orderStatus", "PENDING")).upper()
                         resolved_broker_id = str(st.get("orderId"))
                         filled_qty = int(st.get("filledQty") or 0)
-                        self.db.update_order_intent(corr_id, state=order_status, broker_order_id=resolved_broker_id)
-                        logger.info(f"[RECONCILIATION] Resolved intent {corr_id} -> {order_status} (Broker ID: {resolved_broker_id})")
-
                         existing_in_watcher = (
                             hasattr(self.watcher, "pending")
                             and isinstance(self.watcher.pending, dict)
@@ -1539,6 +1577,8 @@ class StartupReconciliationGate:
                         )
                         if order_status not in ("CANCELLED", "REJECTED", "EXPIRED") or filled_qty > 0 or existing_in_watcher:
                             self._track_or_merge_intent_in_watcher(intent, resolved_broker_id, st)
+                        self.db.update_order_intent(corr_id, state=order_status, broker_order_id=resolved_broker_id)
+                        logger.info(f"[RECONCILIATION] Resolved intent {corr_id} -> {order_status} (Broker ID: {resolved_broker_id})")
                     else:
                         needs_historical_fallback.append(intent)
 

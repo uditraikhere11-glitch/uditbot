@@ -66,7 +66,7 @@ from src.main import TradingBotPipeline
 from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock
 from src.notifier.outbox_worker import OutboxWorker
-from src.notifier.dhan_response import configure_dhan_response_group
+from src.notifier.dhan_response import configure_dhan_response_group, send_telethon_notification
 from src.engine.config_manager import compute_config_version
 from src.notifier.formatter import format_trade_log
 
@@ -156,18 +156,9 @@ async def main():
 
         def _dispatch_notification_sync(formatted_text: str) -> bool:
             if pipeline.notifier.enabled:
-                return pipeline.notifier.send_log_message(formatted_text)
+                return pipeline.notifier.send_log_message(formatted_text, outbox=True)
             if cfg.log_group_id:
-                try:
-                    fut = asyncio.run_coroutine_threadsafe(
-                        client.send_message(cfg.log_group_id, formatted_text, parse_mode="html"),
-                        loop,
-                    )
-                    fut.result(timeout=8.0)
-                    return True
-                except Exception as e:
-                    logging.getLogger("run").error(f"Telethon log_group fallback delivery failed: {e}")
-                    return False
+                return send_telethon_notification(client, cfg.log_group_id, formatted_text, loop, timeout=8.0)
             return False
 
         # Broker-native F&O AMO submits immediately while market is closed.

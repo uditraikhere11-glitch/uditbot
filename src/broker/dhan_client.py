@@ -1170,24 +1170,49 @@ class DhanClient:
         if category != "ORDER":
             raise ValueError("Order mutation requested on a non-order API route")
         governor = self._get_active_read_governor()
-        if governor is not None:
-            try:
+        fn = getattr(self.session, method.lower())
+
+        def admit_before_network():
+            if governor is not None:
                 governor.admit(
                     category="ORDER",
                     priority="urgent" if method.upper() in ("DELETE", "PUT") else "normal",
                     modification_order_id=ReadGovernor.modification_order_id(method, url),
                 )
+
+        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
+            # Legacy mode has no V2 mutation fence; reserve before the HTTP call.
+            try:
+                admit_before_network()
             except (ReadDeferred, OSError, sqlite3.Error) as exc:
                 return self._read_deferral_response(exc)
-        fn = getattr(self.session, method.lower())
-        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
             result = fn(url, **kwargs)
         else:
-            from src.engine.broker_handoff import guarded_request
-            result = guarded_request(
-                self.cfg.data_dir, self.cfg.dhan_client_id, method,
-                lambda: fn(url, **kwargs),
+            # The ledger and configuration fence are admitted FIRST. A refused
+            # fence never consumes the governor's 25-modification allowance.
+            # A locally refused governor request has no broker transport and
+            # must finalize the handoff as definitely NOT sent.
+            from src.engine.broker_handoff import (
+                broker_mutation, BrokerHandoffBlocked, BrokerMutationNotSubmitted,
             )
+            sent = False
+            try:
+                with broker_mutation(self.cfg.data_dir, self.cfg.dhan_client_id, method) as finish:
+                    try:
+                        admit_before_network()
+                    except (ReadDeferred, OSError, sqlite3.Error) as exc:
+                        finish(True)  # Known no-send; do not create UNKNOWN mutation.
+                        return self._read_deferral_response(exc)
+                    sent = True
+                    result = fn(url, **kwargs)
+                    status = getattr(result, "status_code", None)
+                    finish(type(status) is int and (
+                        200 <= status < 400 or status in (400, 404, 409, 422)
+                    ))
+            except BrokerHandoffBlocked as exc:
+                if not sent:
+                    raise BrokerMutationNotSubmitted(str(exc)) from exc
+                raise
         if governor is not None and getattr(result, "headers", {}).get("X-AuditBot-Local-Deferral") != "1":
             try:
                 if self._is_rate_limited_response(result):
@@ -2281,6 +2306,14 @@ class DhanClient:
         except Exception as e:
             return False, 0.0, f"HTTP exception fetching LTP: {e}"
 
+    @staticmethod
+    def _ack_order_id(data):
+        raw = data.get("orderId") if isinstance(data, dict) else None
+        if type(raw) not in (str, int):
+            return ""
+        value = str(raw).strip()
+        return "" if value.lower() in {"", "0", "null", "none"} else value
+
     def get_order_by_correlation_id(self, correlation_id: str) -> Optional[Dict[str, Any]]:
         """
         Queries Dhan external correlation endpoint: GET /v2/orders/external/{correlation-id}.
@@ -2295,8 +2328,14 @@ class DhanClient:
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
-                    return data[0] if data and isinstance(data[0], dict) else None
-                return data if isinstance(data, dict) and data.get("orderId") else None
+                    if len(data) != 1:
+                        return None
+                    data = data[0]
+                if not self._ack_order_id(data):
+                    return None
+                if data.get("correlationId") and str(data["correlationId"]) != correlation_id:
+                    return None
+                return data
             return None
         except Exception as e:
             logger.error(f"HTTP exception fetching order by correlation {correlation_id}: {e}")
@@ -2410,7 +2449,16 @@ class DhanClient:
                     get_priority = "normal"
                 from src.broker.read_governor import ReadGovernor
                 category = ReadGovernor.classify("GET", url)
-                governor.admit(historical=historical, priority=get_priority, category=category)
+                try:
+                    governor.admit(historical=historical, priority=get_priority, category=category)
+                except ReadDeferred as exc:
+                    from src.broker.read_governor import RECONCILIATION_PACING
+                    if not (RECONCILIATION_PACING.get() and exc.short_window and exc.seconds == 1):
+                        raise
+                    # No HTTP request has been sent. Give a long reconciliation
+                    # pass one more admission attempt after its burst ages out.
+                    time.sleep(1)
+                    governor.admit(historical=historical, priority=get_priority, category=category)
         except (ReadDeferred, OSError, sqlite3.Error) as exc:
             return self._read_deferral_response(exc)
         # Transport exceptions retain the callers' UNAVAILABLE classification.
@@ -2771,19 +2819,21 @@ class DhanClient:
         if not found:
             ob = self.get_order_book()
             if isinstance(ob, list):
-                for row in ob:
-                    if isinstance(row, dict) and str(row.get("correlationId") or "") == corr_id:
-                        found = row
-                        break
+                matches = [row for row in ob if isinstance(row, dict) and
+                           str(row.get("correlationId") or "") == corr_id]
+                found = matches[0] if len(matches) == 1 else None
 
-        if isinstance(found, dict) and found.get("orderId"):
+        oid = self._ack_order_id(found) if isinstance(found, dict) else ""
+        if oid:
             sec = str(found.get("securityId") or "").strip()
             if sec and expected_security_id and sec != str(expected_security_id):
                 return False, None, f"Reconciled correlation {corr_id} has mismatched securityId ({sec} != {expected_security_id})"
-            st = str(found.get("orderStatus") or "PENDING").upper()
+            st = str(found.get("orderStatus") or "").upper()
+            if st not in {"TRANSIT", "PENDING", "PART_TRADED", "TRADED", "REJECTED"}:
+                return False, None, f"Order outcome UNKNOWN for {corr_id}: verify status and any fills"
             if st == "REJECTED":
-                return False, None, f"Reconciled order {found['orderId']} was REJECTED at Dhan"
-            return True, str(found["orderId"]), f"Order {found['orderId']} confirmed via correlation reconciliation ({st})"
+                return False, None, f"Reconciled order {oid} was REJECTED at Dhan"
+            return True, oid, f"Order {oid} confirmed via correlation reconciliation ({st})"
 
         return False, None, f"Ambiguous/uncertain response for correlation {corr_id}: outcome UNKNOWN (automatic resubmission prohibited)"
 
@@ -2903,10 +2953,11 @@ class DhanClient:
         try:
             resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 201):
                 data = resp.json() if resp.text else {}
-                raw_order_id = data.get("orderId", "")
-                order_id = str(raw_order_id).strip() if raw_order_id is not None else ""
+                order_id = self._ack_order_id(data)
                 if is_fno_amo and (not order_id.isascii() or not order_id.isdecimal() or len(order_id) < 6):
                     # No acknowledgement without an authentic Dhan order ID.
                     # Never resubmit an UNKNOWN broker outcome automatically.
@@ -3055,12 +3106,14 @@ class DhanClient:
         try:
             resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 201):
                 try:
                     data = resp.json() if resp.text else {}
                 except Exception:
                     data = {}
-                order_id = str(data.get("orderId", "")).strip()
+                order_id = self._ack_order_id(data)
                 if not order_id:
                     uncertain_outcome = True
                     rec_ok, rec_oid, rec_msg = self._reconcile_uncertain_submission(corr_id, str(order_req.security_id))
@@ -3140,6 +3193,10 @@ class DhanClient:
         url = f"{BASE_URL}/super/orders/{order_id}"
         try:
             resp = self._broker_mutating_http("PUT", url, headers=self._headers(), json=body, timeout=5)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                msg = f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
+                return False, msg, {"state": "DEFERRED", "status_code": resp.status_code,
+                                    "error": msg, "price": float(price)}
             if resp.status_code not in (200, 202):
                 st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code == 408) else "REJECTED"
                 msg = f"Failed to modify {leg_clean} ({resp.status_code}): {resp.text}"
@@ -3155,6 +3212,9 @@ class DhanClient:
                 "orderStatus": ord_st or "PENDING",
                 "price": float(price),
             }
+        except BrokerMutationNotSubmitted as e:
+            msg = f"MUTATION NOT_SUBMITTED (config fence): {e}"
+            return False, msg, {"state": "DEFERRED", "error": msg, "price": float(price)}
         except Exception as e:
             msg = f"HTTP exception modifying super order {order_id} ({leg_clean}): {e}"
             return False, msg, {"state": "UNKNOWN", "error": msg, "price": float(price)}
@@ -3212,9 +3272,13 @@ class DhanClient:
         url = f"{BASE_URL}/super/orders/{order_id_clean}/{leg_name}"
         try:
             resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Super order {leg_name} cancellation accepted (HTTP {resp.status_code}) for {order_id_clean}"
             return False, f"Failed to cancel super order {leg_name} ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, f"HTTP exception cancelling super order {leg_name}: {e}"
 
@@ -3232,6 +3296,8 @@ class DhanClient:
         url = f"{BASE_URL}/orders/{order_id_clean}"
         try:
             resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code == 202:
                 return True, f"Order cancellation request accepted by broker (HTTP 202) for {order_id_clean}"
             elif resp.status_code == 200:
@@ -3241,6 +3307,8 @@ class DhanClient:
             elif resp.status_code == 429:
                 return False, f"Dhan rate limit exceeded (429): {resp.text}"
             return False, f"Failed to cancel order ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, f"HTTP exception cancelling order: {e}"
 
@@ -3336,18 +3404,22 @@ class DhanClient:
 
         try:
             resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 201):
                 data = resp.json()
                 order_status = str(data.get("orderStatus", "PENDING")).upper()
                 if order_status == "REJECTED":
                     return False, None, f"Forever OCO rejected by broker RMS: {data}"
-                forever_id = str(data.get("orderId", "")).strip()
+                forever_id = self._ack_order_id(data)
                 if not forever_id:
                     return False, None, f"Ambiguous Forever OCO response missing orderId for {correlation_id}: outcome UNKNOWN"
                 return True, forever_id, "Forever OCO placed successfully on Dhan"
             elif resp.status_code >= 500 or resp.status_code == 408:
                 return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}"
             return False, None, f"Forever OCO rejected ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, None, f"HTTP exception placing Forever OCO: {e}"
 
@@ -3363,9 +3435,13 @@ class DhanClient:
         url = f"{BASE_URL}/forever/orders/{oid_clean}"
         try:
             resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Forever order cancellation accepted (HTTP {resp.status_code}) for {oid_clean}"
             return False, f"Failed to cancel Forever order ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, f"HTTP exception cancelling Forever order {oid_clean}: {e}"
 
