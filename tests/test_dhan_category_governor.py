@@ -137,6 +137,7 @@ class CategoryGovernorTests(unittest.TestCase):
         self.g.admit()
         with sqlite3.connect(self.g.path) as db:db.execute('DROP TABLE reads')
         with self.assertRaises(sqlite3.Error):self.g.seconds_until_capacity()
+        with self.assertRaises(sqlite3.Error):self.g.admit()
 
 
 if __name__ == '__main__':
