@@ -1617,6 +1617,12 @@ class JournalDB:
             ).fetchall()
             if len(intents) != 1 or not intents[0]["created_at"]:
                 raise ValueError("Original account-bound order date unavailable")
+            if conn.execute(
+                "SELECT 1 FROM fills WHERE security_id=? AND exchange_segment=? AND traded_at>=? "
+                "AND transaction_type='SELL' AND is_verified_trade=1 LIMIT 1",
+                (security, segment, intents[0]["created_at"]),
+            ).fetchone():
+                raise ValueError("Journal contains a verified SELL requiring attribution")
             fills = conn.execute(
                 "SELECT f.exchange_trade_id, f.traded_quantity, f.traded_price, a.evidence_json "
                 "FROM fills f LEFT JOIN broker_attested_historical_fills a "

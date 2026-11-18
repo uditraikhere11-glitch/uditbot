@@ -84,8 +84,10 @@ def observed_open_quantity(
             return None, "POSITIONS_SECURITY_MISSING"
         if str(row.get("securityId") or "").strip() != str(security_id).strip():
             continue
-        if (str(row.get("exchangeSegment") or segment).strip().upper() != str(segment).strip().upper()
-                or str(row.get("productType") or product).strip().upper() != str(product).strip().upper()):
+        if not row.get("exchangeSegment") or not row.get("productType"):
+            return None, "POSITION_CONTRACT_UNVERIFIED"
+        if (str(row["exchangeSegment"]).strip().upper() != str(segment).strip().upper()
+                or str(row["productType"]).strip().upper() != str(product).strip().upper()):
             continue
         if account_id and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account_id:
             return None, "POSITION_ACCOUNT_MISMATCH"

@@ -5,6 +5,7 @@ import json
 
 from src.broker.dhan_client import DhanClient, MAX_HISTORICAL_TRADE_WINDOW_DAYS
 from src.engine.market import IST
+from src.engine.holding_quantity import observed_open_quantity
 
 # Scoped to the thread and lifetime of one independent full gate pass.
 GATE_BOOKS = ContextVar("owner_lot_gate_books", default=None)
@@ -30,6 +31,9 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
         for f in fills:
             trade_id = f["exchange_trade_id"]
             attested = None if trade_id else json.loads(f["evidence_json"])
+            if attested and (attested.get("dhanClientId") != account or attested.get("orderId") != oid
+                             or attested.get("securityId") != security or attested.get("isin") != isin):
+                raise ValueError("Original attestation account or security differs")
             key = (oid, str(trade_id) if trade_id else None)
             if key in expected:
                 raise ValueError("Ambiguous original BUY identity")
@@ -119,8 +123,6 @@ def corroborated_external_sells(trades, account, security, segment, product, own
 
 def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=None, forever=None):
     """Run only in the serialized gate worker, before it takes the watcher pass lock."""
-    from src.engine.holding_quantity import observed_open_quantity
-
     rows = db.get_open_positions_lifecycle() if hasattr(db, "get_open_positions_lifecycle") else []
     if not isinstance(rows, list):
         return  # The gate's required lifecycle check rejects invalid storage.

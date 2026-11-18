@@ -4,7 +4,7 @@ import sqlite3
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from src.engine.protection_watcher import ProtectionWatcher
 from src.engine.reconciliation import StartupReconciliationGate
@@ -110,6 +110,37 @@ class OwnerLotRestart(unittest.TestCase):
         with patch.object(self.db, "record_system_event", side_effect=sqlite3.OperationalError("locked")):
             self.run_gate(False)
         self.run_gate(True)
+
+    def test_wrong_live_profile_blocks_before_recording_trades(self):
+        self.broker.cfg.trading_mode = "LIVE"
+        self.broker.get_authenticated_profile_id.return_value = "OTHER"
+        self.broker.get_trade_book.reset_mock()
+        self.run_gate(False)
+        self.broker.get_trade_book.assert_not_called()
+
+    def test_new_buy_does_not_inherit_old_acknowledgements(self):
+        self.run_gate(True)
+        original = self.broker.get_historical_trades.return_value
+        unrelated = dict(self.fx.second, orderId="OTHERBUY", exchangeTradeId="EXECNEW", tradedQuantity=1)
+        self.broker.get_historical_trades.return_value = [*original, unrelated]
+        self.run_gate(False)
+        self.assertFalse(self.db.is_manual_risk_acknowledged("OTHERBUY"))
+
+    def test_t1_settlement_and_unexplained_day_sale(self):
+        self.broker.get_holdings.return_value = [dict(self.broker.get_holdings.return_value[0],
+                                                     dpQty=1, t1Qty=1, totalQty=2)]
+        self.run_gate(True)
+        self.broker.get_positions.return_value = [dict(securityId="11915", exchangeSegment="NSE_EQ",
+                                                       productType="CNC", netQty=0, sellQty=1)]
+        self.run_gate(False)
+
+    def test_verified_sell_in_journal_blocks_even_if_history_omits_it(self):
+        self.run_gate(True)
+        self.db.record_fill("EXTERNAL", "CONFIRMED1", "YESBANK", 20., 1, traded_at=r01.NOW,
+                            transaction_type="SELL", security_id="11915", exchange_segment="NSE_EQ",
+                            product_type="CNC", is_verified_trade=True)
+        self.restart()
+        self.run_gate(False)
 
     def test_no_blocking_history_on_regular_poll_and_one_shared_book_per_full_check(self):
         self.run_gate(True)
