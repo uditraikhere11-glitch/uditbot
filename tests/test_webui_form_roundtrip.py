@@ -108,10 +108,10 @@ class SetupFormRoundTripRegression(unittest.TestCase):
                                         if ('name="' + field + '"') in t), '')
                             self.assertIn('step="any"', tag)
                     form['dhan_response_group_name'] = '-5514889030'
-                    result = client.post('/setup/submit-async', data=form)
+                    result = client.post('/setup/save-apply', data=form)
                     self.assertEqual(result.status_code, 200, result.text)
                     obj = result.json()
-                    self.assertEqual(obj.get('changed_fields'), ['DHAN_RESPONSE_GROUP_NAME'])
+                    self.assertEqual(obj.get('changed_keys'), ['DHAN_RESPONSE_GROUP_NAME'])
                     self.assertFalse(obj.get('runtime_verified'))
                     self.assertFalse(obj.get('restart_performed'))
                     self.assertEqual(p.read_text(encoding='utf-8'), ENV + 'DHAN_RESPONSE_GROUP_NAME=-5514889030\n')

@@ -104,8 +104,8 @@ def main():
         require(status_ui.json().get("equity_amo_can_edit") is False,
                 "Control Center allowed settings while restart was unverified")
         page=client.get("/")
-        require(page.status_code==200 and 'id="v2-recheck"' in page.text,
-                "User-facing Verify pending restart button missing")
+        require(page.status_code==200 and 'id="v2-recheck"' not in page.text,
+                "Retired tracker control still visible")
         with patch("src.engine.tracker_v2_integration.inspect_systemd_service_properties",
                    side_effect=lambda unit,check_fn=None:props()), \
              patch.object(ConfigChangeTracker,"dispatch_telegram_update"):
@@ -115,6 +115,18 @@ def main():
         require(count["n"]==2,"Recovery reissued restart")
         require(json.loads(_paths(data)[2].read_text())["active"] is False,"Recovery fence retained")
         require(tracker.get_change_record(two.change_id).runtime_verified,"Tracker UI state not persisted")
+        os.environ.pop("AUDITBOT_TEST_ISOLATION", None)
+        from src.engine.simple_save_apply import apply_settings
+        # Redirect unit inspection to the actual disposable service. All ACK,
+        # file, journal, PID and broker handoff checks use their real implementations.
+        with patch("src.engine.simple_save_apply.is_isolated_test_environment", return_value=False), \
+             patch("src.engine.simple_save_apply.inspect_systemd_service_properties", side_effect=lambda *a, **k: dict(props(), _explicit_main_pid=True)), \
+             patch("src.engine.config_manager.inspect_systemd_service_properties", side_effect=lambda *a, **k: dict(props(), _explicit_main_pid=True)):
+            direct = apply_settings({"equity_budget_inr": "1111"}, env_path=env,
+                                    expected_revision=revision(env.read_text()), state_reader=lambda: props()["ActiveState"],
+                                    restart=restart)
+        require(direct.restart_performed and count["n"] == 3, "Direct restart verification failed")
+        require(props()["MainPID"] != newest["MainPID"], "Direct save did not replace PID")
         print("PASS genuine systemd replacement, delayed ACK, owner password+CSRF, recovery without restart")
     finally:
         os.chdir(old_cwd)

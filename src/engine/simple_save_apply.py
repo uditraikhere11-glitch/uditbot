@@ -167,6 +167,8 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
     tracker = ConfigChangeTracker(data_dir=str(handoff["data"]))
     expected = compute_config_version(cfg)
     mode = str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper()
+    from src.engine.tracker_credentials import fingerprint
+    expected_credentials = fingerprint(cfg, handoff["data"])
     deadline = time.monotonic() + 15
     while True:
         ok, ack, _ = tracker.is_active_version_confirmed(
@@ -174,7 +176,8 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
             require_systemd_active=True,
         )
         if (ok and isinstance(ack, dict) and
-                ack.get("pid") != handoff["pid"]):
+                ack.get("pid") != handoff["pid"] and expected_credentials
+                and ack.get("credential_fingerprint") == expected_credentials):
             # The new producer must be registered with the same account before
             # the shared broker mutation barrier can be released.
             if not release_apply_barrier(
@@ -191,42 +194,49 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
         time.sleep(0.25)
 
 
-def _annotate_terminal_v2_supersession(
-    data_dir: Path, before_rev: str, after_rev: str, *, commit: bool = True,
-) -> None:
-    """Trust explicit old/new checksums, not a blanket historic-journal reset.
-
-    Write intended successor before changing .env so either side of a crash
-    remains an accepted revision; do not mutate active/uncertain V2 operations.
-    """
-    folder = data_dir / "config_restart_v2"
-    tx_path = folder / "current_transaction.json"
-    tx = read_private_json(tx_path, missing_ok=True)
-    if tx is None:
+def _retire_previous_transaction(data: Path, path: Path, values: Mapping[str, str], current: str) -> None:
+    folder = data / "config_restart_v2"
+    journal = folder / "current_transaction.json"
+    if not journal.exists() and not journal.is_symlink():
+        fence = read_private_json(folder / "apply_barrier.json", missing_ok=True)
+        if fence is not None and fence.get("active") is not False:
+            raise ConfigurationConflict("Broker restart fence is unresolved.")
         return
-    phase = str(tx.get("phase") or "")
-    if phase not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
-        raise ConfigurationConflict("V2 restart record unresolved; safe recovery required before saving")
-    barrier = read_private_json(folder / "apply_barrier.json", missing_ok=True)
-    if barrier is not None and barrier.get("active") is not False:
-        raise ConfigurationConflict("Prior V2 broker apply barrier remains active")
-    previously_accepted = {
-        str(tx.get("requested_file_revision") or ""),
-        str(tx.get("direct_save_to_revision") or ""),
-    }
-    if before_rev not in previously_accepted:
-        raise ConfigurationConflict("V2 journal and current settings differ; do not overwrite unknown edits")
-    if not commit:
-        return
-    updated = dict(tx)
-    updated["direct_save_from_revision"] = before_rev
-    updated["direct_save_to_revision"] = after_rev
-    updated["direct_save_recorded_at"] = time.time()
-    write_json_atomic(str(tx_path), updated)
-    check = read_private_json(tx_path, missing_ok=False)
-    if (check.get("direct_save_from_revision") != before_rev or
-            check.get("direct_save_to_revision") != after_rev):
-        raise ConfigurationConflict("V2 direct-save annotation failed readback")
+    # An old WebUI process may still hold the V2 transaction lock during rollout.
+    from src.engine.tracker_v2_candidate import CandidateCoordinator
+    with CandidateCoordinator(data, path)._exclusive():
+        tx = read_private_json(journal, missing_ok=True)
+        if tx is None:
+            return
+        barrier = read_private_json(folder / "apply_barrier.json", missing_ok=True)
+        phase = tx.get("phase")
+        prepared = (phase == "PREPARED" and tx.get("restart_issued") is False
+                    and tx.get("previous_file_revision") == current)
+        completed = (phase in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE")
+                     and current in (tx.get("requested_file_revision"), tx.get("direct_save_to_revision")))
+        if not (prepared or completed):
+            raise ConfigurationConflict("Previous settings operation needs verification before saving.")
+        if barrier is not None and barrier.get("active") is not False:
+            account = values.get("DHAN_CLIENT_ID", "")
+            cid = tx.get("change_id")
+            pid, start = tx.get("previous_pid"), tx.get("previous_starttime")
+            if (barrier.get("active") is not True or not prepared or not account or not cid or barrier.get("change_id") != cid
+                    or barrier.get("account_id") != account or type(pid) is not int or pid <= 0
+                    or type(start) is not int or start <= 0):
+                raise ConfigurationConflict("Previous broker fence identity is unverified.")
+            def stopped():
+                props = inspect_systemd_service_properties("trading_bot.service")
+                return props.get("ActiveState") == "inactive" and str(props.get("MainPID")) == "0"
+            if stopped():
+                released = release_aborted_apply_barrier(data, account, cid, pid, start, service_stopped=stopped)
+            else:
+                proof = _positive_running_restart_proof(path, values)
+                released = ((pid, start) == (proof["pid"], proof["starttime"])
+                            and release_apply_barrier(data, account, cid, pid, start))
+            if not released:
+                raise ConfigurationConflict("Previous broker fence retained. Broker or service evidence is unresolved.")
+        # Atomic archive retains the exact historical record, including both revisions.
+        journal.rename(folder / ("retired-" + secrets.token_hex(12) + ".json"))
 
 
 def restart_trading_service() -> None:
@@ -277,9 +287,10 @@ def apply_settings(
         if real_runtime:
             # Single direct-save entry point also repairs proven stale
             # config/status records; broker barriers are never blindly reset.
-            ConfigChangeTracker(
-                data_dir=str(data_root),
-            ).reconcile_stale_control_records(str(path))
+            tracker = ConfigChangeTracker(data_dir=str(data_root))
+            tracker.reconcile_stale_control_records(str(path))
+            if tracker.has_unresolved_pending_operation() or os.path.exists(tracker.deferred_env_file):
+                raise ConfigurationConflict("A previous deferred settings operation needs reconciliation.")
         if admission_check is not None:
             admission_check()
         with path.open("r", encoding="utf-8", newline="") as fh:
@@ -304,20 +315,6 @@ def apply_settings(
         new_values, _ = parse_env_strict(proposed)
         if old_values.get("DHAN_CLIENT_ID") and old_values.get("DHAN_CLIENT_ID") != new_values.get("DHAN_CLIENT_ID"):
             raise ConfigurationRejected("Dhan account migration is not a settings restart")
-        # Preserve the existing last-known-good Telegram response destination
-        # handoff on settings changes. No Telegram API call or session mutation.
-        if "DHAN_RESPONSE_GROUP_NAME" in changed:
-            from src.notifier.response_activation import stage_destination_change
-            try:
-                stage_destination_change(
-                    str(data_root),
-                    old_values.get("DHAN_RESPONSE_GROUP_NAME", ""),
-                    new_values.get("DHAN_RESPONSE_GROUP_NAME", ""),
-                )
-            except OSError as exc:
-                raise ConfigurationConflict(
-                    "Cannot stage Telegram response fallback; configuration unchanged"
-                ) from exc
         old_mode = old_values.get("TRADING_MODE", "TEST")
         new_mode = new_values.get("TRADING_MODE", old_mode)
         if old_mode != "LIVE" and new_mode == "LIVE" and not confirm_live:
@@ -329,9 +326,7 @@ def apply_settings(
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
         # Validate completed-V2 journal compatibility before any broker fence
         # or file write; do not claim a successor until the file is committed.
-        _annotate_terminal_v2_supersession(
-            data_root, actual_revision, revision(proposed), commit=False,
-        )
+        _retire_previous_transaction(data_root, path, old_values, actual_revision)
         # Production: cannot restart a LIVE watcher just because systemd
         # reports active; prove old PID/hash and no in-flight/UNKNOWN broker
         # mutation. Isolated tests inject the systemd state/restart.
@@ -383,11 +378,20 @@ def apply_settings(
         # After the handoff barrier is acquired, no new Dhan mutations can
         # begin while we write the file and issue the single restart.
         _atomic_env_write(path, proposed)
-        # Commit V2 supersession metadata only after the new file exists.
-        # A failed journal write is an explicit partial-apply error, not success.
-        _annotate_terminal_v2_supersession(
-            data_root, actual_revision, revision(proposed),
-        )
+        # Preserve the existing last-known-good Telegram response destination
+        # handoff on settings changes. No Telegram API call or session mutation.
+        if "DHAN_RESPONSE_GROUP_NAME" in changed:
+            from src.notifier.response_activation import stage_destination_change
+            try:
+                stage_destination_change(
+                    str(data_root),
+                    old_values.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                    new_values.get("DHAN_RESPONSE_GROUP_NAME", ""),
+                )
+            except OSError as exc:
+                raise ConfigurationConflict(
+                    "Settings saved, but Telegram response destination handoff failed; restart was not issued"
+                ) from exc
         new_revision = revision(proposed)
         keys = tuple(sorted(changed))
         if state == "inactive":
@@ -413,8 +417,13 @@ def apply_settings(
             raise ConfigurationConflict(
                 "Settings saved; bot did not return active. Inspect service before proceeding."
             )
-        return SaveApplyResult(
-            "RESTARTED",
-            "Settings saved and trading service restarted. Check reconciliation before LIVE entries.",
-            True, True, new_revision, keys,
-        )
+        message = "Settings updated. Trading bot restarted and the new configuration was verified."
+        if real_runtime:
+            from src.journal.db import JournalDB
+            try:
+                journal = Path(new_values.get("JOURNAL_DB_PATH") or data_root / "trade_journal.db")
+                db = JournalDB(str(path.parent / journal), account_id=new_values.get("DHAN_CLIENT_ID", ""))
+                db.enqueue_outbox("SETTINGS_RESTART_VERIFIED", {"text": message})
+            except Exception:
+                message += " The Telegram confirmation could not be queued."
+        return SaveApplyResult("RESTARTED", message, True, True, new_revision, keys)

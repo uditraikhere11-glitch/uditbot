@@ -219,6 +219,23 @@ class AbortedBrokerFenceTests(unittest.TestCase):
             service_stopped=lambda: stopped,
         )
 
+    def test_prepared_migration_requires_old_file_and_empty_ledger(self):
+        from src.engine.broker_handoff import _write
+        env = self.root / ".env"
+        env.write_text("DHAN_CLIENT_ID=FAKE_ID\n")
+        rev = revision(env.read_text())
+        tx = self.barrier.parent / "current_transaction.json"
+        _write(tx, dict(phase="PREPARED", previous_file_revision=rev, requested_file_revision="f"*64,
+                        restart_issued=False, previous_pid=101, previous_starttime=123, change_id="SAVE-ONE"))
+        values = {"DHAN_CLIENT_ID": "FAKE_ID"}
+        with patch.object(direct, "inspect_systemd_service_properties", return_value={"MainPID":0, "ActiveState":"inactive"}):
+            with self.assertRaises(ConfigurationConflict):
+                direct._retire_previous_transaction(self.root, env, values, "0"*64)
+            self.assertTrue(json.loads(self.barrier.read_text())["active"])
+            direct._retire_previous_transaction(self.root, env, values, rev)
+        self.assertFalse(tx.exists())
+        self.assertFalse(json.loads(self.barrier.read_text())["active"])
+
     def test_stopped_empty_ledger_releases_exact_precommit_fence(self):
         self.assertTrue(self.release())
         self.assertFalse(json.loads(self.barrier.read_text())["active"])
@@ -301,6 +318,11 @@ class DirectBrokerRestartTests(unittest.TestCase):
         verified.assert_called_once()
         self.assertIn("EQUITY_AMO_ENABLED=true", self.env.read_text())
 
+        import sqlite3
+        with sqlite3.connect(self.proof["data"] / "trade_journal.db") as db:
+            rows = db.execute("select payload from outbox where event_type='SETTINGS_RESTART_VERIFIED'").fetchall()
+        self.assertEqual([json.loads(raw)["text"] for raw, in rows], [out.message])
+
     def test_terminal_v2_journal_tracks_direct_save_without_trusting_external_writes(self):
         from src.engine.tracker_v2_safety import inspect_transaction_recovery
         from hashlib import sha256
@@ -320,12 +342,13 @@ class DirectBrokerRestartTests(unittest.TestCase):
         self.assertEqual(result.status, "SAVED_STOPPED")
         self.assertEqual(
             inspect_transaction_recovery(Path(self.temp.name) / "data", self.env).code,
-            "DIRECT_SAVE_SUPERSEDED",
+            "NO_V2_TRANSACTION",
         )
+        self.assertEqual(len(list(directory.glob("retired-*.json"))), 1)
         self.env.write_text(self.env.read_text() + "UNTRUSTED_MANUAL=YES\n")
         self.assertEqual(
             inspect_transaction_recovery(Path(self.temp.name) / "data", self.env).code,
-            "EXTERNAL_ENV_WRITER",
+            "NO_V2_TRANSACTION",
         )
 
     def test_amotoggle_admission_runs_under_shared_save_lock(self):

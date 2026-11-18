@@ -822,86 +822,12 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
     # B11 — Asynchronous Save & Apply, Truthful Progress & Cancel Deferred (P1)
     # =========================================================================
 
-    def test_B11_durable_async_submission_readonly_status_and_cancel_deferred(self):
-        # This scenario specifically simulates a RUNNING LIVE process with a
-        # pending broker order. The ordinary offline fixture has no systemd
-        # service, so explicitly inject the lifecycle state under test.
-        running_state = patch("src.engine.webui_update._safe_state", return_value=ServiceOperatingState.RUNNING)
-        running_state.start()
-        self.addCleanup(running_state.stop)
+    def test_B11_retired_configuration_endpoints_cannot_start_work(self):
         client = TestClient(app)
-        old_cwd = os.getcwd()
-        os.chdir(self.tmp_dir.name)
-        try:
-            self.db.record_order_intent(
-                correlation_id="CORR-B11-1",
-                symbol="YESBANK",
-                security_id="11915",
-                exchange_segment="NSE_EQ",
-                product_type="CNC",
-                order_type="LIMIT",
-                price=15.60,
-                quantity=1,
-            )
-            self.db.update_order_intent("CORR-B11-1", state="PENDING")
-
-            # 1. Enqueue without spawning background thread to verify initial 15% RECEIVED durable record
-            r_init = client.post(
-                "/setup/submit-async",
-                json={
-                    "is_live_mode": False,
-                    "dhan_client_id": "1113731536",
-                    "equity_budget_inr": 300.0,
-                    "csrf_token": SETUP_CSRF_TOKEN,
-                    "expected_revision": revision(
-                        Path(self.env_path).read_text(encoding="utf-8")
-                    ),
-                    "spawn_worker": False,
-                },
-            )
-            self.assertEqual(r_init.status_code, 200)
-            init_data = r_init.json()
-            cid = init_data["change_id"]
-            self.assertEqual(init_data["state"], "REQUEST_RECEIVED")
-            self.assertEqual(init_data["operation_state"], "REQUESTED")
-            self.assertEqual(init_data["progress_percent"], 15)
-            self.assertTrue(os.path.exists(self.tracker.pending_op_file))
-
-            # 2. Coordinator tick processes the queued operation and pauses at 75% WAITING_FOR_ORDER
-            self.tracker.run_control_coordinator_tick(
-                env_path=self.env_path,
-                stop_state_path=self.stop_path,
-                db_path=self.db_path,
-                check_service_fn=lambda: True,
-            )
-            r_wait = client.get(f"/setup/change-status/{cid}")
-            self.assertEqual(r_wait.status_code, 200)
-            wait_data = r_wait.json()
-            self.assertEqual(wait_data["state"], "WAITING_FOR_SAFE_APPLY")
-            self.assertEqual(wait_data["operation_state"], "WAITING_FOR_ORDER")
-            self.assertEqual(wait_data["progress_percent"], 75)
-            self.assertEqual(wait_data["step_status"]["SAFETY_GATE"], "WAITING")
-            self.assertEqual(wait_data["step_status"]["APPLYING"], "PENDING")
-            self.assertEqual(wait_data["step_status"]["VERIFIED"], "PENDING")
-
-            # 3. Verify GET /setup/change-status/{cid} is strictly read-only even after order resolves!
-            self.db.update_order_intent("CORR-B11-1", state="CANCELLED")
-            with patch.object(ConfigChangeTracker, "try_auto_resume_deferred_update", side_effect=AssertionError("GET must not mutate")):
-                r_poll = client.get(f"/setup/change-status/{cid}")
-                self.assertEqual(r_poll.status_code, 200)
-                self.assertEqual(r_poll.json()["state"], "WAITING_FOR_SAFE_APPLY")
-
-            # 4. Cancel the deferred change via POST /setup/cancel-deferred
-            r_cancel = client.post(
-                "/setup/cancel-deferred",
-                json={"change_id": cid, "reason": "Operator cancelled deferred mode switch", "csrf_token": SETUP_CSRF_TOKEN},
-            )
-            self.assertEqual(r_cancel.status_code, 200)
-            self.assertTrue(r_cancel.json()["cancelled"])
-            self.assertEqual(r_cancel.json()["operation_state"], "CANCELLED")
-            self.assertFalse(self.tracker.is_live_entry_blocked_by_transition()[0])
-        finally:
-            os.chdir(old_cwd)
+        for path in ("submit-async", "coordinator-tick", "cancel-deferred"):
+            reply = client.post("/setup/" + path, json={"csrf_token": SETUP_CSRF_TOKEN})
+            self.assertEqual(reply.status_code, 404)
+        self.assertFalse(os.path.exists(self.tracker.pending_op_file))
 
     # =========================================================================
     # B12 — Broker verification not supplied consistently (P1)

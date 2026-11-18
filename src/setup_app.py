@@ -29,8 +29,6 @@ from src.engine.config_manager import is_isolated_test_environment
 
 SETUP_CSRF_TOKEN = secrets.token_hex(16)
 from src.engine.config_manager import (
-    ConfigApplyState,
-    ConfigChangeRecord,
     ConfigChangeTracker,
     execute_configuration_update,
     compute_config_version,
@@ -38,7 +36,7 @@ from src.engine.config_manager import (
 )
 from src.notifier.telegram_notifier import TelegramNotifier
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, REGISTRY, REQUEST_METADATA, revision
-from src.engine.webui_update import submit_webui_patch, recover_field_transactions
+
 
 
 async def _submitted_webui_form(request: Request) -> dict:
@@ -66,32 +64,6 @@ from src.notifier.message_designer_routes import register_routes as register_mes
 register_message_designer_routes(app, SETUP_CSRF_TOKEN)
 
 
-
-
-def ensure_webui_coordinator_started(
-    data_dir: Optional[str] = None,
-    env_path: str = ".env",
-    stop_when_idle: bool = False,
-):
-    """F02-03: Starts or wakes the persistent background control coordinator for the WebUI process."""
-    cfg = AppConfig.from_env()
-    resolved_data_dir = os.path.abspath(data_dir or getattr(cfg, "data_dir", "data"))
-    resolved_env_path = os.path.abspath(env_path)
-    tracker = ConfigChangeTracker(data_dir=resolved_data_dir)
-    ro_broker = tracker.get_readonly_broker(env_path=resolved_env_path)
-    notifier = TelegramNotifier(cfg) if cfg.log_group_id else None
-    return tracker.start_coordinator_daemon(
-        env_path=resolved_env_path,
-        broker=ro_broker,
-        notifier=notifier,
-        stop_when_idle=stop_when_idle,
-    )
-
-
-@app.on_event("startup")
-def _on_webui_startup() -> None:
-    # Save & Apply uses no persistent configuration coordinator.
-    return None
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -1041,7 +1013,8 @@ document.addEventListener('DOMContentLoaded', function () {
       const rev = form.querySelector('input[name="expected_revision"]');
       if (rev && result.revision) rev.value = result.revision;
       status.className = 'success';
-      status.textContent = result.message || 'Settings saved.';
+      status.textContent = result.message;
+      if (result.saved) window.alert(result.message);
     } catch (error) {
       status.className = 'error';
       status.textContent = String(error.message || error) +
@@ -1639,55 +1612,6 @@ async def simple_save_apply(request: Request):
         return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
 
 
-@app.post("/setup/submit-async")
-async def handle_setup_submission_async(request: Request):
-    """B11: Durable, serialized asynchronous WebUI submission returning change_id immediately."""
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            raw_data = await request.json()
-        except ValueError:
-            return JSONResponse(status_code=400, content={"state": "REJECTED", "reason": "Invalid JSON request"})
-        if not isinstance(raw_data, dict):
-            return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": "Expected a JSON object"})
-    else:
-        form = await request.form()
-        if any(len(form.getlist(k)) != 1 for k in form.keys()):
-            return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": "Duplicate form fields are not permitted"})
-        raw_data = dict(form)
-        if raw_data.get("full_setup_form") == "1":
-            for key in ("is_live_mode", "equity_active", "fno_active"):
-                raw_data[key] = key in form
-
-    csrf_val = raw_data.get("csrf_token")
-    if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
-        tracker = ConfigChangeTracker(data_dir="data")
-        rec = ConfigChangeRecord(
-            change_id=tracker.generate_change_id(),
-            state=ConfigApplyState.REJECTED,
-            reason="Missing or invalid CSRF token",
-        )
-        return JSONResponse(status_code=403, content=rec.to_dict())
-
-    # An invalid existing .env must remain editable rather than causing
-    # AppConfig.from_env() to raise HTTP 500 before the repair is attempted.
-    # Read only the data directory; do not load or mutate process os.environ.
-    source_env = parse_env_dict(".env")
-    tracker = ConfigChangeTracker(data_dir=os.path.abspath(source_env.get("DATA_DIR") or "data"))
-    try:
-        rec = submit_webui_patch(
-            tracker, raw_data, env_path=os.path.abspath(".env"),
-            expected_revision=raw_data.get("expected_revision"),
-            request_id=raw_data.get("request_id"),
-            spawn_worker=str(raw_data.get("spawn_worker", "true")).lower() not in ("0", "false"),
-        )
-    except ConfigurationConflict as exc:
-        return JSONResponse(status_code=409, content={"state": "REJECTED", "reason": str(exc)})
-    except (ConfigurationRejected, ValueError) as exc:
-        return JSONResponse(status_code=422, content={"state": "REJECTED", "reason": str(exc)})
-    return JSONResponse(content=rec.to_dict())
-
-
 @app.get("/setup/change-status/{change_id}")
 def get_change_status(change_id: str):
     """Section F: Strictly read-only polling endpoint for real-time modal progress."""
@@ -1747,54 +1671,6 @@ def get_change_status(change_id: str):
                     "reason": "The connected Telegram listener could not verify the requested destination. Notification mirroring is unavailable until corrected.",
                 })
     return JSONResponse(content=status)
-
-
-@app.post("/setup/coordinator-tick")
-async def handle_coordinator_tick(request: Request):
-    """B07 & B11: Authorized POST endpoint for triggering the control coordinator to process queued/ready operations."""
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        raw_data = await request.json()
-    else:
-        form = await request.form()
-        raw_data = dict(form)
-    csrf_val = raw_data.get("csrf_token")
-    if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
-        return JSONResponse(status_code=403, content={"ok": False, "error": "Missing or invalid CSRF token"})
-    cfg = AppConfig.from_env()
-    data_dir = os.path.abspath(getattr(cfg, "data_dir", "data"))
-    env_path = os.path.abspath(".env")
-    tracker = ConfigChangeTracker(data_dir=data_dir)
-    ro_broker = tracker.get_readonly_broker(env_path=env_path)
-    outcomes = tracker.run_control_coordinator_tick(env_path=env_path, broker=ro_broker)
-    latest = tracker.get_change_record()
-    return JSONResponse(content={
-        "ok": True,
-        "latest_change": latest.to_dict() if latest else None,
-        "service_control": tracker.get_service_control_record(),
-        "transition_gate": tracker.inspect_transition_gate_status(read_only=True),
-        "outcomes_summary": {k: (v.to_dict() if hasattr(v, "to_dict") else v) for k, v in outcomes.items()},
-    })
-
-
-@app.post("/setup/cancel-deferred")
-async def handle_cancel_deferred(request: Request):
-    """Section F: Authorized POST endpoint to cancel a deferred configuration change before it enters APPLYING."""
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        raw_data = await request.json()
-    else:
-        form = await request.form()
-        raw_data = dict(form)
-    csrf_val = raw_data.get("csrf_token")
-    if not csrf_val or str(csrf_val) != SETUP_CSRF_TOKEN:
-        return JSONResponse(status_code=403, content={"ok": False, "error": "Missing or invalid CSRF token"})
-    change_id = raw_data.get("change_id")
-    reason = str(raw_data.get("reason") or "Cancelled by owner from WebUI").strip()
-    cfg = AppConfig.from_env()
-    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
-    res = tracker.cancel_deferred_change(change_id=change_id, reason=reason)
-    return JSONResponse(status_code=200 if res.get("ok") else 400, content=res)
 
 
 @app.post("/setup/service-control")
