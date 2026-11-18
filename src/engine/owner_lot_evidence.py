@@ -13,6 +13,12 @@ GATE_BOOKS = ContextVar("owner_lot_gate_books", default=None)
 
 class ExecutionConflict(ValueError):
     """An authenticated, executed transaction conflicts with the original lot basis."""
+    event = "OWNER_LOT_EXECUTION_CONFLICT"
+
+
+class DematReview(ValueError):
+    """Two broker surfaces show a shortfall that executed trades cannot explain."""
+    event = "OWNER_LOT_DEMAT_REVIEW"
 
 
 def verify_owner_history(broker, db, account, security, segment, product, parents,
@@ -165,8 +171,10 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                         parents=parents, acknowledged=acked, observed_at=now, quantity=quantity,
                         quantity_source=source, profile_matches=True)
         try:
-            if any(db.has_owner_execution_conflict(account, oid) for oid in acked):
-                raise ValueError("Previously confirmed conflicting execution requires attribution")
+            for oid in acked:
+                review = db.owner_lot_review_reason(account, oid)
+                if review:
+                    raise ValueError(f"{review}: independently reviewed movement evidence required")
             if not isinstance(orders, list):
                 raise ValueError("Current order book unavailable")
             if source != "VERIFIED_SETTLED_HOLDINGS":
@@ -204,12 +212,19 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                 if status == "TRADED" and order["orderId"] in parents and order["transactionType"] == "BUY":
                     continue
                 raise ValueError("Current order requires execution or pending-quantity review")
+            if quantity < sum(parents.values()):
+                # eDIS shares a broker with holdings. Agreement warrants demat
+                # statement review, but establishes neither a transfer nor a SELL.
+                corroborating_qty = broker.get_edis_owned_quantity(str(holding.get("isin") or ""))
+                evidence["edis_total"] = corroborating_qty if type(corroborating_qty) is int else None
+                if evidence["edis_total"] == quantity:
+                    raise DematReview("Holdings and eDIS report a shortfall unexplained by trades; review demat statement")
             if quantity != sum(parents.values()):
                 raise ValueError("Quantity differs from original lots; demat movement unresolved")
-        except ExecutionConflict as exc:
+        except (ExecutionConflict, DematReview) as exc:
             decision = str(exc)
             for oid in acked:
-                db.record_system_event("OWNER_LOT_EXECUTION_CONFLICT", f"{account}/{oid}", json.dumps(evidence))
+                db.record_system_event(exc.event, f"{account}/{oid}", json.dumps(evidence))
                 batch["errors"][oid] = decision
         except (ValueError, TypeError, KeyError) as exc:
             decision = str(exc) if type(exc) is ValueError else "Malformed owner lot evidence"

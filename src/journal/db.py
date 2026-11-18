@@ -1597,13 +1597,15 @@ class JournalDB:
             ).fetchone()
             return dict(row) if row else None
 
-    def has_owner_execution_conflict(self, account, order_id):
+    def owner_lot_review_reason(self, account, order_id):
         """A later empty trade book cannot erase a previously observed execution."""
         with self._get_conn() as conn:
-            return conn.execute(
-                "SELECT 1 FROM system_events WHERE event_type='OWNER_LOT_EXECUTION_CONFLICT' "
-                "AND description=? LIMIT 1", (f"{account}/{order_id}",)
-            ).fetchone() is not None
+            row = conn.execute(
+                "SELECT event_type FROM system_events WHERE event_type IN "
+                "('OWNER_LOT_EXECUTION_CONFLICT','OWNER_LOT_DEMAT_REVIEW') AND description=? LIMIT 1",
+                (f"{account}/{order_id}",)
+            ).fetchone()
+            return row["event_type"] if row else None
 
     def owner_lot_basis(self, account, security, segment, product, order_id):
         """Anchor a history query to the original intent, including NULL-ID attestations."""

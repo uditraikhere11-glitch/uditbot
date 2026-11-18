@@ -90,7 +90,7 @@ class OwnerLotRestart(unittest.TestCase):
         self.broker.get_historical_trades.return_value = original
         self.restart()
         self.run_gate(False)
-        self.assertTrue(self.db.has_owner_execution_conflict(r01.ACCOUNT, self.fx.first_oid))
+        self.assertEqual(self.db.owner_lot_review_reason(r01.ACCOUNT, self.fx.first_oid), "OWNER_LOT_EXECUTION_CONFLICT")
 
     def test_unavailable_history_and_demat_shortfall(self):
         self.run_gate(True)
@@ -110,6 +110,39 @@ class OwnerLotRestart(unittest.TestCase):
         with patch.object(self.db, "record_system_event", side_effect=sqlite3.OperationalError("locked")):
             self.run_gate(False)
         self.run_gate(True)
+
+    def test_corroborated_unexplained_demat_shortfall_survives_restored_total(self):
+        self.run_gate(True)
+        original = self.broker.get_holdings.return_value
+        self.broker.get_edis_owned_quantity.assert_not_called()
+        self.broker.get_holdings.return_value = [dict(original[0], totalQty=1, dpQty=1)]
+        self.broker.get_edis_owned_quantity.return_value = 1
+        self.run_gate(False)
+        self.broker.get_holdings.return_value = original
+        self.restart()
+        self.run_gate(False)
+        for oid in (self.fx.first_oid, self.fx.second_oid):
+            self.assertEqual(self.db.owner_lot_review_reason(r01.ACCOUNT, oid), "OWNER_LOT_DEMAT_REVIEW")
+            self.assertFalse(self.db.get_position_lifecycle(oid)["manual_exit_detected"])
+
+    def test_governed_edis_total_and_forever_get_routes(self):
+        from src.broker.dhan_client import DhanClient, BASE_URL
+        from unittest.mock import Mock
+        client = object.__new__(DhanClient)
+        client.cfg = SimpleNamespace(trading_mode="LIVE", dhan_client_id=r01.ACCOUNT)
+        response = Mock(status_code=200)
+        client._get_with_auth_recovery = Mock(return_value=response)
+        isin = "INE528G01035"
+        payload = dict(isin=isin, clientId=r01.ACCOUNT, status="SUCCESS", totalQty="2", aprvdQty=0)
+        response.json.return_value = payload
+        self.assertEqual(client.get_edis_owned_quantity(isin), 2)
+        client._get_with_auth_recovery.assert_called_once_with(f"{BASE_URL}/edis/inquire/{isin}")
+        for invalid in (dict(clientId="OTHER"), dict(isin="OTHER"), dict(totalQty=True), dict(status="FAILED")):
+            response.json.return_value = dict(payload, **invalid)
+            self.assertIsNone(client.get_edis_owned_quantity(isin))
+        response.json.return_value = []
+        self.assertEqual(client.get_forever_orders(), [])
+        client._get_with_auth_recovery.assert_called_with(f"{BASE_URL}/forever/orders")
 
     def test_wrong_live_profile_blocks_before_recording_trades(self):
         self.broker.cfg.trading_mode = "LIVE"

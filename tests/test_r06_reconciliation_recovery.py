@@ -72,7 +72,8 @@ class YesbankTwoParentRecovery(unittest.TestCase):
                  exchange_segment="NSE_EQ", confirmed_open_qty=1) for r in (self.a, self.b)]
         self.db.owner_lot_basis = lambda a, s, g, p, oid: (time.time() - 86400, [
             dict(exchange_trade_id=oid, traded_quantity=1, traded_price=15.)])
-        self.db.has_owner_execution_conflict = Mock(return_value=False)
+        self.db.owner_lot_review_reason = Mock(return_value=None)
+        self.broker.get_edis_owned_quantity = Mock(return_value=None)
         self.history = [dict(dhanClientId="SYNTHETIC", securityId="11915", isin="TEST-ISIN",
                          exchangeSegment="NSE_EQ", productType="CNC", orderId=r["order_id"],
                          exchangeTradeId=r["order_id"], transactionType="BUY", tradedQuantity=1,
