@@ -1250,6 +1250,14 @@ class JournalDB:
                 (time.time(), outbox_id),
             )
 
+    def defer_outbox(self, outbox_id: int, until: float) -> None:
+        """Reschedule an explicitly rate-limited delivery without consuming a failure attempt."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE outbox SET status='PENDING', next_retry_at=?, last_error='Telegram flood control' "
+                "WHERE id=? AND status='CLAIMING'", (until, outbox_id)
+            )
+
     def mark_outbox_retry(self, outbox_id: int, error_msg: str = "", max_retries: int = 5, now: Optional[float] = None) -> str:
         """16-C & P0-08: Increments retry count with exponential backoff or marks DEAD_LETTER with system event alert."""
         current_ts = now if now is not None else time.time()
