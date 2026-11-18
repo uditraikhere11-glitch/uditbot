@@ -323,6 +323,7 @@ def submit_webui_patch(
         # Do not supersede a safety-critical pending transition in the legacy
         # single-record coordinator. Independent, non-restart changes would be
         # possible in a multi-record tracker, but not by overwriting its gate.
+        tracker.reconcile_stale_control_records(env_path, check_service_fn=check_service_fn)
         prior = tracker.get_change_record()
         if prior is not None and prior.state == ConfigApplyState.WAITING_FOR_SAFE_APPLY:
             if recover_legacy_notification_deferred(tracker, env_path):
