@@ -26,7 +26,7 @@ from src.engine.tracker_v2_safety import (
     evaluate_active_broker_operation_gate, read_private_json,
 )
 from src.engine.broker_handoff import (
-    acquire_apply_barrier, release_apply_barrier, BrokerHandoffBlocked,
+    acquire_apply_barrier, release_apply_barrier, release_aborted_apply_barrier, BrokerHandoffBlocked,
 )
 
 from src.engine.config_patch import (
@@ -357,9 +357,28 @@ def apply_settings(
         if state == "active" and (
             _owner_stop_requested(path, old_values) or state_reader() != "active"
         ):
+            # No .env write and no restart has happened. Release ONLY if
+            # systemd positively confirms the service is stopped and the
+            # broker ledger still contains no active/unknown mutations.
+            recovered = False
+            if handoff is not None and revision(path.read_text(encoding="utf-8")) == actual_revision:
+                def _stopped_now() -> bool:
+                    props = inspect_systemd_service_properties("trading_bot.service")
+                    return (props.get("ActiveState") == "inactive"
+                            and int(props.get("MainPID") or 0) == 0)
+                try:
+                    recovered = release_aborted_apply_barrier(
+                        handoff["data"], handoff["account"], handoff["barrier_id"],
+                        handoff["pid"], handoff["starttime"],
+                        service_stopped=_stopped_now,
+                    )
+                except (BrokerHandoffBlocked, OSError, ValueError, ConfigurationConflict):
+                    recovered = False
             raise ConfigurationConflict(
-                "Owner STOP/service transition won before save; no configuration committed. "
-                "Broker fence retained for verified recovery."
+                "Owner STOP/service transition won before save; configuration unchanged. "
+                + ("Pre-commit broker fence safely released; service remains stopped."
+                   if recovered else
+                   "Broker fence retained; inspect broker and service evidence before recovery.")
             )
         # After the handoff barrier is acquired, no new Dhan mutations can
         # begin while we write the file and issue the single restart.

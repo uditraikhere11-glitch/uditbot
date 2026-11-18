@@ -296,7 +296,10 @@ class DirectBrokerRestartTests(unittest.TestCase):
         with patch.object(direct, "is_isolated_test_environment", return_value=False), \
              patch.object(direct, "_positive_running_restart_proof",
                           return_value=dict(self.proof)), \
-             patch.object(direct, "acquire_apply_barrier", return_value=True):
+             patch.object(direct, "acquire_apply_barrier", return_value=True), \\
+             patch.object(direct, "inspect_systemd_service_properties",
+                          return_value={"ActiveState": "inactive", "MainPID": 0}), \\
+             patch.object(direct, "release_aborted_apply_barrier", return_value=True) as release:
             with self.assertRaises(ConfigurationConflict):
                 direct.apply_settings(
                     {"equity_amo_enabled": True}, env_path=self.env,
@@ -304,6 +307,7 @@ class DirectBrokerRestartTests(unittest.TestCase):
                     state_reader=lambda: next(reads), restart=lambda: self.fail("No restart"),
                 )
         self.assertEqual(self.env.read_text(), self.before)
+        release.assert_called_once()
 
     def test_exact_noop_retry_does_not_restart_again(self):
         first = direct.apply_settings(
