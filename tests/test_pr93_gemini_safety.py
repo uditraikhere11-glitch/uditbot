@@ -202,4 +202,39 @@ class BrokerMutationTests(TestCase):
             b.session.put.assert_not_called()
 
 
+class DurableLedgerIntegrationTests(TestCase):
+    def test_real_v2_handoff_local_denial_leaves_no_unknown_mutation(self):
+        import json
+        import os
+        import sqlite3
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+        try:
+            from src.broker.dhan_client import DhanClient
+            from src.broker.read_governor import ReadGovernor
+            from src.engine.broker_handoff import register_producer
+        except (ModuleNotFoundError, ImportError):
+            self.skipTest('Requires full GitHub repository, not changed-files ZIP')
+        with TemporaryDirectory() as tmp:
+            register_producer(tmp, 'ACCOUNT_A')
+            broker = DhanClient.__new__(DhanClient)
+            broker.cfg = SimpleNamespace(data_dir=tmp, dhan_client_id='ACCOUNT_A')
+            broker._read_governor = ReadGovernor(tmp, 'ACCOUNT_A')
+            broker._get_active_read_governor = lambda: broker._read_governor
+            broker._halt_for_read_deferral = Mock()
+            broker.session = SimpleNamespace(post=Mock())
+            with patch.object(broker._read_governor, 'admit',
+                              side_effect=sqlite3.DatabaseError('governor failure')):
+                with patch.dict(os.environ, {'UDITBOT_TRACKER_V2_ENABLE':'1'}):
+                    reply = broker._broker_mutating_http(
+                        'POST', 'https://api.dhan.co/v2/orders', timeout=1)
+            self.assertEqual(reply.status_code, 503)
+            self.assertEqual(reply.headers['X-AuditBot-Local-Deferral'], '1')
+            broker.session.post.assert_not_called()
+            ledger = json.loads((Path(tmp)/'active_broker_mutations.json').read_text())
+            self.assertEqual(ledger['active'], [])
+            self.assertEqual(ledger['unresolved'], [])
+
+
+
 if __name__=='__main__': unittest.main()
