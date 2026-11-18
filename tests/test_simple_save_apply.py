@@ -110,12 +110,14 @@ class SimpleSaveApplyTests(unittest.TestCase):
 
     def test_owner_stop_winning_race_is_never_restarted(self):
         readings = iter(("active", "inactive"))
-        result = apply_settings(
-            {"equity_budget_inr": "801"}, env_path=self.env,
-            expected_revision=revision(self.env.read_text()),
-            state_reader=lambda: next(readings), restart=self.restart,
-        )
-        self.assertEqual(result.status, "SAVED_STOPPED")
+        before = self.env.read_text()
+        with self.assertRaises(ConfigurationConflict):
+            apply_settings(
+                {"equity_budget_inr": "801"}, env_path=self.env,
+                expected_revision=revision(self.env.read_text()),
+                state_reader=lambda: next(readings), restart=self.restart,
+            )
+        self.assertEqual(self.env.read_text(), before)
         self.assertEqual(self.restarts, 0)
 
     def test_unittest_module_presence_alone_cannot_skip_live_proof(self):
