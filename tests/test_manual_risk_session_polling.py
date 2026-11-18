@@ -174,13 +174,17 @@ class BrokerSnapshotTests(unittest.TestCase):
                     get_trade_book=Mock(return_value=trades or []),
                     get_positions=Mock(return_value=[]),
                     get_holdings=Mock(return_value=holdings))
+        broker.get_authenticated_profile_id = Mock(return_value='ACCOUNT')
         w = ProtectionWatcher(
             broker=broker,
-            journal_db=NS(is_manual_risk_acknowledged=Mock(return_value=True)),
+            journal_db=NS(record_system_event=Mock(), is_manual_risk_acknowledged=Mock(return_value=True)),
             path=str(Path(tmp.name) / 'watcher.json'),
         )
         r = {**holding(), 'protection_route': 'FOREVER_OCO', 'product_type': 'CNC',
              'segment': 'NSE_EQ', 'qty': 1}
+        from datetime import datetime
+        from src.engine.market import IST
+        r['owner_history_day'] = datetime.now(IST).date().isoformat()
         w.terminal_orders = {'O1': r}
         w.supervise_open_positions()
         return w, r, gate

@@ -3975,7 +3975,7 @@ class DhanClient:
             )
 
         deduped_trades: List[Dict[str, Any]] = []
-        seen_by_etid: Dict[str, Tuple[str, str, int, float, str]] = {}
+        seen_by_etid: Dict[str, tuple] = {}
         reached_empty_terminal_page = False
 
         for page_idx in range(max_pages + 1):
@@ -4017,8 +4017,9 @@ class DhanClient:
                     str(row["orderId"]),
                     str(row["securityId"]),
                     int(row["tradedQuantity"]),
-                    round(float(row["tradedPrice"]), 6),
-                    str(row["transactionType"]),
+                    float(row["tradedPrice"]),
+                    str(row["transactionType"]), row["exchangeSegment"], row["productType"],
+                    row.get("isin"), row.get("exchangeOrderId"), row.get("exchangeTime"),
                 )
                 if etid in seen_by_etid:
                     if seen_by_etid[etid] != sig:

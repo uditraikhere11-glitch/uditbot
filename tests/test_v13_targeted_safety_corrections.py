@@ -55,6 +55,7 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         self.pending_path = os.path.join(self.tmp.name, "pending_protection.json")
 
     def _make_watcher(self, broker, clock_fn=None, **kwargs):
+        broker.get_authenticated_profile_id = Mock(return_value=self.cfg.dhan_client_id)
         if isinstance(broker, DhanClient) and "get" not in getattr(broker.session, "__dict__", {}):
             def _default_session_get(url, *args, **kw):
                 if "/fundlimit" in str(url):

@@ -192,7 +192,9 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
             r = MagicMock()
             r.status_code = 200
             r.text = "{}"
-            if "/fundlimit" in str(url):
+            if url.endswith("/profile"):
+                r.json.return_value = {"dhanClientId": cfg.dhan_client_id}
+            elif "/fundlimit" in str(url):
                 r.json.return_value = {"availabelBalance": 100000.0}
             else:
                 r.json.return_value = []
