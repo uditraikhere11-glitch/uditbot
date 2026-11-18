@@ -1427,9 +1427,19 @@ class StartupReconciliationGate:
         #    but NEVER open the entry gate when Emergency STOP is active!)
         stop_active_at_start = bool(self.stop_manager.is_stopped())
 
-        # 2. Verify broker connection and fund limits
+        # 2. Verify broker connection and fund limits.  The startup gate may
+        # use the small reserved identity tier (still under the hard governor
+        # limits); ordinary signal-side funds checks remain NORMAL.  Inspect
+        # the concrete type so permissive Mock objects cannot fabricate this
+        # capability and silently bypass the established test contract.
         try:
-            ok, avail, msg = self.broker.get_fund_limits()
+            startup_funds_method = getattr(
+                type(self.broker), "get_reconciliation_fund_limits", None
+            )
+            if callable(startup_funds_method):
+                ok, avail, msg = startup_funds_method(self.broker)
+            else:
+                ok, avail, msg = self.broker.get_fund_limits()
             if not ok:
                 self.state = ReconciliationState.BLOCKED
                 self.last_error = f"Broker funds check failed: {msg}"
