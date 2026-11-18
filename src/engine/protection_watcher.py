@@ -3941,6 +3941,9 @@ class ProtectionWatcher:
                 # a manual BUY could conceal an unlinked historical SELL.
                 # Neither extra nor missing holdings prove both parents open.
                 and broker_net_qty == aggregate_contract_open_qty
+                # Historical settled positions cannot be 'recovered' merely
+                # from fresh current-day CNC BUYs when Demat quantity is zero.
+                and quantity_evidence == "VERIFIED_SETTLED_HOLDINGS"
                 and snapshot_complete
             )
 
