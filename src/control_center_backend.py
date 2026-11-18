@@ -23,6 +23,7 @@ from src.engine.simple_save_apply import apply_settings
 from src.engine.config_manager import (
     ConfigApplyState,
     ConfigChangeTracker,
+    compute_config_version,
     parse_env_content_string,
 )
 
@@ -370,6 +371,23 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 operation_type="AMO_STALE_RECORD_RECOVERY", operation_id=form_key,
             ):
                 tracker.reconcile_stale_control_records(env_path)
+                # Do not supersede a genuine outstanding operation or Owner STOP.
+                # SAVED_FOR_NEXT_START is terminal and is not in _pending().
+                if _pending(tracker):
+                    raise ConfigurationConflict("Existing configuration operation is still active")
+                if _owner_stop_pending(tracker):
+                    raise ConfigurationConflict("Owner STOP pending; AMO update deferred")
+                operating, _ = tracker.resolve_service_operating_state()
+                if operating.value not in _ALLOWED_IDLE:
+                    raise ConfigurationConflict("Service operating state uncertain; AMO update blocked")
+                if operating.value == "RUNNING":
+                    ok, _, _ = tracker.is_active_version_confirmed(
+                        expected_hashes={compute_config_version(cfg)},
+                        expected_mode=cfg.trading_mode.value,
+                        require_systemd_active=True,
+                    )
+                    if not ok:
+                        raise ConfigurationConflict("Running PID/version mismatch; AMO restart blocked")
             # apply_settings independently acquires the same global flock.
             # Do not nest it inside operation_lock (two FDs would deadlock).
             result = apply_settings(
@@ -387,6 +405,7 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 "runtime_verified": result.restart_performed,
                 "restart_performed": result.restart_performed,
                 "message": result.message, "revision": result.revision,
+                "change_id": str(body.get("request_id") or "DIRECT-APPLY"),
             })
         except ConfigurationConflict as exc:
             return _json({"error": str(exc)}, 409)

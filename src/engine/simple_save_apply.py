@@ -229,7 +229,16 @@ def apply_settings(
             raise ConfigurationConflict("Configuration symlinked during save")
         with path.open("r", encoding="utf-8", newline="") as fh:
             existing = fh.read()
-        if revision(existing) != expected_revision:
+        actual_revision = revision(existing)
+        # An exact no-op retry cannot submit a second restart, even when the
+        # browser resends the revision from the first successful save.
+        if actual_revision != expected_revision:
+            _, retry_changes = patch_env(existing, values)
+            if not retry_changes:
+                return SaveApplyResult(
+                    "UNCHANGED", "Setting already saved; no second restart.",
+                    False, False, actual_revision, (),
+                )
             raise ConfigurationConflict("Settings changed since page loaded. Refresh before saving.")
         proposed, changed = patch_env(existing, values, expected_revision=expected_revision)
         if not changed:
