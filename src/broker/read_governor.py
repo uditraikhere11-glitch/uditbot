@@ -33,7 +33,7 @@ class ReadGovernor:
 
     def _connect(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        conn = sqlite3.connect(self.path, timeout=0.05)
+        conn = sqlite3.connect(self.path, timeout=0.07)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=FULL')
@@ -47,14 +47,18 @@ class ReadGovernor:
             raise
 
     def _run_with_busy_retry(self, fn):
-        # At most two 50ms lock waits; never stall supervision for seconds.
-        for attempt in range(2):
+        # SQLite WAL still serializes writers across threads/processes.  Many
+        # same-account callers may race during startup; a 50ms x2 budget made
+        # harmless contention look like an unavailable broker.  Bound waits
+        # to six 70ms SQLite waits plus short backoffs (under 0.75s).
+        # Any exhausted retry STILL raises and closes the entry gate.
+        for attempt in range(6):
             try:
                 with closing(self._connect()) as conn, conn:
                     return fn(conn)
             except sqlite3.OperationalError as exc:
-                if ('locked' in str(exc).lower() or 'busy' in str(exc).lower()) and attempt == 0:
-                    time.sleep(0.01)
+                if ('locked' in str(exc).lower() or 'busy' in str(exc).lower()) and attempt < 5:
+                    time.sleep(0.005 * (attempt + 1))
                     continue
                 raise
 
@@ -108,7 +112,7 @@ class ReadGovernor:
         need = int(required)
         if need < 1 or need > 40:
             raise ValueError("Invalid required read capacity")
-        if priority not in ('routine', 'urgent'):
+        if priority not in ('routine', 'normal', 'low', 'urgent'):
             raise ValueError("Invalid watcher read priority")
         if not self.path.is_file():
             return 0.0
@@ -120,8 +124,12 @@ class ReadGovernor:
             row = conn.execute('SELECT until FROM cooldown WHERE id=1').fetchone()
             delay = max(0.0, float(row[0]) - now) if row and row[0] else 0.0
             for window, limit in self.LIMITS:
-                reserve = int(limit * 0.20) if priority == 'routine' else 0
-                ceiling = limit - reserve
+                # The preflight and final Dhan GET admission must use
+                # compatible ceilings. Watcher GET transport is NORMAL (95%),
+                # not URGENT (100%). Keep the separate conservative routine
+                # and low-priority reserve hints for their own callers.
+                fraction = {'routine': 0.80, 'normal': 0.95, 'low': 0.90, 'urgent': 1.0}[priority]
+                ceiling = max(1, int(limit * fraction))
                 if need > ceiling:
                     raise ValueError("Read requirement exceeds watcher allowance")
                 count = conn.execute(

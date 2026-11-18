@@ -498,9 +498,13 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
             _active_super_order_record("SUP-MAN-1", "11915", "NSE_EQ", "CNC", 50, 15.05, 16.05)
         ]
         broker.get_trade_book.return_value = []
+        broker.get_forever_orders.return_value = []  # verified no unrelated OCO
         broker.get_positions.return_value = [
             {"securityId": "11915", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 50}
         ]
+        # A settled CNC manual-exit inference requires fresh holdings
+        # evidence as well as an intraday positions snapshot.
+        broker.get_holdings.return_value = [{"securityId": "11915", "totalQty": 50}]
 
         watcher = ProtectionWatcher(broker=broker, path=self.pending_path, dry_run=False, journal_db=self.db, clock=lambda: 1000.0)
         watcher.track(
@@ -520,6 +524,7 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         broker.get_positions.return_value = [
             {"securityId": "11915", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 0}
         ]
+        broker.get_holdings.return_value = []  # successful, empty settled book
         watcher.check_once()
         rec = watcher.terminal_orders["SUP-MAN-1"]
         self.assertTrue(rec["manual_exit_detected"])
