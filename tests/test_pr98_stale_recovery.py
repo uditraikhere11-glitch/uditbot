@@ -241,6 +241,33 @@ class DirectBrokerRestartTests(unittest.TestCase):
         verified.assert_called_once()
         self.assertIn("EQUITY_AMO_ENABLED=true", self.env.read_text())
 
+    def test_terminal_v2_journal_tracks_direct_save_without_trusting_external_writes(self):
+        from src.engine.tracker_v2_safety import inspect_transaction_recovery
+        from hashlib import sha256
+        directory = Path(self.temp.name) / "data" / "config_restart_v2"
+        directory.mkdir(parents=True)
+        before_hash = sha256(self.before.encode()).hexdigest()
+        write_json_atomic(str(directory / "current_transaction.json"), {
+            "phase": "VERIFIED",
+            "requested_file_revision": before_hash,
+            "previous_file_revision": before_hash,
+        })
+        result = direct.apply_settings(
+            {"equity_amo_enabled": True}, env_path=self.env,
+            expected_revision=revision(self.before),
+            state_reader=lambda: "inactive", restart=lambda: self.fail("No restart"),
+        )
+        self.assertEqual(result.status, "SAVED_STOPPED")
+        self.assertEqual(
+            inspect_transaction_recovery(Path(self.temp.name) / "data", self.env).code,
+            "DIRECT_SAVE_SUPERSEDED",
+        )
+        self.env.write_text(self.env.read_text() + "UNTRUSTED_MANUAL=YES\n")
+        self.assertEqual(
+            inspect_transaction_recovery(Path(self.temp.name) / "data", self.env).code,
+            "EXTERNAL_ENV_WRITER",
+        )
+
     def test_exact_noop_retry_does_not_restart_again(self):
         first = direct.apply_settings(
             {"equity_amo_enabled": True}, env_path=self.env,
