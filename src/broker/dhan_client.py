@@ -2320,7 +2320,8 @@ class DhanClient:
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
-                    return data[0] if data and isinstance(data[0], dict) else None
+                    # Multiple broker matches are ambiguous; never choose first.
+                    return data[0] if len(data) == 1 and isinstance(data[0], dict) else None
                 return data if isinstance(data, dict) and data.get("orderId") else None
             return None
         except Exception as e:
@@ -2796,19 +2797,27 @@ class DhanClient:
         if not found:
             ob = self.get_order_book()
             if isinstance(ob, list):
-                for row in ob:
-                    if isinstance(row, dict) and str(row.get("correlationId") or "") == corr_id:
-                        found = row
-                        break
+                matches = [
+                    row for row in ob if isinstance(row, dict)
+                    and str(row.get("correlationId") or "") == str(corr_id)
+                ]
+                if len(matches) > 1:
+                    return False, None, (
+                        f"Duplicate correlation {corr_id} in broker book: "
+                        "outcome UNKNOWN (no resubmission)"
+                    )
+                if len(matches) == 1:
+                    found = matches[0]
 
-        if isinstance(found, dict) and found.get("orderId"):
+        oid = str(found.get("orderId") or found.get("order_id") or "").strip() if isinstance(found, dict) else ""
+        if oid:
             sec = str(found.get("securityId") or "").strip()
             if sec and expected_security_id and sec != str(expected_security_id):
                 return False, None, f"Reconciled correlation {corr_id} has mismatched securityId ({sec} != {expected_security_id})"
             st = str(found.get("orderStatus") or "PENDING").upper()
             if st == "REJECTED":
-                return False, None, f"Reconciled order {found['orderId']} was REJECTED at Dhan"
-            return True, str(found["orderId"]), f"Order {found['orderId']} confirmed via correlation reconciliation ({st})"
+                return False, None, f"Reconciled order {oid} was REJECTED at Dhan"
+            return True, oid, f"Order {oid} confirmed via correlation reconciliation ({st})"
 
         return False, None, f"Ambiguous/uncertain response for correlation {corr_id}: outcome UNKNOWN (automatic resubmission prohibited)"
 

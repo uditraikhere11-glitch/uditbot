@@ -1796,7 +1796,7 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
             loop = asyncio.get_running_loop()
 
             def _send_dhan_response(message: str) -> bool:
-                """Uses the already authenticated Telegram client from the outbox thread."""
+                """Use the authenticated Telethon client; propagate server flood waits."""
                 future = asyncio.run_coroutine_threadsafe(
                     client.send_message(response_entity, message, parse_mode="html"), loop
                 )
@@ -1805,6 +1805,13 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
                     return True
                 except Exception as exc:
                     future.cancel()
+                    # concurrent.futures propagates Telethon FloodWaitError
+                    # unchanged. Do not swallow it as False and hammer all
+                    # other claimed messages during the same flood window.
+                    from telethon.errors import FloodWaitError
+                    from src.notifier.outbox_worker import TelegramRetryAfter
+                    if isinstance(exc, FloodWaitError):
+                        raise TelegramRetryAfter(exc.seconds) from exc
                     logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
                     return False
 

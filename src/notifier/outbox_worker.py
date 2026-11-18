@@ -20,6 +20,15 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class TelegramRetryAfter(Exception):
+    """Telegram server-declared flood wait; message was not delivered."""
+
+    def __init__(self, seconds):
+        self.seconds = max(1, int(seconds or 1))
+        super().__init__(f"Telegram rate-limited; retry after {self.seconds}s")
+
+
 _KV_SECRET_RE = re.compile(
     r'("?\b(?:access_token|dhan_access_token|token|pin|dhan_pin|totp_secret|dhan_totp_secret|api_hash|tg_api_hash|api_key|secret)"?\s*[:=]\s*"?)([^",\s\}]+)("?)',
     re.IGNORECASE,
@@ -58,6 +67,7 @@ class OutboxWorker:
         self.max_retries = max_retries
         self.running: bool = False
         self._lock = threading.Lock()
+        self._telegram_resume_at = 0.0
 
     def process_pending_events(self, limit: int = 10, now: Optional[float] = None) -> int:
         """
@@ -67,6 +77,8 @@ class OutboxWorker:
         """
         with self._lock:
             current_ts = now if now is not None else time.time()
+            if current_ts < self._telegram_resume_at:
+                return 0  # Do not claim or send during server-specified wait.
             if hasattr(self.db, "claim_pending_outbox"):
                 try:
                     pending = self.db.claim_pending_outbox(limit=limit, now=current_ts)
@@ -82,7 +94,7 @@ class OutboxWorker:
                 return 0
 
             dispatched_count = 0
-            for item in pending:
+            for index, item in enumerate(pending):
                 out_id = item["id"]
                 payload_raw = item["payload"]
                 try:
@@ -109,6 +121,23 @@ class OutboxWorker:
                                 max_retries=self.max_retries,
                                 now=current_ts,
                             )
+                except TelegramRetryAfter as e:
+                    # A claimed batch must be released WITHOUT sending the
+                    # remaining messages during the same Telegram flood wait.
+                    self._telegram_resume_at = max(self._telegram_resume_at, current_ts + e.seconds)
+                    for remaining in pending[index:]:
+                        if hasattr(self.db, "defer_outbox"):
+                            self.db.defer_outbox(
+                                remaining["id"], self._telegram_resume_at,
+                                error_msg=f"Telegram rate limit; retry after {e.seconds}s",
+                            )
+                        elif hasattr(self.db, "mark_outbox_retry"):
+                            self.db.mark_outbox_retry(
+                                remaining["id"], error_msg="Telegram rate-limited",
+                                max_retries=self.max_retries, now=current_ts,
+                            )
+                    logger.warning("[Outbox] Telegram flood wait %ss; deferred remaining batch", e.seconds)
+                    break
                 except Exception as e:
                     safe_err = redact_secrets(str(e))
                     logger.error(f"[Outbox] Exception processing outbox item {out_id}: {safe_err}")

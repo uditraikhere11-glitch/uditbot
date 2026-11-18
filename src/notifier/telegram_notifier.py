@@ -11,6 +11,7 @@ Implements V12-18 & V12-14 fixes:
 import logging
 import requests
 from src.config import AppConfig
+from src.notifier.outbox_worker import TelegramRetryAfter
 
 logger = logging.getLogger("telegram_notifier")
 
@@ -46,13 +47,31 @@ class TelegramNotifier:
             if resp.status_code == 200:
                 self.last_delivery_status = "DELIVERED"
                 return True
+            if resp.status_code == 429:
+                try:
+                    seconds = int(resp.json().get("parameters", {}).get("retry_after") or
+                                  resp.headers.get("Retry-After") or 30)
+                except (ValueError, TypeError, AttributeError):
+                    seconds = 30
+                self.last_delivery_status = "RATE_LIMITED"
+                raise TelegramRetryAfter(seconds)
             logger.warning(f"Failed to post to Telegram Log Group ({resp.status_code}): {resp.text}")
             # Retry once without HTML parse_mode in case of entity parsing issues
             payload.pop("parse_mode", None)
             retry_resp = requests.post(url, json=payload, timeout=5)
+            if retry_resp.status_code == 429:
+                try:
+                    seconds = int(retry_resp.json().get("parameters", {}).get("retry_after") or
+                                  retry_resp.headers.get("Retry-After") or 30)
+                except (ValueError, TypeError, AttributeError):
+                    seconds = 30
+                self.last_delivery_status = "RATE_LIMITED"
+                raise TelegramRetryAfter(seconds)
             ok = retry_resp.status_code == 200
             self.last_delivery_status = "DELIVERED" if ok else f"HTTP_{retry_resp.status_code}"
             return ok
+        except TelegramRetryAfter:
+            raise
         except Exception as e:
             self.last_delivery_status = f"ERROR: {e}"
             logger.error(f"Network exception posting to Telegram Log Group: {e}")

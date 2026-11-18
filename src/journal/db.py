@@ -1243,6 +1243,25 @@ class JournalDB:
             )
             return [dict(row) for row in cur.fetchall()]
 
+    def defer_outbox(self, outbox_id: int, retry_at: float, error_msg: str = "") -> None:
+        """Release an atomically claimed Telegram item without consuming a retry.
+
+        Preserve later retry deadlines; flood waits are not delivery attempts
+        and must never turn a batch into DEAD_LETTER.
+        """
+        due = float(retry_at)
+        with self._get_conn() as conn:
+            conn.execute(
+                """UPDATE outbox
+                   SET status = 'PENDING', claimed_at = NULL,
+                       next_retry_at = CASE
+                           WHEN next_retry_at IS NULL OR next_retry_at < ? THEN ?
+                           ELSE next_retry_at END,
+                       last_error = ?
+                   WHERE id = ? AND status = 'CLAIMING'""",
+                (due, due, error_msg[:500], int(outbox_id)),
+            )
+
     def mark_outbox_processed(self, outbox_id: int) -> None:
         with self._get_conn() as conn:
             conn.execute(
