@@ -1,0 +1,75 @@
+name: PR98 changed-files review bundle
+on:
+  push:
+    branches:
+      - refactor/simple-save-apply-remove-tracker-ui-20261118
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-reviewed-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify and create complete changed-files ZIP and patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=8a330329a9629f3ede93ba97a328282b2c96ce05
+          git cat-file -e "$BASE^{commit}"
+          git diff --check "$BASE" HEAD
+          python -B -m compileall -q src tests
+          python - <<'PY'
+          import hashlib
+          import subprocess
+          import zipfile
+          from pathlib import Path
+          base = "8a330329a9629f3ede93ba97a328282b2c96ce05"
+          head = subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()
+          changed = subprocess.check_output(
+              ["git","diff","--name-only","--diff-filter=ACMR",base,head],text=True
+          ).splitlines()
+          diff = subprocess.check_output(
+              ["git","diff","--binary","--full-index",base,head]
+          )
+          assert changed and diff
+          sums = []
+          out = Path("PR98_Simple_Save_Apply_ChangedFiles.zip")
+          with zipfile.ZipFile(out,"w",compression=zipfile.ZIP_DEFLATED) as archive:
+              for name in changed:
+                  blob = Path(name).read_bytes()
+                  archive.writestr(name,blob)
+                  sums.append(f"{hashlib.sha256(blob).hexdigest()}  {name}")
+              archive.writestr("REVIEW/PR98_unified.patch",diff)
+              archive.writestr("REVIEW/SHA256SUMS","\n".join(sums)+"\n")
+              archive.writestr("REVIEW/README.txt",
+                  f"PR #98\nBase: {base}\nHead: {head}\n\n"
+                  "Changed repository files plus complete unified binary patch.\n"
+                  "For independent audit only; not a VM installer.\n")
+          Path("PR98_unified.patch").write_bytes(diff)
+          Path("PR98_SHA256SUMS").write_text(
+              hashlib.sha256(out.read_bytes()).hexdigest()+"  "+out.name+"\n"
+          )
+          with zipfile.ZipFile(out) as archive:
+              assert archive.testzip() is None
+              assert all(name in archive.namelist() for name in changed)
+          print("BASE",base,"HEAD",head,"FILES",len(changed))
+          print("ZIP",out,"BYTES",out.stat().st_size)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PR98_ChangedFiles_Audit_Package
+          path: |
+            PR98_Simple_Save_Apply_ChangedFiles.zip
+            PR98_unified.patch
+            PR98_SHA256SUMS
+          retention-days: 30
+          if-no-files-found: error
