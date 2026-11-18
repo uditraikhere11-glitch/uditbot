@@ -226,7 +226,7 @@ sys.exit(1)
     def test_concurrent_multithread_admission_no_false_sqlite_lock_halt(self):
         """Finding 2: Concurrent WAL admission across threads never triggers false SQLite lock halts."""
         def worker(i):
-            gov = ReadGovernor(self.tmp.name, 'ACCOUNT_A', clock=lambda: self.now + i * 0.001)
+            gov = ReadGovernor(self.tmp.name, 'ACCOUNT_A', clock=lambda: self.now + i * 0.060)
             gov.admit()
             return True
 

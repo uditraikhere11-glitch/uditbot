@@ -184,6 +184,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -214,6 +216,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -234,6 +238,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -258,6 +264,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -278,6 +286,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -304,6 +314,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -321,6 +333,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.side_effect = requests.exceptions.Timeout("Connection timed out waiting for Dhan DELETE")
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -415,6 +429,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
     def test_c03_12_test_mode_no_real_dhan_delete(self, mock_delete):
         """C03-12: TEST mode produces no real Dhan DELETE request."""
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.TEST
@@ -431,6 +447,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
     def test_c03_13_invalid_order_id_no_network_delete(self, mock_delete):
         """C03-13: Invalid or missing order IDs produce no network DELETE call."""
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
@@ -452,6 +470,8 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.return_value = mock_resp
 
         cfg = AppConfig.from_env()
+        # Never share a durable order-rate SQLite database across test cases.
+        cfg.data_dir = self.temp_dir.name
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_access_token = "mock_token"
         cfg.trading_mode = TradingMode.LIVE
