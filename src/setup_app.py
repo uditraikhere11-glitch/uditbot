@@ -90,15 +90,8 @@ def ensure_webui_coordinator_started(
 
 @app.on_event("startup")
 def _on_webui_startup() -> None:
-    if not is_isolated_test_environment():
-        # Recover interrupted save-only configuration transactions without
-        # starting the trading service or contacting Dhan.
-        try:
-            cfg = AppConfig.from_env()
-            recover_field_transactions(ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data")))
-        except Exception:
-            pass
-        ensure_webui_coordinator_started(stop_when_idle=False)
+    # Save & Apply uses no persistent configuration coordinator.
+    return None
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -498,170 +491,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-live { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
     .badge-test { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
 
-    /* CV13-06G: Modal & Configuration Change Tracking Styles */
-    .modal-backdrop {
-      display: none;
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(10, 15, 29, 0.85);
-      backdrop-filter: blur(8px);
-      z-index: 9999;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .modal-backdrop.active { display: flex; }
-    .modal-box {
-      background: #111827;
-      border: 1px solid #374151;
-      border-radius: 16px;
-      max-width: 650px;
-      width: 100%;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
-      padding: 28px;
-      color: #f3f4f6;
-      animation: modalFadeIn 0.25s ease-out;
-    }
-    @keyframes modalFadeIn {
-      from { opacity: 0; transform: scale(0.95); }
-      to { opacity: 1; transform: scale(1); }
-    }
-    .modal-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid #1f2937;
-      padding-bottom: 16px;
-      margin-bottom: 20px;
-    }
-    .modal-title {
-      font-size: 18px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .state-pill {
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      padding: 4px 10px;
-      border-radius: 20px;
-      text-transform: uppercase;
-    }
-    .state-REQUEST_RECEIVED { background: #3b82f6; color: #fff; }
-    .state-VALIDATING { background: #8b5cf6; color: #fff; }
-    .state-SAVED { background: #06b6d4; color: #fff; }
-    .state-SAFETY_CHECK_PENDING { background: #f59e0b; color: #fff; }
-    .state-WAITING_FOR_SAFE_APPLY { background: #ea580c; color: #fff; }
-    .state-APPLYING { background: #6366f1; color: #fff; }
-    .state-APPLIED_VERIFIED { background: #10b981; color: #fff; }
-    .state-SAVED_FOR_NEXT_START { background: #14b8a6; color: #fff; }
-    .state-APPLY_FAILED { background: #ef4444; color: #fff; }
-    .state-REJECTED { background: #b91c1c; color: #fff; }
-
-    .stepper {
-      display: flex;
-      width: 100%;
-      justify-content: space-between;
-      margin-bottom: 24px;
-      position: relative;
-    }
-    .stepper .step-item {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      flex: 1;
-      position: relative;
-      z-index: 1;
-    }
-    .step-circle {
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: #1f2937;
-      border: 2px solid #374151;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-      font-weight: 600;
-      color: #9ca3af;
-      margin-bottom: 6px;
-      transition: all 0.2s;
-    }
-    .step-label {
-      font-size: 10px;
-      color: #9ca3af;
-      text-align: center;
-      text-transform: uppercase;
-      font-weight: 600;
-    }
-    .step-item.active .step-circle {
-      background: #3b82f6;
-      border-color: #60a5fa;
-      color: #fff;
-      box-shadow: 0 0 12px rgba(59, 130, 246, 0.5);
-    }
-    .step-item.completed .step-circle {
-      background: #10b981;
-      border-color: #34d399;
-      color: #fff;
-    }
-    .step-item.active .step-label { color: #93c5fd; }
-    .step-item.completed .step-label { color: #a7f3d0; }
-    .step-item.failed .step-circle {
-      background: #ef4444;
-      border-color: #f87171;
-      color: #fff;
-    }
-    .step-item.failed .step-label { color: #fca5a5; }
-
-    .modal-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-    .modal-card {
-      background: #1f2937;
-      border-radius: 8px;
-      padding: 10px 14px;
-      border: 1px solid #374151;
-    }
-    .modal-card-label {
-      font-size: 11px;
-      color: #9ca3af;
-      text-transform: uppercase;
-      margin-bottom: 4px;
-    }
-    .modal-card-val {
-      font-size: 13px;
-      font-weight: 600;
-      color: #f9fafb;
-    }
-
-    .modal-reason {
-      background: #1e293b;
-      border-left: 4px solid #3b82f6;
-      padding: 12px 14px;
-      border-radius: 4px;
-      margin-bottom: 16px;
-      font-size: 13px;
-      line-height: 1.5;
-    }
-    .modal-reason.warning { border-left-color: #f59e0b; background: rgba(245, 158, 11, 0.1); }
-    .modal-reason.error { border-left-color: #ef4444; background: rgba(239, 68, 68, 0.1); }
-    .modal-reason.success { border-left-color: #10b981; background: rgba(16, 185, 129, 0.1); }
-
-    .modal-footer {
-      display: flex;
-      justify-content: flex-end;
-      gap: 10px;
-      margin-top: 20px;
-      border-top: 1px solid #1f2937;
-      padding-top: 16px;
-    }
+    #simpleSaveStatus { display:none; margin-top:14px; padding:14px 16px; border-radius:10px; background:#172334; color:#e2e8f0; border-left:4px solid #3b82f6; }
+    #simpleSaveStatus.success { border-left-color:#10b981; }
+    #simpleSaveStatus.error { border-left-color:#ef4444; }
   </style>
 </head>
 <body>
@@ -1173,393 +1005,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <button type="submit" class="btn-submit">
-        <span>💾</span> Save & Apply Configuration to Audit bot
+        <span>💾</span> Save & Apply
       </button>
     </form>
   </div>
 
-  <!-- CV13-06G & AB-V14-WEBUI-BACKEND-FIX-01: Configuration Save, 0-100% Progress & Service Control Modal -->
-  <div id="configModal" class="modal-backdrop">
-    <div class="modal-box">
-      <div class="modal-header">
-        <div class="modal-title">
-          <span>⚙️</span> Configuration Change Tracker
-        </div>
-        <div style="display: flex; align-items: center; gap: 8px;">
-          <span id="modalProgressBadge" style="font-size: 12px; font-weight: 700; color: #38bdf8; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); padding: 3px 10px; border-radius: 999px;">0%</span>
-          <span id="modalStatePill" class="state-pill state-REQUEST_RECEIVED">Request Received</span>
-        </div>
-      </div>
-
-      <div style="margin-bottom: 18px;">
-        <div style="display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; font-weight: 600; margin-bottom: 6px;">
-          <span id="modalProgressStepText">0% — Preparing Request</span>
-          <span id="modalProgressPctRight">0%</span>
-        </div>
-        <div style="width: 100%; height: 8px; background: #1f2937; border-radius: 999px; overflow: hidden; border: 1px solid #374151;">
-          <div id="modalProgressBar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #3b82f6, #10b981); transition: width 0.25s ease;"></div>
-        </div>
-      </div>
-
-      <div class="stepper">
-        <div id="step_1" class="step-item active">
-          <div class="step-circle">1</div>
-          <div class="step-label">Received</div>
-        </div>
-        <div id="step_2" class="step-item">
-          <div class="step-circle">2</div>
-          <div class="step-label">Validating</div>
-        </div>
-        <div id="step_3" class="step-item">
-          <div class="step-circle">3</div>
-          <div class="step-label">Persisted</div>
-        </div>
-        <div id="step_4" class="step-item">
-          <div class="step-circle">4</div>
-          <div class="step-label">Safety Gate</div>
-        </div>
-        <div id="step_5" class="step-item">
-          <div class="step-circle">5</div>
-          <div class="step-label">Applying</div>
-        </div>
-        <div id="step_6" class="step-item">
-          <div class="step-circle">6</div>
-          <div class="step-label">Verified</div>
-        </div>
-      </div>
-
-      <div id="modalReason" class="modal-reason">
-        Request received. Preparing validation and persistence...
-      </div>
-
-      <div class="modal-grid">
-        <div class="modal-card">
-          <div class="modal-card-label">Change ID</div>
-          <div id="modalChangeId" class="modal-card-val" style="font-family: monospace;">CFG-PENDING</div>
-        </div>
-        <div class="modal-card">
-          <div class="modal-card-label">Service Operating State</div>
-          <div id="modalServiceStatus" class="modal-card-val">Checking...</div>
-        </div>
-        <div class="modal-card">
-          <div class="modal-card-label">Previous Settings</div>
-          <div id="modalPrevVersion" class="modal-card-val">Calculating...</div>
-        </div>
-        <div class="modal-card">
-          <div class="modal-card-label">Requested Settings</div>
-          <div id="modalPropVersion" class="modal-card-val">Calculating...</div>
-        </div>
-        <div class="modal-card" style="grid-column: span 2;">
-          <div class="modal-card-label">Running Settings</div>
-          <div id="modalActiveVersion" class="modal-card-val">Awaiting Running Process Confirmation</div>
-        </div>
-      </div>
-
-      <div id="modalApplicationFacts" style="font-size: 12px; color: #cbd5e1; margin-bottom: 12px;" aria-live="polite">
-        Application: pending · Restart: not performed · Runtime: not verified
-      </div>
-      <div style="background: #0d1321; border: 1px solid #26334d; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 120px; overflow-y: auto;">
-        <div style="font-size: 11px; text-transform: uppercase; color: #94a3b8; font-weight: 600; margin-bottom: 6px;">Changes Audit Trail (Credentials Redacted)</div>
-        <div id="modalChangesList" style="font-size: 12px; color: #cbd5e1; font-family: monospace; line-height: 1.6;">None</div>
-      </div>
-
-      <div class="modal-footer" style="justify-content: space-between; align-items: center;">
-        <div style="display: flex; gap: 8px; align-items: center;">
-          <button id="modalStartBotBtn" type="button" style="background: #10b981; color: #ffffff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; display: none;">▶ Start Bot</button>
-          <button id="modalStopBotBtn" type="button" style="background: #ef4444; color: #ffffff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; display: none;">⏹ Stop Bot</button>
-          <span id="modalWaitingBadge" style="font-size: 12px; color: #fbbf24; font-weight: 600; display: none;">⏳ Waiting for LIVE Order</span>
-        </div>
-        <button id="modalCloseBtn" type="button" style="background: #374151; color: #f9fafb; border: none; border-radius: 8px; padding: 8px 18px; font-size: 13px; font-weight: 600; cursor: pointer; display: none;">Close</button>
-      </div>
-    </div>
-  </div>
-
+  <div id="simpleSaveStatus" role="status" aria-live="polite"></div>
 <script>
-document.addEventListener('DOMContentLoaded', function() {
-  const form = document.querySelector('form');
-  const modal = document.getElementById('configModal');
-  const closeBtn = document.getElementById('modalCloseBtn');
-  const startBotBtn = document.getElementById('modalStartBotBtn');
-  const stopBotBtn = document.getElementById('modalStopBotBtn');
-  let pollTimer = null;
-  let lastRecord = null;
-
-  function getCsrfToken() {
-    const inp = document.querySelector('input[name="csrf_token"]');
-    return inp ? inp.value : '';
-  }
-
-  if (closeBtn) {
-    closeBtn.addEventListener('click', function() {
-      modal.classList.remove('active');
-      if (pollTimer) clearInterval(pollTimer);
-    });
-  }
-
-  async function invokeServiceControl(action, confirmLive = false) {
-    const reasonBox = document.getElementById('modalReason');
-    reasonBox.textContent = (action === 'start' ? 'Starting AuditBot service...' : 'Stopping AuditBot service safely...');
-    reasonBox.className = 'modal-reason';
-    document.getElementById('modalApplicationFacts').textContent = 'Service control: ' + String(action) + ' · Runtime verification pending';
+document.addEventListener('DOMContentLoaded', function () {
+  const form = document.querySelector('form[action="/setup"]');
+  if (!form) return;
+  const button = form.querySelector('button[type="submit"]');
+  const status = document.getElementById('simpleSaveStatus');
+  form.addEventListener('submit', async function (event) {
+    event.preventDefault();
+    if (button.disabled) return;
+    const mode = form.querySelector('input[name="is_live_mode"]');
+    if (mode && mode.checked &&
+        !window.confirm('Save LIVE settings? Restarting a running bot can interrupt protection supervision. Continue?')) return;
+    button.disabled = true;
+    status.style.display = 'block';
+    status.className = '';
+    status.textContent = 'Saving settings and applying changes...';
     try {
-      const resp = await fetch('/setup/service-control', {
+      const response = await fetch('/setup/save-apply', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          action: action,
-          confirm_live: confirmLive,
-          csrf_token: getCsrfToken()
-        })
+        credentials: 'same-origin',
+        body: new FormData(form)
       });
-      const res = await resp.json();
-      if (res.requires_live_confirmation) {
-        if (window.confirm(res.message || 'You are about to start AuditBot in LIVE mode. Real Dhan orders may be placed. Continue?')) {
-          return await invokeServiceControl('start', true);
-        } else {
-          reasonBox.textContent = 'LIVE startup cancelled by operator.';
-          return;
-        }
-      }
-      if (res.service_state_label || res.service_state) {
-        document.getElementById('modalServiceStatus').textContent = res.service_state_label || res.service_state;
-      }
-      reasonBox.textContent = res.message || res.error || 'Service control operation completed.';
-      reasonBox.className = res.ok ? 'modal-reason success' : (res.deferred ? 'modal-reason warning' : 'modal-reason error');
-      document.getElementById('modalApplicationFacts').textContent = 'Service control: ' + String(action) +
-        ' · Runtime: ' + (res.runtime_verified === true ? 'Verified' : 'Not verified');
-      if (res.service_state === 'RUNNING') {
-        startBotBtn.style.display = 'none';
-        stopBotBtn.style.display = res.deferred ? 'none' : 'inline-block';
-        document.getElementById('modalActiveVersion').textContent = (res.running_mode || res.saved_mode || 'TEST') +
-          (res.runtime_verified === true ? ' — Verified' : ' — Running, configuration not verified');
-      } else if (res.service_state && res.service_state.startsWith('STOPPED')) {
-        startBotBtn.style.display = 'inline-block';
-        stopBotBtn.style.display = 'none';
-        document.getElementById('modalActiveVersion').textContent = 'Bot Stopped (Saved: ' + (res.saved_mode || 'TEST') + ')';
-      }
-    } catch (err) {
-      reasonBox.textContent = 'Service control request error: ' + err;
-      reasonBox.className = 'modal-reason error';
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw Error(result.message || result.error || 'Save failed');
+      const rev = form.querySelector('input[name="expected_revision"]');
+      if (rev && result.revision) rev.value = result.revision;
+      status.className = 'success';
+      status.textContent = result.message || 'Settings saved.';
+    } catch (error) {
+      status.className = 'error';
+      status.textContent = String(error.message || error) +
+        ' Refresh this page before trying another change.';
+    } finally {
+      button.disabled = false;
+      status.scrollIntoView({block: 'nearest', behavior: 'smooth'});
     }
-  }
-
-  if (startBotBtn) {
-    startBotBtn.addEventListener('click', function() {
-      const savedMode = (lastRecord && (lastRecord.saved_mode || lastRecord.requested_mode)) || 'TEST';
-      if (savedMode === 'LIVE') {
-        if (!window.confirm('You are about to start AuditBot in LIVE mode. Real Dhan orders may be placed. Continue?')) {
-          return;
-        }
-        invokeServiceControl('start', true);
-      } else {
-        invokeServiceControl('start', false);
-      }
-    });
-  }
-
-  if (stopBotBtn) {
-    stopBotBtn.addEventListener('click', function() {
-      invokeServiceControl('stop', false);
-    });
-  }
-
-  function startPolling(changeId) {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(async () => {
-      try {
-        const sResp = await fetch('/setup/change-status/' + changeId);
-        if (sResp.ok) {
-          const sRec = await sResp.json();
-          updateModal(sRec);
-          if (['APPLIED_VERIFIED', 'SAVED_FOR_NEXT_START', 'APPLY_FAILED', 'REJECTED'].includes(sRec.state)) {
-            clearInterval(pollTimer);
-            document.getElementById('modalCloseBtn').style.display = 'inline-block';
-          } else if (sRec.state === 'WAITING_FOR_SAFE_APPLY') {
-            document.getElementById('modalCloseBtn').style.display = 'inline-block';
-          }
-        }
-      } catch (err) {
-        console.error('Polling error:', err);
-      }
-    }, 450);
-  }
-
-  // Resume active or waiting configuration tracker popup across page refresh if a transition is in progress
-  (async function checkExistingOperationOnLoad() {
-    try {
-      const resp = await fetch('/setup/active-version');
-      if (resp.ok) {
-        const info = await resp.json();
-        if (info.latest_change && ['REQUEST_RECEIVED', 'VALIDATING', 'SAVED', 'SAFETY_CHECK_PENDING', 'WAITING_FOR_SAFE_APPLY', 'APPLYING'].includes(info.latest_change.state)) {
-          modal.classList.add('active');
-          updateModal(info.latest_change);
-          startPolling(info.latest_change.change_id);
-        }
-      }
-    } catch (e) {}
-  })();
-
-  if (form) {
-    form.addEventListener('submit', async function(e) {
-      e.preventDefault();
-      const liveCheckbox = form.querySelector('input[name="is_live_mode"]');
-      if (liveCheckbox && liveCheckbox.checked) {
-        if (!window.confirm('You are about to enable LIVE Trading Mode. Real Dhan orders may be placed when active. Continue?')) {
-          return;
-        }
-      }
-      modal.classList.add('active');
-      document.getElementById('modalStatePill').textContent = 'Request Received';
-      document.getElementById('modalStatePill').className = 'state-pill state-REQUEST_RECEIVED';
-      document.getElementById('modalReason').textContent = 'Submitting configuration request to server...';
-      document.getElementById('modalReason').className = 'modal-reason';
-      document.getElementById('modalChangeId').textContent = 'Generating...';
-      document.getElementById('modalCloseBtn').style.display = 'none';
-
-      const formData = new FormData(form);
-      const newId = (window.crypto && window.crypto.getRandomValues)
-        ? Array.from(window.crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('')
-        : String(Date.now()) + '-' + String(Math.random()).slice(2);
-      formData.set('request_id', newId);
-      if (liveCheckbox && liveCheckbox.checked) formData.set('confirm_live', 'true');
-      try {
-        const resp = await fetch('/setup/submit-async', {
-          method: 'POST',
-          body: formData
-        });
-        const rec = await resp.json();
-        updateModal(rec);
-
-        if (rec.change_id) {
-          startPolling(rec.change_id);
-        }
-      } catch (err) {
-        document.getElementById('modalStatePill').textContent = 'Could Not Apply Settings';
-        document.getElementById('modalStatePill').className = 'state-pill state-APPLY_FAILED';
-        document.getElementById('modalReason').textContent = 'Network error communicating with setup engine: ' + err;
-        document.getElementById('modalReason').className = 'modal-reason error';
-        document.getElementById('modalCloseBtn').style.display = 'inline-block';
-      }
-    });
-  }
-
-  function updateModal(rec) {
-    if (!rec) return;
-    lastRecord = rec;
-    document.getElementById('modalChangeId').textContent = rec.change_id || 'CFG-PENDING';
-    const pill = document.getElementById('modalStatePill');
-    pill.textContent = rec.state_label || rec.state;
-    pill.className = 'state-pill state-' + rec.state;
-
-    const pct = (typeof rec.progress_percent === 'number') ? rec.progress_percent : 0;
-    document.getElementById('modalProgressBadge').textContent = pct + '%';
-    document.getElementById('modalProgressPctRight').textContent = pct + '%';
-    document.getElementById('modalProgressBar').style.width = pct + '%';
-
-    let stepCaption = pct + '% — ' + (rec.state_label || rec.current_step || rec.state);
-    if (rec.state === 'WAITING_FOR_SAFE_APPLY' || rec.operation_state === 'WAITING_FOR_ORDER') {
-      stepCaption = pct + '% — Waiting for Broker-Safe Trading Transition';
-    } else if (rec.state === 'SAVED_FOR_NEXT_START') {
-      stepCaption = pct + '% — Saved for Next Controlled Start (Not Yet Active)';
-    }
-    document.getElementById('modalProgressStepText').textContent = stepCaption;
-
-    document.getElementById('modalServiceStatus').textContent = rec.service_state_label || rec.service_status || 'UNKNOWN';
-    document.getElementById('modalApplicationFacts').textContent =
-      'Application: ' + String(rec.application_method || 'Legacy controlled transition') +
-      ' · Trading restart: ' + (rec.restart_performed === true ? 'Performed' : 'Not performed') +
-      ' · Broker safety check: ' + (rec.broker_checks_required === true ? 'Required' : 'Not required') +
-      ' · Runtime: ' + (rec.runtime_verified === true ? 'Verified' : 'Not verified');
-
-    const prevMode = rec.previous_mode || 'TEST';
-    const reqMode = rec.requested_mode || 'TEST';
-    const prevRef = rec.previous_version_hash ? ' (Ref: ' + rec.previous_version_hash.slice(0, 8) + ')' : '';
-    const propRef = rec.proposed_version_hash ? ' (Ref: ' + rec.proposed_version_hash.slice(0, 8) + ')' : '';
-    document.getElementById('modalPrevVersion').textContent = prevMode + prevRef;
-    document.getElementById('modalPropVersion').textContent = reqMode + propRef;
-
-    if (rec.state === 'APPLIED_VERIFIED') {
-      document.getElementById('modalActiveVersion').textContent = (rec.running_mode || reqMode) + ' — Verified';
-    } else if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
-      document.getElementById('modalActiveVersion').textContent = (rec.running_mode || prevMode) + ' — Waiting for Order';
-    } else if (rec.state === 'SAVED_FOR_NEXT_START') {
-      document.getElementById('modalActiveVersion').textContent = 'Saved: ' + (rec.saved_mode || reqMode) + ' — Current running settings unchanged; activation pending';
-    } else if (rec.runtime_verified === true && rec.effective_version_hash) {
-      document.getElementById('modalActiveVersion').textContent = (rec.running_mode || reqMode) + ' — Verified (Ref: ' + rec.effective_version_hash.slice(0, 8) + ')';
-    } else {
-      document.getElementById('modalActiveVersion').textContent = 'Pending Verification';
-    }
-
-    const reasonBox = document.getElementById('modalReason');
-    let msg = rec.error_msg || rec.reason || ('Configuration state: ' + (rec.state_label || rec.state));
-    if (rec.state === 'WAITING_FOR_SAFE_APPLY' && (rec.blocked_reason === 'LIVE_ORDER_IN_PROGRESS' || msg.toLowerCase().includes('order'))) {
-      msg = '⏳ Configuration Paused — LIVE Order in Progress: ' + msg;
-    }
-    reasonBox.textContent = msg;
-
-    if (rec.state === 'APPLIED_VERIFIED' || rec.state === 'SAVED_FOR_NEXT_START') {
-      reasonBox.className = 'modal-reason success';
-    } else if (rec.state === 'WAITING_FOR_SAFE_APPLY' || rec.state === 'SAFETY_CHECK_PENDING') {
-      reasonBox.className = 'modal-reason warning';
-    } else if (rec.state === 'APPLY_FAILED' || rec.state === 'REJECTED') {
-      reasonBox.className = 'modal-reason error';
-    } else {
-      reasonBox.className = 'modal-reason';
-    }
-
-    const changesList = document.getElementById('modalChangesList');
-    changesList.replaceChildren();
-    const changes = (rec.changes_summary && rec.changes_summary.length > 0)
-      ? rec.changes_summary
-      : (rec.previous_version_hash && rec.previous_version_hash === rec.proposed_version_hash)
-        ? ['No configuration values changed.']
-        : ['None'];
-    for (const change of changes) {
-      const row = document.createElement('div');
-      row.textContent = '• ' + String(change);
-      changesList.appendChild(row);
-    }
-
-    // Context-sensitive Start / Stop / Waiting controls (Part 5)
-    const waitBadge = document.getElementById('modalWaitingBadge');
-    if (rec.state === 'WAITING_FOR_SAFE_APPLY') {
-      startBotBtn.style.display = 'none';
-      stopBotBtn.style.display = 'none';
-      waitBadge.textContent = (rec.blocked_reason === 'LIVE_ORDER_IN_PROGRESS' ||
-                               rec.blocked_reason === 'UNPROTECTED_POSITION')
-        ? '⏳ Waiting for broker-safe existing order verification'
-        : '⏳ Trading transition deferred: ' + String(rec.blocked_reason || 'Safety check pending');
-      waitBadge.style.display = 'inline-block';
-    } else if (rec.service_state === 'RUNNING' || rec.service_status === 'LIVE' || rec.service_status === 'TEST') {
-      startBotBtn.style.display = 'none';
-      stopBotBtn.style.display = 'inline-block';
-      waitBadge.style.display = 'none';
-    } else if (rec.service_state && (rec.service_state.startsWith('STOPPED') || rec.service_state === 'FAILED')) {
-      startBotBtn.style.display = 'inline-block';
-      stopBotBtn.style.display = 'none';
-      waitBadge.style.display = 'none';
-    } else {
-      startBotBtn.style.display = 'none';
-      stopBotBtn.style.display = 'none';
-      waitBadge.style.display = 'none';
-    }
-
-    if (['APPLIED_VERIFIED', 'WAITING_FOR_SAFE_APPLY', 'SAVED_FOR_NEXT_START', 'APPLY_FAILED', 'REJECTED'].includes(rec.state)) {
-      document.getElementById('modalCloseBtn').style.display = 'inline-block';
-    }
-
-    const stepKeys = ['RECEIVED', 'VALIDATING', 'PERSISTED', 'SAFETY_GATE', 'APPLYING', 'VERIFIED'];
-    const stepMap = (rec.step_status && typeof rec.step_status === 'object') ? rec.step_status : {};
-    for (let i = 0; i < stepKeys.length; i++) {
-      const el = document.getElementById('step_' + (i + 1));
-      if (!el) continue;
-      const st = stepMap[stepKeys[i]] || 'PENDING';
-      if (st === 'COMPLETED') el.className = 'step-item completed';
-      else if (st === 'FAILED' || st === 'CANCELLED') el.className = 'step-item failed';
-      else if (st === 'IN_PROGRESS' || st === 'WAITING' || st === 'READY') el.className = 'step-item active';
-      else el.className = 'step-item';
-    }
-  }
+  });
 });
 </script>
 </body>
@@ -2118,6 +1606,36 @@ SCRIP_MASTER_MAX_AGE_SEC={clean_scrip_max_age}
     return env_content, params_dict
 
 
+@app.post("/setup/save-apply")
+async def simple_save_apply(request: Request):
+    """One synchronous Save & Apply action; no tracker modal or async worker."""
+    from src.engine.simple_save_apply import apply_settings
+    try:
+        form = await request.form()
+        if any(len(form.getlist(key)) != 1 for key in form):
+            return JSONResponse(status_code=422, content={"ok": False, "error": "Duplicate form field"})
+        submitted = dict(form)
+        if submitted.get("csrf_token") != SETUP_CSRF_TOKEN:
+            return JSONResponse(status_code=403, content={"ok": False, "error": "Invalid CSRF token"})
+        unknown = set(submitted) - set(REGISTRY) - REQUEST_METADATA - {"dhan_access_token", "daily_trade_limit"}
+        if unknown:
+            return JSONResponse(status_code=422, content={"ok": False, "error": "Unsupported settings fields"})
+        editable = {k: v for k, v in submitted.items() if k in REGISTRY or k in ("dhan_access_token", "daily_trade_limit")}
+        if submitted.get("full_setup_form") == "1":
+            for name in ("is_live_mode", "equity_active", "fno_active"):
+                editable[name] = name in submitted
+        result = apply_settings(
+            editable, env_path=os.path.abspath(".env"),
+            expected_revision=str(submitted.get("expected_revision") or ""),
+            confirm_live=str(submitted.get("confirm_live") or "").lower() in ("1", "true", "on", "yes"),
+        )
+        return JSONResponse(content=result.as_dict())
+    except ConfigurationConflict as exc:
+        return JSONResponse(status_code=409, content={"ok": False, "error": str(exc)})
+    except (ConfigurationRejected, ValueError) as exc:
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+
+
 @app.post("/setup/submit-async")
 async def handle_setup_submission_async(request: Request):
     """B11: Durable, serialized asynchronous WebUI submission returning change_id immediately."""
@@ -2419,13 +1937,11 @@ def handle_setup_submission(
             editable[key] = key in submitted
     if submitted.get("confirm_live") is not None:
         editable["confirm_live"] = submitted["confirm_live"]
-    source_env = parse_env_dict(".env")
-    tracker = ConfigChangeTracker(data_dir=os.path.abspath(source_env.get("DATA_DIR") or "data"))
+    from src.engine.simple_save_apply import apply_settings
     try:
-        record = submit_webui_patch(
-            tracker, editable, env_path=".env",
-            expected_revision=str(expected),
-            request_id=_extract_val(request_id, None),
+        record = apply_settings(
+            editable, env_path=".env", expected_revision=str(expected),
+            confirm_live=str(submitted.get("confirm_live") or "").lower() in ("1", "true", "on", "yes"),
         )
     except ConfigurationConflict as exc:
         return HTMLResponse(status_code=409, content=escape_html(str(exc)))
@@ -2438,11 +1954,10 @@ def handle_setup_submission(
         "instance": new_cfg.instance_name,
         "dhan_id": new_cfg.dhan_client_id,
         "log_group": new_cfg.log_group_id,
-        "service_restarted": bool(record.restart_performed and record.runtime_verified),
-        "change_id": record.change_id,
-        "state": record.state.value,
-        "reason": record.reason or record.error_msg or "",
-        "version_hash": record.proposed_version_hash[:8] if record.proposed_version_hash else "",
+        "service_restarted": record.restart_performed,
+        "state": record.status,
+        "reason": record.message,
+        "version_hash": record.revision[:8],
     })
 
 
