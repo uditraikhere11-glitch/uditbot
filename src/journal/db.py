@@ -3095,6 +3095,14 @@ class JournalDB:
         ack = self.get_manual_risk_acknowledgement(parent_order_id, correlation_id)
         if not isinstance(ack, dict):
             return False
+        # The legacy lookup accepts parent ID OR correlation ID for discovery.
+        # Recovery authorisation is stricter: both supplied identities must
+        # refer to the SAME acknowledged order. Otherwise another order with
+        # the same account/security/quantity could inherit a risk waiver.
+        if parent_order_id and str(ack.get("parent_order_id") or "").strip() != str(parent_order_id).strip():
+            return False
+        if correlation_id and str(ack.get("correlation_id") or "").strip() != str(correlation_id).strip():
+            return False
         if str(ack.get("status") or "").upper() != "UNPROTECTED_MANUAL_RISK":
             return False
         exp_acct = str(expected_account_id or self.account_id or "").strip()
