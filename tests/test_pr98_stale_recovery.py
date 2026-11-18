@@ -110,6 +110,57 @@ class StaleServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(self.tracker.get_change_record().state,
                          ConfigApplyState.APPLYING)
 
+    def test_v2_stopped_journal_becomes_terminal_without_second_restart(self):
+        target = self.data / "config_restart_v2"
+        target.mkdir()
+        write_json_atomic(str(target / "current_transaction.json"), {
+            "phase": "ACK_UNCERTAIN",
+            "request_id": "previous-restart",
+            "restart_issued": True,
+            "requested_file_revision": revision(self.env.read_text()),
+        })
+        out = self.stopped()
+        self.assertEqual(out["v2"], "SAVED_FOR_NEXT_START")
+        self.assertEqual(
+            json.loads((target / "current_transaction.json").read_text())["phase"],
+            "SAVED_FOR_NEXT_START",
+        )
+        self.assertEqual(
+            json.loads((target / "current_transaction.json").read_text())["restart_issued"],
+            True,
+        )
+
+    def test_v2_active_barrier_never_auto_cleared(self):
+        target = self.data / "config_restart_v2"
+        target.mkdir()
+        write_json_atomic(str(target / "current_transaction.json"), {
+            "phase": "ACK_UNCERTAIN",
+            "requested_file_revision": revision(self.env.read_text()),
+        })
+        write_json_atomic(str(target / "apply_barrier.json"), {
+            "active": True, "owner_pid": 101, "owner_starttime": 123,
+        })
+        out = self.running()
+        self.assertNotIn("v2", out)
+        self.assertTrue(json.loads((target / "apply_barrier.json").read_text())["active"])
+        self.assertEqual(
+            json.loads((target / "current_transaction.json").read_text())["phase"],
+            "ACK_UNCERTAIN",
+        )
+
+    def test_v2_mismatched_env_never_auto_resolved(self):
+        target = self.data / "config_restart_v2"
+        target.mkdir()
+        write_json_atomic(str(target / "current_transaction.json"), {
+            "phase": "ACK_UNCERTAIN",
+            "requested_file_revision": "9" * 64,
+        })
+        self.stopped()
+        self.assertEqual(
+            json.loads((target / "current_transaction.json").read_text())["phase"],
+            "ACK_UNCERTAIN",
+        )
+
     def test_terminal_saved_for_next_start_not_busy(self):
         self.record.state = ConfigApplyState.SAVED_FOR_NEXT_START
         self.record.operation_state = OperationState.SAVED_FOR_NEXT_START.value
