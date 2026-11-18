@@ -293,9 +293,9 @@ class DirectBrokerRestartTests(unittest.TestCase):
 
     def test_stop_race_before_env_commit_reports_failure(self):
         reads = iter(("active", "inactive"))
-        with patch.object(direct, "is_isolated_test_environment", return_value=False), \\
+        with patch.object(direct, "is_isolated_test_environment", return_value=False), \
              patch.object(direct, "_positive_running_restart_proof",
-                          return_value=dict(self.proof)), \\
+                          return_value=dict(self.proof)), \
              patch.object(direct, "acquire_apply_barrier", return_value=True):
             with self.assertRaises(ConfigurationConflict):
                 direct.apply_settings(
