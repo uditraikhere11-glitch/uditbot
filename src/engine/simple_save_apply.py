@@ -126,7 +126,7 @@ def apply_settings(
         validate_effective_config(proposed)
         old_values, _ = parse_env_strict(existing)
         new_values, _ = parse_env_strict(proposed)
-        if old_values.get("DHAN_CLIENT_ID") != new_values.get("DHAN_CLIENT_ID"):
+        if old_values.get("DHAN_CLIENT_ID") and old_values.get("DHAN_CLIENT_ID") != new_values.get("DHAN_CLIENT_ID"):
             raise ConfigurationRejected("Dhan account migration is not a settings restart")
         old_mode = old_values.get("TRADING_MODE", "TEST")
         new_mode = new_values.get("TRADING_MODE", old_mode)

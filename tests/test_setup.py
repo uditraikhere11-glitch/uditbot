@@ -53,7 +53,14 @@ class TestSetupApp(unittest.TestCase):
                     "csrf_token": SETUP_CSRF_TOKEN,
                     "expected_revision": revision(""),
                 }
-                resp = self.client.post("/setup", data=data)
+                from src.engine import simple_save_apply as simple
+                from unittest.mock import patch
+                from pathlib import Path
+                Path(".env").write_text("")
+                with patch("src.engine.simple_save_apply.apply_settings",
+                           side_effect=lambda *args, **kw: simple.apply_settings(
+                               *args, **kw, state_reader=lambda: "inactive")):
+                    resp = self.client.post("/setup", data=data)
                 self.assertEqual(resp.status_code, 200)
                 self.assertTrue(os.path.exists(".env"))
                 with open(".env") as f:
