@@ -33,7 +33,7 @@ class ReadGovernor:
 
     def _connect(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        conn = sqlite3.connect(self.path, timeout=0.20)
+        conn = sqlite3.connect(self.path, timeout=0.07)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=FULL')
@@ -50,15 +50,15 @@ class ReadGovernor:
         # SQLite WAL still serializes writers across threads/processes.  Many
         # same-account callers may race during startup; a 50ms x2 budget made
         # harmless contention look like an unavailable broker.  Bound waits
-        # to four 200ms SQLite lock timeouts + short backoffs.  Any exhausted
-        # retry STILL raises and closes the entry gate; never bypass admission.
-        for attempt in range(4):
+        # to six 70ms SQLite waits plus short backoffs (under 0.75s).
+        # Any exhausted retry STILL raises and closes the entry gate.
+        for attempt in range(6):
             try:
                 with closing(self._connect()) as conn, conn:
                     return fn(conn)
             except sqlite3.OperationalError as exc:
-                if ('locked' in str(exc).lower() or 'busy' in str(exc).lower()) and attempt < 3:
-                    time.sleep(0.01 * (attempt + 1))
+                if ('locked' in str(exc).lower() or 'busy' in str(exc).lower()) and attempt < 5:
+                    time.sleep(0.005 * (attempt + 1))
                     continue
                 raise
 
