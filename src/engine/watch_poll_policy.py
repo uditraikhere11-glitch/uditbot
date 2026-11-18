@@ -16,45 +16,89 @@ AFTER_HOURS_SECONDS = 300.0
 IDLE_MARKET_SECONDS = 90.0
 
 
+def is_new_order_window(rec, now):
+    """Use an actual placement timestamp, not stale reconciliation markers."""
+    if not isinstance(rec, dict):
+        return False
+    try:
+        created = float(rec.get("created_at") or 0)
+        age = float(now) - created
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        math.isfinite(created) and created > 0
+        and math.isfinite(age) and 0 <= age <= NEW_ORDER_FAST_WINDOW_SECONDS
+    )
+
+
+def is_amo_record(rec):
+    """Recognize the existing watcher metadata, never infer order validity."""
+    return isinstance(rec, dict) and (
+        rec.get("is_amo") is True or rec.get("entry_only_amo") is True
+        or str(rec.get("protection_route") or "").upper() == "ENTRY_ONLY_AMO"
+    )
+
+
 def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
-    """Return a scheduled GET cycle interval; never suppress an open record."""
+    """Schedule broker GETs, independently of the fail-closed entry gate.
+
+    Closed market: stale/unreadable/reconciliation flags cannot force 10s loops.
+    Only an actually recent order may temporarily accelerate its first 45s.
+    A newly placed after-hours AMO uses 10s (not 2s) to protect GET headroom.
+    """
     pending_records = list((pending or {}).values())
-    if any(has_urgent_obligation(rec) for rec in pending_records + list(open_records or [])):
-        return 10.0
-    if pending_records:
-        for rec in pending_records:
-            if not isinstance(rec, dict):
+    open_all = list(open_records or [])
+
+    if not market_open:
+        # Closed/DRY historical records are not newly placed live orders.
+        # Ignore them even when they have a recent saved timestamp.
+        recent = [
+            rec for rec in pending_records
+            if is_new_order_window(rec, now)
+            and not str(rec.get("order_id") or "").startswith("DRY-")
+        ]
+        for rec in open_all:
+            if not is_new_order_window(rec, now):
+                continue
+            if str(rec.get("order_id") or "").startswith("DRY-"):
+                continue
+            if str(rec.get("position_state") or "").upper() == "POSITION_CLOSED":
                 continue
             try:
-                created = float(rec.get("created_at") or 0)
+                active_filled = int(rec.get("filled_qty") or 0) > 0
             except (TypeError, ValueError, OverflowError):
-                created = 0
-            if math.isfinite(created) and created > 0 and 0 <= now - created <= NEW_ORDER_FAST_WINDOW_SECONDS:
-                return POLL_HEARTBEAT_SECONDS
-        if not market_open:
-            return AFTER_HOURS_SECONDS
-        # Repeated stale pending reads are never allowed to consume the
-        # entire hourly budget just because their status is unresolved.
+                active_filled = False
+            if active_filled:
+                recent.append(rec)
+        if recent:
+            return 10.0 if any(
+                is_amo_record(rec) or has_urgent_obligation(rec)
+                for rec in recent
+            ) else POLL_HEARTBEAT_SECONDS
+        return AFTER_HOURS_SECONDS
+
+    # Existing urgent market-hours supervision is deliberately unchanged.
+    if any(has_urgent_obligation(rec) for rec in pending_records + open_all):
+        return 10.0
+    if pending_records:
+        if any(is_new_order_window(rec, now) for rec in pending_records):
+            return POLL_HEARTBEAT_SECONDS
+        # Stale pending orders cannot exhaust the hourly broker GET budget.
         return max(STALE_PENDING_SECONDS, supervision_read_requirement(len(pending_records)) * 7.5)
 
     open_recs = [
-        rec for rec in (open_records or [])
+        rec for rec in open_all
         if isinstance(rec, dict)
         and not str(rec.get("order_id") or "").startswith("DRY-")
         and int(rec.get("filled_qty") or 0) > 0
         and str(rec.get("position_state") or "") != "POSITION_CLOSED"
     ]
     if open_recs:
-        # Broker-side SL/Target orders remain live outside exchange hours;
-        # slower verification still monitors holdings without burning the
-        # durable 24-hour GET quota overnight.
-        if not market_open:
-            return AFTER_HOURS_SECONDS
         if manual_risk_only(pending, open_recs):
             return MANUAL_RISK_OPEN_SECONDS
         return NORMAL_OPEN_SECONDS
 
-    return IDLE_MARKET_SECONDS if market_open else AFTER_HOURS_SECONDS
+    return IDLE_MARKET_SECONDS
 
 
 def supervision_read_requirement(pending_count):

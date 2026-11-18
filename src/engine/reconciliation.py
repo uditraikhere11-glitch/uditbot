@@ -363,13 +363,33 @@ class StartupReconciliationGate:
                 pass
 
         if order_book:
-            for ob_row in order_book:
-                if isinstance(ob_row, dict) and (
-                    ob_row.get("correlationId") == corr_id
-                    or (broker_oid and str(ob_row.get("orderId")) == str(broker_oid))
-                ):
-                    candidates.append(ob_row)
-                    break
+            matching_corr = [
+                row for row in order_book
+                if isinstance(row, dict) and str(row.get("correlationId") or "") == str(corr_id)
+            ]
+            if len(matching_corr) > 1:
+                # Two rows with one correlation ID are NEVER resolved by
+                # selecting the first or falling back to an arbitrary order ID.
+                logger.error("[RECONCILIATION] Duplicate broker correlation ID %s: %d matches", corr_id, len(matching_corr))
+                return None
+            if len(matching_corr) == 1:
+                ok, reason = self._validate_broker_order_matches_intent(
+                    matching_corr[0], intent, corr_id, broker_oid,
+                )
+                if not ok:
+                    logger.error("[RECONCILIATION] Ambiguous broker correlation %s: %s", corr_id, reason)
+                    return None
+                candidates.append(matching_corr[0])
+            elif broker_oid:
+                matching_oid = [
+                    row for row in order_book
+                    if isinstance(row, dict) and str(row.get("orderId") or "") == str(broker_oid)
+                ]
+                if len(matching_oid) > 1:
+                    logger.error("[RECONCILIATION] Duplicate broker order ID %s", broker_oid)
+                    return None
+                if matching_oid:
+                    candidates.append(matching_oid[0])
 
         if hasattr(self.broker, "order_status"):
             target_id = broker_oid or corr_id

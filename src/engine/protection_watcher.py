@@ -51,7 +51,10 @@ from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
-from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only, has_urgent_obligation
+from src.engine.watch_poll_policy import (
+    watcher_cadence_seconds, supervision_read_requirement, manual_risk_only,
+    has_urgent_obligation, AFTER_HOURS_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,8 @@ TERMINAL_STATES = {
 
 def _is_ambiguous_message(msg: str) -> bool:
     m = str(msg or "").lower()
+    if "mutation not_submitted" in m:
+        return False  # Local broker fence/admission; no HTTP request was sent.
     return any(
         k in m
         for k in (
@@ -4344,19 +4349,38 @@ class ProtectionWatcher:
                         last_signature = None
                     else:
                         now = time.monotonic()
-                        pending, open_records, signature = self._poll_snapshot()
+                        pending, open_records, snapshot_signature = self._poll_snapshot()
                         lifecycle_now = is_lifecycle_open()
-                        signature = (lifecycle_now, signature)
-                        # An exchange opening/closing transition wakes a
-                        # scheduled pass without waiting for off-hours cadence.
+                        cadence = watcher_cadence_seconds(
+                            pending=pending,
+                            open_records=open_records,
+                            now=self.clock(),
+                            market_open=lifecycle_now,
+                        )
+                        if not lifecycle_now and cadence == AFTER_HOURS_SECONDS:
+                            # Ignore oscillating stale/reconciliation book flags
+                            # when deciding whether to wake a *new* broker GET.
+                            # Do notice new order IDs, owner-ack changes,
+                            # transition into an urgent state, and explicit
+                            # operator-initiated checks, exactly once.
+                            request, _ = snapshot_signature
+                            signature = (
+                                lifecycle_now, "SLOW", request,
+                                tuple(sorted(str(k) for k in pending)),
+                                tuple(sorted(
+                                    (str(r.get("order_id") or ""),
+                                     r.get("_schedule_ack_verified") is True,
+                                     has_urgent_obligation(r))
+                                    for r in open_records if isinstance(r, dict)
+                                )),
+                                any(has_urgent_obligation(r) for r in pending.values()),
+                            )
+                        else:
+                            signature = (lifecycle_now, "FAST", snapshot_signature)
+                        # Market lifecycle opening and actual new records still
+                        # wake immediately, despite an after-hours due time.
                         if signature != last_signature or now >= next_due:
                             one_shot = not lifecycle_now and manual_risk_only(pending, open_records)
-                            cadence = watcher_cadence_seconds(
-                                pending=pending,
-                                open_records=open_records,
-                                now=self.clock(),
-                                market_open=lifecycle_now,
-                            )
                             governor = getattr(self.broker, "_read_governor", None)
                             if not isinstance(governor, ReadGovernor):
                                 governor = None
@@ -4370,8 +4394,17 @@ class ProtectionWatcher:
                                         governor = check_binding()
                                     wait = governor.seconds_until_capacity(
                                         required=supervision_read_requirement(len(pending)),
-                                        priority="urgent" if pending or any(
-                                            has_urgent_obligation(r) for r in open_records
+                                        # Only market-hours urgency can consume
+                                        # the governor's urgent reserve. Even a
+                                        # fresh after-hours AMO is routine: its
+                                        # short verification window must not
+                                        # starve later protective broker reads.
+                                        priority="urgent" if (
+                                            lifecycle_now and (
+                                                pending or any(
+                                                    has_urgent_obligation(r) for r in open_records
+                                                )
+                                            )
                                         ) else "routine",
                                     )
                                 except Exception as exc:

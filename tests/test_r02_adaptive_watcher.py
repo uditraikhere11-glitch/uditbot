@@ -16,6 +16,7 @@ from src.engine.watch_poll_policy import (
     watcher_cadence_seconds,
     supervision_read_requirement,
     POLL_HEARTBEAT_SECONDS,
+    AFTER_HOURS_SECONDS, is_new_order_window,
 )
 
 
@@ -111,7 +112,7 @@ class R02CadencePolicyTests(unittest.TestCase):
             ), 300.0
         )
 
-    def test_uncertain_cancel_or_protection_never_waits_five_minutes(self):
+    def test_stale_cancel_reconciliation_flags_use_300_seconds_when_closed(self):
         for fields in (
             {"cancel_uncertain": True},
             {"cancel_requested": True},
@@ -127,8 +128,77 @@ class R02CadencePolicyTests(unittest.TestCase):
                     watcher_cadence_seconds(
                         pending={"UNRESOLVED": {"created_at": 1, **fields}},
                         open_records=[], now=100000, market_open=False,
-                    ), 10.0
+                    ), AFTER_HOURS_SECONDS
                 )
+
+    def test_recent_amo_10_seconds_only_during_first_45_seconds(self):
+        rec = {
+            "created_at": 99990.0, "is_amo": True,
+            "position_state": "RECONCILIATION_REQUIRED",
+            "unreadable_broker_response": True,
+        }
+        for age, expected in (
+            (0, 10.0), (15, 10.0), (45, 10.0),
+            (45.001, AFTER_HOURS_SECONDS), (300, AFTER_HOURS_SECONDS),
+        ):
+            with self.subTest(age=age):
+                self.assertEqual(watcher_cadence_seconds(
+                    pending={"AMO-1": rec}, open_records=[],
+                    now=99990 + age, market_open=False,
+                ), expected)
+
+    def test_recent_non_amo_afterhours_fast_window_expires(self):
+        recent = {"created_at": 99990, "state": "ACKED"}
+        self.assertEqual(watcher_cadence_seconds(
+            pending={"NEW": recent}, open_records=[],
+            now=100000, market_open=False,
+        ), POLL_HEARTBEAT_SECONDS)
+        self.assertEqual(watcher_cadence_seconds(
+            pending={"NEW": recent}, open_records=[],
+            now=100036, market_open=False,
+        ), AFTER_HOURS_SECONDS)
+
+    def test_recent_terminal_amo_fast_window_then_slow(self):
+        rec = {**record("AMO-2", state="RECONCILIATION_REQUIRED"),
+               "created_at": 99990, "entry_only_amo": True,
+               "reconciliation_required": True}
+        self.assertEqual(watcher_cadence_seconds(
+            pending={}, open_records=[rec], now=100000, market_open=False,
+        ), 10)
+        self.assertEqual(watcher_cadence_seconds(
+            pending={}, open_records=[rec], now=100036, market_open=False,
+        ), AFTER_HOURS_SECONDS)
+
+    def test_recent_closed_and_dry_records_do_not_accelerate_afterhours(self):
+        bad = [
+            {**record("CLOSED", state="POSITION_CLOSED"), "created_at": 99999,
+             "is_amo": True},
+            {**record("DRY-NEW", state="RECONCILIATION_REQUIRED"), "created_at": 99999,
+             "is_amo": True},
+            {"order_id": "NO-FILL", "created_at": 99999, "filled_qty": 0,
+             "is_amo": True, "position_state": "RECONCILIATION_REQUIRED"},
+        ]
+        self.assertEqual(watcher_cadence_seconds(
+            pending={}, open_records=bad, now=100000, market_open=False,
+        ), AFTER_HOURS_SECONDS)
+
+    def test_invalid_or_future_order_created_at_cannot_trigger_burst(self):
+        for value in (None, -1, float("inf"), float("nan"), "bad", 100050):
+            with self.subTest(created_at=value):
+                rec = {"created_at": value, "unreadable_broker_response": True}
+                self.assertFalse(is_new_order_window(rec, 100000))
+                self.assertEqual(watcher_cadence_seconds(
+                    pending={"OLD": rec}, open_records=[], now=100000,
+                    market_open=False,
+                ), AFTER_HOURS_SECONDS)
+
+    def test_market_open_urgent_reconciliation_is_still_ten_seconds(self):
+        rec = {"created_at": 1, "position_state": "RECONCILIATION_REQUIRED",
+               "unreadable_broker_response": True}
+        self.assertEqual(watcher_cadence_seconds(
+            pending={"UNRESOLVED": rec}, open_records=[], now=100000,
+            market_open=True,
+        ), 10.0)
 
     def test_read_requirement_is_bounded(self):
         self.assertEqual(supervision_read_requirement(0), 8)
