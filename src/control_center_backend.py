@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 
 from src.config import AppConfig, parse_env_dict
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
-from src.engine.webui_update import submit_webui_patch
+from src.engine.simple_save_apply import apply_settings
 from src.engine.config_manager import (
     ConfigApplyState,
     ConfigChangeTracker,
@@ -343,14 +343,14 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             return _json({"summary": "AMO journal unavailable", "orders": [], "verified": False}, 503)
 
     async def _save_amo_toggle(request: Request, form_key: str):
-        """Same transactional CAS/idempotent path as Setup; broker only when RUNNING."""
+        """Save field directly under the shared service lock; never skip broker handoff."""
         if "application/json" not in request.headers.get("content-type", "").lower():
             return _json({"error": "JSON content type required"}, 415)
         try:
             body = await request.json()
         except Exception:
             return _json({"error": "Malformed JSON"}, 400)
-        allowed = {"enabled", "csrf_token", "expected_revision", "request_id"}
+        allowed = {"enabled", "csrf_token", "expected_revision", "request_id", "confirm_live"}
         if not isinstance(body, dict) or "enabled" not in body or "csrf_token" not in body or set(body) - allowed:
             return _json({"error": "Only enabled, csrf_token, expected_revision and request_id are permitted"}, 400)
         if body.get("csrf_token") != csrf_token or not isinstance(body.get("csrf_token"), str):
@@ -363,22 +363,36 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             cfg, env_path, data_dir = _config_and_paths()
             if not os.path.isfile(env_path) or os.path.islink(env_path):
                 return _json({"error": "Configuration file must be a regular file"}, 409)
+            # Reconcile only stale display/service records; broker mutation
+            # barriers and Owner STOP instructions remain independent.
             tracker = ConfigChangeTracker(data_dir=data_dir)
-            rec = submit_webui_patch(
-                tracker, {form_key: body["enabled"]}, env_path=env_path,
-                expected_revision=body.get("expected_revision"),
-                request_id=body.get("request_id"),
-                spawn_worker=True,
-            )
-            state = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
+            with tracker.operation_lock(
+                operation_type="AMO_DIRECT_SAVE", operation_id=form_key,
+            ):
+                tracker.reconcile_stale_control_records(env_path)
+                result = apply_settings(
+                    {form_key: body["enabled"]}, env_path=env_path,
+                    expected_revision=body["expected_revision"],
+                    confirm_live=body.get("confirm_live") is True,
+                )
             return _json({
-                "ok": True, "change_id": rec.change_id, "state": state,
-                "runtime_verified": rec.runtime_verified,
-                "message": rec.reason or "Configuration submitted for safe processing",
-            }, 202 if rec.broker_checks_required else 200)
+                "ok": True,
+                "state": (
+                    "APPLIED_VERIFIED" if result.restart_performed
+                    else "SAVED_FOR_NEXT_START" if result.saved
+                    else "UNCHANGED"
+                ),
+                "runtime_verified": result.restart_performed,
+                "restart_performed": result.restart_performed,
+                "message": result.message, "revision": result.revision,
+            })
         except ConfigurationConflict as exc:
             return _json({"error": str(exc)}, 409)
-        except (ConfigurationRejected, ValueError) as exc:
+        except ConfigurationRejected as exc:
+            if "LIVE restart confirmation" in str(exc):
+                return _json({"error": str(exc), "requires_live_confirmation": True}, 409)
+            return _json({"error": str(exc)}, 422)
+        except ValueError as exc:
             return _json({"error": str(exc)}, 422)
         except (OSError, TimeoutError):
             return _json({"error": "Configuration storage or service state unavailable"}, 409)
