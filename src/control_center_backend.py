@@ -367,12 +367,10 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             # Reconcile only stale display/service records; broker mutation
             # barriers and Owner STOP instructions remain independent.
             tracker = ConfigChangeTracker(data_dir=data_dir)
-            with tracker.operation_lock(
-                operation_type="AMO_STALE_RECORD_RECOVERY", operation_id=form_key,
-            ):
+            def _admission_check():
+                # Called from apply_settings while holding the SAME global
+                # config_operation.lock as validation, CAS, save and restart.
                 tracker.reconcile_stale_control_records(env_path)
-                # Do not supersede a genuine outstanding operation or Owner STOP.
-                # SAVED_FOR_NEXT_START is terminal and is not in _pending().
                 if _pending(tracker):
                     raise ConfigurationConflict("Existing configuration operation is still active")
                 if _owner_stop_pending(tracker):
@@ -388,12 +386,11 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                     )
                     if not ok:
                         raise ConfigurationConflict("Running PID/version mismatch; AMO restart blocked")
-            # apply_settings independently acquires the same global flock.
-            # Do not nest it inside operation_lock (two FDs would deadlock).
             result = apply_settings(
                 {form_key: body["enabled"]}, env_path=env_path,
                 expected_revision=body["expected_revision"],
                 confirm_live=body.get("confirm_live") is True,
+                admission_check=_admission_check,
             )
             return _json({
                 "ok": True,

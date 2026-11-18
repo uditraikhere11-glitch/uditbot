@@ -120,10 +120,10 @@ class StaleServiceRecoveryTests(unittest.TestCase):
             "requested_file_revision": revision(self.env.read_text()),
         })
         out = self.stopped()
-        self.assertEqual(out["v2"], "SAVED_FOR_NEXT_START")
+        self.assertNotIn("v2", out)
         self.assertEqual(
             json.loads((target / "current_transaction.json").read_text())["phase"],
-            "SAVED_FOR_NEXT_START",
+            "ACK_UNCERTAIN",
         )
         self.assertEqual(
             json.loads((target / "current_transaction.json").read_text())["restart_issued"],

@@ -243,6 +243,7 @@ def apply_settings(
     expected_revision: str, confirm_live: bool = False,
     state_reader: Callable[[], str] = trading_service_state,
     restart: Callable[[], None] = restart_trading_service,
+    admission_check: Callable[[], None] | None = None,
 ) -> SaveApplyResult:
     """Apply validated field changes; restart the bot once if already active.
 
@@ -277,6 +278,8 @@ def apply_settings(
             ConfigChangeTracker(
                 data_dir=str(data_root),
             ).reconcile_stale_control_records(str(path))
+        if admission_check is not None:
+            admission_check()
         with path.open("r", encoding="utf-8", newline="") as fh:
             existing = fh.read()
         actual_revision = revision(existing)
@@ -322,9 +325,6 @@ def apply_settings(
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
         if state == "active" and _owner_stop_requested(path, old_values):
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
-        _annotate_terminal_v2_supersession(
-            data_root, actual_revision, revision(proposed),
-        )
         # Production: cannot restart a LIVE watcher just because systemd
         # reports active; prove old PID/hash and no in-flight/UNKNOWN broker
         # mutation. Isolated tests inject the systemd state/restart.
@@ -345,9 +345,23 @@ def apply_settings(
                 if not acquired:
                     raise ConfigurationConflict("An active or unresolved broker mutation blocks restart")
                 handoff["barrier_id"] = barrier_id
+        # Check STOP again before the .env commit, while the broker fence is held.
+        # A STOP that wins before commit must never be reported as success.
+        if state == "active" and (
+            _owner_stop_requested(path, old_values) or state_reader() != "active"
+        ):
+            raise ConfigurationConflict(
+                "Owner STOP/service transition won before save; no configuration committed. "
+                "Broker fence retained for verified recovery."
+            )
         # After the handoff barrier is acquired, no new Dhan mutations can
         # begin while we write the file and issue the single restart.
         _atomic_env_write(path, proposed)
+        # Commit V2 supersession metadata only after the new file exists.
+        # A failed journal write is an explicit partial-apply error, not success.
+        _annotate_terminal_v2_supersession(
+            data_root, actual_revision, revision(proposed),
+        )
         new_revision = revision(proposed)
         keys = tuple(sorted(changed))
         if state == "inactive":
@@ -357,12 +371,9 @@ def apply_settings(
                 True, False, new_revision, keys,
             )
         if _owner_stop_requested(path, old_values) or state_reader() != "active":
-            # Keep an acquired broker fence if a STOP raced the update:
-            # it may not be released without verified new producer evidence.
-            return SaveApplyResult(
-                "SAVED_STOPPED",
-                "Settings saved; bot stopped during apply and was not restarted.",
-                True, False, new_revision, keys,
+            raise ConfigurationConflict(
+                "Settings saved, but Owner STOP/service transition won before restart. "
+                "No restart issued; broker fence retained for verified recovery."
             )
         try:
             restart()

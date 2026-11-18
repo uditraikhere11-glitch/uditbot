@@ -2128,7 +2128,7 @@ class ConfigChangeTracker:
                 # Never certify a different .env or a different requested version.
                 if (
                     record.requested_file_revision == file_revision
-                    or record.proposed_version_hash == current_hash
+                    and record.proposed_version_hash == current_hash
                 ):
                     record.state = (
                         ConfigApplyState.SAVED_FOR_NEXT_START if stopped
@@ -2189,40 +2189,9 @@ class ConfigChangeTracker:
                 result["service"] = updated["observed_state"]
                 result["resolved"] = True
 
-            # A leftover V2 candidate journal must not wedge a stopped bot
-            # or a positively verified new runtime forever. It is terminal
-            # only when the exact requested .env is already persisted and the
-            # broker apply barrier is explicitly inactive (or absent).
-            tx_path = os.path.join(
-                self.data_dir, "config_restart_v2", "current_transaction.json",
-            )
-            barrier_path = os.path.join(
-                self.data_dir, "config_restart_v2", "apply_barrier.json",
-            )
-            tx = read_private_json(tx_path, missing_ok=True)
-            barrier = read_private_json(barrier_path, missing_ok=True)
-            if (tx is not None and
-                    str(tx.get("phase") or "") not in (
-                        "VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE",
-                    ) and
-                    (barrier is None or barrier.get("active") is False) and
-                    str(tx.get("requested_file_revision") or "") == file_revision):
-                recovered = dict(tx)
-                recovered["phase"] = (
-                    "SAVED_FOR_NEXT_START" if stopped else "VERIFIED"
-                )
-                recovered["runtime_verified"] = bool(verified)
-                recovered["reconciled_at"] = time.time()
-                recovered["recovery_basis"] = (
-                    "SYSTEMD_INACTIVE_NO_PID" if stopped
-                    else "SYSTEMD_PID_CONFIG_ACK_AND_EMPTY_BROKER_HANDOFF"
-                )
-                write_json_atomic(tx_path, recovered)
-                check = read_private_json(tx_path, missing_ok=False)
-                if check.get("phase") != recovered["phase"]:
-                    return {"resolved": False, "reason": "V2 journal reconciliation readback failed"}
-                result["v2"] = recovered["phase"]
-                result["resolved"] = True
+            # Never infer completion of a V2 restart from service state alone.
+            # In particular, ACK_UNCERTAIN and in-flight phases retain their
+            # durable evidence and require the V2 recovery coordinator.
             return result
         except (OSError, ValueError, TypeError) as exc:
             logger.warning("Stale tracker state not reconciled: %s", type(exc).__name__)
