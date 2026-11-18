@@ -86,13 +86,24 @@ class DhanCategoryTransportTests(unittest.TestCase):
         self.assertEqual(result.status_code,429)
         self.assertEqual(self.c.session.put.call_count,25)
 
-    def test_failed_admission_never_invokes_v2_broker_handoff(self):
-        for _ in range(10):self.g.admit(category='ORDER')
-        with patch('src.engine.broker_handoff.guarded_request') as handoff:
+    def test_failed_admission_occurs_inside_authorized_v2_handoff_before_http(self):
+        for _ in range(10):
+            self.g.admit(category='ORDER')
+
+        def fenced_before_http(*args, **kwargs):
+            # The V2 fence is acquired BEFORE governor admission. Simulate
+            # admitted fence and invoke only the pre-send callback.
+            return kwargs['before_send']()
+
+        with patch('src.engine.broker_handoff.guarded_request',
+                   side_effect=fenced_before_http) as handoff:
             with patch.dict('os.environ', {'UDITBOT_TRACKER_V2_ENABLE':'1'}):
-                response_local=self.c._broker_mutating_http('POST','https://api.dhan.co/v2/orders')
-            self.assertEqual(response_local.status_code,429)
-            handoff.assert_not_called()
+                response_local=self.c._broker_mutating_http(
+                    'POST','https://api.dhan.co/v2/orders')
+        self.assertEqual(response_local.status_code,429)
+        self.assertEqual(response_local.headers['X-AuditBot-Local-Deferral'],'1')
+        handoff.assert_called_once()
+        self.c.session.post.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()
