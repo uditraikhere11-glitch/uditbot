@@ -226,13 +226,24 @@ def broker_mutation(data_dir: str | os.PathLike[str], account: str, kind: str) -
 def guarded_request(
     data_dir: str | os.PathLike[str], account: str, method: str,
     send: Callable[[], Any],
+    before_send: Optional[Callable[[], Any]] = None,
 ) -> Any:
-    """One exact transport attempt; do not retry, modify payloads, or fake ACKs."""
+    """Register the broker fence before local admission, then attempt HTTP once.
+
+    A failed local admission is provably NOT_SUBMITTED: the broker callback has
+    not been entered. Finish the registered handoff as known/no-send so a
+    synthetic local 429/503 never becomes an unresolved broker mutation.
+    """
     attempted = False
     try:
         with broker_mutation(data_dir, account, method) as finish:
-            # Once this point is reached, the HTTP callback may have sent data.
-            # A subsequent ledger-write failure cannot be called NOT_SUBMITTED.
+            if before_send is not None:
+                try:
+                    before_send()
+                except Exception:
+                    finish(True)  # No HTTP callback, no ambiguous broker outcome.
+                    raise
+            # Any failure from this point may have transmitted an order.
             attempted = True
             response = send()
             status = getattr(response, "status_code", None)

@@ -73,6 +73,8 @@ def _is_transport_uncertainty(msg: str) -> bool:
     exceptions whose broker outcome is UNKNOWN.
     """
     m = (msg or "").lower()
+    if "mutation not_submitted" in m:
+        return False  # Local fence/admission refusal: broker transport never began.
     return any(
         k in m
         for k in (

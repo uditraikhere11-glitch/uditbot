@@ -69,6 +69,19 @@ from src.broker.dhan_token import (
 
 logger = logging.getLogger(__name__)
 
+
+class _LocalMutationDeferred(Exception):
+    """Broker transport has NOT started; carry only the local admission error."""
+
+    def __init__(self, cause):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def _is_local_mutation_deferral(response) -> bool:
+    return getattr(response, "headers", {}).get("X-AuditBot-Local-Deferral") == "1"
+
+
 BASE_URL = "https://api.dhan.co/v2"
 AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
 
@@ -1159,36 +1172,48 @@ class DhanClient:
         }
 
     def _broker_mutating_http(self, method: str, url: str, **kwargs):
-        """Account-scoped Dhan ORDER admission, then original V2 broker handoff.
+        """Admit category ORDER only after the V2 broker fence has authorized sending.
 
-        A local 429 is returned BEFORE the network mutation; never retry an
-        ambiguous response or bypass the protection handoff for a real send.
-        The rate category is determined by verb and path, not caller priority.
+        Admission, local 429, local SQLite failure and account mismatch cannot
+        be classified as a remote UNKNOWN outcome. A network exception after
+        admission remains UNKNOWN and is NEVER resubmitted automatically.
         """
         from src.broker.read_governor import ReadGovernor, ReadDeferred
-        category = ReadGovernor.classify(method, url)
-        if category != "ORDER":
+        if ReadGovernor.classify(method, url) != "ORDER":
             raise ValueError("Order mutation requested on a non-order API route")
-        governor = self._get_active_read_governor()
-        if governor is not None:
+
+        governor_box = [None]
+
+        def admit_before_http():
             try:
-                governor.admit(
-                    category="ORDER",
-                    priority="urgent" if method.upper() in ("DELETE", "PUT") else "normal",
-                    modification_order_id=ReadGovernor.modification_order_id(method, url),
-                )
-            except (ReadDeferred, OSError, sqlite3.Error) as exc:
-                return self._read_deferral_response(exc)
+                governor = self._get_active_read_governor()
+                governor_box[0] = governor
+                if governor is not None:
+                    governor.admit(
+                        category="ORDER",
+                        priority="urgent" if method.upper() in ("DELETE", "PUT") else "normal",
+                        modification_order_id=ReadGovernor.modification_order_id(method, url),
+                    )
+            except (ReadDeferred, OSError, sqlite3.Error, ValueError) as exc:
+                raise _LocalMutationDeferred(exc) from exc
+
         fn = getattr(self.session, method.lower())
-        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
-            result = fn(url, **kwargs)
-        else:
-            from src.engine.broker_handoff import guarded_request
-            result = guarded_request(
-                self.cfg.data_dir, self.cfg.dhan_client_id, method,
-                lambda: fn(url, **kwargs),
-            )
-        if governor is not None and getattr(result, "headers", {}).get("X-AuditBot-Local-Deferral") != "1":
+        try:
+            if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+                from src.engine.broker_handoff import guarded_request
+                result = guarded_request(
+                    self.cfg.data_dir, self.cfg.dhan_client_id, method,
+                    lambda: fn(url, **kwargs),
+                    before_send=admit_before_http,
+                )
+            else:
+                admit_before_http()
+                result = fn(url, **kwargs)
+        except _LocalMutationDeferred as exc:
+            return self._read_deferral_response(exc.cause)
+
+        governor = governor_box[0]
+        if governor is not None and not _is_local_mutation_deferral(result):
             try:
                 if self._is_rate_limited_response(result):
                     governor.throttled(
@@ -2902,6 +2927,9 @@ class DhanClient:
         t_order_start_ns = time.perf_counter_ns()
         try:
             resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if _is_local_mutation_deferral(resp):
+                uncertain_outcome = False
+                return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 data = resp.json() if resp.text else {}
@@ -3054,6 +3082,9 @@ class DhanClient:
         t_order_start_ns = time.perf_counter_ns()
         try:
             resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if _is_local_mutation_deferral(resp):
+                uncertain_outcome = False
+                return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if resp.status_code in (200, 201):
                 try:
@@ -3140,6 +3171,9 @@ class DhanClient:
         url = f"{BASE_URL}/super/orders/{order_id}"
         try:
             resp = self._broker_mutating_http("PUT", url, headers=self._headers(), json=body, timeout=5)
+            if _is_local_mutation_deferral(resp):
+                msg = f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
+                return False, msg, {"state": "DEFERRED", "status_code": resp.status_code, "error": msg, "price": float(price)}
             if resp.status_code not in (200, 202):
                 st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code == 408) else "REJECTED"
                 msg = f"Failed to modify {leg_clean} ({resp.status_code}): {resp.text}"
@@ -3155,6 +3189,9 @@ class DhanClient:
                 "orderStatus": ord_st or "PENDING",
                 "price": float(price),
             }
+        except BrokerMutationNotSubmitted as e:
+            msg = f"MUTATION NOT_SUBMITTED (config fence): {e}"
+            return False, msg, {"state": "DEFERRED", "error": msg, "price": float(price)}
         except Exception as e:
             msg = f"HTTP exception modifying super order {order_id} ({leg_clean}): {e}"
             return False, msg, {"state": "UNKNOWN", "error": msg, "price": float(price)}
@@ -3212,9 +3249,13 @@ class DhanClient:
         url = f"{BASE_URL}/super/orders/{order_id_clean}/{leg_name}"
         try:
             resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if _is_local_mutation_deferral(resp):
+                return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Super order {leg_name} cancellation accepted (HTTP {resp.status_code}) for {order_id_clean}"
             return False, f"Failed to cancel super order {leg_name} ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, f"HTTP exception cancelling super order {leg_name}: {e}"
 
@@ -3232,6 +3273,8 @@ class DhanClient:
         url = f"{BASE_URL}/orders/{order_id_clean}"
         try:
             resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if _is_local_mutation_deferral(resp):
+                return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code == 202:
                 return True, f"Order cancellation request accepted by broker (HTTP 202) for {order_id_clean}"
             elif resp.status_code == 200:
@@ -3241,6 +3284,8 @@ class DhanClient:
             elif resp.status_code == 429:
                 return False, f"Dhan rate limit exceeded (429): {resp.text}"
             return False, f"Failed to cancel order ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, f"HTTP exception cancelling order: {e}"
 
@@ -3336,6 +3381,8 @@ class DhanClient:
 
         try:
             resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if _is_local_mutation_deferral(resp):
+                return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 201):
                 data = resp.json()
                 order_status = str(data.get("orderStatus", "PENDING")).upper()
@@ -3348,6 +3395,8 @@ class DhanClient:
             elif resp.status_code >= 500 or resp.status_code == 408:
                 return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}"
             return False, None, f"Forever OCO rejected ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, None, f"HTTP exception placing Forever OCO: {e}"
 
@@ -3363,9 +3412,13 @@ class DhanClient:
         url = f"{BASE_URL}/forever/orders/{oid_clean}"
         try:
             resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if _is_local_mutation_deferral(resp):
+                return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Forever order cancellation accepted (HTTP {resp.status_code}) for {oid_clean}"
             return False, f"Failed to cancel Forever order ({resp.status_code}): {resp.text}"
+        except BrokerMutationNotSubmitted as e:
+            return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             return False, f"HTTP exception cancelling Forever order {oid_clean}: {e}"
 
