@@ -280,6 +280,15 @@ def submit_webui_patch(
     except DualServiceMismatch as exc:
         raise ConfigurationConflict("V2 routing safety gate: " + str(exc)) from None
     if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+        # Keep V2 interface for compatibility. Reconcile stale *legacy* status
+        # records from systemd before entering the V2 coordinator. This does
+        # not clear a V2 broker barrier or replay an uncertain restart.
+        with tracker.operation_lock(
+            operation_type="V2_COMPAT_STATUS_RECOVERY", operation_id="recover",
+        ):
+            tracker.reconcile_stale_control_records(
+                env_path, check_service_fn=check_service_fn,
+            )
         from src.engine.tracker_v2_integration import submit_v2_webui_patch
         return submit_v2_webui_patch(
             tracker, form_data, env_path, expected_revision=expected_revision,
