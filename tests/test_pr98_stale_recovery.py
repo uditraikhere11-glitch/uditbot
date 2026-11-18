@@ -194,6 +194,66 @@ class StaleServiceRecoveryTests(unittest.TestCase):
         )
 
 
+class AbortedBrokerFenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        from src.engine.broker_handoff import _paths, _write
+        _, self.ledger, self.barrier = _paths(self.root)
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        _write(self.ledger, {
+            "schema_version": 2, "handoff_verified": True,
+            "account_id": "FAKE_ID", "producer_pid": 101,
+            "producer_starttime": 123, "active": [], "unresolved": [],
+        })
+        _write(self.barrier, {
+            "active": True, "change_id": "SAVE-ONE",
+            "account_id": "FAKE_ID", "owner_pid": 42,
+        })
+
+    def release(self, stopped=True):
+        from src.engine.broker_handoff import release_aborted_apply_barrier
+        return release_aborted_apply_barrier(
+            self.root, "FAKE_ID", "SAVE-ONE", 101, 123,
+            service_stopped=lambda: stopped,
+        )
+
+    def test_stopped_empty_ledger_releases_exact_precommit_fence(self):
+        self.assertTrue(self.release())
+        self.assertFalse(json.loads(self.barrier.read_text())["active"])
+        self.assertEqual(json.loads(self.barrier.read_text())["release_reason"],
+                         "ABORTED_BEFORE_ENV_COMMIT_SYSTEMD_STOPPED")
+
+    def test_running_service_never_releases(self):
+        self.assertFalse(self.release(stopped=False))
+        self.assertTrue(json.loads(self.barrier.read_text())["active"])
+
+    def test_unknown_mutation_never_releases(self):
+        from src.engine.broker_handoff import _write
+        ledger = json.loads(self.ledger.read_text())
+        ledger["unresolved"] = [{"id": "UNKNOWN"}]
+        _write(self.ledger, ledger)
+        self.assertFalse(self.release())
+        self.assertTrue(json.loads(self.barrier.read_text())["active"])
+
+    def test_wrong_change_id_never_releases(self):
+        from src.engine.broker_handoff import release_aborted_apply_barrier
+        self.assertFalse(release_aborted_apply_barrier(
+            self.root, "FAKE_ID", "OTHER", 101, 123,
+            service_stopped=lambda: True,
+        ))
+        self.assertTrue(json.loads(self.barrier.read_text())["active"])
+
+    def test_wrong_producer_never_releases(self):
+        from src.engine.broker_handoff import release_aborted_apply_barrier
+        self.assertFalse(release_aborted_apply_barrier(
+            self.root, "FAKE_ID", "SAVE-ONE", 999, 123,
+            service_stopped=lambda: True,
+        ))
+        self.assertTrue(json.loads(self.barrier.read_text())["active"])
+
+
 class DirectBrokerRestartTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
