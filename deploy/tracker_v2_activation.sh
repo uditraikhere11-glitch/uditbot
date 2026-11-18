@@ -230,8 +230,9 @@ case "$mode" in
     PYTHONDONTWRITEBYTECODE=1 ./venv/bin/python3 - <<'PY'
 from deploy.tracker_v2_preflight import process_flag, run
 pid = int(run(['systemctl','show','auditbot-web.service','-p','MainPID','--value']))
-if process_flag(pid) != 'ON':
-    raise SystemExit('WebUI process did not load V2 flag')
+flag = process_flag(pid)  # unprivileged Python; sudo -n cat only if /proc denied
+if flag != 'ON':
+    raise SystemExit(f'WebUI V2 process flag not verified ({flag})')
 PY
     # Confirm no login bypass on the public surface. Do not send credentials.
     status=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 6 -o /dev/null -w '%{http_code}' http://127.0.0.1/)

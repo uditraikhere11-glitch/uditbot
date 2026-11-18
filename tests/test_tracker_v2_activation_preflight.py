@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 import sys
 import tarfile
@@ -186,6 +187,44 @@ class PreflightPureTests(unittest.TestCase):
         proc.mkdir(parents=True)
         (proc/'environ').write_bytes(b'FOO=bar\x00')
         self.assertEqual(process_flag(1234, self.p/'proc'), 'OFF')
+
+    def test_capability_protected_real_proc_uses_privileged_cat_without_root_python(self):
+        payload = b"SENSITIVE_VALUE=must-not-print\0UDITBOT_TRACKER_V2_ENABLE=1\0"
+        proc = subprocess.CompletedProcess(["sudo"], 0, stdout=payload, stderr=b"")
+        with patch("pathlib.Path.read_bytes", side_effect=PermissionError("protected")), \
+             patch("deploy.tracker_v2_preflight.subprocess.run", return_value=proc) as called:
+            self.assertEqual(process_flag(1234), "ON")
+        self.assertEqual(called.call_args.args[0],
+                         ["sudo", "-n", "/usr/bin/cat", "/proc/1234/environ"])
+        self.assertEqual(called.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(called.call_args.kwargs["timeout"], 4)
+
+    def test_privileged_proc_read_failure_stays_unreadable(self):
+        for outcome in [
+            subprocess.CompletedProcess(["sudo"], 1, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(["sudo"], 1,
+                                        stdout=b"UDITBOT_TRACKER_V2_ENABLE=1\0", stderr=b""),
+        ]:
+            with self.subTest(outcome=outcome.returncode):
+                with patch("pathlib.Path.read_bytes", side_effect=PermissionError()), \
+                     patch("deploy.tracker_v2_preflight.subprocess.run", return_value=outcome):
+                    self.assertEqual(process_flag(4321), "UNREADABLE")
+
+    def test_privileged_proc_duplicate_flags_stay_ambiguous(self):
+        proc = subprocess.CompletedProcess(
+            ["sudo"], 0,
+            stdout=b"UDITBOT_TRACKER_V2_ENABLE=1\0UDITBOT_TRACKER_V2_ENABLE=0\0",
+            stderr=b"",
+        )
+        with patch("pathlib.Path.read_bytes", side_effect=PermissionError()), \
+             patch("deploy.tracker_v2_preflight.subprocess.run", return_value=proc):
+            self.assertEqual(process_flag(4321), "AMBIGUOUS")
+
+    def test_non_proc_fixture_does_not_request_privilege(self):
+        with patch("pathlib.Path.read_bytes", side_effect=PermissionError()), \
+             patch("deploy.tracker_v2_preflight.subprocess.run") as called:
+            self.assertEqual(process_flag(4321, self.p / "proc"), "UNREADABLE")
+            called.assert_not_called()
 
     def test_empty_report_must_not_imply_broker_pass(self):
         r = Report('stopped')
