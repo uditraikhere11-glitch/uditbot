@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 
 from src.config import AppConfig, parse_env_dict
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
-from src.engine.webui_update import submit_webui_patch
+from src.engine.simple_save_apply import apply_settings
 from src.engine.config_manager import (
     ConfigApplyState,
     ConfigChangeTracker,
@@ -148,21 +148,18 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     stopping = _owner_stop_pending(tracker)
     gate = tracker.inspect_transition_gate_status(read_only=True)
     # No concurrent new request when a transition/gate cannot be verified.
+    # Settings edits no longer enter the legacy or V2 tracker. Keep actual
+    # Owner STOP and service transition gates separate from the Save button.
     can_edit = (
         os.path.isfile(absolute_env)
         and state in _ALLOWED_IDLE
-        and not pending
-        and not v2_blocked
         and not stopping
-        and gate.get("ok") is True
-        and gate.get("active") is False
-        and (state != "RUNNING" or verified)
     )
     active = saved if verified else None
     msg = (
-        "Configuration change in progress; request disabled"
-        if pending else "Owner Stop pending; AMO change disabled"
-        if stopping else "Runtime active setting verified" if verified else "Saved setting only — active bot setting unverified"
+        "Owner Stop pending; AMO change disabled" if stopping
+        else "Settings saved; service may require restart" if not verified
+        else "Runtime active setting verified"
     )
     return {
         "service_state": state,
@@ -343,7 +340,7 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             return _json({"summary": "AMO journal unavailable", "orders": [], "verified": False}, 503)
 
     async def _save_amo_toggle(request: Request, form_key: str):
-        """Same transactional CAS/idempotent path as Setup; broker only when RUNNING."""
+        """Same direct one-click apply as Setup; no tracker or Dhan calls."""
         if "application/json" not in request.headers.get("content-type", "").lower():
             return _json({"error": "JSON content type required"}, 415)
         try:
@@ -363,19 +360,16 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             cfg, env_path, data_dir = _config_and_paths()
             if not os.path.isfile(env_path) or os.path.islink(env_path):
                 return _json({"error": "Configuration file must be a regular file"}, 409)
-            tracker = ConfigChangeTracker(data_dir=data_dir)
-            rec = submit_webui_patch(
-                tracker, {form_key: body["enabled"]}, env_path=env_path,
+            result = apply_settings(
+                {form_key: body["enabled"]}, env_path=env_path,
                 expected_revision=body.get("expected_revision"),
-                request_id=body.get("request_id"),
-                spawn_worker=True,
             )
-            state = rec.state.value if hasattr(rec.state, "value") else str(rec.state)
             return _json({
-                "ok": True, "change_id": rec.change_id, "state": state,
-                "runtime_verified": rec.runtime_verified,
-                "message": rec.reason or "Configuration submitted for safe processing",
-            }, 202 if rec.broker_checks_required else 200)
+                "ok": True, "state": result.status,
+                "runtime_verified": False,
+                "restart_performed": result.restart_performed,
+                "message": result.message, "revision": result.revision,
+            })
         except ConfigurationConflict as exc:
             return _json({"error": str(exc)}, 409)
         except (ConfigurationRejected, ValueError) as exc:
