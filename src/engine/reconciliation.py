@@ -403,7 +403,10 @@ class StartupReconciliationGate:
         if len(rows) == 1:
             return rows[0] if matches(rows[0]) else None
 
-        for method, key in (("get_order_by_correlation_id", corr_id), ("order_status", broker_oid)):
+        # When the journal has no broker order ID, legacy brokers can look up
+        # the correlation key directly. Validate the returned broker payload
+        # before accepting it; duplicates in the order book are still fatal.
+        for method, key in (("get_order_by_correlation_id", corr_id), ("order_status", broker_oid or corr_id)):
             lookup = getattr(self.broker, method, None)
             if key and callable(lookup):
                 try:

@@ -16,10 +16,16 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
     State changes independently wake the watcher. A stale reconciliation flag
     must not force a continuous 10s GET loop while the exchange is closed.
     """
-    if not market_open:
-        return AFTER_HOURS_SECONDS
     pending_records = list((pending or {}).values())
-    if any(has_urgent_obligation(rec) for rec in pending_records + list(open_records or [])):
+    urgent_records = [rec for rec in pending_records + list(open_records or [])
+                      if has_urgent_obligation(rec)]
+    if urgent_records:
+        # The only safe after-hours downgrade is a *stale read-only* mismatch,
+        # never an uncertain cancellation, OCO placement, pending retry or
+        # broker mutation whose protection can be affected by delay.
+        if not market_open and all(_stale_read_reconciliation_only(rec, now)
+                                   for rec in urgent_records):
+            return AFTER_HOURS_SECONDS
         return 10.0
     if pending_records:
         for rec in pending_records:
@@ -31,6 +37,8 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
                 created = 0
             if math.isfinite(created) and created > 0 and 0 <= now - created <= NEW_ORDER_FAST_WINDOW_SECONDS:
                 return POLL_HEARTBEAT_SECONDS
+        if not market_open:
+            return AFTER_HOURS_SECONDS
         return max(STALE_PENDING_SECONDS, supervision_read_requirement(len(pending_records)) * 7.5)
 
     open_recs = [
@@ -41,10 +49,40 @@ def watcher_cadence_seconds(*, pending, open_records, now, market_open=False):
         and str(rec.get("position_state") or "") != "POSITION_CLOSED"
     ]
     if open_recs:
+        if not market_open:
+            return AFTER_HOURS_SECONDS
         if manual_risk_only(pending, open_recs):
             return MANUAL_RISK_OPEN_SECONDS
         return NORMAL_OPEN_SECONDS
-    return IDLE_MARKET_SECONDS
+    return IDLE_MARKET_SECONDS if market_open else AFTER_HOURS_SECONDS
+
+
+
+def _stale_read_reconciliation_only(rec, now):
+    if not isinstance(rec, dict):
+        return False
+    if not (rec.get("reconciliation_required") or rec.get("unreadable_broker_response")
+            or str(rec.get("position_state") or "").upper() == "RECONCILIATION_REQUIRED"):
+        return False
+    if str(rec.get("position_state") or "").upper() in (
+        "PERSISTENCE_UNCERTAIN", "EXIT_TRIGGERED", "EXIT_PART_FILLED", "MANUAL_INTERVENTION_REQUIRED",
+    ):
+        return False
+    if any(rec.get(key) for key in (
+        "pending_oco", "cancel_uncertain", "cancel_requested", "entry_timeout_elapsed",
+        "retry_reserved", "persistence_uncertain", "orphaned_legs_detected",
+        "orphaned_leg_cancel_states", "exit_order_id", "sl_order_id", "tp_order_id",
+    )):
+        return False
+    created = rec.get("created_at")
+    if created is not None:
+        try:
+            age = float(now) - float(created)
+            if not math.isfinite(age) or age < NEW_ORDER_FAST_WINDOW_SECONDS:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
 
 
 def supervision_read_requirement(pending_count):
