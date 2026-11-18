@@ -415,6 +415,10 @@ class StartupReconciliationGate:
                     continue
                 if matches(row):
                     return row
+                # A real but contradictory correlation lookup is not permission
+                # to resolve a different order by an unrelated point request.
+                if isinstance(row, dict) and row.get("orderId"):
+                    return None
         return None
 
     def _compute_verified_oco_for_order(
