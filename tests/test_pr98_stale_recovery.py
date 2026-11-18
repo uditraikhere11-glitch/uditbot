@@ -169,6 +169,19 @@ class StaleServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(self.tracker.get_change_record().state,
                          ConfigApplyState.SAVED_FOR_NEXT_START)
 
+    def test_saved_for_next_start_matching_pending_envelope_is_terminal(self):
+        self.record.state = ConfigApplyState.SAVED_FOR_NEXT_START
+        self.record.operation_state = OperationState.SAVED_FOR_NEXT_START.value
+        self.tracker.save_change_record(self.record)
+        write_json_atomic(self.tracker.pending_op_file, {
+            "change_id": self.record.change_id, "status": "QUEUED",
+        })
+        self.assertFalse(self.tracker.has_unresolved_pending_operation())
+        write_json_atomic(self.tracker.pending_op_file, {
+            "change_id": "OTHER-CHANGE", "status": "QUEUED",
+        })
+        self.assertTrue(self.tracker.has_unresolved_pending_operation())
+
     def test_active_owner_stop_intent_is_not_overwritten(self):
         self.control["desired_service_state"] = "STOPPED"
         write_json_atomic(self.tracker.service_control_file, self.control)
