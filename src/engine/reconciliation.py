@@ -403,10 +403,7 @@ class StartupReconciliationGate:
         if len(rows) == 1:
             return rows[0] if matches(rows[0]) else None
 
-        # When the journal has no broker order ID, legacy brokers can look up
-        # the correlation key directly. Validate the returned broker payload
-        # before accepting it; duplicates in the order book are still fatal.
-        for method, key in (("get_order_by_correlation_id", corr_id), ("order_status", broker_oid or corr_id)):
+        for method, key in (("get_order_by_correlation_id", corr_id), ("order_status", broker_oid)):
             lookup = getattr(self.broker, method, None)
             if key and callable(lookup):
                 try:
@@ -949,15 +946,25 @@ class StartupReconciliationGate:
         return resolved_count
 
     def _schedule_historical_background_recheck(self) -> None:
-        if self.is_accepting_entries or not self.db:
+        if self._in_startup_reconciliation_pass or self.state != ReconciliationState.BLOCKED or not self.db:
             return
         now = time.monotonic()
         if now < self._historical_background_retry_after:
             return
         if not self._historical_background_lock.acquire(blocking=False):
             return
-        # Cool down even after a failed API read; avoids per-poll API storms.
+        if now < self._historical_background_retry_after:
+            self._historical_background_lock.release()
+            return
+        # Rate-limit failed checks, including checks while an owner STOP is active.
         self._historical_background_retry_after = now + 600.0
+        try:
+            if self.stop_manager.is_stopped():
+                self._historical_background_lock.release()
+                return
+        except Exception:
+            self._historical_background_lock.release()
+            raise
 
         def _worker() -> None:
             try:
@@ -975,7 +982,7 @@ class StartupReconciliationGate:
             daemon=True,
         ).start()
 
-    def _verify_open_positions_protected(self, positions: List[Dict[str, Any]]) -> Tuple[bool, str]:
+    def _verify_open_positions_protected(self, positions: List[Dict[str, Any]], used_forever=None) -> Tuple[bool, str]:
         """
         Safety Correction C.B, C.C & CV13-05:
         Validates every position record strictly before evaluating coverage, then verifies that every
@@ -1039,7 +1046,7 @@ class StartupReconciliationGate:
                 return False, "Malformed Super Order record missing orderId"
             super_groups[gid] = row
 
-        used_forever_ids: Set[str] = set()
+        used_forever = {} if used_forever is None else used_forever
         used_super_ids: Set[str] = set()
 
         # Index local watcher records by security_id ONLY for metadata/reconciliation (never for coverage credit!)
@@ -1065,8 +1072,8 @@ class StartupReconciliationGate:
 
             # 1. Validate Forever OCO groups for this securityId, segment, and productType
             for gid, grp_rows in forever_groups.items():
-                if gid in used_forever_ids:
-                    continue
+                if covered_qty >= net_qty:
+                    break
                 row_sec = str(grp_rows[0].get("securityId") or "").strip()
                 if row_sec != sec_id:
                     continue
@@ -1080,8 +1087,10 @@ class StartupReconciliationGate:
                     expected_product_type=pos_prod,
                 )
                 if ver.is_verified and ver.protected_quantity > 0:
-                    used_forever_ids.add(gid)
-                    covered_qty += ver.protected_quantity
+                    available = max(0, ver.protected_quantity - used_forever.get(gid, 0))
+                    allocated = min(net_qty - covered_qty, available)
+                    used_forever[gid] = used_forever.get(gid, 0) + allocated
+                    covered_qty += allocated
                 else:
                     unresolved_evidence.append(f"Forever OCO {gid}: {ver.reason}")
 
@@ -1125,7 +1134,7 @@ class StartupReconciliationGate:
 
     def _verify_bot_owned_holdings_protected(
         self,
-        intraday_positions: List[Dict[str, Any]],
+        intraday_positions: List[Dict[str, Any]], current_trades=(), used_forever=None,
     ) -> Tuple[bool, str]:
         """
         H08 & H16: Verifies that bot-owned settled CNC/MTF holdings (from historically reconciled
@@ -1146,23 +1155,39 @@ class StartupReconciliationGate:
             return False, f"Cannot verify settled holdings: positions_lifecycle query failed: {exc}"
 
         # Filter to CNC/MTF bot-owned open positions that were historically reconciled (or settled into holdings)
-        intraday_sec_ids = {
-            str(p.get("securityId") or "").strip()
-            for p in (intraday_positions or [])
-            if isinstance(p, dict) and int(p.get("netQty") or 0) > 0
-        }
         bot_settled_candidates = [
             row for row in open_lifecycle_rows
             if str(row.get("product_type") or "").strip().upper() in ("CNC", "MTF")
             and int(row.get("confirmed_open_qty") or 0) > 0
-            and str(row.get("security_id") or "").strip() not in intraday_sec_ids
-            and (
-                str(row.get("parent_order_id") or "") in self.last_historical_reconciled_ids
-                or str(row.get("position_state") or "").upper() in ("UNPROTECTED", "UNPROTECTED_MANUAL_RISK")
-            )
+            # Never skip a persisted RECONCILIATION_REQUIRED or otherwise
+            # open bot-owned settled position merely because its historical
+            # fill is already TRADED (or the current intraday book has a row).
+            and bool(str(row.get("parent_order_id") or "").strip())
+            and bool(str(row.get("security_id") or "").strip())
         ]
         if not bot_settled_candidates:
             return True, "No settled bot-owned holdings requiring separate verification"
+
+        # R06: manual-risk acknowledgement does not extinguish a *different*
+        # unresolved reconciliation obligation. In particular, the old
+        # watcher wrote manual_exit_detected=True on an unavailable GET.
+        # Startup may validate that the two BUYs traded, but MUST NOT reopen
+        # new entries until the watcher has independently repaired/persisted
+        # that lifecycle using fresh complete broker books and account-bound
+        # owner ACK. This check is deliberately before the manual-risk bypass
+        # and before any status can be declared healthy.
+        for row in bot_settled_candidates:
+            lifecycle_state = str(row.get("position_state") or "").strip().upper()
+            if row.get("manual_exit_detected") or row.get("orphaned_legs_detected") or lifecycle_state in (
+                "RECONCILIATION_REQUIRED", "PERSISTENCE_UNCERTAIN",
+                "MANUAL_INTERVENTION_REQUIRED", "UNKNOWN",
+            ):
+                return False, (
+                    "Settled bot-owned holding remains unresolved: "
+                    f"orderId={str(row.get('parent_order_id') or '')}, "
+                    f"position_state={lifecycle_state}; "
+                    "fresh watcher reconciliation and durable lifecycle recovery required"
+                )
 
         expected_acct = str(
             getattr(getattr(self.broker, "cfg", None), "dhan_client_id", "")
@@ -1170,17 +1195,46 @@ class StartupReconciliationGate:
             or ""
         ).strip()
 
+        # A current-day BUY can be absent from holdings. Only its own fills and
+        # an already protected position in the same contract can explain that lot.
+        def contract(record):
+            return tuple(str(record.get(k) or "").strip().upper()
+                         for k in ("securityId", "exchangeSegment", "productType"))
+
+        day_positions = {contract(p): int(p["netQty"]) for p in intraday_positions}
+        day_buys = {}
+        seen_fills = set()
+        for trade in current_trades:
+            identity = (str(trade.get("orderId") or ""), contract(trade))
+            fill = (identity, trade.get("exchangeTradeId"))
+            if (trade.get("transactionType") == "BUY" and fill[1] and fill not in seen_fills
+                    and str(trade.get("tradedQuantity", "")).isdigit()):
+                seen_fills.add(fill)
+                day_buys[identity] = day_buys.get(identity, 0) + int(trade["tradedQuantity"])
+        settled = []
+        for row in bot_settled_candidates:
+            key = tuple(str(row.get(k) or "").strip().upper()
+                        for k in ("security_id", "exchange_segment", "product_type"))
+            qty = int(row["confirmed_open_qty"])
+            if day_buys.get((str(row["parent_order_id"]), key), 0) >= qty and day_positions.get(key, 0) >= qty:
+                day_positions[key] -= qty
+            else:
+                settled.append(row)
+        bot_settled_candidates = settled
+        if not settled:
+            return True, "Current-day lots verified in protected broker positions"
         # Check live holdings if get_holdings is available on broker (reusing in-pass snapshot if already fetched)
         holdings_by_sec: Dict[str, int] = {}
         has_holdings_api = False
         if getattr(self, "_in_startup_reconciliation_pass", False) and self._active_pass_holdings is not None:
             has_holdings_api = True
-            for h in self._active_pass_holdings:
-                if isinstance(h, dict):
-                    s_id = str(h.get("securityId") or "").strip()
-                    t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
-                    if s_id:
-                        holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+            try:
+                from src.engine.holding_quantity import aggregate_holdings
+                holdings_by_sec = aggregate_holdings(
+                    self._active_pass_holdings, account_id=expected_acct
+                )
+            except ValueError as exc:
+                return False, f"Broker holdings snapshot malformed: {exc}"
         elif hasattr(self.broker, "get_holdings"):
             try:
                 h_res = self.broker.get_holdings()
@@ -1191,12 +1245,10 @@ class StartupReconciliationGate:
                     has_holdings_api = True
                     if getattr(self, "_in_startup_reconciliation_pass", False):
                         self._active_pass_holdings = list(h_res)
-                    for h in h_res:
-                        if isinstance(h, dict):
-                            s_id = str(h.get("securityId") or "").strip()
-                            t_qty = int(h.get("totalQty") if h.get("totalQty") is not None else (h.get("dpQty") or 0))
-                            if s_id:
-                                holdings_by_sec[s_id] = holdings_by_sec.get(s_id, 0) + max(0, t_qty)
+                    from src.engine.holding_quantity import aggregate_holdings
+                    holdings_by_sec = aggregate_holdings(
+                        list(h_res), account_id=expected_acct
+                    )
             except Exception as exc:
                 return False, f"Broker holdings query failed while verifying settled bot positions: {exc}"
 
@@ -1231,8 +1283,7 @@ class StartupReconciliationGate:
                 return False, "Malformed Forever OCO record missing orderId"
             forever_groups.setdefault(gid, []).append(row)
 
-        remaining_forever_qty: Dict[str, int] = {}
-        invalid_forever_ids: Set[str] = set()
+        used_forever = {} if used_forever is None else used_forever
         for row in bot_settled_candidates:
             p_oid = str(row.get("parent_order_id") or "").strip()
             sym = str(row.get("symbol") or "").strip()
@@ -1244,29 +1295,19 @@ class StartupReconciliationGate:
             covered_q = 0
             matched_gids: List[str] = []
             for gid, grp_rows in forever_groups.items():
-                if gid in invalid_forever_ids:
-                    continue
                 if str(grp_rows[0].get("securityId") or "").strip() != sec_id:
                     continue
-                if gid not in remaining_forever_qty:
-                    ver = verify_forever_oco_group(
-                        matching_rows=grp_rows,
-                        forever_order_id=gid,
-                        expected_security_id=sec_id,
-                        expected_account_id=expected_acct or None,
-                        expected_segment=seg,
-                        expected_product_type=prod,
-                    )
-                    if ver.is_verified and ver.protected_quantity > 0:
-                        remaining_forever_qty[gid] = int(ver.protected_quantity)
-                    else:
-                        invalid_forever_ids.add(gid)
-                        continue
-                rem_q = remaining_forever_qty.get(gid, 0)
-                if rem_q > 0 and covered_q < open_q:
-                    alloc_q = min(open_q - covered_q, rem_q)
+                ver = verify_forever_oco_group(
+                    matching_rows=grp_rows, forever_order_id=gid, expected_security_id=sec_id,
+                    expected_account_id=expected_acct or None, expected_segment=seg, expected_product_type=prod,
+                )
+                if not ver.is_verified:
+                    continue
+                available = int(ver.protected_quantity) - used_forever.get(gid, 0)
+                if available > 0 and covered_q < open_q:
+                    alloc_q = min(open_q - covered_q, available)
                     covered_q += alloc_q
-                    remaining_forever_qty[gid] = rem_q - alloc_q
+                    used_forever[gid] = used_forever.get(gid, 0) + alloc_q
                     matched_gids.append(gid)
 
             if covered_q >= open_q:
@@ -1448,7 +1489,7 @@ class StartupReconciliationGate:
         #    but NEVER open the entry gate when Emergency STOP is active!)
         stop_active_at_start = bool(self.stop_manager.is_stopped())
 
-        # 2. Verify broker connection and fund limits
+        # The reconciliation context selects the funds admission tier, including on auth retry.
         try:
             ok, avail, msg = self.broker.get_fund_limits()
             if not ok:
@@ -1463,6 +1504,7 @@ class StartupReconciliationGate:
             return False, self.last_error
 
         # 3. Query broker trade book and positions (Safety Correction C.A: fail closed on read error/malformed)
+        trade_book = []
         if hasattr(self.broker, "get_trade_book"):
             ok_tb, trade_book, tb_msg = self._read_required_broker_collection("get_trade_book", "trade_book")
             if not ok_tb:
@@ -1635,7 +1677,8 @@ class StartupReconciliationGate:
                 return False, self.last_error
 
         # 6a. Verify all open intraday broker positions are covered by active broker protection (Safety Correction C.B & CV13-05)
-        pos_ok, pos_msg = self._verify_open_positions_protected(positions)
+        used_forever = {}
+        pos_ok, pos_msg = self._verify_open_positions_protected(positions, used_forever)
         if not pos_ok:
             self.state = ReconciliationState.BLOCKED
             self.last_error = pos_msg
@@ -1643,7 +1686,7 @@ class StartupReconciliationGate:
             return False, self.last_error
 
         # 6b. Verify all bot-owned settled CNC/MTF holdings have active Forever OCO protection or audited manual-risk acknowledgement (H08 & H16)
-        hld_ok, hld_msg = self._verify_bot_owned_holdings_protected(positions)
+        hld_ok, hld_msg = self._verify_bot_owned_holdings_protected(positions, trade_book, used_forever)
         if not hld_ok:
             self.state = ReconciliationState.BLOCKED
             self.last_error = hld_msg

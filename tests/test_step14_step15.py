@@ -149,7 +149,8 @@ class TestStep14And15(unittest.TestCase):
             ],
         }
         self.mock_broker.get_super_orders.return_value = [super_status]
-        self.mock_broker.order_status.return_value = super_status
+        super_status["correlationId"] = "OPT-RECON-1"
+        self.mock_broker.get_order_by_correlation_id.return_value = super_status
 
         ok, msg = self.gate.run_startup_reconciliation()
         self.assertTrue(ok)

@@ -137,14 +137,14 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await self.drive(32, event)
         self.assertEqual(self.calls, [1000, 1010, 1020, 1030])
 
-    async def test_terminal_uncertainty_uses_urgent_governor_reserve(self):
+    async def test_terminal_uncertainty_previews_normal_transport_allowance(self):
         from src.broker.read_governor import ReadGovernor
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
         governor.seconds_until_capacity = Mock(return_value=0)
         self.w.broker._read_governor = governor
         self.w.terminal_orders['O1']['cancel_uncertain'] = True
         await self.drive(4)
-        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='urgent')
+        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='normal')
 
     async def test_throttled_closed_session_is_not_consumed(self):
         from src.broker.read_governor import ReadGovernor
@@ -168,13 +168,17 @@ class BrokerSnapshotTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         gate = NS(halt_new_entries=Mock())
         broker = NS(cfg=NS(dhan_client_id='ACCOUNT'), reconciliation_gate=gate,
+                    get_trades_for_order=Mock(return_value=[]),
                     get_super_orders=Mock(return_value=[]),
                     get_forever_orders=Mock(return_value=[]),
                     get_trade_book=Mock(return_value=trades or []),
                     get_positions=Mock(return_value=[]),
                     get_holdings=Mock(return_value=holdings))
-        w = ProtectionWatcher(broker=broker, journal_db=None,
-                              path=str(Path(tmp.name) / 'watcher.json'))
+        w = ProtectionWatcher(
+            broker=broker,
+            journal_db=NS(is_manual_risk_acknowledged=Mock(return_value=True)),
+            path=str(Path(tmp.name) / 'watcher.json'),
+        )
         r = {**holding(), 'protection_route': 'FOREVER_OCO', 'product_type': 'CNC',
              'segment': 'NSE_EQ', 'qty': 1}
         w.terminal_orders = {'O1': r}

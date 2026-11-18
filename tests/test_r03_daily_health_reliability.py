@@ -315,8 +315,12 @@ class R03GovernorReserveTests(unittest.TestCase):
         self.assertEqual(normal.headers.get("X-AuditBot-Local-Deferral"), "1")
         c.session.get.assert_not_called()
 
-        c._identity_verification_context = True
-        critical = c._governed_get(url, headers={}, timeout=1)
+        from src.broker.read_governor import RECONCILIATION_PACING
+        token = RECONCILIATION_PACING.set(True)
+        try:
+            critical = c._governed_get(url, headers={}, timeout=1)
+        finally:
+            RECONCILIATION_PACING.reset(token)
         self.assertEqual(critical.status_code, 200)
         self.assertEqual(c.session.get.call_count, 1)
         with sqlite3.connect(self.g.path) as db:

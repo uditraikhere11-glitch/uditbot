@@ -237,14 +237,12 @@ def cmd_refresh_token(cfg: AppConfig, stop_mgr: EmergencyStopManager, *, verific
         for delay in (0, 2, 3, 4):
             if delay:
                 time.sleep(delay)
-            # A private, single-process client marks only this scheduled
-            # post-refresh funds probe as identity-critical. Ordinary hourly
-            # funds checks do not consume the 5% reserved admission pool.
-            client._identity_verification_context = True
+            from src.broker.read_governor import RECONCILIATION_PACING
+            token = RECONCILIATION_PACING.set(True)
             try:
                 ok_f, bal, msg_f = client.verify_token_authenticated()
             finally:
-                client._identity_verification_context = False
+                RECONCILIATION_PACING.reset(token)
             if ok_f:
                 break
             auth_error = str(msg_f or "").lower()

@@ -2987,9 +2987,11 @@ class JournalDB:
                 """
                 UPDATE positions_lifecycle
                 SET position_state = 'UNPROTECTED_MANUAL_RISK', updated_at = ?
-                WHERE parent_order_id = ?
+                WHERE parent_order_id = ? AND security_id = ? AND confirmed_open_qty = ?
+                  AND protected_qty = 0 AND manual_exit_detected = 0 AND orphaned_legs_detected = 0
+                  AND position_state IN ('OPEN', 'UNPROTECTED', 'UNPROTECTED_MANUAL_RISK')
                 """,
-                (ts, p_oid),
+                (ts, p_oid, eff_sec, eff_qty),
             )
             # Update watcher_orders record_json if present
             w_row = conn.execute(
@@ -3000,7 +3002,12 @@ class JournalDB:
                 try:
                     w_data = json.loads(w_row["record_json"])
                     if isinstance(w_data, dict):
-                        w_data["position_state"] = "UNPROTECTED_MANUAL_RISK"
+                        if (w_data.get("position_state") in ("OPEN", "UNPROTECTED", "UNPROTECTED_MANUAL_RISK")
+                                and not any(w_data.get(k) for k in ("manual_exit_detected", "orphaned_legs_detected",
+                                                                    "reconciliation_required", "unreadable_broker_response"))
+                                and str(w_data.get("security_id")) == eff_sec
+                                and w_data.get("confirmed_position_open_qty") == eff_qty):
+                            w_data["position_state"] = "UNPROTECTED_MANUAL_RISK"
                         w_data["manual_risk_acknowledged"] = True
                         w_data["manual_risk_acknowledged_by"] = actor
                         w_data["manual_risk_reason"] = reas

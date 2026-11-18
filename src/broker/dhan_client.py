@@ -1593,6 +1593,10 @@ class DhanClient:
                 if not math.isfinite(avail):
                     return False, 0.0, f"Malformed Dhan funds response: non-finite balance ({raw_bal!r})"
                 return True, avail, "Funds retrieved successfully"
+            elif resp.headers.get("X-AuditBot-Local-Deferral") == "1":
+                wait = resp.headers.get("Retry-After")
+                reason = f"retry after {wait}s" if wait else "read governor unavailable"
+                return False, 0.0, f"Local Dhan GET admission deferred ({reason}): no broker request sent"
             elif self.is_token_error(resp.status_code, resp.text):
                 # The shared helper already made at most one read-only retry.
                 return False, 0.0, f"Dhan auth error ({resp.status_code}): {resp.text}"
@@ -2429,7 +2433,7 @@ class DhanClient:
 
     def _governed_get(self, url, *, headers, timeout, priority=None):
         """All Dhan GETs, including candidate-profile and auth retry, share admission."""
-        from src.broker.read_governor import ReadDeferred
+        from src.broker.read_governor import ReadDeferred, RECONCILIATION_PACING
         governor = self._get_active_read_governor()
         try:
             if governor is not None:
@@ -2438,10 +2442,8 @@ class DhanClient:
                 historical = bool(re.fullmatch(r"/v2/trades/\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}/\d+", path))
                 if priority is not None:
                     get_priority = priority
-                elif (path == "/v2/fundlimit"
-                      and getattr(self, "_identity_verification_context", False)):
-                    # Only the dedicated post-refresh funds probe can use the
-                    # identity reserve; other routine funds readers cannot.
+                elif path == "/v2/fundlimit" and RECONCILIATION_PACING.get():
+                    # Identity checks and the independent gate share the hard category ceiling.
                     get_priority = "identity"
                 elif path == "/v2/orders" or path.startswith("/v2/orders/external/"):
                     get_priority = "low"
@@ -2452,7 +2454,6 @@ class DhanClient:
                 try:
                     governor.admit(historical=historical, priority=get_priority, category=category)
                 except ReadDeferred as exc:
-                    from src.broker.read_governor import RECONCILIATION_PACING
                     if not (RECONCILIATION_PACING.get() and exc.short_window and exc.seconds == 1):
                         raise
                     # No HTTP request has been sent. Give a long reconciliation
@@ -2469,7 +2470,7 @@ class DhanClient:
                 try:
                     governor.throttled(getattr(response, "headers", {}).get("Retry-After"), category=category)
                 except (OSError, sqlite3.Error) as exc:
-                    return self._read_deferral_response(exc)
+                    logger.error("Could not persist broker rate-limit cooldown: %s", type(exc).__name__)
             if int(response.status_code) != 429:
                 result = requests.Response()
                 result.status_code = 429
@@ -2623,6 +2624,12 @@ class DhanClient:
                 )
 
             err_text = str(getattr(resp, "text", "") or "")
+            if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                return BrokerReadFailure(
+                    status=BrokerReadStatus.UNAVAILABLE.value,
+                    error=f"Local GET admission deferred for {label}",
+                    status_code=status_code,
+                )
             err = f"Dhan {label} read failed (HTTP {status_code}): {err_text}"
             if self._requires_token_refresh(status_code, err_text):
                 self._log_throttled_broker_auth_error(label, err)
