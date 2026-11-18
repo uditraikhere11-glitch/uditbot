@@ -117,6 +117,25 @@ class SimpleSaveApplyTests(unittest.TestCase):
         self.assertEqual(result.status, "SAVED_STOPPED")
         self.assertEqual(self.restarts, 0)
 
+    def test_unittest_module_presence_alone_cannot_skip_live_proof(self):
+        from src.engine import simple_save_apply as module
+        with patch.object(module, "is_isolated_test_environment", return_value=True), \
+             patch.object(module, "trading_service_state", return_value="active"), \
+             patch.object(module, "_positive_running_restart_proof",
+                          side_effect=ConfigurationConflict("No verified broker evidence")) as proof:
+            # Inject adapters only when BOTH are actually customized; a
+            # normal production call must enforce the handoff despite
+            # unittest being loaded.
+            with self.assertRaises(ConfigurationConflict):
+                module.apply_settings(
+                    {"equity_budget_inr": "801"}, env_path=self.env,
+                    expected_revision=revision(self.env.read_text()),
+                    state_reader=module.trading_service_state,
+                    restart=module.restart_trading_service,
+                )
+            proof.assert_called_once()
+        self.assertEqual(self.restarts, 0)
+
     def test_real_systemd_restart_only_targets_already_running_service(self):
         from src.engine import simple_save_apply as module
         from unittest.mock import patch

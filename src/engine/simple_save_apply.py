@@ -224,10 +224,18 @@ def apply_settings(
     if not data_root.is_absolute():
         data_root = path.parent / data_root
     data_root.mkdir(parents=True, exist_ok=True)
+    # A production handler always uses the standard systemd adapter. Loading
+    # unittest.mock in an unrelated process must NOT turn off broker checks.
+    injected_test_adapters = (
+        is_isolated_test_environment()
+        and state_reader is not trading_service_state
+        and restart is not restart_trading_service
+    )
+    real_runtime = not injected_test_adapters
     with _short_lock(data_root):
         if path.is_symlink():
             raise ConfigurationConflict("Configuration symlinked during save")
-        if not is_isolated_test_environment():
+        if real_runtime:
             # Single direct-save entry point also repairs proven stale
             # config/status records; broker barriers are never blindly reset.
             ConfigChangeTracker(
@@ -267,7 +275,6 @@ def apply_settings(
         # Production: cannot restart a LIVE watcher just because systemd
         # reports active; prove old PID/hash and no in-flight/UNKNOWN broker
         # mutation. Isolated tests inject the systemd state/restart.
-        real_runtime = not is_isolated_test_environment()
         handoff = None
         if state == "active":
             if new_mode == "LIVE" and not confirm_live:
