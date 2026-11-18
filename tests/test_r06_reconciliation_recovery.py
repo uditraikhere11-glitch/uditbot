@@ -154,6 +154,25 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertTrue(item["reconciliation_required"])
 
+    def test_extra_manual_shares_cannot_conceal_unlinked_sale(self):
+        # Two bot BUY parents total two shares. A separate manual BUY can
+        # restore aggregate shares after an unlinked SELL. Quantity greater
+        # than the bot total is NOT sufficient proof for legacy recovery.
+        for item in (self.a, self.b):
+            item.update(
+                position_state="RECONCILIATION_REQUIRED",
+                reconciliation_required=True,
+                manual_exit_detected=True,
+                unreadable_broker_response=True,
+            )
+        self.healthy(qty=3)
+        self.w.supervise_open_positions()
+        for item in (self.a, self.b):
+            self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
+            self.assertTrue(item["reconciliation_required"])
+            self.assertTrue(item["manual_exit_detected"])
+        self.broker.reconciliation_gate.halt_new_entries.assert_called()
+
     def test_legacy_flags_never_clear_without_verified_ack(self):
         for item in (self.a, self.b):
             item.update(position_state="RECONCILIATION_REQUIRED",
