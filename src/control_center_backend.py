@@ -206,6 +206,11 @@ def build_control_health(env_path: str = ".env") -> Dict[str, Any]:
     check("Trading service", "PASS" if state == "RUNNING" else ("WARN" if state in ("STOPPED_BY_OWNER", "STOPPED_OTHER") else "UNKNOWN"), "systemd state: " + str(state))
     verified = status.get("runtime_verified") is True
     check("Active mode/version", "PASS" if verified else "UNKNOWN", "Verified" if verified else "Running process version not verified")
+    # Positive service/process verification alone cannot override a saved
+    # owner STOP. This diagnostic is read-only and never edits control files.
+    from src.engine.tracker_v2_health import owner_intent_health
+    intent = owner_intent_health(str(state), status.get("owner_intent"))
+    check("Owner service intent", intent.status, intent.message)
     stop_file = os.path.join(data_dir, "emergency_stop.json")
     try:
         with open(stop_file, "r", encoding="utf-8") as fh:
