@@ -115,10 +115,18 @@ class ReadGovernor:
 
     def _connect(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        persisted = self.path.is_file() and self.path.stat().st_size > 0
         conn = sqlite3.connect(self.path, timeout=0.07)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=FULL')
+            if persisted:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {'reads', 'cooldown'}.issubset(tables):
+                    # Never recreate lost persisted broker-limit evidence as
+                    # an empty, apparently healthy quota database.
+                    raise sqlite3.DatabaseError('Persisted governor audit tables missing')
             conn.execute("CREATE TABLE IF NOT EXISTS reads "
                          "(at REAL NOT NULL, category TEXT NOT NULL DEFAULT 'NON_TRADING')")
             cols = {row[1] for row in conn.execute('PRAGMA table_info(reads)')}
