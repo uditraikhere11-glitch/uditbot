@@ -16,7 +16,9 @@ No successful broker response is cached or fabricated, and no watcher sleeps.
 The existing legacy SQLite records (all historically GET admissions) are
 migrated in place to NON_TRADING without deleting history or cooling counters.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
+import fcntl
+import os
 from contextvars import ContextVar
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -118,7 +120,34 @@ class ReadGovernor:
         override = self.__dict__.get('LIMITS')
         return tuple(override) if override is not None else self.CATEGORY_LIMITS[category]
 
+    @contextmanager
+    def _schema_initialization_lock(self):
+        """Coordinate first use across workers before the DB file exists.
+
+        Inspecting SQLite's file-size marker without a cross-process lock can
+        mistake another worker's uncommitted initial schema for corruption.
+        This separate owner-only lock protects initialization only; the SQLite
+        transaction continues to protect each individual admission.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = str(self.path) + ".schema.lock"
+        fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def _connect(self):
+        with self._schema_initialization_lock():
+            return self._connect_unlocked()
+
+    def _connect_unlocked(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         persisted = self.path.is_file() and self.path.stat().st_size > 0
         conn = sqlite3.connect(self.path, timeout=0.07)
