@@ -104,18 +104,26 @@ async def configure_dhan_response_group(
         return None
 
     def dispatch_dhan_response(message: str) -> bool:
-        """Invoked only from the existing outbox worker's background thread."""
-        future = asyncio.run_coroutine_threadsafe(
-            client.send_message(entity, message, parse_mode="html"), loop
-        )
-        try:
-            future.result(timeout=12.0)
-            return True
-        except Exception as exc:
-            future.cancel()
-            logger.warning("Dhan Response Telegram delivery unsuccessful: %s", type(exc).__name__)
-            return False
+        return send_telethon_notification(client, entity, message, loop, timeout=12.0)
 
     reporter.dhan_response_enabled = True
     logger.info("Dhan final response destination verified: %s (requested_verified=%s)", active_name, verified)
     return dispatch_dhan_response
+
+def send_telethon_notification(client, entity, message, loop, *, timeout):
+    """Dispatch from an outbox thread and expose Telegram's flood-wait delay."""
+    from telethon.errors import FloodWaitError
+    from src.notifier.outbox_worker import TelegramRetryAfter
+
+    future = asyncio.run_coroutine_threadsafe(
+        client.send_message(entity, message, parse_mode="html"), loop
+    )
+    try:
+        future.result(timeout=timeout)
+        return True
+    except FloodWaitError as exc:
+        raise TelegramRetryAfter(max(1, exc.seconds)) from None
+    except Exception as exc:
+        future.cancel()
+        logger.warning("Telegram delivery unsuccessful (%s)", type(exc).__name__)
+        return False
