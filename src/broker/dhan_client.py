@@ -1480,7 +1480,17 @@ class DhanClient:
             return False, 0.0, msg_f
         return True, avail, msg_f
 
-    def get_fund_limits(self, retry: bool = True) -> Tuple[bool, float, str]:
+    def get_reconciliation_fund_limits(self) -> Tuple[bool, float, str]:
+        """Startup-only, read-only funds verification using the reserved GET tier.
+
+        All actual requests still obey the governor's hard daily/hourly caps.
+        Ordinary signal funds checks remain NORMAL and cannot consume reserve.
+        """
+        return self.get_fund_limits(retry=True, _startup_reconciliation=True)
+
+    def get_fund_limits(
+        self, retry: bool = True, *, _startup_reconciliation: bool = False
+    ) -> Tuple[bool, float, str]:
         """
         Retrieves available ledger balance from Dhan v2 /fundlimit endpoint.
         Returns: (success, available_balance, message)
@@ -1512,7 +1522,12 @@ class DhanClient:
 
         url = f"{BASE_URL}/fundlimit"
         try:
-            resp = self._get_with_auth_recovery(url, allow_refresh=retry)
+            if _startup_reconciliation:
+                resp = self._get_with_auth_recovery(
+                    url, allow_refresh=retry, priority="identity"
+                )
+            else:
+                resp = self._get_with_auth_recovery(url, allow_refresh=retry)
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, dict):
@@ -1540,6 +1555,12 @@ class DhanClient:
                 if not math.isfinite(avail):
                     return False, 0.0, f"Malformed Dhan funds response: non-finite balance ({raw_bal!r})"
                 return True, avail, "Funds retrieved successfully"
+            elif str(getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") or "") == "1":
+                retry_sec = str(resp.headers.get("Retry-After") or "unknown")
+                return False, 0.0, (
+                    f"Local Dhan GET admission deferred ({retry_sec}s); "
+                    "no broker request sent"
+                )
             elif self.is_token_error(resp.status_code, resp.text):
                 # The shared helper already made at most one read-only retry.
                 return False, 0.0, f"Dhan auth error ({resp.status_code}): {resp.text}"
@@ -2384,7 +2405,8 @@ class DhanClient:
         return response
 
     def _get_with_auth_recovery(
-        self, url: str, *, timeout: float = 5, allow_refresh: bool = True
+        self, url: str, *, timeout: float = 5, allow_refresh: bool = True,
+        priority: Optional[str] = None,
     ) -> requests.Response:
         """One coordinated token recovery and one read-only GET retry on Dhan 401/403.
 
@@ -2400,7 +2422,10 @@ class DhanClient:
 
         headers = self._headers()
         sent_token = headers.get("access-token", "")
-        response = self._governed_get(url, headers=headers, timeout=timeout)
+        admission_options = {"priority": priority} if priority is not None else {}
+        response = self._governed_get(
+            url, headers=headers, timeout=timeout, **admission_options
+        )
         status = int(getattr(response, "status_code", 0) or 0)
         error_text = str(getattr(response, "text", "") or "")
         if not allow_refresh or not self._requires_token_refresh(status, error_text):
@@ -2484,7 +2509,9 @@ class DhanClient:
             return response
         # A successful/failed second GET is terminal for this call. It must
         # never trigger a second token generation or a trading order replay.
-        return self._governed_get(url, headers=retry_headers, timeout=timeout)
+        return self._governed_get(
+            url, headers=retry_headers, timeout=timeout, **admission_options
+        )
 
     def _read_collection(
         self,
