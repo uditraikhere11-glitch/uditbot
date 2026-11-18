@@ -2229,6 +2229,26 @@ class ConfigChangeTracker:
             return {"resolved": False, "reason": "Safety evidence unreadable"}
 
 
+    def has_unresolved_pending_operation(self) -> bool:
+        """A terminal saved change is not a forever-blocking old queue file.
+
+        Preserve a pending envelope for a different change and fail closed on
+        corrupt/unreadable pending metadata; never delete safety evidence.
+        """
+        if not os.path.exists(self.pending_op_file):
+            return False
+        try:
+            from src.engine.tracker_v2_safety import read_private_json
+            pending = read_private_json(self.pending_op_file, missing_ok=False)
+            rec = self.get_change_record()
+            return not bool(
+                rec is not None
+                and rec.state == ConfigApplyState.SAVED_FOR_NEXT_START
+                and pending.get("change_id") == rec.change_id
+            )
+        except (OSError, ValueError, TypeError):
+            return True
+
     def get_change_record(self, change_id: Optional[str] = None) -> Optional[ConfigChangeRecord]:
         """Loads change record from disk."""
         with self._lock:

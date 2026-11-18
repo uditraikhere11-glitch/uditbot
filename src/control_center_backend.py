@@ -58,7 +58,7 @@ def _config_and_paths(env_path: str = ".env") -> Tuple[AppConfig, str, str]:
 
 def _pending(tracker: ConfigChangeTracker) -> bool:
     """Under the global operation lock, refuse overlap with any coordinator work."""
-    if os.path.exists(tracker.pending_op_file) or os.path.exists(tracker.deferred_env_file):
+    if tracker.has_unresolved_pending_operation() or os.path.exists(tracker.deferred_env_file):
         return True
     rec = tracker.get_change_record()
     return bool(rec and rec.state in _PENDING_STATES)

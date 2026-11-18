@@ -341,7 +341,7 @@ def submit_webui_patch(
             raise ConfigurationConflict(
                 "Another configuration change is pending. Review or cancel it before resubmitting"
             )
-        if os.path.exists(tracker.pending_op_file):
+        if tracker.has_unresolved_pending_operation():
             raise ConfigurationConflict("Existing durable configuration operation needs coordinator recovery")
         control_rec = tracker.get_service_control_record()
         if isinstance(control_rec, dict) and control_rec.get("deferred_stop_pending"):
