@@ -12,6 +12,14 @@ class ActivationScriptSafetyTests(unittest.TestCase):
         p = subprocess.run(['bash', '-n', str(SCRIPT)], capture_output=True)
         self.assertEqual(p.returncode, 0, p.stderr.decode())
 
+    def test_unprivileged_activation_and_running_checks_share_safe_proc_fallback(self):
+        script = SCRIPT.read_text()
+        preflight = (ROOT / 'deploy/tracker_v2_preflight.py').read_text()
+        self.assertIn('flag = process_flag(pid)', script)
+        self.assertIn('preflight running', script)
+        self.assertIn('["sudo", "-n", "/usr/bin/cat", str(target)]', preflight)
+        self.assertNotIn('sudo env PYTHONDONTWRITEBYTECODE=1 ./venv/bin/python3', script)
+
     def test_no_live_trade_service_mutation_commands(self):
         script = SCRIPT.read_text()
         self.assertNotIn('systemctl restart "$TRADING"', script)

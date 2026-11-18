@@ -75,15 +75,37 @@ def unit_info(name: str, command: Callable[[list[str]], str] = run) -> dict:
 
 
 def process_flag(pid: int, proc_root: Path = Path("/proc")) -> str:
-    """Only reads one selected variable, never prints the process environment."""
+    """Check the executable environment without exposing any other variables.
+
+    A capability-protected systemd process may have an unreadable /proc/PID
+    environ even when both units have the same User. Retry only that read via
+    a fixed root-owned cat executable; never run checkout Python as root.
+    A failed sudo read remains UNREADABLE and cannot authorize activation.
+    """
     if pid < 1:
         return "NOT_RUNNING"
+    target = proc_root / str(pid) / "environ"
     try:
-        env = (proc_root / str(pid) / "environ").read_bytes().split(b"\0")
-        flags = [e.partition(b"=")[2] for e in env if e.startswith((FLAG + "=").encode())]
-        return "ON" if flags == [b"1"] else "OFF" if not flags or flags == [b"0"] else "AMBIGUOUS"
-    except (OSError, PermissionError):
+        env = target.read_bytes()
+    except PermissionError:
+        if proc_root != Path("/proc"):
+            return "UNREADABLE"
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "/usr/bin/cat", str(target)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=4, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "UNREADABLE"
+        if result.returncode != 0:
+            return "UNREADABLE"
+        env = result.stdout
+    except OSError:
         return "UNREADABLE"
+    flags = [e.partition(b"=")[2] for e in env.split(b"\0")
+             if e.startswith((FLAG + "=").encode())]
+    return "ON" if flags == [b"1"] else "OFF" if not flags or flags == [b"0"] else "AMBIGUOUS"
 
 
 def _secure_regular_file(path: Path, *, mode_mask: int = 0o077) -> bool:
