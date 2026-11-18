@@ -226,14 +226,19 @@ sys.exit(1)
     def test_concurrent_multithread_admission_no_false_sqlite_lock_halt(self):
         """Finding 2: Concurrent WAL admission across threads never triggers false SQLite lock halts."""
         def worker(i):
-            gov = ReadGovernor(self.tmp.name, 'ACCOUNT_A', clock=lambda: self.now + i * 0.001)
-            gov.admit()
-            return True
+            # Forty simultaneous requests must never slip past a documented
+            # 20/s NON_TRADING ceiling, nor fail due to spurious SQLite locks.
+            gov = ReadGovernor(self.tmp.name, 'ACCOUNT_A', clock=lambda: self.now)
+            try:
+                gov.admit()
+                return True
+            except ReadDeferred:
+                return False
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(worker, range(40)))
         self.assertEqual(len(results), 40)
-        self.assertTrue(all(results))
+        self.assertEqual(sum(results), 20)
 
     def test_low_priority_polling_preserves_top_10_percent_critical_reserve(self):
         """Low-priority stops at 90%; ordinary reads also preserve identity capacity."""
