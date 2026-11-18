@@ -3936,6 +3936,11 @@ class ProtectionWatcher:
                 and not both_legs_dead and resting_protective_qty == 0
                 and not entry_only_unlinked_reduction
                 and not manual_risk_quantity_unverified
+                # Exact aggregate ownership evidence is necessary for
+                # repairing legacy false MANUAL_EXIT flags. Extra shares from
+                # a manual BUY could conceal an unlinked historical SELL.
+                # Neither extra nor missing holdings prove both parents open.
+                and broker_net_qty == aggregate_contract_open_qty
                 and snapshot_complete
             )
 
