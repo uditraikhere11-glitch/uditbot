@@ -12,7 +12,10 @@ from unittest.mock import Mock
 from src.engine.holding_quantity import (
     QuantityUnverified, aggregate_holdings, observed_open_quantity,
 )
-from src.engine.watch_poll_policy import watcher_cadence_seconds
+from src.engine.watch_poll_policy import (
+    watcher_cadence_seconds, manual_risk_only,
+    supervision_preflight_priority,
+)
 from src.engine.protection_watcher import ProtectionWatcher
 from src.engine.reconciliation import StartupReconciliationGate
 from src.models import BrokerReadFailure, BrokerReadStatus
@@ -74,6 +77,46 @@ class YesbankTwoParentRecovery(unittest.TestCase):
         self.broker.get_holdings.return_value = [
             {"securityId": "11915", field: qty}
         ]
+
+    def test_acknowledged_stale_manual_risk_keeps_budget_but_not_health(self):
+        for item in (self.a, self.b):
+            item.update(
+                position_state="RECONCILIATION_REQUIRED",
+                reconciliation_required=True,
+                manual_risk_acknowledged=True,
+                unreadable_broker_response=True,
+                manual_exit_detected=True,
+            )
+        pending, open_records, _signature = self.w._poll_snapshot()
+        self.assertFalse(manual_risk_only(pending, open_records))
+        self.assertEqual("routine", supervision_preflight_priority(pending, open_records))
+        self.assertEqual(120.0, watcher_cadence_seconds(
+            pending=pending, open_records=open_records, now=time.time(),
+            market_open=True,
+        ))
+        self.assertTrue(all(r["reconciliation_required"] for r in (self.a, self.b)))
+        self.assertFalse(self.broker.reconciliation_gate.halt_new_entries.called)
+
+    def test_live_exit_leg_still_forces_urgent_broker_supervision(self):
+        self.a.update(
+            position_state="RECONCILIATION_REQUIRED",
+            reconciliation_required=True,
+            manual_risk_acknowledged=True,
+            unreadable_broker_response=True,
+            sl_order_id="LIVE-STOP-LEG",
+        )
+        self.b.update(
+            position_state="RECONCILIATION_REQUIRED",
+            reconciliation_required=True,
+            manual_risk_acknowledged=True,
+            unreadable_broker_response=True,
+        )
+        pending, open_records, _ = self.w._poll_snapshot()
+        self.assertEqual("normal", supervision_preflight_priority(pending, open_records))
+        self.assertEqual(10.0, watcher_cadence_seconds(
+            pending=pending, open_records=open_records, now=time.time(),
+            market_open=True,
+        ))
 
     def test_read_denial_cannot_invent_manual_exit_or_sell(self):
         self.unreadable()
