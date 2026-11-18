@@ -356,9 +356,9 @@ class DirectBrokerRestartTests(unittest.TestCase):
         with patch.object(direct, "is_isolated_test_environment", return_value=False), \
              patch.object(direct, "_positive_running_restart_proof",
                           return_value=dict(self.proof)), \
-             patch.object(direct, "acquire_apply_barrier", return_value=True), \\
+             patch.object(direct, "acquire_apply_barrier", return_value=True), \
              patch.object(direct, "inspect_systemd_service_properties",
-                          return_value={"ActiveState": "inactive", "MainPID": 0}), \\
+                          return_value={"ActiveState": "inactive", "MainPID": 0}), \
              patch.object(direct, "release_aborted_apply_barrier", return_value=True) as release:
             with self.assertRaises(ConfigurationConflict):
                 direct.apply_settings(
