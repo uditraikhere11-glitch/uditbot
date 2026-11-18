@@ -1021,8 +1021,11 @@ document.addEventListener('DOMContentLoaded', function () {
     event.preventDefault();
     if (button.disabled) return;
     const mode = form.querySelector('input[name="is_live_mode"]');
-    if (mode && mode.checked &&
-        !window.confirm('Save LIVE settings? Restarting a running bot can interrupt protection supervision. Continue?')) return;
+    if (mode && mode.checked) {
+      if (!window.confirm('Save LIVE settings? Restarting a running bot can interrupt protection supervision. Continue?')) return;
+      const livePermission = form.querySelector('input[name="confirm_live"]');
+      if (livePermission) livePermission.checked = true;
+    }
     button.disabled = true;
     status.style.display = 'block';
     status.className = '';

@@ -10,10 +10,24 @@ from dataclasses import dataclass
 import fcntl
 import json
 import os
+import secrets
+import time
 from pathlib import Path
 import subprocess
 import tempfile
 from typing import Any, Callable, Mapping
+
+from src.config import AppConfig
+from src.engine.config_manager import (
+    ConfigChangeTracker, compute_config_version, inspect_systemd_service_properties,
+    is_isolated_test_environment,
+)
+from src.engine.tracker_v2_safety import (
+    evaluate_active_broker_operation_gate, read_private_json,
+)
+from src.engine.broker_handoff import (
+    acquire_apply_barrier, release_apply_barrier, BrokerHandoffBlocked,
+)
 
 from src.engine.config_patch import (
     ConfigurationConflict, ConfigurationRejected, patch_env, revision,
@@ -41,7 +55,7 @@ class SaveApplyResult:
 @contextmanager
 def _short_lock(directory: Path):
     """Short-lived flock, not a persisted tracker transaction or lease."""
-    lock_path = directory / ".simple_save_apply.lock"
+    lock_path = directory / "config_operation.lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -114,6 +128,69 @@ def _owner_stop_requested(env_file: Path, cfg: Mapping[str, str]) -> bool:
         ) from exc
 
 
+def _positive_running_restart_proof(path: Path, old_values: Mapping[str, str]) -> dict[str, Any]:
+    """Require matching systemd/ACK/account/empty broker handoff before restart."""
+    cfg = AppConfig.from_env(env=dict(old_values), env_file="")
+    data = Path(cfg.data_dir).expanduser()
+    if not data.is_absolute():
+        data = path.parent / data
+    data = data.resolve()
+    tracker = ConfigChangeTracker(data_dir=str(data))
+    props = inspect_systemd_service_properties("trading_bot.service")
+    main_pid = int(props.get("MainPID") or 0)
+    if props.get("ActiveState") != "active" or main_pid <= 0:
+        raise ConfigurationConflict("Trading service state changed; restart refused")
+    ok, ack, _ = tracker.is_active_version_confirmed(
+        expected_hashes={compute_config_version(cfg)},
+        expected_mode=str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper(),
+        require_systemd_active=True,
+    )
+    if not ok or not isinstance(ack, dict) or ack.get("pid") != main_pid:
+        raise ConfigurationConflict("Current runtime PID and saved version not verified")
+    gate = evaluate_active_broker_operation_gate(data, require_handoff=True)
+    ledger = read_private_json(data / "active_broker_mutations.json", missing_ok=True)
+    if (not gate.allowed or gate.code != "NO_ACTIVE_BROKER_OPERATION"
+            or not isinstance(ledger, dict)
+            or ledger.get("account_id") != cfg.dhan_client_id
+            or gate.evidence.get("producer_pid") != main_pid
+            or gate.evidence.get("producer_starttime") != ack.get("process_starttime")):
+        raise ConfigurationConflict("Broker mutation handoff is active, unresolved or unverifiable")
+    # Do not erase an Emergency Stop, an active order, or a prior barrier.
+    return {"data": data, "account": cfg.dhan_client_id,
+            "pid": main_pid, "starttime": ack["process_starttime"],
+            "old_hash": compute_config_version(cfg)}
+
+
+def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) -> None:
+    """Read-only ACK polling; never send another restart on timeout."""
+    cfg = AppConfig.from_env(env=dict(new_values), env_file="")
+    tracker = ConfigChangeTracker(data_dir=str(handoff["data"]))
+    expected = compute_config_version(cfg)
+    mode = str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper()
+    deadline = time.monotonic() + 15
+    while True:
+        ok, ack, _ = tracker.is_active_version_confirmed(
+            expected_hashes={expected}, expected_mode=mode,
+            require_systemd_active=True,
+        )
+        if (ok and isinstance(ack, dict) and
+                ack.get("pid") != handoff["pid"]):
+            # The new producer must be registered with the same account before
+            # the shared broker mutation barrier can be released.
+            if not release_apply_barrier(
+                handoff["data"], handoff["account"], handoff["barrier_id"],
+                ack["pid"], ack["process_starttime"],
+            ):
+                raise ConfigurationConflict("New runtime ACK verified but broker fence remains held")
+            return
+        if time.monotonic() >= deadline:
+            raise ConfigurationConflict(
+                "Settings saved and one restart issued; new PID/version not verified. "
+                "Do not repeat restart or clear broker fence."
+            )
+        time.sleep(0.25)
+
+
 def restart_trading_service() -> None:
     result = subprocess.run(
         ["sudo", "-n", "/usr/bin/systemctl", "try-restart", "trading_bot.service"],
@@ -141,7 +218,13 @@ def apply_settings(
         raise ConfigurationConflict("Configuration file missing or unsafe")
     if not isinstance(expected_revision, str) or len(expected_revision) != 64:
         raise ConfigurationConflict("Refresh Setup: missing configuration revision")
-    with _short_lock(path.parent):
+    from src.config import parse_env_dict
+    bootstrap = parse_env_dict(str(path))
+    data_root = Path(bootstrap.get("DATA_DIR") or "data").expanduser()
+    if not data_root.is_absolute():
+        data_root = path.parent / data_root
+    data_root.mkdir(parents=True, exist_ok=True)
+    with _short_lock(data_root):
         if path.is_symlink():
             raise ConfigurationConflict("Configuration symlinked during save")
         with path.open("r", encoding="utf-8", newline="") as fh:
@@ -166,6 +249,29 @@ def apply_settings(
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
         if state == "active" and _owner_stop_requested(path, old_values):
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
+        # Production: cannot restart a LIVE watcher just because systemd
+        # reports active; prove old PID/hash and no in-flight/UNKNOWN broker
+        # mutation. Isolated tests inject the systemd state/restart.
+        real_runtime = not is_isolated_test_environment()
+        handoff = None
+        if state == "active":
+            if new_mode == "LIVE" and not confirm_live:
+                raise ConfigurationRejected("Explicit LIVE restart confirmation required")
+            if real_runtime:
+                handoff = _positive_running_restart_proof(path, old_values)
+                barrier_id = "SAVE-" + secrets.token_hex(8)
+                try:
+                    acquired = acquire_apply_barrier(
+                        handoff["data"], handoff["account"], barrier_id,
+                        handoff["pid"], handoff["starttime"],
+                    )
+                except (BrokerHandoffBlocked, OSError) as exc:
+                    raise ConfigurationConflict("Broker restart fence could not be acquired") from exc
+                if not acquired:
+                    raise ConfigurationConflict("An active or unresolved broker mutation blocks restart")
+                handoff["barrier_id"] = barrier_id
+        # After the handoff barrier is acquired, no new Dhan mutations can
+        # begin while we write the file and issue the single restart.
         _atomic_env_write(path, proposed)
         new_revision = revision(proposed)
         keys = tuple(sorted(changed))
@@ -175,9 +281,9 @@ def apply_settings(
                 "Settings saved. Trading remains stopped; use Control Center Start Bot when ready.",
                 True, False, new_revision, keys,
             )
-        # Never resurrect a bot that stopped between saving and restart.
-        # try-restart is also no-op if Owner STOP wins this race.
-        if state_reader() != "active":
+        if _owner_stop_requested(path, old_values) or state_reader() != "active":
+            # Keep an acquired broker fence if a STOP raced the update:
+            # it may not be released without verified new producer evidence.
             return SaveApplyResult(
                 "SAVED_STOPPED",
                 "Settings saved; bot stopped during apply and was not restarted.",
@@ -189,7 +295,9 @@ def apply_settings(
             raise ConfigurationConflict(
                 "Settings saved, but restart could not be verified. Check service status before retrying."
             ) from exc
-        if state_reader() != "active":
+        if real_runtime and handoff is not None:
+            _verify_new_runtime(handoff, new_values)
+        elif state_reader() != "active":
             raise ConfigurationConflict(
                 "Settings saved; bot did not return active. Inspect service before proceeding."
             )
