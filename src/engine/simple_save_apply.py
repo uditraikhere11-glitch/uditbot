@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping
 from src.config import AppConfig
 from src.engine.config_manager import (
     ConfigChangeTracker, compute_config_version, inspect_systemd_service_properties,
-    is_isolated_test_environment,
+    is_isolated_test_environment, write_json_atomic,
 )
 from src.engine.tracker_v2_safety import (
     evaluate_active_broker_operation_gate, read_private_json,
@@ -191,6 +191,42 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
         time.sleep(0.25)
 
 
+def _annotate_terminal_v2_supersession(
+    data_dir: Path, before_rev: str, after_rev: str,
+) -> None:
+    """Trust explicit old/new checksums, not a blanket historic-journal reset.
+
+    Write intended successor before changing .env so either side of a crash
+    remains an accepted revision; do not mutate active/uncertain V2 operations.
+    """
+    folder = data_dir / "config_restart_v2"
+    tx_path = folder / "current_transaction.json"
+    tx = read_private_json(tx_path, missing_ok=True)
+    if tx is None:
+        return
+    phase = str(tx.get("phase") or "")
+    if phase not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
+        raise ConfigurationConflict("V2 restart record unresolved; safe recovery required before saving")
+    barrier = read_private_json(folder / "apply_barrier.json", missing_ok=True)
+    if barrier is not None and barrier.get("active") is not False:
+        raise ConfigurationConflict("Prior V2 broker apply barrier remains active")
+    previously_accepted = {
+        str(tx.get("requested_file_revision") or ""),
+        str(tx.get("direct_save_to_revision") or ""),
+    }
+    if before_rev not in previously_accepted:
+        raise ConfigurationConflict("V2 journal and current settings differ; do not overwrite unknown edits")
+    updated = dict(tx)
+    updated["direct_save_from_revision"] = before_rev
+    updated["direct_save_to_revision"] = after_rev
+    updated["direct_save_recorded_at"] = time.time()
+    write_json_atomic(str(tx_path), updated)
+    check = read_private_json(tx_path, missing_ok=False)
+    if (check.get("direct_save_from_revision") != before_rev or
+            check.get("direct_save_to_revision") != after_rev):
+        raise ConfigurationConflict("V2 direct-save annotation failed readback")
+
+
 def restart_trading_service() -> None:
     result = subprocess.run(
         ["sudo", "-n", "/usr/bin/systemctl", "try-restart", "trading_bot.service"],
@@ -286,6 +322,9 @@ def apply_settings(
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
         if state == "active" and _owner_stop_requested(path, old_values):
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
+        _annotate_terminal_v2_supersession(
+            data_root, actual_revision, revision(proposed),
+        )
         # Production: cannot restart a LIVE watcher just because systemd
         # reports active; prove old PID/hash and no in-flight/UNKNOWN broker
         # mutation. Isolated tests inject the systemd state/restart.
