@@ -195,12 +195,22 @@ $('health').addEventListener('click',async()=>{
 $('equity-amo').addEventListener('change',async()=>{
   const requested=$('equity-amo').checked;
   if(!current){$('equity-amo').checked=!requested;return}
-  $('equity-amo').disabled=true;setText('amo-feedback','Applying Equity AMO settings…');
+  $('equity-amo').disabled=true;setText('amo-feedback','Saving Equity AMO request through safe configuration coordinator…');
   try{
     const r=await requestJSON('/control/amo/equity',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({enabled:requested,csrf_token:csrf,expected_revision:current.config_file_revision,request_id:(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():'AMO-'+Date.now()+'-'+Math.random().toString(36).slice(2))})});
     setText('amo-feedback',r.message||('Request received: '+String(r.state||'PENDING')));
-    setText('amo-feedback',r.message||'Equity AMO setting saved.');
+    if(r.change_id){
+      const requestedChangeId=encodeURIComponent(String(r.change_id));
+      // Poll the authoritative coordinator result; a queued request is not applied.
+      for(let i=0;i<15;i++){
+        await new Promise(resolve=>setTimeout(resolve,1500));
+        const rec=await requestJSON('/setup/change-status/'+requestedChangeId);
+        const st=String(rec.state||'UNKNOWN');
+        setText('amo-feedback','Equity AMO configuration: '+st+' · '+String(rec.reason||''));
+        if(['APPLIED_VERIFIED','SAVED_FOR_NEXT_START','REJECTED','APPLY_FAILED'].includes(st))break;
+      }
+    }
   }catch(err){setText('amo-feedback','Equity AMO change/status verification failed: '+err.message)}
   await refreshStatus();
 });
@@ -210,12 +220,21 @@ $('fno-amo').addEventListener('change',async()=>{
   if(requested&&!confirm('Enable broker-native F&O AMO? Eligible NSE stock option orders will be sent to Dhan after hours. Dhan will return a real Order ID if acknowledged. NO automatic SL or target will protect a filled position.')) {
     $('fno-amo').checked=false;return;
   }
-  $('fno-amo').disabled=true;setText('amo-feedback','Applying F&O AMO settings…');
+  $('fno-amo').disabled=true;setText('amo-feedback','Requesting F&O AMO setting through safety coordinator…');
   try{
     const r=await requestJSON('/control/amo/fno',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({enabled:requested,csrf_token:csrf,expected_revision:current.config_file_revision,request_id:(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():'AMO-'+Date.now()+'-'+Math.random().toString(36).slice(2))})});
     setText('amo-feedback',r.message||('Requested: '+String(r.state||'PENDING')));
-    setText('amo-feedback',r.message||'F&O AMO setting saved.');
+    if(r.change_id){
+      const id=encodeURIComponent(String(r.change_id));
+      for(let i=0;i<15;i++){
+        await new Promise(resolve=>setTimeout(resolve,1500));
+        const rec=await requestJSON('/setup/change-status/'+id);
+        const st=String(rec.state||'UNKNOWN');
+        setText('amo-feedback','F&O AMO configuration: '+st+' · '+String(rec.reason||''));
+        if(['APPLIED_VERIFIED','SAVED_FOR_NEXT_START','REJECTED','APPLY_FAILED'].includes(st))break;
+      }
+    }
   }catch(err){setText('amo-feedback','F&O AMO change not verified: '+err.message)}
   await refreshStatus();
 });
