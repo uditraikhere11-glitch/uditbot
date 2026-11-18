@@ -17,6 +17,7 @@ The existing legacy SQLite records (all historically GET admissions) are
 migrated in place to NON_TRADING without deleting history or cooling counters.
 """
 from contextlib import closing
+from contextvars import ContextVar
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -28,8 +29,12 @@ import time
 from urllib.parse import urlsplit
 
 
+RECONCILIATION_PACING = ContextVar("reconciliation_pacing", default=False)
+
+
 class ReadDeferred(RuntimeError):
-    def __init__(self, seconds, reason):
+    def __init__(self, seconds, reason, *, short_window=False):
+        self.short_window = short_window
         self.seconds = max(1, math.ceil(seconds))
         super().__init__(f'Dhan API deferred locally for {self.seconds}s: {reason}')
 
@@ -135,6 +140,8 @@ class ReadGovernor:
             cols = {row[1] for row in conn.execute('PRAGMA table_info(reads)')}
             if 'at' not in cols:
                 raise sqlite3.DatabaseError('Invalid governor reads schema')
+            if 'category' in cols and persisted and not {'category_cooldown', 'order_modifications'} <= tables:
+                raise sqlite3.DatabaseError('Persisted category governor tables missing')
             if 'category' not in cols:
                 # Legacy DB contains ONLY GET admissions. Existing rows remain
                 # present and now count against per-second non-trading policy;
@@ -207,7 +214,7 @@ class ReadGovernor:
                 ).fetchone()
                 if count >= ceiling:
                     delay = max(.001, (float(oldest)+window-now) if oldest is not None else window)
-                    raise ReadDeferred(delay, f'{cat} {window}s category budget exhausted')
+                    raise ReadDeferred(delay, f'{cat} {window}s category budget exhausted', short_window=window == 1)
             if modification_order_id is not None:
                 if cat != 'ORDER' or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', str(modification_order_id)):
                     raise ValueError('Invalid order modification admission')
