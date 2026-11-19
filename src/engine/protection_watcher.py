@@ -446,7 +446,11 @@ class ProtectionWatcher:
                                 self.pending.pop(oid, None)
                                 self.terminal_orders[oid] = rec
                                 needs_migration_save = True
-                        elif 0 < ver_buy_qty < req_qty:
+                        elif 0 < ver_buy_qty < req_qty and not (
+                            in_term and rec.get("terminal_confirmed") and open_q == 0
+                            and cur_state in ("CANCELLED", "EXPIRED")
+                            and rec.get("verified_entry_terminal_status") == cur_state
+                        ):
                             if cur_state != OrderLifecycleState.PART_FILLED.value:
                                 rec["state"] = OrderLifecycleState.PART_FILLED.value
                                 rec["terminal_confirmed"] = False
@@ -532,7 +536,7 @@ class ProtectionWatcher:
             json.dump(self.pending, f, indent=2)
         os.replace(tmp, self.path)
 
-        if self.terminal_orders:
+        if self.terminal_orders or os.path.exists(f"{self.path}.terminal.json"):
             term_path = f"{self.path}.terminal.json"
             term_tmp = f"{term_path}.tmp"
             with open(term_tmp, "w", encoding="utf-8") as f:
@@ -970,6 +974,7 @@ class ProtectionWatcher:
         verified_sell_vwap: Optional[float] = None,
         verified_realized_pnl: Optional[float] = None,
         confirmed_protection_ids: Optional[List[str]] = None,
+        entry_terminal_status: Optional[str] = None,
         manual_risk_acknowledged: bool = False,
         is_amo: bool = False,
         protection_route: str = "",
@@ -1046,6 +1051,11 @@ class ProtectionWatcher:
                 rec["state"] = OrderLifecycleState.TRADED.value
                 rec["terminal_confirmed"] = True
                 rec["finalized_at"] = float(rec.get("finalized_at") or ts)
+            elif entry_terminal_status in ("CANCELLED", "CANCELED", "EXPIRED"):
+                rec["state"] = "CANCELLED" if entry_terminal_status == "CANCELED" else entry_terminal_status
+                rec["verified_entry_terminal_status"] = rec["state"]
+                rec["terminal_confirmed"] = True
+                rec["finalized_at"] = float(rec.get("finalized_at") or ts)
             else:
                 rec["state"] = OrderLifecycleState.PART_FILLED.value if fill_q > 0 else OrderLifecycleState.PENDING.value
                 rec["terminal_confirmed"] = False
@@ -1081,8 +1091,11 @@ class ProtectionWatcher:
                 pending, terminal = self.journal_db.load_watcher_state()
                 with open(self.path, encoding="utf-8") as stream:
                     disk_pending = json.load(stream)
-                with open(f"{self.path}.terminal.json", encoding="utf-8") as stream:
-                    disk_terminal = json.load(stream)
+                disk_terminal = {}
+                terminal_path = f"{self.path}.terminal.json"
+                if terminal or os.path.exists(terminal_path):
+                    with open(terminal_path, encoding="utf-8") as stream:
+                        disk_terminal = json.load(stream)
                 if ((pending.get(oid), terminal.get(oid)) != (self.pending.get(oid), self.terminal_orders.get(oid))
                         or (disk_pending.get(oid), disk_terminal.get(oid)) != (pending.get(oid), terminal.get(oid))):
                     raise RuntimeError("Verified exit watcher readback failed")
