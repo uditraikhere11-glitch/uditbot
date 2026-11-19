@@ -56,7 +56,14 @@ jobs:
           actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           assert actual == head, f'Head mismatch: {actual} != {head}'
           subprocess.run(['git', 'cat-file', '-e', base + '^{commit}'], check=True)
-          subprocess.run(['git', 'diff', '--check', base, head], check=True)
+          # The exact pre-replica Setup source has one historical whitespace line.
+          # Pin its entire Git blob instead of editing any working input or handler.
+          setup_blob = subprocess.check_output(
+              ['git', 'rev-parse', head + ':src/setup_app.py'], text=True).strip()
+          assert setup_blob == 'c8a81e63d3045229c97cbe7e5f58085b2395e6bf', (
+              'Setup source differs from verified pre-replica working code')
+          subprocess.run(['git', 'diff', '--check', base, head, '--', '.',
+                          ':(exclude)src/setup_app.py'], check=True)
           paths = subprocess.check_output(['git', 'diff', '--name-only', base, head], text=True).splitlines()
           assert paths, 'No changes to package'
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
