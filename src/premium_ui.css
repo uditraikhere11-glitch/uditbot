@@ -76,11 +76,330 @@ body.prem-drawer-open{overflow:hidden}
 @media(min-width:1120px){.premium-setup body{padding:22px 25px 40px 277px}.premium-control main{width:calc(100% - 305px);margin:23px 24px 32px 277px;padding:0}.premium-designer main{width:calc(100% - 305px);margin:0 24px 0 277px}}
 @media(max-width:1119px){.premium-setup body{padding:18px}.premium-designer main{padding:20px}}
 @media(max-width:720px){.premium-setup body{padding:12px}.premium-setup .container{padding:20px 15px}.premium-setup .section-card{padding:18px}.premium-setup .grid-2,.premium-setup .grid-3{grid-template-columns:1fr}}
-/* Two-column card layout on wide desktops, without moving/removing any form fields. */
-@media(min-width:1500px){
-  .premium-setup form[action="/setup"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
-  .premium-setup form[action="/setup"]>input[type="hidden"]{display:none}
-  .premium-setup form[action="/setup"]>.setup-section-jumps,.premium-setup form[action="/setup"]>label.toggle-row,.premium-setup form[action="/setup"]>.btn-submit{grid-column:1/-1}
-  .premium-setup form[action="/setup"]>.section-card{margin-bottom:0;min-width:0}
-  .premium-setup form[action="/setup"]>.btn-submit{justify-self:end}
+
+/* ====================================================================
+ * Approved design, actual controls — six native Setup sections only.
+ * Presentation-only overrides: no replacement <input>, HTML min/step,
+ * event handlers, endpoints, configuration or broker-state assumptions.
+ * ==================================================================== */
+:root {
+  --ui-canvas:#080f1b;
+  --ui-panel:#111e30;
+  --ui-card:#15243a;
+  --ui-field:#0d1a2b;
+  --ui-border:#304861;
+  --ui-border-soft:#253c54;
+  --ui-ink:#edf5ff;
+  --ui-muted:#a9bdd3;
+  --ui-blue:#6bbded;
+  --ui-purple:#9882e9;
+  --ui-amber:#deb16c;
+  --ui-teal:#47b9b3;
+  --ui-shadow:0 14px 34px rgba(2,7,17,.25);
+}
+/* Reuse the same visual system across actual, authenticated pages. */
+.premium-setup body,
+.premium-control body,
+.premium-designer body{
+  background:radial-gradient(ellipse at 80% -12%,#122744 0%,#0a1525 43%,var(--ui-canvas) 88%);
+  color:var(--ui-ink);
+  -webkit-font-smoothing:antialiased;
+}
+.prem-nav{
+  background:linear-gradient(165deg,#0c1b2c,#091322 82%);
+  border-color:#29435d;
+}
+.prem-nav a,.prem-nav-toggle{transition:background-color .16s ease,border-color .16s ease,color .16s ease,box-shadow .16s ease}
+.prem-nav a:hover{background:#1e3b59}
+.prem-nav a[aria-current="page"]{
+  background:linear-gradient(100deg,#18588d,#17406a);
+  border-color:#3873a3;
+  box-shadow:inset 3px 0 #78c6f1,0 6px 15px rgba(5,47,97,.2);
+}
+.prem-nav-foot{
+  background:#102239;border-color:#294a68;color:#99b5ce;
+}
+.premium-setup .container{
+  width:100%;max-width:1700px;padding:0 22px 38px;
+  background:transparent;border:0;box-shadow:none;
+}
+/* Actual existing Setup title, not a second status header. */
+.premium-setup .header{
+  display:grid;grid-template-columns:53px minmax(0,1fr);grid-template-rows:auto auto;
+  align-items:center;gap:1px 15px;text-align:left;
+  min-height:106px;margin:0 0 19px;padding:19px 22px;
+  border:1px solid var(--ui-border);border-radius:16px;
+  background:
+    linear-gradient(115deg,rgba(33,107,176,.09),transparent 65%),
+    linear-gradient(160deg,#14263d,#101c2e);
+  box-shadow:0 9px 25px rgba(2,10,23,.22);
+}
+.premium-setup .header .icon-badge{
+  grid-row:1/3;grid-column:1;display:inline-flex;margin:0;
+  height:52px;width:52px;border-radius:13px;
+  background:linear-gradient(140deg,#155d97,#238ad1);
+  box-shadow:0 7px 21px rgba(12,86,147,.3);
+}
+.premium-setup .header .icon-badge svg{height:27px;width:27px}
+.premium-setup .header h1{
+  grid-row:1;grid-column:2;margin:0;font-size:clamp(22px,2vw,27px);
+  letter-spacing:-.035em;line-height:1.2;
+}
+.premium-setup .header .subtitle{
+  grid-row:2;grid-column:2;margin:3px 0 0;font-size:12px;
+  color:#a7bbd2;line-height:1.5;
+}
+/* The original server-rendered state continues to report real facts. */
+.premium-setup .system-status-panel{
+  padding:18px 20px;background:linear-gradient(150deg,#13243a,#101e31);
+  border:1px solid var(--ui-border-soft);border-radius:15px;box-shadow:var(--ui-shadow);
+  margin:0 0 19px;
+}
+.premium-setup .status-header{border-bottom-color:var(--ui-border-soft)}
+.premium-setup .status-header-tag{background:#123a36;color:#79d7bb;border-color:#26735c}
+.premium-setup .status-card{
+  border:1px solid #2c4560;background:#102037;border-radius:9px;
+  min-width:0;padding:13px;
+}
+.premium-setup .status-card-label{color:#9eb5cd}
+.premium-setup .status-card-val{overflow-wrap:anywhere}
+/* Existing quick anchors, not duplicate editable settings. */
+.premium-setup .setup-section-jumps{
+  position:relative;top:auto;z-index:10;display:flex;flex-wrap:wrap;
+  gap:7px;padding:9px 12px;margin:0 0 18px;
+  border:1px solid var(--ui-border-soft);border-radius:12px;
+  background:#101e31;backdrop-filter:none;
+}
+.premium-setup .setup-section-jumps a{
+  padding:10px 13px;border:1px solid transparent;border-radius:9px;
+  font-size:12px;font-weight:650;color:#bfd2e6;white-space:nowrap;
+  transition:background .16s ease,color .16s ease,border-color .16s ease;
+}
+.premium-setup .setup-section-jumps a:hover,
+.premium-setup .setup-section-jumps a:focus-visible{
+  color:white;background:#1b4268;border-color:#366589;
+}
+/* Six existing sections in a responsive 2-column workspace. */
+.premium-setup form[action="/setup"]{
+  display:grid;grid-template-columns:minmax(0,1fr);gap:17px;
+  align-items:start;width:100%;
+}
+.premium-setup form[action="/setup"]>input[type="hidden"]{display:none}
+.premium-setup form[action="/setup"]>.setup-section-jumps,
+.premium-setup form[action="/setup"]>label.toggle-row,
+.premium-setup form[action="/setup"]>.btn-submit{grid-column:1/-1}
+.premium-setup form[action="/setup"]>.section-card{
+  width:100%;min-width:0;margin:0;padding:0 20px 19px;
+  background:linear-gradient(157deg,#16263c,#101f32 82%);
+  border:1px solid var(--ui-border);border-radius:17px;
+  box-shadow:var(--ui-shadow);overflow:hidden;
+  scroll-margin-top:24px;transition:box-shadow .18s ease,border-color .18s ease;
+}
+.premium-setup form[action="/setup"]>.section-card:hover{
+  border-color:#46627e;box-shadow:0 17px 41px rgba(2,7,17,.33);
+}
+.premium-setup .section-title{
+  position:relative;display:flex;align-items:center;gap:14px;
+  min-height:77px;padding:16px 20px;margin:0 -20px 20px;
+  color:#eff7ff;font-weight:750;font-size:15px;line-height:1.4;
+  border:0;border-bottom:1px solid #304c6a;
+  background:linear-gradient(100deg,#1b4e7c 0%,#173451 78%,#164777 100%);
+}
+.premium-setup .section-title::after{
+  content:"";position:absolute;top:-34px;right:-8px;height:140px;width:100px;
+  transform:rotate(32deg);border-radius:42px;
+  background:radial-gradient(ellipse,rgba(99,177,253,.13),transparent 72%);
+  pointer-events:none;
+}
+.premium-setup .section-title svg{
+  position:relative;z-index:1;width:38px;height:38px;flex:none;
+  padding:8px;border-radius:10px;
+  background:linear-gradient(145deg,#238bda,#175592);
+  stroke:#e0f5ff;filter:drop-shadow(0 3px 5px rgba(0,0,0,.2));
+}
+/* Accent themes have no bearing on the underlying safety controls. */
+.premium-setup #setup-telegram .section-title,
+.premium-setup #setup-protection .section-title{
+  background:linear-gradient(100deg,#3c3b80 0%,#262e58 80%,#48369b 100%);
+  border-bottom-color:#545590;
+}
+.premium-setup #setup-telegram .section-title svg,
+.premium-setup #setup-protection .section-title svg{
+  background:linear-gradient(145deg,#7365d7,#473c9e);
+}
+.premium-setup #setup-broker .section-title,
+.premium-setup #setup-risk .section-title{
+  background:linear-gradient(100deg,#5a442d,#302d2c 77%,#72512d 100%);
+  border-bottom-color:#6b573e;
+}
+.premium-setup #setup-broker .section-title svg,
+.premium-setup #setup-risk .section-title svg{
+  background:linear-gradient(145deg,#af843d,#73552b);
+}
+.premium-setup #setup-sizing .section-title{
+  background:linear-gradient(100deg,#19505a,#173642 75%,#166776);
+  border-bottom-color:#30717c;
+}
+.premium-setup #setup-sizing .section-title svg{
+  background:linear-gradient(145deg,#258d95,#165e6e);
+}
+/* All original named controls remain visible and editable in their original cards. */
+.premium-setup .section-card .grid-2,
+.premium-setup .section-card .grid-3{
+  grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 15px;
+}
+.premium-setup .section-card .form-group{
+  min-width:0;margin-bottom:10px;
+}
+.premium-setup .section-card label{
+  font-size:12px;font-weight:650;line-height:1.4;
+  color:#d5e1ef;letter-spacing:.005em;
+}
+.premium-setup .section-card .help-text{
+  font-size:11px;line-height:1.45;color:#9db1c6;margin-top:6px;
+}
+.premium-setup .section-card .input-wrap input,
+.premium-setup .section-card .input-wrap select{
+  min-width:0;width:100%;min-height:42px;padding:10px 12px;
+  background:var(--ui-field);border:1px solid #3b5875;
+  border-radius:9px;color:var(--ui-ink);font-size:13px;
+  transition:border-color .16s ease,box-shadow .16s ease;
+}
+.premium-setup .section-card .input-wrap input:hover,
+.premium-setup .section-card .input-wrap select:hover{border-color:#557490}
+.premium-setup .section-card .input-wrap input:focus-visible,
+.premium-setup .section-card .input-wrap select:focus-visible{
+  outline:2px solid #79c7f4;outline-offset:1px;
+  box-shadow:0 0 0 4px rgba(77,147,204,.12);
+}
+.premium-setup .section-card .toggle-row{
+  min-width:0;margin-bottom:12px;padding:13px 14px;
+  background:#112238;border-color:#34506c;border-radius:11px;
+}
+.premium-setup .section-card .toggle-info{min-width:0}
+.premium-setup .section-card .toggle-info h4{color:#edf5ff}
+.premium-setup .section-card .toggle-info p{color:#acbfd2}
+.premium-setup .section-card .switch input:focus-visible + .slider{
+  outline:2px solid #86d1f6;outline-offset:3px;
+}
+.premium-setup .section-card .slider{background:#40536d}
+.premium-setup .section-card input:checked + .slider{background:#178c70}
+/* Preserve original LIVE confirmation check, with clear safety emphasis. */
+.premium-setup form[action="/setup"]>label.toggle-row{
+  margin:0;padding:14px 17px;border-radius:12px;border:1px solid #826540;
+  background:#29261e;color:#f4d49e;font-size:12px;font-weight:650;
+}
+.premium-setup form[action="/setup"]>label.toggle-row input{accent-color:#e3ab5d}
+/* Save & Apply is the only Setup action. No fake Save/Reset buttons. */
+.premium-setup form[action="/setup"]>.btn-submit{
+  justify-self:end;min-width:226px;width:min(270px,100%);
+  margin:1px 0 0;padding:15px 23px;border:1px solid #43aff2;
+  border-radius:12px;background:linear-gradient(110deg,#1469a9,#258ddd);
+  color:#fff;font-size:14px;box-shadow:0 9px 28px rgba(8,105,188,.3);
+  transition:background .18s ease,box-shadow .18s ease,transform .12s ease;
+}
+.premium-setup form[action="/setup"]>.btn-submit:hover{
+  background:linear-gradient(110deg,#197ebc,#32a1f0);
+  box-shadow:0 11px 28px rgba(8,105,188,.4);
+}
+/* Control Center: preserve service buttons and health checks as-is. */
+.premium-control main{max-width:1450px}
+.premium-control header{
+  margin:0 0 22px;padding:16px 21px;border:1px solid var(--ui-border);
+  border-radius:16px;background:linear-gradient(150deg,#172b44,#101d2f);
+  box-shadow:0 9px 26px rgba(2,9,23,.22);
+}
+.premium-control section{
+  border-radius:16px;border-color:var(--ui-border);
+  background:linear-gradient(158deg,#182a43,#101e30 88%);
+  box-shadow:var(--ui-shadow);
+  transition:border-color .18s ease,box-shadow .18s ease;
+}
+.premium-control section:hover{border-color:#44617e;box-shadow:0 17px 37px rgba(2,7,17,.31)}
+.premium-control section h2{color:#eaf4ff;letter-spacing:-.02em}
+.premium-control section[aria-label="Bot operating state"]{border-top:3px solid #3696d4}
+.premium-control section[aria-label="After market order controls"]{border-top:3px solid #8b7dce}
+.premium-control section[aria-label="AMO order reconciliation"]{border-top:3px solid #c09a5e}
+.premium-control section[aria-label="Health check results"]{border-top:3px solid #398f95}
+.premium-control .tile,.premium-control .status-note,
+.premium-control .check,.premium-control .order{
+  background:#112239;border-color:#354e68;
+}
+.premium-control .tile{min-height:105px}
+.premium-control .buttons button,
+.premium-control .section-header button{transition:background .16s ease,border-color .16s ease,transform .1s ease}
+.premium-control .buttons button:active,
+.premium-control .section-header button:active{transform:scale(.992)}
+.premium-control .btn-start{background:#15503f;border-color:#247964}
+.premium-control .btn-stop{background:#5b3040;border-color:#854963}
+.premium-control button:disabled{cursor:not-allowed}
+/* Telegram Designer: same cards, smoother controls, existing event handlers. */
+.premium-designer main{max-width:1450px}
+.premium-designer .top{
+  background:linear-gradient(160deg,#172b44,#101d2e);
+  border:1px solid var(--ui-border);border-radius:16px;
+  padding:17px 20px;box-shadow:0 9px 26px rgba(2,9,23,.21);
+}
+.premium-designer .card{
+  border:1px solid var(--ui-border);border-radius:16px;
+  background:linear-gradient(157deg,#182b43,#111f32 90%);
+  box-shadow:var(--ui-shadow);
+}
+.premium-designer .card:first-child{border-top:3px solid #4c9fd4}
+.premium-designer .card:last-child{border-top:3px solid #8c80cf}
+.premium-designer input[type=text],
+.premium-designer select,
+.premium-designer textarea{
+  background:#0d1d30;border-color:#3b5877;border-radius:9px;
+  transition:border-color .16s ease,box-shadow .16s ease;
+}
+.premium-designer input[type=text]:focus-visible,
+.premium-designer select:focus-visible,
+.premium-designer textarea:focus-visible{
+  outline:2px solid #83c6ec;outline-offset:1px;
+}
+.premium-designer button{transition:background .16s ease,border-color .16s ease,transform .12s ease}
+.premium-designer button:active:not(:disabled){transform:scale(.99)}
+.premium-designer #preview{border-color:#365775;background:#0d2032;line-height:1.85}
+/* Responsive: keep native fields, nothing hidden behind 'advanced'. */
+@media(min-width:1260px){
+  .premium-setup form[action="/setup"]{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .premium-setup .section-card .grid-3{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .premium-setup .section-card .grid-2{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media(max-width:1259px){
+  .premium-setup .section-card .grid-3{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .premium-setup .section-card .grid-2{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media(max-width:760px){
+  .premium-setup .container{padding:0 7px 28px;}
+  .premium-setup .header{min-height:0;padding:14px;grid-template-columns:42px minmax(0,1fr);gap:3px 11px;}
+  .premium-setup .header .icon-badge{width:42px;height:42px;border-radius:10px}
+  .premium-setup .header h1{font-size:21px}
+  .premium-setup .header .subtitle{font-size:11px}
+  .premium-setup .system-status-panel{padding:13px}
+  .premium-setup form[action="/setup"]>.section-card{padding:0 15px 16px}
+  .premium-setup .section-title{padding:14px 15px;margin:0 -15px 17px;min-height:69px;font-size:14px}
+  .premium-setup .section-title svg{width:34px;height:34px;padding:7px}
+  .premium-setup .section-card .grid-2,.premium-setup .section-card .grid-3{grid-template-columns:minmax(0,1fr)}
+  .premium-setup form[action="/setup"]>.btn-submit{width:100%;justify-self:stretch}
+  .premium-setup .setup-section-jumps{flex-wrap:nowrap;overflow-x:auto}
+  .premium-control header{padding:13px 15px}
+  .premium-designer .top{padding:14px}
+}
+@media(prefers-reduced-motion:reduce){
+  .premium-setup *, .premium-control *, .premium-designer *, .prem-nav *{
+    transition-duration:0.01ms!important;animation-duration:0.01ms!important;
+  }
+}
+
+/* Narrow Control Center: wrap the actual Setup/Logout controls, never add new ones. */
+@media(max-width:760px){
+  .premium-control header{display:flex;flex-direction:column;align-items:stretch;gap:12px}
+  .premium-control header .logo{min-width:0}
+  .premium-control header>div:last-child{display:flex!important;flex-wrap:wrap;gap:8px;min-width:0;width:100%}
+  .premium-control header>div:last-child form{min-width:0;max-width:100%}
+  .premium-control header>div:last-child button,
+  .premium-control header>div:last-child a{padding:9px 12px;font-size:12px}
+  .premium-control header .logo h1{font-size:22px}
 }
