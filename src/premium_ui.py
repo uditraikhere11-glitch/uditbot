@@ -42,7 +42,20 @@ def premium_nav(page: str) -> str:
     <div><strong>Audit<span>Bot</span></strong><small>TRADING SYSTEM · UDITBOT</small></div></div>
   <div class="prem-nav-group">WORKSPACE</div>
   ''' + links[0] + '\n  ' + links[1] + '''
+  <a href="/#amo-orders" class="replica-extra-nav"><span aria-hidden="true">◇</span>Trading &amp; Orders</a>
+  <a href="/#system-health" class="replica-extra-nav"><span aria-hidden="true">▤</span>Logs &amp; Monitoring</a>
   <div class="prem-nav-group">NOTIFICATIONS</div>
   ''' + links[2] + '''
-  <p class="prem-nav-foot">Navigation does not start trading or change orders. Check the Control Center for verified runtime status.</p>
+  <div class="prem-nav-inert" aria-label="Reports not available in this interface">▥ &nbsp; Reports</div>
+  <a href="/#system-health" class="replica-extra-nav"><span aria-hidden="true">☷</span>System</a>
+  <p class="prem-nav-foot"><b id="replicaServiceText">Status Unverified</b><span>Mode: <span id="replicaNavMode">UNVERIFIED</span></span><br><span id="replicaNavState">Read-only runtime status pending</span></p>
 </nav>'''
+
+@lru_cache(maxsize=1)
+def approved_replica_styles() -> str:
+    return '<style>\n' + (_ASSET_DIR / 'approved_replica.css').read_text(encoding='utf-8') + '\n</style>'
+
+
+@lru_cache(maxsize=1)
+def approved_replica_js() -> str:
+    return (_ASSET_DIR / 'approved_replica.js').read_text(encoding='utf-8')
