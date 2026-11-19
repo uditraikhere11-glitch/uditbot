@@ -1,90 +1,93 @@
-"""Approved-screenshot WebUI contracts. Pure presentation checks; no broker calls."""
+"""Approved production UI: six native cards; no proxy controls or broker writes."""
 from __future__ import annotations
 import ast
+import hashlib
 from pathlib import Path
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+KNOWN_WORKING_SETUP_BLOB = 'c8a81e63d3045229c97cbe7e5f58085b2395e6bf'
 
 
-def template_constants():
-    tree = ast.parse((ROOT / 'src/setup_app.py').read_text(encoding='utf-8'))
-    values = {}
+def source(rel):
+    path = ROOT / rel
+    raw = path.read_bytes()
+    ast.parse(raw.decode('utf-8')) if path.suffix == '.py' else None
+    return raw.decode('utf-8')
+
+
+def html_template():
+    tree = ast.parse(source('src/setup_app.py'))
     for node in tree.body:
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    values[target.id] = node.value.value
-    return values
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == 'HTML_TEMPLATE' for t in node.targets):
+                return ast.literal_eval(node.value)
+    raise AssertionError('Setup HTML template not found')
 
 
-class ApprovedReplicaContract(unittest.TestCase):
-    def test_four_card_reference_structure(self):
-        values = template_constants()
-        board = values['APPROVED_REFERENCE_BOARD']
-        self.assertEqual(board.count('class="replica-card replica-'), 4)
-        for title in ('Bot Configuration', 'Risk &amp; Protection',
-                      'AMO Settings', 'Market &amp; Data'):
-            self.assertIn(title, board)
-        self.assertIn('id="replicaLive"', board)
-        self.assertIn('id="replicaTest"', board)
-        self.assertIn('id="replicaAMOEquity"', board)
-        self.assertIn('id="replicaAMOFno"', board)
+class ApprovedVisualOnlyContract(unittest.TestCase):
+    def test_exact_previous_working_setup(self):
+        raw = (ROOT / 'src/setup_app.py').read_bytes()
+        data = b'blob ' + str(len(raw)).encode() + b'\0' + raw
+        self.assertEqual(hashlib.sha1(data).hexdigest(), KNOWN_WORKING_SETUP_BLOB)
 
-    def test_legacy_forms_and_safety_still_available(self):
-        page = template_constants()['HTML_TEMPLATE']
-        for name in ('is_live_mode','confirm_live','csrf_token','expected_revision',
-                     'equity_budget_inr','fno_capital_per_trade','fno_max_lots',
-                     'equity_sl_pct','equity_target_pct','fno_sl_pct','fno_target_pct',
-                     'max_quote_age_sec','equity_cmp_execution_policy',
-                     'scrip_master_max_age_sec'):
-            self.assertIn('name="' + name + '"', page)
-        self.assertIn('fetch(\'/setup/save-apply\'', page)
-        self.assertIn('id="replicaAdvanced"', page)
-        self.assertIn('id="replicaApply"', page)
-        self.assertIn('name="full_setup_form"', page)
+    def test_six_existing_cards_and_exact_54_unique_field_names(self):
+        page = html_template()
+        self.assertEqual(page.count('class="section-card"'), 6)
+        for section in ('execution', 'telegram', 'broker', 'sizing', 'risk', 'protection'):
+            self.assertEqual(page.count('id="setup-' + section + '"'), 1)
+        form = page.split('<form method="POST" action="/setup">', 1)[1].split('</form>', 1)[0]
+        names = re.findall(r'<(?:input|select|textarea)\b[^>]*\bname="([^"]+)"', form)
+        self.assertEqual(len(names), 54)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertIn('csrf_token', names)
+        self.assertIn('expected_revision', names)
+        self.assertIn('confirm_live', names)
+        self.assertIn('max_quote_age_sec', names)
+        self.assertNotIn('data-mirror', form)
+        self.assertNotIn('replicaAdvanced', page)
+        self.assertNotIn('replicaBoard', page)
 
-    def test_mirror_fields_are_not_submitted_twice(self):
-        values = template_constants()
-        board = values['APPROVED_REFERENCE_BOARD']
-        self.assertNotIn('name="equity_budget_inr"', board)
-        self.assertNotIn('name="fno_sl_pct"', board)
-        self.assertNotIn('name="fno_capital_per_trade"', board)
-        script = (ROOT / 'src/approved_replica.js').read_text(encoding='utf-8')
-        self.assertIn('original.value = input.value', script)
-        self.assertIn('refreshMirrors()', script)
-        self.assertIn("form.requestSubmit(get('replicaApply'))", script)
-        self.assertIn("if (!brokerState || dirty())", script)
+    def test_quote_2_valid_under_existing_rules(self):
+        page = html_template()
+        tag = re.search(r'<input\b[^>]*name="max_quote_age_sec"[^>]*>', page).group()
+        self.assertIn('step="0.5"', tag)
+        self.assertNotIn('min=', tag)
+        self.assertIn("fetch('/setup/save-apply'", page)
 
-    def test_no_invented_verified_reconciliation_or_oco(self):
-        board = template_constants()['HTML_TEMPLATE']
-        self.assertIn('Reconciliation: Not verified', board)
-        self.assertIn('OCO Guard: Not verified', board)
-        script = (ROOT / 'src/approved_replica.js').read_text(encoding='utf-8')
-        self.assertIn("state.runtime_verified === true", script)
-        self.assertIn("state.equity_amo_can_edit !== true", script)
-        self.assertIn("state.fno_amo_can_edit !== true", script)
-        self.assertIn("'/control/amo/fno'", script)
-        self.assertIn('csrf_token:csrf', script)
-        self.assertIn('expected_revision:brokerState.config_file_revision', script)
+    def test_navigation_is_three_real_pages_only(self):
+        helper = source('src/premium_ui.py')
+        self.assertIn("('control', '/',", helper)
+        self.assertIn("('setup', '/setup',", helper)
+        self.assertIn("('designer', '/setup/telegram-designer',", helper)
+        self.assertNotIn('replica-extra-nav', helper)
+        self.assertNotIn('Trading &amp; Orders', helper)
+        self.assertNotIn('Logs &amp; Monitoring', helper)
+        self.assertNotIn('approved_replica_', helper)
 
-    def test_css_desktop_and_mobile(self):
-        css = (ROOT / 'src/approved_replica.css').read_text(encoding='utf-8')
-        self.assertIn('grid-template-columns:repeat(2,minmax(0,1fr))', css)
-        self.assertIn('max-width:760px', css)
-        self.assertIn('.replica-footer', css)
-        self.assertIn('.replica-advanced', css)
-        self.assertIn('approved', css)
+    def test_presentation_cannot_rewrite_or_mirror_inputs(self):
+        css = source('src/premium_ui.css')
+        self.assertIn('AuditBot approved professional dashboard', css)
+        self.assertIn('column-count:2', css)
+        self.assertIn('column-count:1', css)
+        self.assertIn('.premium-designer', css)
+        self.assertIn('.premium-control', css)
+        js = source('src/premium_ui.js')
+        for forbidden in ('FormData(', '.value=', 'requestSubmit(', '/setup/save-apply', '/control/amo'):
+            self.assertNotIn(forbidden, js)
 
-    def test_asset_loading_and_existing_routes(self):
-        module = (ROOT / 'src/premium_ui.py').read_text(encoding='utf-8')
-        self.assertIn('approved_replica_styles', module)
-        self.assertIn('approved_replica_js', module)
-        cc = (ROOT / 'src/control_center_ui.py').read_text(encoding='utf-8')
-        self.assertIn('id="amo-orders"', cc)
-        self.assertIn('id="system-health"', cc)
-        self.assertIn("requestJSON('/control/status')", cc)
-        self.assertIn('/setup/service-control', cc)
+    def test_actual_control_center_and_designer_contracts(self):
+        cc = source('src/control_center_ui.py')
+        for token in ('id="start"', 'id="stop"', 'id="health"',
+                      'id="equity-amo"', 'id="fno-amo"', 'id="amo-orders"',
+                      'id="system-health"', '/setup/service-control', '/control/status'):
+            self.assertIn(token, cc)
+        designer = source('src/notifier/message_designer_ui.py')
+        for token in ('id="event"', 'id="enabled"', 'id="selected"',
+                      'id="available"', 'id="preview"', 'id="save"',
+                      'id="export"', 'id="import"'):
+            self.assertIn(token, designer)
 
 
 if __name__ == '__main__':

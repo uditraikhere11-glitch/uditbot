@@ -36,7 +36,8 @@ jobs:
         run: |
           python -m compileall -q src/premium_ui.py src/setup_app.py src/control_center_ui.py src/notifier/message_designer_ui.py
           python -m unittest -v tests.test_premium_ui_contract tests.test_control_center_ui_contract tests.test_message_designer tests.test_approved_replica_contract
-          git diff --check
+          git diff --check -- . ':!src/setup_app.py'
+          python -m unittest -v tests.test_approved_replica_contract
       - name: Create exact changed-files ZIP and independent patch
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -56,7 +57,10 @@ jobs:
           actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           assert actual == head, f'Head mismatch: {actual} != {head}'
           subprocess.run(['git', 'cat-file', '-e', base + '^{commit}'], check=True)
-          subprocess.run(['git', 'diff', '--check', base, head], check=True)
+          # Preserve the exact known-working Setup blob, including historical whitespace.
+          setup_blob = subprocess.check_output(['git', 'rev-parse', head + ':src/setup_app.py'], text=True).strip()
+          assert setup_blob == 'c8a81e63d3045229c97cbe7e5f58085b2395e6bf', 'Working Setup changed'
+          subprocess.run(['git', 'diff', '--check', base, head, '--', '.', ':(exclude)src/setup_app.py'], check=True)
           paths = subprocess.check_output(['git', 'diff', '--name-only', base, head], text=True).splitlines()
           assert paths, 'No changes to package'
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
@@ -65,13 +69,18 @@ jobs:
                      'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           assert set(paths).issubset(allowed), f'Unexpected changed file(s): {set(paths) - set(allowed)}'
-          manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head, 'files': {}}
+          manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head, 'files': {}, 'removed_files': []}
           out = Path('review-out')
           out.mkdir(exist_ok=True)
           zip_path = out / ('AuditBot_PR' + os.environ['PR_NUMBER'] + '_ChangedFiles.zip')
           with ZipFile(zip_path, 'w', ZIP_DEFLATED, compresslevel=9) as archive:
               for path in paths:
                   file = Path(path)
+                  if not file.exists():
+                      assert path in ('src/approved_replica.css', 'src/approved_replica.js')
+                      subprocess.run(['git', 'cat-file', '-e', base + ':' + path], check=True)
+                      manifest['removed_files'].append(path)
+                      continue
                   assert file.is_file() and not file.is_symlink(), f'Unsafe file: {path}'
                   raw = file.read_bytes()
                   manifest['files'][path] = hashlib.sha256(raw).hexdigest()

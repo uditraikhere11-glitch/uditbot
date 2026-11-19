@@ -84,3 +84,217 @@ body.prem-drawer-open{overflow:hidden}
   .premium-setup form[action="/setup"]>.section-card{margin-bottom:0;min-width:0}
   .premium-setup form[action="/setup"]>.btn-submit{justify-self:end}
 }
+/* =======================================================================
+ * AuditBot approved professional dashboard — PRESENTATION ONLY.
+ * The actual six Setup .section-card elements and all named input elements
+ * remain untouched. No proxy forms, field duplication or runtime assertions.
+ * Control Center, Telegram Designer and Setup share the same visual system.
+ * ======================================================================= */
+:root {
+  color-scheme: dark;
+  --ad-bg: #070d16;
+  --ad-surface: #101b2b;
+  --ad-card: #121f31;
+  --ad-card-top: #1b3049;
+  --ad-field: #0d1929;
+  --ad-border: #37516e;
+  --ad-border-soft: #263b53;
+  --ad-text: #edf4fc;
+  --ad-muted: #aebfd1;
+  --ad-blue: #1680e5;
+  --ad-cyan: #58b7eb;
+  --ad-amber: #d3a869;
+  --ad-violet: #7e79cf;
+  --ad-green: #27bd84;
+}
+.premium-setup body,
+.premium-control body,
+.premium-designer body {
+  background: radial-gradient(ellipse at 60% -20%,#11243c 0%,#090f1b 43%,#060b12 88%);
+  color:var(--ad-text);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+/* One navigation system with the actual three authenticated destinations. */
+.prem-nav {
+  background: linear-gradient(180deg,#0b1829 0%,#091320 64%,#0a1425 100%);
+  border-right:1px solid #28405a;
+  box-shadow:6px 0 27px #02091235;
+}
+.prem-brand-icon {
+  background:linear-gradient(145deg,#066ebc,#2496e9);
+  box-shadow:0 6px 18px #0067ae40;
+}
+.prem-nav a { border-radius:11px;transition:background .16s,border-color .16s,color .16s; }
+.prem-nav a[aria-current="page"] {
+  background:linear-gradient(105deg,#116dcb,#16569e);
+  border-color:#3c9be8;
+  box-shadow:inset 3px 0 #8ccefa,0 5px 15px #0754a333;
+}
+.prem-nav a:hover { background:#1b344e; }
+/* Avoid repeating the same navigation/safety messages beneath the sidebar. */
+.prem-nav-foot {display:none;}
+.prem-nav-group {color:#849cb7;}
+.prem-nav-toggle {border-color:#375b7d;background:#163452;}
+/* Actual Setup; no replacement or movement of a named control. */
+.premium-setup body {padding:18px 20px;}
+.premium-setup .container {
+  max-width:1690px;width:100%;margin:0 auto;padding:0 6px 35px;
+  background:none;border:0;border-radius:0;box-shadow:none;
+}
+.premium-setup .header {
+  display:grid;grid-template-columns:52px minmax(0,1fr);grid-template-rows:auto auto;
+  align-items:center;gap:0 14px;padding:8px 4px 19px;margin:0 0 18px;
+  text-align:left;border-bottom:1px solid #35506d;
+}
+.premium-setup .header .icon-badge {
+  display:grid!important;place-items:center;grid-column:1;grid-row:1/3;
+  width:49px;height:49px;margin:0;border-radius:12px;
+  background:linear-gradient(145deg,#0c75ca,#266db4);
+  box-shadow:0 6px 19px #0b5db03d;
+}
+.premium-setup .header .icon-badge svg{width:26px;height:26px;}
+.premium-setup .header h1 {grid-column:2;grid-row:1;margin:0;letter-spacing:-.035em;font-size:clamp(23px,2.1vw,31px);line-height:1.17;}
+.premium-setup .header .subtitle {grid-column:2;grid-row:2;margin:3px 0 0;font-size:13px;line-height:1.45;color:var(--ad-muted);}
+/* The original status content has ONE source; display it as a compact sidebar
+   readout on wide screens, and in its original flow on narrow screens. */
+.premium-setup .system-status-panel {
+  padding:12px;background:linear-gradient(175deg,#13243a,#0d1a2b);
+  border:1px solid #365777;border-radius:14px;
+  box-shadow:0 12px 28px #0004;
+}
+.premium-setup .status-header {display:flex;align-items:flex-start;gap:7px;padding-bottom:8px;margin-bottom:9px;border-bottom:1px solid #2a4057;}
+.premium-setup .status-header-title {font-size:11px;line-height:1.45;letter-spacing:0;text-transform:none;}
+.premium-setup .status-header-tag {display:none;} /* status is already verified per item */
+.premium-setup .status-grid {grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;}
+.premium-setup .status-card {min-width:0;padding:8px;border-radius:8px;background:#0e1e31;border-color:#27435d;}
+.premium-setup .status-card-label {font-size:9px;letter-spacing:.025em;line-height:1.35;}
+.premium-setup .status-card-val {font-size:11px;overflow-wrap:anywhere;line-height:1.4;}
+.premium-setup .status-pill {font-size:10px;padding:3px 5px;white-space:normal;overflow-wrap:anywhere;}
+/* Hide only redundant within-page navigation links, not real fields. */
+.premium-setup .setup-section-jumps {display:none;}
+/* Six original cards in responsive columns without empty CSS grid rows. */
+.premium-setup form[action="/setup"]{display:block;column-count:2;column-gap:18px;}
+.premium-setup form[action="/setup"]>.section-card {
+  display:block;break-inside:avoid;page-break-inside:avoid;
+  margin:0 0 18px!important;padding:0 18px 18px;
+  width:100%;max-width:100%;min-width:0;
+  background:linear-gradient(170deg,#14253a 0%,#0e1a2b 100%);
+  border:1px solid #3a5676;border-radius:16px;
+  box-shadow:0 10px 25px #02070e33;
+  overflow:hidden;transition:border-color .17s,box-shadow .17s;
+}
+.premium-setup form[action="/setup"]>.section-card:hover {border-color:#56769a;box-shadow:0 12px 31px #01071055;}
+.premium-setup .section-title {
+  display:flex;align-items:center;gap:12px;min-height:62px;
+  margin:0 -18px 17px;padding:13px 18px;
+  border:0;border-bottom:1px solid #34516d;
+  background:linear-gradient(115deg,#25496e,#1b3049 72%,#193858);
+  color:#f1f7ff;font-weight:750;font-size:16px;line-height:1.3;
+  letter-spacing:-.012em;
+}
+.premium-setup .section-title::after {display:none;}
+.premium-setup .section-title svg {
+  width:37px;height:37px;flex:none;padding:8px;border-radius:10px;
+  background:linear-gradient(140deg,#166abb,#20518d);stroke:#f0f8ff;
+  box-shadow:inset 0 1px 0 #ffffff1d;
+}
+/* Restrained per-section accent. No neon rainbow backgrounds. */
+.premium-setup #setup-telegram .section-title,.premium-setup #setup-protection .section-title {background:linear-gradient(115deg,#2b355c,#202a45);border-bottom-color:#444b79;}
+.premium-setup #setup-telegram .section-title svg,.premium-setup #setup-protection .section-title svg {background:linear-gradient(140deg,#5656a4,#393d79);}
+.premium-setup #setup-broker .section-title,.premium-setup #setup-risk .section-title {background:linear-gradient(115deg,#413b38,#242c38);border-bottom-color:#635242;}
+.premium-setup #setup-broker .section-title svg,.premium-setup #setup-risk .section-title svg {background:linear-gradient(140deg,#9d7642,#574d4a);}
+.premium-setup #setup-sizing .section-title {background:linear-gradient(115deg,#244753,#17323e);border-bottom-color:#326775;}
+.premium-setup #setup-sizing .section-title svg {background:linear-gradient(140deg,#267b9b,#1b586f);}
+.premium-setup .grid-2,.premium-setup .grid-3{gap:13px;}
+.premium-setup .section-card .grid-3 {grid-template-columns:repeat(2,minmax(0,1fr));}
+.premium-setup .section-card .form-group {min-width:0;}
+.premium-setup .section-card label {font-size:12px;line-height:1.4;font-weight:650;color:#d8e6f6;}
+.premium-setup .section-card .help-text {font-size:11px;line-height:1.4;color:#94a9c0;}
+.premium-setup .section-card .input-wrap input,.premium-setup .section-card .input-wrap select {
+  background:var(--ad-field);border:1px solid #405a78;border-radius:8px;
+  color:#f3f8ff;min-height:40px;font-size:13px;
+}
+.premium-setup .section-card .input-wrap input:focus,.premium-setup .section-card .input-wrap select:focus {
+  border-color:#71bded;box-shadow:0 0 0 3px #3191d630;outline:none;
+}
+.premium-setup .section-card .toggle-row {background:#11243a;border:1px solid #2d4b66;border-radius:11px;}
+.premium-setup .section-card .toggle-info p {color:#94abc1;}
+.premium-setup .section-card input:checked+.slider {background:#167ac5;}
+.premium-setup form[action="/setup"]>label.toggle-row {
+  display:flex;column-span:all;break-inside:avoid;
+  width:100%;margin:0 0 15px!important;background:#12253a;
+  border:1px solid #375b79;padding:11px 15px;border-radius:12px;
+  color:#dce9f7;font-size:12px;
+}
+.premium-setup .btn-submit {
+  display:block;column-span:all;margin:0 0 0 auto;min-width:210px;
+  max-width:100%;padding:13px 24px;font-size:14px;font-weight:750;
+  background:linear-gradient(120deg,#197bd6,#075cc3);border:1px solid #4da5ec;
+  border-radius:10px;box-shadow:0 6px 20px #056bc751;
+}
+.premium-setup .btn-submit:hover {background:linear-gradient(120deg,#288dec,#106fda);}
+/* Existing compact save confirmation remains fixed and avoids layout jumps. */
+.premium-setup #simpleSaveStatus,.premium-setup .setup-post-confirmation {background:#15273b;border-color:#4a6581;color:#f1f7ff;}
+/* Control Center: approved surface, original running-state and AMO actions. */
+.premium-control main {max-width:1500px;}
+.premium-control header {gap:17px;flex-wrap:wrap;border-bottom:1px solid #35506a;padding:10px 0 18px;}
+.premium-control h1 {font-size:27px;letter-spacing:-.04em;}
+.premium-control .subtitle {color:#a8bed3;}
+.premium-control .logo-icon {background:linear-gradient(140deg,#1c6cb3,#15416e);box-shadow:0 5px 14px #0a4d8b44;}
+.premium-control section {background:linear-gradient(165deg,#14253a,#0e1b2d);border:1px solid #35516f;border-radius:16px;padding:20px;box-shadow:0 10px 27px #0003;}
+.premium-control section::after {display:none;}
+.premium-control h2 {font-size:16px;color:#f2f6fb;}
+.premium-control .tile,.premium-control .status-note,.premium-control .check,.premium-control .order {background:#102034;border:1px solid #344e6a;border-radius:10px;}
+.premium-control button,.premium-control a.setup {border-color:#43617d;background:#203650;color:#f2f7ff;border-radius:10px;}
+.premium-control button:hover:not(:disabled),.premium-control a.setup:hover {background:#2a4563;}
+.premium-control .btn-start{background:#165f43;border-color:#267e5c;}
+.premium-control .btn-stop{background:#4e2d3b;border-color:#8b5767;}
+.premium-control .toggle{accent-color:#278cd5;}
+.premium-control .grid{gap:15px;}
+/* Designer: all existing eight server-defined notification types and fields. */
+.premium-designer main {max-width:1480px;}
+.premium-designer .top {padding:5px 0 17px;border-bottom:1px solid #34516c;}
+.premium-designer h1 {font-size:27px;letter-spacing:-.04em;}
+.premium-designer .card {background:linear-gradient(155deg,#14263b,#0f1e30);border:1px solid #35516f;border-radius:16px;box-shadow:0 10px 27px #0003;}
+.premium-designer h2,.premium-designer h3 {color:#f2f7fd;}
+.premium-designer label{font-size:13px;color:#d9e6f6;}
+.premium-designer input[type=text],.premium-designer textarea,.premium-designer select {background:#0e1c2e;border:1px solid #415d7b;color:#f3f9ff;}
+.premium-designer input[type=text]:focus,.premium-designer select:focus,.premium-designer textarea:focus {outline:2px solid #5fa9de;outline-offset:1px;}
+.premium-designer button {background:#203650;border:1px solid #405d7a;color:#eef7ff;}
+.premium-designer button:hover {background:#304e6d;}
+.premium-designer button.primary {background:linear-gradient(110deg,#187bd0,#0d64b9);border-color:#4e9dde;color:white;}
+.premium-designer input[type=checkbox]{accent-color:#177dcb;}
+.premium-designer #preview {background:#0b1a2d;border:1px solid #345672;box-shadow:inset 0 0 22px #0813223a;}
+.premium-designer .immutable{background:#232b34;border-left-color:#c6a56c;color:#ddcfb4;}
+/* Desktop / tablet / mobile. No fields, types, constraints or names altered. */
+@media(min-width:1120px){
+  .premium-setup body{padding:16px 20px 40px 276px;}
+  .premium-setup .system-status-panel{
+    position:fixed;left:12px;bottom:14px;width:231px;z-index:1110;
+    max-height:calc(100dvh - 365px);overflow-y:auto;margin:0;
+  }
+  .premium-control main{width:calc(100% - 314px);margin:20px 21px 26px 277px;}
+  .premium-designer main{width:calc(100% - 314px);margin:0 22px 0 277px;}
+}
+@media(max-width:1119px){
+  .premium-setup body {padding:17px 15px;}
+  .premium-setup .system-status-panel {position:static;max-height:none;width:auto;margin-bottom:16px;}
+}
+@media(max-width:1000px){
+  .premium-setup form[action="/setup"]{column-count:1;}
+}
+@media(max-width:700px){
+  .premium-setup body{padding:10px;}
+  .premium-setup .header{grid-template-columns:44px 1fr;gap:0 10px;}
+  .premium-setup .header .icon-badge{width:42px;height:42px;}
+  .premium-setup .container{padding:0 2px 25px;}
+  .premium-setup .section-card .grid-2,.premium-setup .section-card .grid-3{grid-template-columns:1fr;}
+  .premium-setup .section-title{font-size:14px;min-height:58px;}
+  .premium-setup .status-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .premium-control section{padding:16px;}
+  .premium-designer .card{padding:16px;}
+}
+@media(prefers-reduced-motion:reduce){
+  .premium-setup form[action="/setup"]>.section-card,.prem-nav a{transition:none;}
+}
