@@ -16,7 +16,7 @@ Safely reads from and writes to .env with chmod 0600 file permissions.
 import os
 import sys
 from html import escape as escape_html
-from src.premium_ui import premium_styles, premium_nav, premium_nav_js
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js, premium_reference_styles, premium_reference_js
 from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
@@ -389,6 +389,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     /* Save status styling lives in the shared premium design system. */
   </style>
   <!--PREMIUM_STYLES-->
+  <!--PREMIUM_REFERENCE_STYLES-->
 </head>
 <body>
   <div class="container">
@@ -398,11 +399,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="icon-badge">
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
       </div>
-      <h1 aria-label="Audit bot Setup &amp; Configuration">Setup &amp; Configuration</h1>
-      <p class="subtitle">Configure trading parameters, DhanHQ access, Telegram channels and risk limits. Existing safety and service controls remain in force.</p>
+      <h1 aria-label="Audit bot Setup &amp; Configuration"><span class="dash-header-gear" aria-hidden="true">⚙</span><span class="dash-header-title">Setup &amp; Configuration</span></h1>
+      <p class="subtitle">Configure trading, risk, AMO and notification settings</p>
+<div class="dash-header-status" aria-label="Verified operating status">
+  <span id="dashModeStatus" class="dash-header-pill">Verifying mode</span>
+  <a href="/#system-health" id="dashReconStatus" class="dash-header-check">Reconciliation: Verify</a>
+  <a href="/#system-health" id="dashGuardStatus" class="dash-header-check">OCO Guard: Verify</a>
+  <span id="dashClock" class="dash-clock" aria-label="Indian standard time">--:-- IST</span>
+</div>
+
     </div>
 
-    <!--SYSTEM_STATUS_BAR-->
+    <div id="dashOriginalSystemStatus"><!--SYSTEM_STATUS_BAR--></div>
 
     <!--STATUS_BANNER-->
 
@@ -419,6 +427,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           I explicitly authorize switching TEST to LIVE. Actual broker orders may be placed.
         </label>
       
+<div id="dashOverview" class="dash-overview" hidden>
+  <div class="dash-board-grid" aria-label="Key trading settings">
+    <section class="dash-card dash-bot" aria-labelledby="dash-bot-title">
+      <header class="dash-card-heading"><span class="dash-card-symbol" aria-hidden="true">▣</span><div><h2 id="dash-bot-title">Bot Configuration</h2><p>Core trading operation and signal settings</p></div><span class="dash-card-watermark" aria-hidden="true">↗</span></header>
+      <div class="dash-card-body">
+        <div class="dash-row"><label id="dash-mode-label">Trading Mode</label><div class="dash-mode-buttons" role="group" aria-labelledby="dash-mode-label"><button type="button" id="dashLiveButton" aria-pressed="false">◉ LIVE</button><button type="button" id="dashTestButton" aria-pressed="false">◯ TEST</button></div></div>
+        <div class="dash-row"><span>Equity Signals <span class="dash-help" title="Enable or disable NSE cash-equity signal processing">ⓘ</span></span><div id="dashEquitySlot" class="dash-switch-slot"></div></div>
+        <div class="dash-row"><span>Stock Options Signals</span><div id="dashFnoSlot" class="dash-switch-slot"></div></div>
+        <div class="dash-row"><span>Monitored Channels</span><span id="dashChannels" class="dash-readout">From saved settings</span></div>
+      </div>
+    </section>
+    <section class="dash-card dash-risk" aria-labelledby="dash-risk-title">
+      <header class="dash-card-heading"><span class="dash-card-symbol" aria-hidden="true">⬡</span><div><h2 id="dash-risk-title">Risk &amp; Protection</h2><p>Position sizing and automatic exit protection</p></div><span class="dash-card-watermark" aria-hidden="true">⬡</span></header>
+      <div class="dash-card-body dash-risk-body">
+        <div class="dash-field-slot" data-move="equity_sl_pct" data-label="Equity Stop Loss (SL)"></div>
+        <div class="dash-field-slot" data-move="equity_target_pct" data-label="Equity Target (TP)"></div>
+        <div class="dash-field-slot" data-move="fno_max_lots" data-label="Max Lots (F&amp;O)"></div>
+        <div class="dash-field-slot" data-move="fno_capital_per_trade" data-label="F&amp;O Budget (₹)"></div>
+        <div class="dash-field-slot" data-move="equity_budget_inr" data-label="Equity Budget (₹)"></div>
+      </div>
+    </section>
+    <section class="dash-card dash-amo" aria-labelledby="dash-amo-title">
+      <header class="dash-card-heading"><span class="dash-card-symbol" aria-hidden="true">▣</span><div><h2 id="dash-amo-title">AMO Settings</h2><p>After Market Order (AMO) configuration</p></div><span class="dash-card-watermark" aria-hidden="true">▦</span></header>
+      <div class="dash-card-body">
+        <div class="dash-row"><label for="dashEquityAmo">Equity AMO</label><input id="dashEquityAmo" class="dash-amo-switch" type="checkbox" role="switch" disabled aria-describedby="dashAmoHelp"></div>
+        <div class="dash-row"><label for="dashFnoAmo">F&amp;O AMO</label><input id="dashFnoAmo" class="dash-amo-switch" type="checkbox" role="switch" disabled aria-describedby="dashAmoHelp"></div>
+        <div class="dash-row"><span>AMO Dispatch Preference</span><span class="dash-readout dash-amo-time">Market Open (09:15 IST)</span></div>
+        <p id="dashAmoHelp" class="dash-amo-help" role="status" aria-live="polite">Verifying saved AMO settings; changes disabled until verified.</p>
+      </div>
+    </section>
+    <section class="dash-card dash-market" aria-labelledby="dash-market-title">
+      <header class="dash-card-heading"><span class="dash-card-symbol" aria-hidden="true">◇</span><div><h2 id="dash-market-title">Market &amp; Data</h2><p>Quotes, data freshness and scrip master</p></div><span class="dash-card-watermark" aria-hidden="true">▥</span></header>
+      <div class="dash-card-body">
+        <div class="dash-field-slot" data-move="max_quote_age_sec" data-label="Quote Staleness (sec)"></div>
+        <div class="dash-field-slot" data-move="equity_cmp_execution_policy" data-label="Equity Price Policy"></div>
+        <div class="dash-field-slot" data-move="scrip_master_max_age_sec" data-label="Scrip Cache Lifetime (sec)"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
       <!-- 1. Master Execution Mode & Segments -->
       <div id="setup-execution" class="section-card">
         <div class="section-title">
@@ -898,12 +947,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <button type="submit" class="btn-submit">
-        <span>💾</span> Save & Apply
-      </button>
+<div id="dashActionBar" class="dash-action-bar">
+  <button id="dashReset" type="button" class="dash-soft-button" disabled title="Discard unsaved form edits">↶ &nbsp; Reset</button>
+  <button id="dashSaveStopped" type="button" class="dash-soft-button" disabled title="Save without restarting is available only when the bot is verified stopped">▣ &nbsp; Save</button>
+  <button type="submit" class="btn-submit"><span>✓</span> Save &amp; Apply</button>
+</div>
+
+      <details id="dashAdvanced" class="dash-advanced" hidden><summary>Advanced Configuration <small>All remaining settings, credentials and monitoring</small></summary><div id="dashAdvancedBody"></div></details>
     </form>
   </div>
 
+  <script>/*PREMIUM_REFERENCE_JS*/</script>
   <div id="simpleSaveStatus" role="status" aria-live="polite" hidden><span id="toastMessage"></span><button type="button" id="toastDismiss" aria-label="Dismiss notification">×</button></div>
 <script>
 document.addEventListener('DOMContentLoaded', function () {
@@ -948,6 +1002,7 @@ document.addEventListener('DOMContentLoaded', function () {
       if (rev && result.revision) rev.value = result.revision;
       const verified = result.status === 'RESTARTED' && result.restart_performed === true;
       showToast(result.message || 'Save & Apply completed.', verified ? 'success' : 'neutral', 5200);
+      form.dispatchEvent(new CustomEvent('setup:saved', {detail: {status: result.status}}));
     } catch (error) {
       showToast(String(error.message || error) +
         ' Check service status and refresh before trying another change.', 'error', 0);
@@ -1089,6 +1144,8 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
 
     html = (
         HTML_TEMPLATE.replace("<!--PREMIUM_STYLES-->", premium_styles())
+        .replace("<!--PREMIUM_REFERENCE_STYLES-->", premium_reference_styles())
+        .replace("/*PREMIUM_REFERENCE_JS*/", premium_reference_js())
         .replace("<!--PREMIUM_NAV-->", premium_nav("setup"))
         .replace("/*PREMIUM_NAV_JS*/", premium_nav_js())
         .replace("<!--STATUS_BANNER-->", banner)

@@ -1,0 +1,124 @@
+/* Screenshot-aligned Setup layout. Existing authenticated forms and broker gates are untouched.
+   Dashboard controls reuse the original form elements and do not duplicate names. */
+.premium-setup body{padding:0 0 44px 272px!important;background:#07111e!important;color:#eaf1fd;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+.premium-setup .container{margin:0!important;padding:0 16px 34px 0!important;width:100%!important;max-width:none!important;background:transparent!important;border:none!important;box-shadow:none!important;border-radius:0!important}
+.premium-setup .prem-nav{width:272px!important;background:linear-gradient(166deg,#101f35 0%,#091626 74%,#091320 100%)!important;box-shadow:none!important;border-right:1px solid #27415e!important;padding:0 10px 25px!important}
+.premium-setup .prem-brand{height:85px;margin:0 -10px 12px;padding:9px 30px;border-bottom:1px solid #28425e}
+.premium-setup .prem-brand-icon{height:44px;width:44px;font-size:29px;background:linear-gradient(135deg,#0e507c,#2098db);color:#dff7ff}
+.premium-setup .prem-brand strong{font-size:25px;line-height:1;letter-spacing:-.05em}
+.premium-setup .prem-brand small{font-size:12px;letter-spacing:-.01em;line-height:1.1;margin-top:4px;color:#e1eaf7}
+.premium-setup .prem-nav-group{display:none}
+.premium-setup .prem-nav>a{display:flex;height:50px;font-size:15px;font-weight:530;padding:10px 20px;margin:5px 0 6px;border-radius:10px}
+.premium-setup .prem-nav>a span{font-size:23px;width:29px;color:#c5d7ee}
+.premium-setup .prem-nav>a[aria-current="page"]{background:linear-gradient(135deg,#1979d0,#0f4da1);border:1px solid #287ac4;box-shadow:0 6px 18px #00509936}
+.premium-setup .prem-nav-foot{display:none}
+.premium-setup .dash-sidebar-status{position:absolute;bottom:23px;left:22px;right:22px;padding:17px 16px 18px;border:1px solid #176b65;border-radius:15px;background:linear-gradient(160deg,#102d35,#0b1d2e 66%,#0a2634);min-height:156px;box-shadow:0 7px 24px #0003;overflow:hidden}
+.premium-setup .dash-sidebar-status::after{content:"";position:absolute;height:40px;width:120%;bottom:-23px;left:-10px;background:radial-gradient(ellipse at 45% 0,#1de6a033,transparent 66%);pointer-events:none}
+.premium-setup .dash-sidebar-title{display:flex;gap:10px;align-items:center;color:#4beaaf;font-size:17px;font-weight:800;margin:0 0 12px}
+.premium-setup .dash-dot{display:inline-block;flex:none;width:11px;height:11px;background:#74869e;border-radius:50%;box-shadow:0 0 0 3px #8b9cb211}
+.premium-setup .dash-dot.verified{background:#25e59e;box-shadow:0 0 10px #22eb9f77}
+.premium-setup .dash-sidebar-detail{font-size:13px;margin-top:8px;color:#c4d5eb}
+.premium-setup .dash-sidebar-detail b{color:#a3bfe1;font-weight:650}
+.premium-setup .header{position:relative;display:flex!important;flex-direction:column;justify-content:center;height:84px;margin:0 -16px 0 0!important;padding:11px 24px 12px 86px!important;border-bottom:1px solid #294058!important;background:linear-gradient(112deg,#101e34,#0b2138 63%,#0c192b 100%);box-shadow:0 5px 14px #010a181c;isolation:isolate}
+.premium-setup .header::after{content:"";pointer-events:none;position:absolute;right:44%;top:0;width:120px;height:83px;transform:skewX(-36deg);background:linear-gradient(100deg,transparent,#187bd227,transparent);z-index:0}
+.premium-setup .header h1{margin:0;font-size:26px;line-height:1.11;white-space:nowrap;color:#f5f8ff;letter-spacing:-.034em}
+.premium-setup .header .subtitle{margin-top:5px;font-size:13px;color:#c2d0e2;line-height:1.3}
+.premium-setup .dash-header-gear{position:absolute;left:26px;top:17px;display:grid;place-items:center;background:linear-gradient(145deg,#185c9f,#103b76);border-radius:12px;width:50px;height:49px;color:#d9f0ff;font-size:34px;box-shadow:inset 0 0 0 1px #356da7}
+.premium-setup .dash-header-status{position:absolute;top:19px;right:17px;display:flex;align-items:center;gap:0;height:44px;white-space:nowrap;z-index:1}
+.premium-setup .dash-header-pill{color:#92a8c3;background:#162b45;border:1px solid #30485f;border-radius:22px;padding:8px 17px;font-size:13px;font-weight:700}
+.premium-setup .dash-header-pill.verified-live{color:#51f4b3;background:#082b26;border-color:#0b8e55}
+.premium-setup .dash-header-pill.verified-test{color:#92cbff;background:#0c294c;border-color:#2779a6}
+.premium-setup .dash-header-check{border-left:1px solid #40536c;margin-left:19px;padding:3px 0 3px 19px;color:#bacbdd;text-decoration:none;font-size:12px;font-weight:650}
+.premium-setup .dash-header-check:hover{text-decoration:underline}
+.premium-setup .dash-clock{font-size:12px;border-radius:22px;color:#d3e2f6;background:#1b304a;border:1px solid #374e6b;padding:9px 12px;margin-left:18px}
+.premium-setup .dash-overview{margin:80px 0 0 24px}
+.premium-setup #dashOverview[hidden]{display:none}
+.premium-setup .dash-board-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:296px 232px;column-gap:20px;row-gap:19px}
+.premium-setup .dash-card{border:1px solid #294461;border-radius:17px;background:linear-gradient(159deg,#122339,#0e1b2d 85%);overflow:hidden;box-shadow:0 13px 28px #0003;min-width:0}
+.premium-setup .dash-card-heading{position:relative;height:66px;display:flex;align-items:center;gap:15px;padding:11px 25px;border-bottom:1px solid #35516f;background:linear-gradient(100deg,#19385a,#162c49 58%,#153355);overflow:hidden}
+.premium-setup .dash-card-heading::after{content:"";position:absolute;right:-27px;top:-19px;width:160px;height:90px;background:linear-gradient(121deg,transparent,#3d8df177);transform:skewX(-37deg);pointer-events:none;opacity:.45}
+.premium-setup .dash-card h2{font-size:19px;font-weight:800;letter-spacing:-.04em;color:#f5f8ff;margin:0 0 3px;line-height:1.06}
+.premium-setup .dash-card-heading p{color:#aebfd5;font-size:12.5px;margin:0}
+.premium-setup .dash-card-symbol{height:43px;width:44px;flex:none;display:grid;place-items:center;border-radius:12px;background:linear-gradient(140deg,#216eb6,#123c7f);font-size:25px;color:#d3e9ff;box-shadow:inset 0 0 0 1px #4a87bf}
+.premium-setup .dash-card-watermark{margin-left:auto;font-size:37px;color:#8eb7e0;opacity:.78;position:relative;z-index:1}
+.premium-setup .dash-risk .dash-card-heading{background:linear-gradient(96deg,#282c67,#212750 65%,#2c2465);border-bottom-color:#48417d}
+.premium-setup .dash-risk .dash-card-heading::after{background:linear-gradient(121deg,transparent,#7157ff9c)}
+.premium-setup .dash-risk .dash-card-symbol{background:linear-gradient(135deg,#4557b5,#292c7e);box-shadow:inset 0 0 0 1px #6774cb}
+.premium-setup .dash-amo .dash-card-heading{background:linear-gradient(100deg,#143b69,#19314d 64%,#534023)}
+.premium-setup .dash-amo .dash-card-heading::after{background:linear-gradient(121deg,transparent,#f7b43eaf)}
+.premium-setup .dash-market .dash-card-heading{background:linear-gradient(99deg,#2b317c,#252a65 63%,#38216a)}
+.premium-setup .dash-market .dash-card-heading::after{background:linear-gradient(121deg,transparent,#9953ffa0)}
+.premium-setup .dash-market .dash-card-symbol{background:linear-gradient(145deg,#555bbd,#2c378f);box-shadow:inset 0 0 0 1px #6677e3}
+.premium-setup .dash-card-body{padding:14px 25px 12px}
+.premium-setup .dash-row{display:grid;grid-template-columns:minmax(110px,1fr) minmax(210px,55%);gap:14px;align-items:center;height:45px;font-size:13.2px;font-weight:540;color:#e9f0fa}
+.premium-setup .dash-row label{margin:0;font-size:13.2px;font-weight:540;color:inherit}
+.premium-setup .dash-row .dash-help{color:#7fa8ce;cursor:help}
+.premium-setup .dash-readout{justify-self:stretch;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#101e31;color:#d9e5f6;border:1px solid #385470;border-radius:9px;padding:10px 12px;font-size:12.5px}
+.premium-setup .dash-mode-buttons{display:grid;grid-template-columns:1fr 1fr;border:1px solid #3b5774;border-radius:11px;overflow:hidden;height:40px;background:#112037}
+.premium-setup .dash-mode-buttons button{font-size:14px;font-weight:750;border:none;cursor:pointer;color:#adbed5;background:transparent}
+.premium-setup .dash-mode-buttons button[aria-pressed="true"]{background:linear-gradient(120deg,#13b983,#0d915f);color:#fafffd;box-shadow:0 2px 12px #00c38937}
+.premium-setup .dash-mode-buttons button#dashTestButton[aria-pressed="true"]{background:linear-gradient(110deg,#1f70b5,#204d9a)}
+.premium-setup .dash-switch-slot{display:flex;justify-content:flex-end}
+.premium-setup .dash-switch-slot .switch{display:inline-block;width:48px;height:26px}
+.premium-setup .dash-switch-slot .switch .slider:before{height:20px;width:20px}
+.premium-setup .dash-switch-slot .switch input:checked+.slider{background:#00b783}
+.premium-setup .dash-field-slot .form-group{display:grid;grid-template-columns:minmax(122px,1fr) minmax(190px,54%);gap:14px;align-items:center;margin:0;min-height:39px}
+.premium-setup .dash-field-slot .form-group>label{margin:0;min-width:0;color:#e6eef9;font-size:12.5px;font-weight:520;line-height:1.2}
+.premium-setup .dash-field-slot .form-group .help-text{display:none}
+.premium-setup .dash-field-slot .input-wrap{min-width:0}
+.premium-setup .dash-field-slot .input-wrap input,.premium-setup .dash-field-slot .input-wrap select{width:100%;min-width:0;height:34px;min-height:34px!important;padding:6px 12px;font-size:13.2px;border-radius:9px;background:#0e192b;border:1px solid #3a5876}
+.premium-setup .dash-field-slot .input-wrap select{font-size:11.6px;text-overflow:ellipsis;padding-right:15px}
+.premium-setup .dash-risk-body{padding-top:13px}
+.premium-setup .dash-market .dash-card-body{padding-top:10px}
+.premium-setup .dash-market .dash-field-slot .form-group{min-height:46px}
+.premium-setup .dash-amo-switch{justify-self:end;appearance:none;cursor:not-allowed;width:49px;height:27px;border:1px solid #547089;border-radius:19px;background:#41526a;position:relative;margin:0;transition:background .16s}
+.premium-setup .dash-amo-switch:before{content:"";position:absolute;height:19px;width:19px;border-radius:50%;top:3px;left:3px;background:#f8fbff;transition:transform .16s}
+.premium-setup .dash-amo-switch:checked{background:#0fbb84;border-color:#21c799}
+.premium-setup .dash-amo-switch:checked:before{transform:translateX(21px)}
+.premium-setup .dash-amo-switch:disabled{opacity:.63}
+.premium-setup .dash-amo-switch:not(:disabled){cursor:pointer}
+.premium-setup .dash-amo .dash-amo-help{font-size:10px;color:#96aec8;margin:5px 0 0;line-height:1.35}
+.premium-setup .dash-action-bar{margin:30px 0 0 24px;min-height:80px;border:1px solid #314e6b;border-radius:16px;background:linear-gradient(145deg,#14253c,#101c2e);display:flex;align-items:center;justify-content:flex-end;gap:18px;padding:12px 15px;box-shadow:0 13px 26px #0003}
+.premium-setup .dash-action-bar button{font:650 13.5px Inter,system-ui,sans-serif;height:49px;min-width:120px;display:inline-flex;align-items:center;justify-content:center;border-radius:11px;cursor:pointer}
+.premium-setup .dash-action-bar .dash-soft-button{color:#e2ecfa;background:linear-gradient(#263950,#17273c);border:1px solid #425e79}
+.premium-setup .dash-action-bar .dash-soft-button:disabled{opacity:.52;cursor:not-allowed}
+.premium-setup .dash-action-bar .btn-submit{margin:0;min-width:204px;height:50px;padding:0 24px;background:linear-gradient(125deg,#0793e4,#1a64e2);box-shadow:0 4px 18px #007bdf57;font-size:14px}
+.premium-setup .dash-action-bar .btn-submit:hover{background:linear-gradient(125deg,#17b1ef,#267aed)}
+.premium-setup .dash-advanced{display:block;margin:24px 0 40px 24px;border:1px solid #2a435e;background:#0e1c2e;border-radius:14px;overflow:hidden}
+.premium-setup .dash-advanced[hidden]{display:none}
+.premium-setup .dash-advanced summary{display:flex;align-items:center;gap:12px;cursor:pointer;padding:18px 22px;font-size:15px;font-weight:750;color:#dceafb;list-style:none}
+.premium-setup .dash-advanced summary:after{content:'⌄';margin-left:auto;color:#91bfdf;font-size:19px}
+.premium-setup .dash-advanced[open] summary:after{transform:rotate(180deg)}
+.premium-setup .dash-advanced summary small{color:#9bb2c8;font-size:11px;font-weight:420}
+.premium-setup #dashAdvancedBody{padding:14px 20px 22px}
+.premium-setup #dashAdvancedBody>.section-card{margin-bottom:14px}
+.premium-setup #dashAdvancedBody .grid-2:empty,.premium-setup #dashAdvancedBody .grid-3:empty{display:none}
+.premium-setup #dashAdvancedBody .form-group:empty{display:none}
+.premium-setup #dashAdvancedBody .toggle-row{padding:10px 14px}
+.premium-setup .dash-live-confirm{display:flex;margin:0 0 12px;padding:12px;border:1px solid #725732;border-radius:10px;background:#2e271d;color:#ebd4b4;font-size:12px}
+.premium-setup #dashOriginalSystemStatus{margin:14px 0 0 24px}
+.premium-setup #dashOriginalSystemStatus .system-status-panel{margin:0}
+.premium-setup .dash-status-advanced{margin-top:12px}
+.premium-setup .dash-alerts[hidden]{display:none}
+.premium-setup .dash-alerts{margin:14px 0 0 24px;color:#ffdba3;font-size:12px}
+.premium-setup .header .dash-header-status .verified-state{color:#35eaa5}
+@media(min-width:1120px){.premium-setup .prem-nav-toggle{display:none!important}.premium-setup #premNav{visibility:visible!important;transform:none!important}}
+@media(max-width:1480px){.premium-setup .dash-header-status{right:13px;gap:0}.premium-setup .dash-header-check{margin-left:11px;padding-left:11px;font-size:11px}.premium-setup .dash-card-heading{padding:11px 18px}.premium-setup .dash-card-body{padding-left:18px;padding-right:18px}}
+@media(max-width:1280px){.premium-setup .dash-header-status{position:relative;right:auto;top:auto;height:auto;margin-top:10px;justify-content:flex-start}.premium-setup .header{height:112px;justify-content:center}.premium-setup .dash-overview{margin-top:30px}.premium-setup .dash-board-grid{grid-template-rows:auto auto}.premium-setup .dash-card{min-height:232px}.premium-setup .dash-card-heading p{font-size:11px}}
+@media(max-width:1119px){.premium-setup body{padding:0!important}.premium-setup .container{padding:0 12px 22px!important}.premium-setup .header{margin:0 -12px!important;height:auto;min-height:110px;padding:18px 20px 17px 82px!important}.premium-setup .prem-nav-toggle{position:fixed;right:17px;bottom:18px;z-index:1000;box-shadow:0 6px 25px #000a}.premium-setup .dash-overview,.premium-setup .dash-action-bar,.premium-setup .dash-advanced,.premium-setup #dashOriginalSystemStatus{margin-left:0}}
+@media(max-width:780px){.premium-setup .dash-board-grid{display:flex;flex-direction:column}.premium-setup .dash-card{min-height:unset}.premium-setup .dash-card-heading{height:69px}.premium-setup .dash-card-body{padding-bottom:18px}.premium-setup .dash-action-bar{gap:8px;padding:12px}.premium-setup .dash-action-bar button{min-width:0;flex:1}.premium-setup .dash-action-bar .btn-submit{min-width:0;flex:1.4}.premium-setup .dash-header-status{flex-wrap:wrap;gap:8px}.premium-setup .dash-header-check{border-left:0;margin-left:0;padding-left:0}.premium-setup .header{padding-top:15px!important;padding-bottom:15px!important}.premium-setup .header h1{white-space:normal;font-size:20px}}
+@media(max-width:510px){.premium-setup .dash-field-slot .form-group{grid-template-columns:minmax(0,1fr) minmax(112px,49%)}.premium-setup .dash-row{grid-template-columns:minmax(0,1fr) minmax(120px,49%)}.premium-setup .dash-card-heading{padding:10px 12px}.premium-setup .dash-card-heading p{font-size:10px}.premium-setup .dash-card h2{font-size:17px}.premium-setup .dash-card-heading .dash-card-watermark{font-size:21px}.premium-setup .header{padding-left:71px!important}.premium-setup .dash-header-gear{left:15px;width:40px;height:42px;font-size:27px}.premium-setup .dash-header-status{font-size:10px}.premium-setup .dash-header-check{font-size:10px}.premium-setup .dash-clock{margin-left:0}}
+@media(prefers-reduced-motion:reduce){.premium-setup .dash-amo-switch,.premium-setup .dash-amo-switch:before{transition:none}}
+/* PR100 used a six-card grid only at very wide widths; disable that old form
+   layout so the new four-card overview controls the complete content width. */
+@media(min-width:1500px){
+  .premium-setup form[action="/setup"]{display:block!important;grid-template-columns:none!important;gap:0!important}
+  .premium-setup form[action="/setup"]>.dash-overview,
+  .premium-setup form[action="/setup"]>.dash-action-bar,
+  .premium-setup form[action="/setup"]>.dash-advanced{grid-column:auto!important}
+}
+.premium-setup.dash-ready .setup-section-jumps{display:none!important}
+.premium-setup.dash-ready #dashOriginalSystemStatus{display:none}
+.premium-setup.dash-ready .dash-advanced #dashOriginalSystemStatus{display:block}
+
+.premium-setup.dash-ready #dashAdvancedBody .toggle-row.dash-relocated{display:none}
