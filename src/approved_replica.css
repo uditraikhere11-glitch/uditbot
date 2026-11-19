@@ -107,3 +107,88 @@
 .premium-setup a.replica-readonly-toggle{cursor:pointer;text-decoration:none}.premium-setup a.replica-readonly-toggle:hover{outline:2px solid #6687a1;outline-offset:2px}
 
 .premium-setup .replica-advanced{margin-top:54px}
+
+/* SAFETY-LOCKED UI REFINEMENT — VISUAL ONLY.
+ * The six original Setup cards remain the sole owners of all 54 submitted
+ * fields. No cloned inputs, relocated controls, changes to names, constraints,
+ * defaults, validation, submit behavior, or AMO broker operations.
+ */
+.premium-setup #replicaAdvanced.replica-advanced{
+  margin:27px 0 22px;padding:0;border:0;background:transparent;border-radius:0;
+}
+.premium-setup #replicaAdvanced.replica-advanced>summary{
+  position:relative;cursor:pointer;list-style-position:inside;
+  margin:0 0 17px;padding:19px 22px;
+  background:linear-gradient(100deg,#12263e,#132b46 63%,#11243d);
+  color:#eaf4ff;border:1px solid #2d4865;border-radius:13px;
+  font-size:17px;line-height:1.4;letter-spacing:-.015em;
+}
+.premium-setup #replicaAdvanced.replica-advanced>summary::after{
+  content:'ALL ORIGINAL SETTINGS';float:right;position:relative;top:2px;
+  color:#88b7dc;font-size:10px;letter-spacing:.13em;font-weight:800;
+}
+.premium-setup #replicaAdvanced.replica-advanced[open]>.replica-advanced-body{
+  padding:0 0 22px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:18px 20px;align-items:start;
+}
+.premium-setup #replicaAdvanced .replica-advanced-body>label.toggle-row{
+  grid-column:1/-1;margin:0!important;padding:12px 16px;
+  color:#f3dcb6;border-color:#6d5a40;background:#2b2730;border-radius:11px;
+}
+.premium-setup #replicaAdvanced .replica-advanced-body>.section-card{
+  min-width:0;margin:0;padding:18px 19px 20px;border-radius:15px;
+  background:linear-gradient(155deg,#14273e,#0d1d30 87%);
+  border:1px solid #2b4a68;box-shadow:0 10px 25px rgba(0,5,14,.18);
+  overflow:hidden;
+}
+.premium-setup #replicaAdvanced .section-title{
+  min-height:60px;display:flex;align-items:center;gap:10px;
+  margin:-18px -19px 18px;padding:14px 18px;
+  border-bottom:1px solid #304d68;
+  background:linear-gradient(105deg,#1c4168,#162b44 82%);
+  font-size:15px;line-height:1.3;font-weight:730;color:#f2f7ff;
+}
+.premium-setup #replicaAdvanced .section-title svg{
+  flex:none;width:33px;height:33px;padding:5px;
+  border-radius:9px;background:rgba(46,143,215,.17);stroke:#92d1ff;
+}
+.premium-setup #replicaAdvanced #setup-broker .section-title,
+.premium-setup #replicaAdvanced #setup-risk .section-title{
+  background:linear-gradient(105deg,#322b61,#202542 83%);
+}
+.premium-setup #replicaAdvanced #setup-protection .section-title{
+  background:linear-gradient(105deg,#40334d,#222940 83%);
+}
+.premium-setup #replicaAdvanced .input-wrap input,
+.premium-setup #replicaAdvanced .input-wrap select{
+  width:100%;max-width:100%;color:#f1f7ff;background:#0e1e33;
+  border-color:#385874;min-height:41px;
+}
+.premium-setup #replicaAdvanced .section-card .grid-2,
+.premium-setup #replicaAdvanced .section-card .grid-3{
+  grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;
+}
+.premium-setup #replicaAdvanced .section-card .form-group{
+  min-width:0;
+}
+.premium-setup #replicaAdvanced .section-card .help-text{
+  overflow-wrap:anywhere;font-size:11px;line-height:1.45;
+}
+/* At smaller sizes, keep real inputs fully accessible and usable. */
+@media(max-width:1150px){
+  .premium-setup #replicaAdvanced.replica-advanced[open]>.replica-advanced-body{
+    grid-template-columns:1fr;
+  }
+}
+@media(max-width:730px){
+  .premium-setup #replicaAdvanced.replica-advanced>summary{
+    font-size:14px;padding:16px 13px;
+  }
+  .premium-setup #replicaAdvanced.replica-advanced>summary::after{display:none}
+  .premium-setup #replicaAdvanced .section-card .grid-2,
+  .premium-setup #replicaAdvanced .section-card .grid-3{
+    grid-template-columns:1fr;
+  }
+  .premium-setup #replicaAdvanced .replica-advanced-body>.section-card{padding:15px}
+  .premium-setup #replicaAdvanced .section-title{margin:-15px -15px 14px;padding:12px 14px}
+}

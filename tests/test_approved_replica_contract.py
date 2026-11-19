@@ -89,3 +89,62 @@ class ApprovedReplicaContract(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CSSOnlyReliabilityContracts(unittest.TestCase):
+    """Lock original configuration semantics while skinning the three pages."""
+
+    def test_exact_54_form_control_contract(self):
+        import hashlib
+        import json
+        from html.parser import HTMLParser
+
+        class SavedFields(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.fields = []
+            def handle_starttag(self, tag, attrs):
+                if tag in {'input', 'select', 'textarea'} and dict(attrs).get('name'):
+                    self.fields.append((tag, tuple(sorted(attrs))))
+
+        parser = SavedFields()
+        parser.feed(template_constants()['HTML_TEMPLATE'])
+        encoded = json.dumps(parser.fields, ensure_ascii=False, separators=(',', ':'))
+        self.assertEqual(len(parser.fields), 54)
+        self.assertEqual(hashlib.sha256(encoded.encode()).hexdigest(),
+                         '89f72336971cddc6a4cee394aaf75a98e1b94908ff74b5d3fb4e591b8dfcbf80',
+                         'An original field name/type/constraint/default changed; UI-only contract violated')
+
+    def test_only_existing_advanced_disclosure_initial_state_changed(self):
+        from hashlib import sha256
+        original_script = (ROOT / 'src/approved_replica.js').read_text(encoding='utf-8')
+        target = 'advanced.open = true;  // Display the unchanged working Setup controls by default.'
+        self.assertEqual(original_script.count(target), 1)
+        normalized = original_script.replace(target, 'advanced.open = false;')
+        self.assertEqual(sha256(normalized.encode()).hexdigest(),
+                         'b163edc8212f1db80c99ba1049cda9deb1fe68667e978d2a7da08cddde4eacc7',
+                         'A nonvisual action, request or edit listener was changed')
+
+    def test_all_original_configuration_cards_are_visible(self):
+        page = template_constants()['HTML_TEMPLATE']
+        for key in ('setup-execution', 'setup-telegram', 'setup-broker',
+                    'setup-sizing', 'setup-risk', 'setup-protection'):
+            self.assertIn('id="'+key+'"', page)
+        self.assertIn('<details id="replicaAdvanced"', page)
+        self.assertEqual(page.count('class="section-card"'), 6)
+        css = (ROOT / 'src/approved_replica.css').read_text(encoding='utf-8')
+        self.assertIn('#replicaAdvanced.replica-advanced[open]>.replica-advanced-body', css)
+        self.assertIn('grid-template-columns:repeat(2,minmax(0,1fr))', css)
+
+    def test_no_new_script_or_backend_api_in_global_skin(self):
+        css = (ROOT / 'src/premium_ui.css').read_text(encoding='utf-8')
+        self.assertIn('Shared approved header and card geometry', css)
+        self.assertIn('.premium-control main>header', css)
+        self.assertIn('.premium-designer main>.top', css)
+        self.assertNotIn('@import', css)
+        # Setup's real backend remains one Save & Apply endpoint, not a new API.
+        page = template_constants()['HTML_TEMPLATE']
+        self.assertEqual(page.count("fetch('/setup/save-apply'"), 1)
+        self.assertIn('name="csrf_token"', page)
+        self.assertIn('name="expected_revision"', page)
+        self.assertIn('name="confirm_live"', page)

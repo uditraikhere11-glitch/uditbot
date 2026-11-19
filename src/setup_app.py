@@ -16,7 +16,7 @@ Safely reads from and writes to .env with chmod 0600 file permissions.
 import os
 import sys
 from html import escape as escape_html
-from src.premium_ui import premium_styles, premium_nav, premium_nav_js, approved_replica_styles, approved_replica_js, systemwide_styles
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js, approved_replica_styles, approved_replica_js
 from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
@@ -73,7 +73,7 @@ APPROVED_REFERENCE_BOARD = r'''<div id="replicaBoard" class="replica-board" aria
     <div class="replica-rows">
       <div class="replica-row"><span class="replica-label">Trading Mode</span><div class="replica-modes replica-field" role="group" aria-label="Saved trading mode, applied on Save & Apply"><button id="replicaLive" type="button" aria-pressed="false">◉ &nbsp; LIVE</button><button id="replicaTest" type="button" class="replica-test" aria-pressed="true">◯ &nbsp; TEST</button></div></div>
       <div class="replica-row"><span class="replica-label">Trading Switch <a class="replica-link" href="/" aria-label="Manage running bot in Control Center">ⓘ</a></span><a id="replicaServiceState" href="/" class="replica-readonly-toggle" data-on="false" title="Manage the bot service in Control Center" aria-label="Open Control Center to manage the trading service"></a></div>
-      <div class="replica-row"><span class="replica-label">Signal Channels</span><div class="replica-field" style="text-align:right"><a class="replica-link" href="#setup-telegram" id="replicaSources">Edit monitored channels in Settings</a></div></div>
+      <div class="replica-row"><span class="replica-label">Signal Channels</span><div class="replica-field" style="text-align:right"><a class="replica-link" href="#setup-telegram" id="replicaSources">Edit monitored channels in Advanced</a></div></div>
       <div class="replica-row"><label for="replicaPerOrder">Per Order Amount (₹)</label><div class="replica-field"><input id="replicaPerOrder" type="number" min="0.01" step="any" data-mirror="equity_budget_inr" disabled></div></div>
     </div>
   </section>
@@ -430,7 +430,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </style>
   <!--PREMIUM_STYLES-->
   <!--APPROVED_REPLICA_STYLES-->
-  <!--SYSTEMWIDE_STYLES-->
 </head>
 <body>
   <div class="container">
@@ -460,7 +459,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!--STATUS_BANNER-->
 
     <form method="POST" action="/setup">
-
+      <nav class="setup-section-jumps" aria-label="Setup sections">
+        <a href="#setup-execution">Execution</a><a href="#setup-telegram">Telegram</a><a href="#setup-broker">Dhan Broker</a>
+        <a href="#setup-sizing">Sizing</a><a href="#setup-risk">Risk Controls</a><a href="#setup-protection">Protection</a>
+      </nav>
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
         <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
         <input type="hidden" name="full_setup_form" value="1">
@@ -472,17 +474,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button id="replicaApply" type="submit" class="btn-submit"><span>✓</span> Save &amp; Apply</button>
       </div>
 
-      <section id="replicaAdvanced" class="replica-advanced replica-settings" aria-labelledby="replicaAllSettingsTitle">
-        <div class="replica-settings-intro">
-          <div><span class="replica-eyebrow">COMPLETE CONFIGURATION</span>
-            <h2 id="replicaAllSettingsTitle">All Trading &amp; System Settings</h2>
-            <p>Every existing configuration control is available here, organized into focused cards. Changes stay unsaved until Save &amp; Apply.</p></div>
-          <span class="replica-settings-count">6 detailed sections</span>
-        </div>
-      <nav class="setup-section-jumps" aria-label="Setup sections">
-        <a href="#setup-execution">Execution</a><a href="#setup-telegram">Telegram</a><a href="#setup-broker">Dhan Broker</a>
-        <a href="#setup-sizing">Sizing</a><a href="#setup-risk">Risk Controls</a><a href="#setup-protection">Protection</a>
-      </nav>
+      <details id="replicaAdvanced" class="replica-advanced" open>
+        <summary>Advanced Configuration — Telegram, Dhan, account limits, and detailed protections</summary>
         <div class="replica-advanced-body">
                 <label class="toggle-row" style="margin:12px 0;gap:12px;">
           <input type="checkbox" name="confirm_live" value="true" style="width:18px;height:18px;">
@@ -969,7 +962,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
         </div>
-      </section>
+      </details>
       <div class="replica-extras">
         <div id="replicaPending" class="replica-info" role="status">All displayed values come from saved configuration</div>
         <details class="replica-diagnostics"><summary>Runtime diagnostics and existing status details</summary>
@@ -1167,7 +1160,6 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         HTML_TEMPLATE.replace("<!--PREMIUM_STYLES-->", premium_styles())
         .replace("<!--PREMIUM_NAV-->", premium_nav("setup"))
         .replace("<!--APPROVED_REPLICA_STYLES-->", approved_replica_styles())
-        .replace("<!--SYSTEMWIDE_STYLES-->", systemwide_styles())
         .replace("<!--APPROVED_REFERENCE_BOARD-->", APPROVED_REFERENCE_BOARD)
         .replace("/*APPROVED_REPLICA_JS*/", approved_replica_js())
         .replace("/*PREMIUM_NAV_JS*/", premium_nav_js())

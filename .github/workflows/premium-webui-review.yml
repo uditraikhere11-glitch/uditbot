@@ -8,8 +8,6 @@ on:
       - 'src/notifier/message_designer_ui.py'
       - 'src/premium_ui.*'
       - 'src/approved_replica.*'
-      - 'src/systemwide_ui.*'
-      - 'tests/test_systemwide_ui_contract.py'
       - 'tests/test_approved_replica_contract.py'
       - 'tests/test_premium_ui_contract.py'
       - '.github/workflows/premium-webui-review.yml'
@@ -37,7 +35,7 @@ jobs:
       - name: Verify premium UI syntax and contracts
         run: |
           python -m compileall -q src/premium_ui.py src/setup_app.py src/control_center_ui.py src/notifier/message_designer_ui.py
-          python -m unittest -v tests.test_premium_ui_contract tests.test_approved_replica_contract tests.test_systemwide_ui_contract tests.test_control_center_ui_contract tests.test_message_designer
+          python -m unittest -v tests.test_premium_ui_contract tests.test_control_center_ui_contract tests.test_message_designer tests.test_approved_replica_contract
           git diff --check
       - name: Create exact changed-files ZIP and independent patch
         env:
@@ -64,9 +62,7 @@ jobs:
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
                      'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
                      'src/approved_replica.css', 'src/approved_replica.js',
-                     'src/systemwide_ui.css', 'src/systemwide_ui.js',
-                     'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py',
-                     'tests/test_systemwide_ui_contract.py', 'tests/test_webui_integrated_acceptance.py',
+                     'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           assert set(paths).issubset(allowed), f'Unexpected changed file(s): {set(paths) - set(allowed)}'
           manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head, 'files': {}}

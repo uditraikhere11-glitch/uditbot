@@ -84,3 +84,74 @@ body.prem-drawer-open{overflow:hidden}
   .premium-setup form[action="/setup"]>.section-card{margin-bottom:0;min-width:0}
   .premium-setup form[action="/setup"]>.btn-submit{justify-self:end}
 }
+/* Shared approved header and card geometry across existing WebUI pages.
+ * Pure CSS: no new controls, scripts, requests, service or broker state.
+ * Existing page DOM, authenticated routes, configuration and actions remain
+ * the sole sources of functionality. */
+.premium-control main>header,
+.premium-designer main>.top{
+  min-height:83px;
+  background:linear-gradient(110deg,#0e1e36,#0c213d 45%,#0b1729 82%);
+  border:1px solid #29415e;border-radius:12px;
+  padding:13px 24px 12px;
+  margin-bottom:22px;
+  box-shadow:0 8px 25px rgba(0,5,14,.17);
+}
+.premium-control main>header h1,
+.premium-designer main>.top h1{
+  margin:0 0 3px;font-size:25px;font-weight:750;
+  line-height:1.2;color:#f2f7ff;letter-spacing:-.045em;
+}
+.premium-control main>header .subtitle,
+.premium-designer main>.top p{
+  font-size:12px;line-height:1.4;color:#afc6e0;margin:0;
+}
+.premium-control main>header .logo-icon{
+  width:47px;height:47px;flex-shrink:0;border-radius:12px;
+  background:linear-gradient(135deg,#1764a3,#164372);
+  box-shadow:0 6px 19px rgba(10,106,208,.22);
+}
+.premium-control section,
+.premium-designer .card{
+  background:linear-gradient(155deg,#14273e,#0e1d30 87%);
+  border-color:#2d4966;border-radius:15px;
+  box-shadow:0 10px 25px rgba(0,5,14,.15);
+}
+.premium-control section>h2,
+.premium-designer .card h2{
+  color:#f1f7ff;letter-spacing:-.015em;
+}
+.premium-control .tile,
+.premium-control .status-note,
+.premium-designer #preview{
+  border-color:#304e69;background:#10243a;
+}
+/* Existing Control Center sections become a responsive two-column visual grid;
+ * their actual service/AMO buttons and behavior remain untouched. */
+@media(min-width:1280px){
+  .premium-control main{
+    display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:19px 22px;align-items:start;
+  }
+  .premium-control main>header{grid-column:1/-1;margin-bottom:0;min-width:0}
+  .premium-control main>section{min-width:0;margin:0}
+}
+@media(max-width:760px){
+  .premium-control main>header,
+  .premium-designer main>.top{min-height:85px;padding:15px 14px;margin-bottom:16px}
+  .premium-control main>header h1,
+  .premium-designer main>.top h1{font-size:20px}
+  .premium-control main>header .subtitle,
+  .premium-designer main>.top p{font-size:11px}
+}
+@media(max-width:600px){
+  .premium-control main>header{flex-wrap:wrap;gap:10px;min-width:0}
+  .premium-control main>header>.logo{min-width:0}
+  .premium-control main>header>div:last-child{
+    width:100%;min-width:0;flex-wrap:wrap;justify-content:flex-start;
+  }
+  .premium-control main>header>div:last-child button,
+  .premium-control main>header>div:last-child a.setup{
+    padding:9px 12px;font-size:12px;
+  }
+}
