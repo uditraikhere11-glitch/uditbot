@@ -16,7 +16,7 @@ Safely reads from and writes to .env with chmod 0600 file permissions.
 import os
 import sys
 from html import escape as escape_html
-from src.premium_ui import premium_styles, premium_nav, premium_nav_js
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js, premium_replica_js
 from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
@@ -399,14 +399,54 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
       </div>
       <h1 aria-label="Audit bot Setup &amp; Configuration">Setup &amp; Configuration</h1>
-      <p class="subtitle">Configure trading parameters, DhanHQ access, Telegram channels and risk limits. Existing safety and service controls remain in force.</p>
+      <p class="subtitle">Configure trading, risk, AMO and notification settings.</p>
     </div>
 
-    <!--SYSTEM_STATUS_BAR-->
+    <div class="rp-header-status" role="status" aria-live="polite">
+      <span id="rp-top-service" data-state="neutral">Service: checking…</span>
+      <span id="rp-top-mode" data-state="neutral">Mode: checking…</span>
+      <span id="rp-top-recon" data-state="neutral">Reconciliation: not verified</span>
+      <span id="rp-top-oco" data-state="neutral">OCO Guard: not verified</span>
+    </div>
+    <div class="rp-status-details"><!--SYSTEM_STATUS_BAR--></div>
 
     <!--STATUS_BANNER-->
 
     <form method="POST" action="/setup">
+      <div id="replica-grid" class="replica-grid">
+        <section class="rp-card rp-bot" aria-labelledby="rp-bot-title">
+          <div class="rp-card-head"><span class="rp-card-icon">▣</span><div><h2 id="rp-bot-title">Bot Configuration</h2><p>Core trading operation and signal settings</p></div><span class="rp-card-art" aria-hidden="true">↗</span></div>
+          <div class="rp-card-body">
+            <div class="rp-setting rp-mode-row"><span class="rp-row-label">Trading Mode</span><div class="rp-mode-buttons"><button id="rp-live-button" type="button" aria-pressed="false">◉ LIVE</button><button id="rp-test-button" type="button" aria-pressed="false">◯ TEST</button></div><span id="rp-mode-label" class="rp-sr-only">Checking</span><div id="rp-mode" class="rp-original-field"></div></div>
+            <div class="rp-setting rp-signal-row"><span class="rp-row-label">Trading Segments</span><div class="rp-signal-switches"><div id="rp-equity-switch"></div><div id="rp-fno-switch"></div></div></div>
+            <div class="rp-setting" id="rp-sources"></div>
+            <div class="rp-setting" id="rp-order-cap"></div>
+          </div>
+        </section>
+        <section class="rp-card rp-risk" aria-labelledby="rp-risk-title">
+          <div class="rp-card-head"><span class="rp-card-icon">♢</span><div><h2 id="rp-risk-title">Risk &amp; Protection</h2><p>Position sizing and automatic exit protection</p></div><span class="rp-card-art" aria-hidden="true">♢</span></div>
+          <div class="rp-card-body">
+            <div class="rp-setting" id="rp-equity-sl"></div><div class="rp-setting" id="rp-equity-tp"></div>
+            <div class="rp-setting" id="rp-fno-lots"></div><div class="rp-setting" id="rp-fno-budget"></div>
+            <div class="rp-setting" id="rp-equity-budget"></div>
+          </div>
+        </section>
+        <section class="rp-card rp-amo" aria-labelledby="rp-amo-title">
+          <div class="rp-card-head"><span class="rp-card-icon">▦</span><div><h2 id="rp-amo-title">AMO Settings</h2><p>After Market Order (AMO) configuration</p></div><span class="rp-card-art" aria-hidden="true">▦</span></div>
+          <div class="rp-card-body">
+            <label class="rp-setting rp-amo-row"><span>Equity AMO</span><input type="checkbox" role="switch" id="rp-amo-equity" disabled></label>
+            <label class="rp-setting rp-amo-row"><span>F&amp;O AMO</span><input type="checkbox" role="switch" id="rp-amo-fno" disabled></label>
+            <div class="rp-setting rp-readonly"><span>AMO Dispatch Preference</span><strong>Market Open (broker native)</strong></div>
+            <p id="rp-amo-feedback" class="rp-amo-note" role="status" aria-live="polite">Verifying saved AMO settings…</p>
+          </div>
+        </section>
+        <section class="rp-card rp-market" aria-labelledby="rp-market-title">
+          <div class="rp-card-head"><span class="rp-card-icon">▱</span><div><h2 id="rp-market-title">Market &amp; Data</h2><p>Quotes, data freshness and scrip master</p></div><span class="rp-card-art" aria-hidden="true">▥</span></div>
+          <div class="rp-card-body"><div class="rp-setting" id="rp-quote-age"></div><div class="rp-setting" id="rp-price-policy"></div><div class="rp-setting" id="rp-scrip-refresh"></div></div>
+        </section>
+      </div>
+      <div id="rp-actions" class="rp-form-actions"><button type="reset" class="rp-secondary" id="rp-reset">↺ Reset unsaved edits</button><span>Changes require Save &amp; Apply verification. Separate save-only is not supported.</span></div>
+      <details id="replica-advanced" class="rp-advanced"><summary>Advanced Configuration <span>Telegram · Credentials · Sizing · Risk Controls · Protection</span></summary><div id="replica-advanced-content"></div></details>
       <nav class="setup-section-jumps" aria-label="Setup sections">
         <a href="#setup-execution">Execution</a><a href="#setup-telegram">Telegram</a><a href="#setup-broker">Dhan Broker</a>
         <a href="#setup-sizing">Sizing</a><a href="#setup-risk">Risk Controls</a><a href="#setup-protection">Protection</a>
@@ -908,6 +948,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 document.addEventListener('DOMContentLoaded', function () {
   /*PREMIUM_NAV_JS*/
+  /*PREMIUM_REPLICA_JS*/
   const form = document.querySelector('form[action="/setup"]');
   if (!form) return;
   const button = form.querySelector('button[type="submit"]');
@@ -1091,6 +1132,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         HTML_TEMPLATE.replace("<!--PREMIUM_STYLES-->", premium_styles())
         .replace("<!--PREMIUM_NAV-->", premium_nav("setup"))
         .replace("/*PREMIUM_NAV_JS*/", premium_nav_js())
+        .replace("/*PREMIUM_REPLICA_JS*/", premium_replica_js())
         .replace("<!--STATUS_BANNER-->", banner)
         .replace("<!--SYSTEM_STATUS_BAR-->", status_bar)
         # Mode & Products
