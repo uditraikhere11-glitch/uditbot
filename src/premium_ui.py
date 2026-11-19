@@ -22,6 +22,11 @@ def premium_nav_js() -> str:
     return (_ASSET_DIR / 'premium_ui.js').read_text(encoding='utf-8')
 
 
+@lru_cache(maxsize=1)
+def premium_replica_js() -> str:
+    return (_ASSET_DIR / 'premium_replica.js').read_text(encoding='utf-8')
+
+
 def premium_nav(page: str) -> str:
     """Navigation only; hrefs are known authenticated routes, not user input."""
     if page not in _PAGES:
