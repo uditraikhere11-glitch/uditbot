@@ -68,7 +68,7 @@ class ScreenshotReferenceContracts(unittest.TestCase):
     def test_fallback_does_not_hide_legacy_form_without_js(self):
         self.assertIn('id="dashOverview" class="dash-overview" hidden',self.template)
         self.assertIn('id="dashAdvanced" class="dash-advanced" hidden',self.template)
-        self.assertIn('oldSections.length !== 6',self.js)
+        self.assertIn("querySelectorAll(':scope > .section-card').length !== 6",self.js)
         self.assertIn('if (fields.length !== 1)',self.js)
         self.assertIn('overview.hidden = false',self.js)
         self.assertIn('Advanced Configuration',self.template)
