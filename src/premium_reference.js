@@ -86,6 +86,10 @@
     overview.hidden = false;
     advanced.hidden = false;
     document.documentElement.classList.add('dash-ready');
+    // Form validation must reveal the field, never focus a closed details pane.
+    form.addEventListener('invalid', e => {
+      if (advanced.contains(e.target)) advanced.open = true;
+    }, true);
     byId('dashReset').disabled = false;
 
     // Statuses always start UNKNOWN until the authenticated read-only service proves them.
