@@ -1,0 +1,193 @@
+/* PR #107 finishing pass — CSS ONLY; no changes to native input attributes,
+ * forms, operations, broker health, routes or JavaScript. */
+:root{
+  --ui-canvas:#080e19;
+  --ui-panel:#111d2e;
+  --ui-card:#132238;
+  --ui-field:#0e1b2c;
+  --ui-border:#344b63;
+  --ui-border-soft:#263d54;
+  --ui-ink:#eaf1fb;
+  --ui-muted:#a6b8cb;
+  --ui-blue:#75bbeb;
+  --ui-purple:#aaa0e9;
+  --ui-amber:#d8b37a;
+  --ui-teal:#69c4bb;
+  --ui-shadow:0 16px 38px rgba(2,9,21,.23);
+}
+.premium-setup body,.premium-control body,.premium-designer body{
+  background:radial-gradient(ellipse at 88% -15%,#172943 0%,#0c1728 43%,#080f1b 100%);
+}
+.prem-nav{background:linear-gradient(172deg,#0d1a2b,#091423 83%);border-right-color:#263b53}
+.prem-nav a[aria-current="page"]{
+  background:linear-gradient(98deg,#17466c,#142f4e);border-color:#32628a;
+  box-shadow:inset 3px 0 #77c3ed,0 4px 18px #071b2e55;
+}
+.prem-nav-foot{background:#101f33;border-color:#2c4158;color:#9db1c6}
+.premium-setup .container{max-width:1650px;padding:0 20px 30px}
+.premium-setup .header{
+  min-height:90px;padding:15px 20px;margin:0 0 14px;border-radius:15px;
+  background:linear-gradient(116deg,rgba(38,98,150,.13),transparent 69%),#101e31;
+  border-color:#2e465f;box-shadow:0 7px 23px #030a1845;
+}
+.premium-setup .header .icon-badge{height:46px;width:46px;border-radius:12px;box-shadow:0 6px 16px #0a5a9d38}
+.premium-setup .header h1{font-size:25px;color:#edf5ff}
+.premium-setup .header .subtitle{font-size:11.5px;color:#a9bbcd}
+.premium-setup .setup-section-jumps{
+  border-color:#2b4158;background:#0f1b2c;padding:7px 9px;margin:0 0 14px;
+  border-radius:12px;gap:5px;
+}
+.premium-setup .setup-section-jumps a{padding:9px 12px}
+.premium-setup form[action="/setup"]{
+  display:block;
+  column-count:2;
+  column-gap:18px;
+  width:100%;
+}
+.premium-setup form[action="/setup"]>input[type="hidden"]{display:none}
+.premium-setup form[action="/setup"]>.setup-section-jumps,
+.premium-setup form[action="/setup"]>label.toggle-row,
+.premium-setup form[action="/setup"]>.btn-submit{
+  column-span:all;
+}
+.premium-setup form[action="/setup"]>.section-card{
+  display:inline-block;
+  width:100%;vertical-align:top;
+  break-inside:avoid-column;
+  -webkit-column-break-inside:avoid;
+  margin:0 0 18px;
+  min-width:0;padding:0 18px 17px;
+  background:linear-gradient(164deg,#17283e 0%,#112034 57%,#101c2c 100%);
+  border:1px solid #314960;border-radius:16px;
+  box-shadow:0 12px 28px #02091635;
+  transition:border-color .18s ease,box-shadow .18s ease;
+}
+.premium-setup form[action="/setup"]>.section-card:hover{
+  border-color:#46647f;box-shadow:0 17px 34px #02091657;
+}
+.premium-setup .section-title{
+  min-height:67px;padding:12px 18px;margin:0 -18px 17px;
+  gap:12px;border-bottom:1px solid #36506b;
+  letter-spacing:-.012em;font-size:14px;font-weight:730;
+  background:linear-gradient(105deg,#1a456b,#182f4b 74%,#203954);
+}
+.premium-setup .section-title::before{
+  content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+  background:#68bced;box-shadow:0 0 18px #5dbaf488;
+}
+.premium-setup .section-title::after{width:130px;height:130px;top:-40px;right:-25px;background:radial-gradient(ellipse,#67b7eb1d,transparent 72%)}
+.premium-setup .section-title svg{
+  width:36px;height:36px;padding:8px;border-radius:10px;
+  background:linear-gradient(140deg,#206c9c,#1b456c);
+  filter:drop-shadow(0 3px 5px rgba(0,0,0,.17));
+}
+.premium-setup #setup-telegram .section-title{
+  background:linear-gradient(105deg,#34305e,#252b4d 72%,#343455);
+  border-bottom-color:#494a74;
+}
+.premium-setup #setup-telegram .section-title::before{background:#aaa1e8;box-shadow:0 0 18px #9890ed55}
+.premium-setup #setup-telegram .section-title svg{background:linear-gradient(145deg,#625aad,#413973)}
+.premium-setup #setup-broker .section-title{
+  background:linear-gradient(105deg,#473a2a,#312e2c 73%,#4a3b2d);
+  border-bottom-color:#5c4c3b;
+}
+.premium-setup #setup-broker .section-title::before{background:#d8ae70;box-shadow:0 0 18px #dcac6d44}
+.premium-setup #setup-broker .section-title svg{background:linear-gradient(145deg,#997548,#6a512f)}
+.premium-setup #setup-sizing .section-title{
+  background:linear-gradient(105deg,#1d4850,#18343f 73%,#24535c);
+  border-bottom-color:#38616a;
+}
+.premium-setup #setup-sizing .section-title::before{background:#69bcb7;box-shadow:0 0 18px #5cc5bd44}
+.premium-setup #setup-sizing .section-title svg{background:linear-gradient(145deg,#277680,#20525b)}
+.premium-setup #setup-risk .section-title{
+  background:linear-gradient(105deg,#473440,#302c3b 73%,#4b3647);
+  border-bottom-color:#5a465a;
+}
+.premium-setup #setup-risk .section-title::before{background:#c58ea6;box-shadow:0 0 18px #bd789b44}
+.premium-setup #setup-risk .section-title svg{background:linear-gradient(145deg,#87546e,#5b3d59)}
+.premium-setup #setup-protection .section-title{
+  background:linear-gradient(105deg,#363760,#282c4b 73%,#353b62);
+  border-bottom-color:#4d5279;
+}
+.premium-setup #setup-protection .section-title::before{background:#9aabed;box-shadow:0 0 18px #9aabed44}
+.premium-setup #setup-protection .section-title svg{background:linear-gradient(145deg,#656cba,#454878)}
+.premium-setup .section-card .grid-2,.premium-setup .section-card .grid-3{gap:9px 13px}
+.premium-setup .section-card .form-group{margin-bottom:7px}
+.premium-setup .section-card label{color:#d5e1ef;font-size:11.5px;letter-spacing:0}
+.premium-setup .section-card .help-text{color:#a4b4c6;font-size:10.5px;line-height:1.4;margin-top:5px}
+.premium-setup .section-card .input-wrap input,
+.premium-setup .section-card .input-wrap select{
+  background:#0e1c2e;border-color:#36516e;border-radius:9px;
+  min-height:40px;padding:9px 11px;font-size:12.5px;
+}
+.premium-setup .section-card .input-wrap input:focus-visible,
+.premium-setup .section-card .input-wrap select:focus-visible{
+  outline:2px solid #74c0ee;outline-offset:1px;
+  box-shadow:0 0 0 4px #5598c326;
+}
+.premium-setup .section-card .toggle-row{
+  background:#12253a;border-color:#2f4b66;
+  padding:11px 12px;margin-bottom:9px;
+}
+.premium-setup .section-card .toggle-info p{color:#9fb4c9}
+.premium-setup form[action="/setup"]>label.toggle-row{
+  margin:0 0 17px;padding:13px 16px;border-radius:12px;
+  border-color:#765d3e;background:#26231f;color:#efd29f;
+}
+.premium-setup form[action="/setup"]>.btn-submit{
+  display:block;margin:1px 0 0 auto;min-width:225px;
+  box-shadow:0 10px 23px rgba(14,89,152,.24);
+  background:linear-gradient(110deg,#196ba3,#278acb);
+  border-color:#4aa3db;
+}
+.premium-setup form[action="/setup"]>.btn-submit:hover{background:linear-gradient(110deg,#247db5,#319cdb)}
+/* All pages: polished surfaces without touching any controls or callbacks. */
+.premium-control header,.premium-designer .top{
+  background:linear-gradient(155deg,#16263c,#101d2f);
+  border:1px solid #30465f;box-shadow:0 10px 24px #0209163a;
+}
+.premium-control section,.premium-designer .card{
+  background:linear-gradient(160deg,#16283e,#112137 83%);
+  border:1px solid #304961;box-shadow:0 13px 30px #02091636;
+}
+.premium-control section:hover,.premium-designer .card:hover{
+  border-color:#45607c;box-shadow:0 16px 36px #0209164a;
+}
+.premium-control .tile,.premium-control .status-note,.premium-control .check,.premium-control .order{
+  background:#112237;border-color:#314c66;
+}
+.premium-designer input[type=text],.premium-designer select,.premium-designer textarea{
+  background:#0e1e30;border-color:#3a5774;
+}
+@media(max-width:1279px){
+ .premium-setup form[action="/setup"]{column-count:1;}
+ .premium-setup form[action="/setup"]>.section-card{display:block;margin:0 0 16px;}
+}
+@media(max-width:760px){
+ .premium-setup .container{padding:0 6px 27px;}
+ .premium-setup .header{padding:14px;min-height:0;}
+ .premium-setup form[action="/setup"]>.section-card{padding:0 14px 15px;}
+ .premium-setup .section-title{margin:0 -14px 14px;padding:13px 14px;min-height:64px;}
+ .premium-setup .section-card .grid-2,.premium-setup .section-card .grid-3{grid-template-columns:minmax(0,1fr);}
+ .premium-setup form[action="/setup"]>.btn-submit{width:100%;}
+}
+/* Balanced masonry-like placement at desktop only; native sections unchanged. */
+@media(min-width:1280px){
+ .premium-setup form[action="/setup"].prem-balanced-columns{
+   display:grid;
+   grid-template-columns:repeat(2,minmax(0,1fr));
+   grid-template-rows:auto auto;
+   grid-auto-rows:var(--prem-grid-step,6px);
+   gap:0 18px;
+   align-items:start;
+ }
+ .premium-setup form[action="/setup"].prem-balanced-columns>.setup-section-jumps{
+   grid-area:1 / 1 / 2 / -1;
+ }
+ .premium-setup form[action="/setup"].prem-balanced-columns>label.toggle-row{
+   grid-area:2 / 1 / 3 / -1;
+ }
+ .premium-setup form[action="/setup"].prem-balanced-columns>.section-card{
+   display:block;margin:0;align-self:start;
+ }
+}

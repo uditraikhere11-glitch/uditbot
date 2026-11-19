@@ -13,13 +13,16 @@ _PAGES = frozenset({'setup', 'control', 'designer'})
 
 @lru_cache(maxsize=1)
 def premium_styles() -> str:
-    content = (_ASSET_DIR / 'premium_ui.css').read_text(encoding='utf-8')
-    return '<style>\n' + content + '\n</style>'
+    core = (_ASSET_DIR / 'premium_ui.css').read_text(encoding='utf-8')
+    finish = (_ASSET_DIR / 'premium_finish.css').read_text(encoding='utf-8')
+    return '<style>\n' + core + '\n' + finish + '\n</style>'
 
 
 @lru_cache(maxsize=1)
 def premium_nav_js() -> str:
-    return (_ASSET_DIR / 'premium_ui.js').read_text(encoding='utf-8')
+    navigation = (_ASSET_DIR / 'premium_ui.js').read_text(encoding='utf-8')
+    visual_layout = (_ASSET_DIR / 'premium_layout.js').read_text(encoding='utf-8')
+    return navigation + '\n' + visual_layout
 
 
 def premium_nav(page: str) -> str:
