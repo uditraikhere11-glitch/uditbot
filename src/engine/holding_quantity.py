@@ -52,8 +52,8 @@ def aggregate_holdings(
         dp = row.get("dpQty")
         if total is not None:
             amount = _quantity(total)
-            if dp is not None and amount < _quantity(dp):
-                raise QuantityUnverified("totalQty smaller than dpQty")
+            if amount < (0 if dp is None else _quantity(dp)) + _quantity(row.get("t1Qty", 0)):
+                raise QuantityUnverified("totalQty smaller than DP/T1 components")
         elif dp is not None:
             amount = _quantity(dp) + _quantity(row.get("t1Qty", 0))
         else:
@@ -80,10 +80,14 @@ def observed_open_quantity(
     for row in positions:
         if not isinstance(row, dict):
             return None, "POSITIONS_ROW_MALFORMED"
+        if not str(row.get("securityId") or "").strip():
+            return None, "POSITIONS_SECURITY_MISSING"
         if str(row.get("securityId") or "").strip() != str(security_id).strip():
             continue
-        if (str(row.get("exchangeSegment") or segment).strip().upper() != str(segment).strip().upper()
-                or str(row.get("productType") or product).strip().upper() != str(product).strip().upper()):
+        if not row.get("exchangeSegment") or not row.get("productType"):
+            return None, "POSITION_CONTRACT_UNVERIFIED"
+        if (str(row["exchangeSegment"]).strip().upper() != str(segment).strip().upper()
+                or str(row["productType"]).strip().upper() != str(product).strip().upper()):
             continue
         if account_id and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account_id:
             return None, "POSITION_ACCOUNT_MISMATCH"
@@ -99,19 +103,21 @@ def observed_open_quantity(
     if not isinstance(holdings, list):
         return None, "SETTLED_HOLDINGS_READ_UNAVAILABLE"
     try:
-        settled = aggregate_holdings(holdings, account_id=account_id).get(str(security_id).strip(), 0)
+        settled = aggregate_holdings(holdings, account_id=account_id).get(str(security_id).strip())
     except QuantityUnverified as exc:
         return None, "SETTLED_HOLDINGS_UNVERIFIED: " + str(exc)
     if net < 0:
         # A negative intraday position can indicate a same-day manual SELL,
         # even while old DP quantities remain in the holdings book.
         return None, "NEGATIVE_CNC_POSITION_REVIEW"
-    if net > 0 and settled == 0:
+    if net > 0 and settled in (None, 0):
         # Dhan documents /positions as the *current-day* open position book;
         # /holdings contains stock from prior trading sessions. A filled CNC
         # BUY placed today may correctly appear only in /positions. This is
         # verified current-day exposure, NOT evidence of settled legacy stock.
         return net, "VERIFIED_POSITIONS"
+    if settled is None:
+        return None, "SETTLED_HOLDING_NOT_REPORTED"
     if net > 0 and settled > 0:
         # When both books show nonzero quantities, don't guess whether
         # broker totals overlap or represent distinct lots.

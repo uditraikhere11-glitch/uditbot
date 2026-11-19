@@ -2661,6 +2661,24 @@ class DhanClient:
         """Retrieves delivery, T1 and MTF holdings: GET /v2/holdings."""
         return self._read_collection("/holdings", "holdings", bypass_test_mode=bypass_test_mode)
 
+    def get_edis_owned_quantity(self, isin: str) -> Optional[int]:
+        """Supplementary eDIS total only; authorization quantity is never an execution."""
+        if self.cfg.trading_mode == TradingMode.TEST or not re.fullmatch(r"[A-Z0-9]{12}", isin):
+            return None
+        try:
+            resp = self._get_with_auth_recovery(f"{BASE_URL}/edis/inquire/{isin}")
+            if resp.status_code != 200:
+                return None
+            row = resp.json()
+            if (not isinstance(row, dict) or row.get("isin") != isin
+                    or str(row.get("clientId") or "") != self.cfg.dhan_client_id
+                    or row.get("status") != "SUCCESS"):
+                return None
+            qty = str(row.get("totalQty", ""))
+            return int(qty) if re.fullmatch(r"[0-9]+", qty) else None
+        except (requests.RequestException, ValueError, TypeError):
+            return None
+
     def get_forever_orders(self, bypass_test_mode: bool = False) -> Union[BrokerReadList, BrokerReadFailure]:
         """Retrieves all Forever OCO orders: GET /v2/forever/orders."""
         return self._read_collection("/forever/orders", "forever_orders", bypass_test_mode=bypass_test_mode)
@@ -3975,7 +3993,7 @@ class DhanClient:
             )
 
         deduped_trades: List[Dict[str, Any]] = []
-        seen_by_etid: Dict[str, Tuple[str, str, int, float, str]] = {}
+        seen_by_etid: Dict[str, tuple] = {}
         reached_empty_terminal_page = False
 
         for page_idx in range(max_pages + 1):
@@ -4017,8 +4035,9 @@ class DhanClient:
                     str(row["orderId"]),
                     str(row["securityId"]),
                     int(row["tradedQuantity"]),
-                    round(float(row["tradedPrice"]), 6),
-                    str(row["transactionType"]),
+                    float(row["tradedPrice"]),
+                    str(row["transactionType"]), row["exchangeSegment"], row["productType"],
+                    row.get("isin"), row.get("exchangeOrderId"), row.get("exchangeTime"),
                 )
                 if etid in seen_by_etid:
                     if seen_by_etid[etid] != sig:

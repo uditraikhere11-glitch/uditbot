@@ -359,6 +359,13 @@ class JournalDB:
                 created_at REAL
             );
 
+            CREATE TRIGGER IF NOT EXISTS preserve_owner_evidence_updates BEFORE UPDATE ON system_events
+            WHEN OLD.event_type GLOB 'OWNER_LOT_*' OR OLD.event_type='RECONCILIATION_GATE_HALTED'
+            BEGIN SELECT RAISE(ABORT, 'Reconciliation audit is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS preserve_owner_evidence_deletes BEFORE DELETE ON system_events
+            WHEN OLD.event_type GLOB 'OWNER_LOT_*' OR OLD.event_type='RECONCILIATION_GATE_HALTED'
+            BEGIN SELECT RAISE(ABORT, 'Reconciliation audit is append-only'); END;
+
             CREATE TABLE IF NOT EXISTS signal_latency_telemetry (
                 trace_id TEXT PRIMARY KEY,
                 correlation_id TEXT,
@@ -1589,6 +1596,46 @@ class JournalDB:
                 (etid,),
             ).fetchone()
             return dict(row) if row else None
+
+    def owner_lot_review_reason(self, account, order_id):
+        """A later empty trade book cannot erase a previously observed execution."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT event_type FROM system_events WHERE event_type IN "
+                "('OWNER_LOT_EXECUTION_CONFLICT','OWNER_LOT_DEMAT_REVIEW') AND description=? LIMIT 1",
+                (f"{account}/{order_id}",)
+            ).fetchone()
+            return row["event_type"] if row else None
+
+    def owner_lot_basis(self, account, security, segment, product, order_id):
+        """Anchor a history query to the original intent, including NULL-ID attestations."""
+        if not account or account != self.account_id:
+            raise ValueError("Owner lot journal account mismatch")
+        with self._get_conn() as conn:
+            intents = conn.execute(
+                "SELECT created_at FROM order_intents WHERE broker_order_id=? AND account_id=? "
+                "AND security_id=? AND exchange_segment=? AND product_type=?",
+                (order_id, account, security, segment, product),
+            ).fetchall()
+            if len(intents) != 1 or not intents[0]["created_at"]:
+                raise ValueError("Original account-bound order date unavailable")
+            if conn.execute(
+                "SELECT 1 FROM fills WHERE security_id=? AND exchange_segment=? AND traded_at>=? "
+                "AND transaction_type='SELL' AND is_verified_trade=1 LIMIT 1",
+                (security, segment, intents[0]["created_at"]),
+            ).fetchone():
+                raise ValueError("Journal contains a verified SELL requiring attribution")
+            fills = conn.execute(
+                "SELECT f.exchange_trade_id, f.traded_quantity, f.traded_price, a.evidence_json "
+                "FROM fills f LEFT JOIN broker_attested_historical_fills a "
+                "ON a.broker_order_id=f.broker_order_id AND a.account_id=? "
+                "WHERE f.broker_order_id=? AND f.security_id=? AND f.exchange_segment=? "
+                "AND f.product_type=? AND f.transaction_type='BUY' AND f.is_verified_trade=1",
+                (account, order_id, security, segment, product),
+            ).fetchall()
+            if not fills:
+                raise ValueError("Verified original BUY fills unavailable")
+            return intents[0]["created_at"], [dict(r) for r in fills]
 
     def get_sell_fills_for_parent(self, parent_order_id: str) -> List[Dict[str, Any]]:
         """P0-A: Returns verified parent-linked SELL fills persisted for `parent_order_id`."""

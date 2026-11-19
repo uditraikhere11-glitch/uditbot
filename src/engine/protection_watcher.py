@@ -49,6 +49,7 @@ from src.models import (
     infer_record_protection_route,
 )
 from src.engine.sizer import calculate_protection_levels, round_to_tick
+from src.engine.owner_lot_evidence import GATE_BOOKS, corroborated_external_sells
 from src.engine.holding_quantity import observed_open_quantity
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
@@ -1066,6 +1067,10 @@ class ProtectionWatcher:
 
     def check_once(self) -> bool:
         with self._pass_lock:
+            gate_books = GATE_BOOKS.get()
+            if gate_books is not None and self.pending:
+                # Pending protection can mutate the broker before supervision.
+                gate_books["share"] = False
             self._supervision_read_complete = False
             changed = False
             current_time = self.clock()
@@ -1507,26 +1512,34 @@ class ProtectionWatcher:
                     gate.halt_new_entries("Open-position supervision could not complete")
                 logger.warning(f"[Protection] Open-position supervision error: {sup_err}")
 
-            if changed:
+            verified_manual_ids = {
+                oid for oid in (gate_books or {}).get("verified", {})
+                if self.terminal_orders.get(oid, {}).get("position_state") == "UNPROTECTED_MANUAL_RISK"
+            }
+            if changed or verified_manual_ids:
                 saved = self._save()
                 recovered_ids = set(getattr(self, "_recovered_manual_risk_ids", set()))
                 self._recovered_manual_risk_ids = set()
-                if recovered_ids and saved:
-                    saved = self._verify_recovery_saved(recovered_ids)
-                if recovered_ids and not saved:
+                readback_ids = recovered_ids | verified_manual_ids
+                if readback_ids and saved:
+                    saved = self._verify_recovery_saved(readback_ids)
+                if readback_ids and not saved:
                     # Avoid a green in-memory record when JSON or SQLite failed
                     # to persist the same verified position lifecycle.
-                    for oid in recovered_ids:
+                    for oid in readback_ids:
                         rec = self.terminal_orders.get(oid)
                         if not isinstance(rec, dict):
                             continue
                         rec["reconciliation_required"] = True
-                        rec["persistence_uncertain"] = True
+                        rec["owner_readback_failed"] = True
+                        rec["unreadable_broker_response"] = True
                         rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
                         self._sync_position_lifecycle(rec)
                     self._save()
                     if gate is not None and hasattr(gate, "halt_new_entries"):
                         gate.halt_new_entries("Manual-risk recovery watcher persistence failed")
+                elif recovered_ids and saved and gate_books is not None:
+                    gate_books["recovered"] = True
                 elif recovered_ids and saved and gate is not None:
                     # Exactly one bounded *independent* full gate recheck is
                     # queued only after lifecycle AND watcher state persisted.
@@ -3323,8 +3336,14 @@ class ProtectionWatcher:
         )
 
         unreadable_books = set()
+        gate_books = GATE_BOOKS.get()
+        profile_checked = False
+        profile_account = None
+
 
         def _safe_list_call(attr_name: str) -> Optional[List[Dict[str, Any]]]:
+            if gate_books is not None and gate_books["share"] and attr_name in gate_books:
+                return list(gate_books[attr_name])
             fn = getattr(self.broker, attr_name, None)
             if not callable(fn):
                 return None
@@ -3364,6 +3383,11 @@ class ProtectionWatcher:
                 super_book, forever_book, trade_book, positions_book, holdings_book
             )
         )
+
+        if (gate_books is not None and gate_books["share"] and snapshot_complete
+                and not super_book and not forever_book and needs_holdings and not native_amo_only):
+            # No protective legs in either book that supervision could cancel.
+            gate_books.update(shared_holdings=holdings_book, shared_forever=forever_book)
 
         changed = False
         gate = getattr(self.broker, "reconciliation_gate", None)
@@ -3933,29 +3957,26 @@ class ProtectionWatcher:
                 prev_pos_state == "UNPROTECTED_MANUAL_RISK"
                 or (stale_manual_record and (rec.get("manual_risk_acknowledged") or rec.get("unreadable_broker_response")))
             )
+            legacy_quantity_warning = rec.get("manual_exit_evidence_reason") == "VERIFIED_AGGREGATE_QUANTITY_REDUCTION"
+            manual_risk_candidate = bool(manual_risk_candidate or (stale_manual_record and legacy_quantity_warning))
             entry_only_unlinked_reduction = (
                 (route == "ENTRY_ONLY_AMO" or manual_risk_candidate)
                 and snapshot_complete and broker_net_qty is not None
                 and broker_net_qty < aggregate_contract_open_qty and sell_qty < buy_filled
             )
             manual_risk_quantity_unverified = (
-                manual_risk_candidate and (broker_net_qty is None or not snapshot_complete)
+                manual_risk_candidate and confirmed_open_qty > 0 and (quantity_evidence != "VERIFIED_SETTLED_HOLDINGS"
+                    or broker_net_qty != aggregate_contract_open_qty or not snapshot_complete)
             )
             if entry_only_unlinked_reduction or manual_risk_quantity_unverified:
                 rec["reconciliation_required"] = True
                 rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
-                if entry_only_unlinked_reduction:
-                    rec["manual_exit_detected"] = True
-                    rec["manual_exit_evidence_verified"] = True
-                    rec["manual_exit_evidence_reason"] = "VERIFIED_AGGREGATE_QUANTITY_REDUCTION"
-                else:
-                    # Inaccessible/Dhan-429 broker books are UNKNOWN, not SELL.
-                    rec["broker_quantity_unverified"] = True
-                    rec["unreadable_broker_response"] = True
+                rec["broker_quantity_unverified"] = True
+                rec["unreadable_broker_response"] = True
                 if gate is not None and hasattr(gate, "halt_new_entries"):
                     gate.halt_new_entries(
                         f"Open holding {oid}: " + (
-                            "verified aggregate holding reduction with unlinked SELL"
+                            "aggregate holding shortfall; cause unverified"
                             if entry_only_unlinked_reduction else "quantity not verified"
                         )
                     )
@@ -3977,7 +3998,7 @@ class ProtectionWatcher:
                     ) is True
                 except Exception:
                     owner_ack_verified = False
-            manual_risk_ack_unverified = manual_risk_candidate and not owner_ack_verified
+            manual_risk_ack_unverified = manual_risk_candidate and confirmed_open_qty > 0 and not owner_ack_verified
             if manual_risk_ack_unverified:
                 # A stored text label or stale watcher boolean is not an
                 # account-bound, quantity-qualified durable owner ACK.
@@ -4000,14 +4021,57 @@ class ProtectionWatcher:
                 "orphaned_leg_cancel_states", "retry_reserved", "entry_timeout_elapsed",
                 "protected_qty",
             ))
-            # This can repair older falsely labelled records, but never
-            # override a newer VERIFIED reduction or a failed broker/journal
-            # check. It only repairs the record, not the entry gate.
+            history_ok = gate_books is not None and gate_books["verified"].get(oid) == (
+                expected_client_id, sec_id, effective_parent_open_qty)
+            if manual_risk_candidate and prod in ("CNC", "MTF") and confirmed_open_qty:
+                if not profile_checked:
+                    profile_checked = True
+                    if gate_books is not None:
+                        profile_account = gate_books.get("account")
+                    else:
+                        try:
+                            profile_account = self.broker.get_authenticated_profile_id(allow_refresh=False)
+                        except Exception:
+                            profile_account = None
+                if not expected_client_id or profile_account != expected_client_id:
+                    manual_risk_quantity_unverified = True
+                # Any fresh execution on this instrument needs attribution to the
+                # original lots before a previous day's proof can be reused.
+                market_date = datetime.fromtimestamp(now_ts, IST).date().isoformat()
+                if history_ok and rec.get("owner_history_day") != market_date:
+                    rec["owner_history_day"] = market_date
+                    changed = True
+                if not history_ok and rec.get("owner_history_day") != market_date:
+                    manual_risk_quantity_unverified = True
+                if not history_ok and any(
+                    str(t.get("securityId")) == sec_id or not t.get("securityId")
+                    or (t.get("exchangeSegment") in ("NSE_EQ", "BSE_EQ")
+                        and t.get("exchangeSegment") != seg and (not t.get("isin") or any(
+                            h.get("isin") == t["isin"] for h in holdings_book or []
+                            if str(h.get("securityId")) == sec_id)))
+                    for t in trade_book or []
+                ):
+                    manual_risk_quantity_unverified = True
+                if manual_risk_quantity_unverified or (gate_books is not None and not history_ok):
+                    reason = ((gate_books or {}).get("errors", {}).get(oid)
+                              or "Owner holding quantity, identity or executions require verification")
+                    rec["reconciliation_required"] = True
+                    rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                    rec["unreadable_broker_response"] = True
+                    if gate is not None:
+                        gate.halt_new_entries(f"Open holding {oid}: {reason}")
+                    if rec.get("owner_evidence_error") != reason:
+                        self.journal_db.record_system_event("OWNER_LOT_UNRESOLVED", reason,
+                            json.dumps({"order_id": oid, "security": sec_id, "account": expected_client_id,
+                                        "quantity": broker_net_qty, "source": quantity_evidence,
+                                        "previous_reason": rec.get("manual_exit_evidence_reason")}))
+                    rec["owner_evidence_error"] = reason
+                    changed = True
             recovery_candidate = bool(
-                stale_manual_record
-                and rec.get("unreadable_broker_response")
-                and not rec.get("manual_exit_evidence_verified")
-                and not rec.get("manual_exit_evidence_reason")
+                stale_manual_record and history_ok
+                and (rec.get("unreadable_broker_response") or legacy_quantity_warning)
+                and (legacy_quantity_warning or (not rec.get("manual_exit_evidence_verified")
+                                                and not rec.get("manual_exit_evidence_reason")))
                 and not journal_persistence_failed
                 and owner_ack_verified and no_protection_conflicts
                 and parent_reads_complete
@@ -4055,6 +4119,17 @@ class ProtectionWatcher:
                     or (rec.get("orphaned_legs_detected", False) and not rec.get("orphaned_legs_cancelled", False))
                 )
             )
+            if has_orphan_condition and prod in ("CNC", "MTF"):
+                # Quantity alone cannot authorize cancellation of a resting exit.
+                sold = corroborated_external_sells(trade_book, expected_client_id, sec_id,
+                                                   seg, prod, all_bot_leg_owners)
+                attributable = broker_net_qty == 0 or effective_parent_open_qty == aggregate_contract_open_qty
+                if not attributable or sold < max(1, aggregate_contract_open_qty - broker_net_qty):
+                    has_orphan_condition = False
+                    rec["reconciliation_required"] = True
+                    if gate is not None:
+                        gate.halt_new_entries(f"Unconfirmed delivery shortfall for {oid}; protective legs retained")
+                    changed = True
             if has_orphan_condition:
                 rec["manual_exit_detected"] = True
                 rec["orphaned_legs_detected"] = True
@@ -4345,6 +4420,15 @@ class ProtectionWatcher:
                 changed = True
             elif recovery_candidate:
                 previous = dict(rec)
+                self.journal_db.record_system_event("OWNER_LOT_RECOVERY", "Verified prior owner acknowledgement",
+                    json.dumps({"order_id": oid, "account": expected_client_id, "open_qty": effective_parent_open_qty,
+                                "previous_state": prev_pos_state, "previous_manual_exit": rec.get("manual_exit_detected"),
+                                "previous_reason": rec.get("manual_exit_evidence_reason"), "observed_at": now_ts}))
+                rec.pop("owner_evidence_error", None)
+                rec.pop("owner_readback_failed", None)
+                rec.pop("manual_risk_ack_unverified", None)
+                rec.pop("manual_exit_evidence_reason", None)
+                rec.pop("manual_exit_evidence_verified", None)
                 rec["position_state"] = "UNPROTECTED_MANUAL_RISK"
                 rec["confirmed_position_open_qty"] = effective_parent_open_qty
                 rec["manual_exit_detected"] = False
@@ -4358,7 +4442,8 @@ class ProtectionWatcher:
                     rec.update(previous)
                     rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
                     rec["reconciliation_required"] = True
-                    rec["persistence_uncertain"] = True
+                    rec["owner_readback_failed"] = True
+                    rec["unreadable_broker_response"] = True
                     if gate is not None and hasattr(gate, "halt_new_entries"):
                         gate.halt_new_entries(f"Manual-risk recovery persistence failed: {oid}")
                 else:

@@ -2,7 +2,7 @@ name: Combined release regression
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, audit/owner-lot-reconciliation]
 permissions:
   contents: read
 jobs:

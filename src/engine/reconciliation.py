@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 import threading
 import zoneinfo
+from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots
 from src.models import BrokerReadFailure, ProtectionRoute, infer_record_protection_route
 from src.broker.dhan_client import (
     DhanClient,
@@ -553,7 +554,7 @@ class StartupReconciliationGate:
         if not callable(profile_fn):
             return "Broker profile identity verification unavailable for zero-ID historical proof"
         try:
-            profile_acct = str(
+            profile_acct = (GATE_BOOKS.get() or {}).get("account") or str(
                 profile_fn(bypass_test_mode=True, allow_refresh=False) or ""
             ).strip()
         except Exception as exc:
@@ -1262,7 +1263,7 @@ class StartupReconciliationGate:
             if holdings_by_sec.get(sec, 0) < required_qty:
                 return False, (
                     f"Bot-owned settled holding quantity cannot be verified for securityId={sec}: "
-                    f"sumOfBotOpenQty={required_qty}, brokerHoldingsQty={holdings_by_sec.get(sec, 0)}"
+                    f"sumOfBotOpenQty={required_qty}, brokerHoldingsQty={holdings_by_sec.get(sec, 'unreported')}"
                 )
 
         forever_orders: List[Dict[str, Any]] = []
@@ -1291,6 +1292,13 @@ class StartupReconciliationGate:
             seg = str(row.get("exchange_segment") or "NSE_EQ").strip().upper()
             prod = str(row.get("product_type") or "CNC").strip().upper()
             open_q = int(row.get("confirmed_open_qty") or 0)
+
+            # An acknowledged, independently verified lot must not consume a
+            # different parent's Forever coverage or be relabelled protected.
+            batch = GATE_BOOKS.get()
+            if (batch is not None and row.get("position_state") == "UNPROTECTED_MANUAL_RISK"
+                    and batch["verified"].get(p_oid) == (expected_acct, sec_id, open_q)):
+                continue
 
             covered_q = 0
             matched_gids: List[str] = []
@@ -1340,6 +1348,9 @@ class StartupReconciliationGate:
                 )
             )
             if is_man_ack:
+                batch = GATE_BOOKS.get()
+                if batch is not None and batch["verified"].get(p_oid) != (expected_acct, sec_id, open_q):
+                    return False, f"No current account-bound execution proof for owner-managed order {p_oid}"
                 logger.warning(
                     f"[RECONCILIATION] Settled bot holding for {sym} (orderId={p_oid}, qty={open_q}) "
                     f"is in audited UNPROTECTED_MANUAL_RISK state (owner acknowledged)."
@@ -1454,10 +1465,20 @@ class StartupReconciliationGate:
             self._active_pass_holdings = None
             self._active_pass_forever_orders = None
             from src.broker.read_governor import RECONCILIATION_PACING
+            books_token = GATE_BOOKS.set({"verified": {}, "errors": {}, "share": False})
             pacing_token = RECONCILIATION_PACING.set(True)
             try:
-                return self._run_startup_reconciliation_inner(starting_halt_generation)
+                result = self._run_startup_reconciliation_inner(starting_halt_generation)
+                books = GATE_BOOKS.get()
+                if books.get("repeat_after_readback"):
+                    # Exactly one independent pass after the recovery writes and dual-store readback.
+                    books.clear()
+                    books.update(verified={}, errors={}, share=False)
+                    self._active_pass_holdings = self._active_pass_forever_orders = None
+                    result = self._run_startup_reconciliation_inner(starting_halt_generation)
+                return result
             finally:
+                GATE_BOOKS.reset(books_token)
                 RECONCILIATION_PACING.reset(pacing_token)
                 self._in_startup_reconciliation_pass = False
                 self._active_pass_holdings = None
@@ -1503,6 +1524,18 @@ class StartupReconciliationGate:
             logger.critical(f"[RECONCILIATION] {self.last_error}")
             return False, self.last_error
 
+        # Verify token identity before broker rows from this pass can enter the journal.
+        cfg = getattr(self.broker, "cfg", None)
+        if getattr(cfg, "trading_mode", None) == "LIVE":
+            expected = str(getattr(cfg, "dhan_client_id", "") or "").strip()
+            try:
+                account = self.broker.get_authenticated_profile_id(allow_refresh=False)
+            except Exception:
+                account = None
+            if not expected or account != expected or str(getattr(self.db, "account_id", "") or "") != expected:
+                return self._fail_reconciliation_locked("Dhan profile or journal account unverified", starting_halt_generation)
+            GATE_BOOKS.get()["account"] = account
+
         # 3. Query broker trade book and positions (Safety Correction C.A: fail closed on read error/malformed)
         trade_book = []
         if hasattr(self.broker, "get_trade_book"):
@@ -1543,6 +1576,9 @@ class StartupReconciliationGate:
                             starting_halt_generation,
                         )
                     try:
+                        side = str(trade.get("transactionType") or "").strip().upper()
+                        if side not in ("BUY", "SELL"):
+                            raise ValueError("Missing or invalid executed trade side")
                         raw_qty = trade.get("tradedQuantity")
                         if isinstance(raw_qty, bool) or not re.fullmatch(r"[+]?[0-9]+", str(raw_qty)):
                             raise ValueError("invalid integer tradedQuantity")
@@ -1558,7 +1594,7 @@ class StartupReconciliationGate:
                             symbol=str(trade.get("tradingSymbol") or trade.get("customSymbol") or ""),
                             traded_price=t_price,
                             traded_quantity=t_qty,
-                            transaction_type=str(trade.get("transactionType") or "BUY").upper(),
+                            transaction_type=side,
                             security_id=str(trade.get("securityId") or ""),
                             exchange_segment=str(trade.get("exchangeSegment") or ""),
                             product_type=str(trade.get("productType") or ""),
@@ -1663,9 +1699,22 @@ class StartupReconciliationGate:
             logger.warning(f"[RECONCILIATION] {self.last_error}. Remaining in fail-closed state.")
             return False, self.last_error
 
+        # This earlier book is reusable only before the watcher runs.
+        pre_watcher_holdings = self._active_pass_holdings
+        pre_watcher_forever = self._active_pass_forever_orders
         # Broker mutations during watcher reconciliation invalidate earlier proof snapshots.
         self._active_pass_holdings = None
         self._active_pass_forever_orders = None
+        books = GATE_BOOKS.get()
+        if books is not None:
+            try:
+                prepare_owner_lots(self.broker, self.db, books, positions, trade_book, time.time(),
+                                   pre_watcher_holdings, pre_watcher_forever)
+            except Exception as exc:
+                return self._fail_reconciliation_locked(
+                    str(exc) if isinstance(exc, ValueError) else f"Owner-lot evidence unavailable ({type(exc).__name__})", starting_halt_generation)
+        if books is not None and books.get("verified") and not pending_intents:
+            books.update(share=True, get_trade_book=trade_book, get_positions=positions)
         # 5. Check existing pending protection orders in watcher
         if self.watcher and hasattr(self.watcher, "check_once"):
             try:
@@ -1675,6 +1724,13 @@ class StartupReconciliationGate:
                 self.last_error = f"Watcher reconciliation pass failed: {e}"
                 logger.critical(f"[RECONCILIATION] {self.last_error}")
                 return False, self.last_error
+
+        if books is not None and books["share"]:
+            self._active_pass_holdings = books.get("shared_holdings")
+            self._active_pass_forever_orders = books.get("shared_forever")
+        if books is not None and books["errors"]:
+            oid, reason = next(iter(books["errors"].items()))
+            return self._fail_reconciliation_locked(f"Owner holding {oid}: {reason}", starting_halt_generation)
 
         # 6a. Verify all open intraday broker positions are covered by active broker protection (Safety Correction C.B & CV13-05)
         used_forever = {}
@@ -1716,6 +1772,11 @@ class StartupReconciliationGate:
                 self._accepting_entries = False
                 self.state = ReconciliationState.BLOCKED
                 self.last_error = self.last_error or "Safety halt occurred during reconciliation"
+                return False, self.last_error
+            if books is not None and books.get("recovered"):
+                books["repeat_after_readback"] = True
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = "Recovered owner lots persisted; independent verification pending"
                 return False, self.last_error
             self._accepting_entries = True
             self.state = ReconciliationState.HEALTHY

@@ -326,6 +326,12 @@ class AdditionalMergeGate(unittest.TestCase):
 
             # Manual exit flattens position while FO-LEG-1 is still CONFIRM; first cancel rejected
             case.broker.get_positions.return_value = [{"securityId": "55001", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 0}]
+            case.broker.get_holdings.return_value = [{"securityId": "55001", "totalQty": 0}]
+            case.broker.get_trade_book.return_value = [{
+                "dhanClientId": "1100000001", "transactionType": "SELL", "securityId": "55001",
+                "exchangeSegment": "NSE_EQ", "productType": "CNC", "orderId": "EXTERNAL01",
+                "exchangeTradeId": "EXEC001", "tradedQuantity": 10, "tradedPrice": 100.0,
+            }]
             case.broker.cancel_forever_order.return_value = (False, "Temporary 503")
             case.watcher.check_once()
             rec = case.watcher.terminal_orders["ORD-FO-1"]

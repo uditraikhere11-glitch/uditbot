@@ -241,6 +241,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         }
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if url.endswith("/forever/orders"):
@@ -322,6 +324,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         ]
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if url.endswith("/forever/orders"):
@@ -368,6 +372,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         )
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if url.endswith("/holdings"):
@@ -547,6 +553,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         }
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if "/trades/2026-11-02/" in url and url.endswith("/0"):
@@ -595,6 +603,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         }
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if "/trades/2026-11-02/" in url and url.endswith("/0"):
@@ -821,6 +831,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         }
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if "/trades/2026-11-02/" in url and url.endswith("/0"):
@@ -909,6 +921,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         self.db.update_order_intent("EQ-NO-BROKER-ID", state="UNKNOWN", broker_order_id=None)
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             return _http_resp(200, [])
@@ -969,6 +983,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         ]
 
         def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if "/trades/2026-11-02/" in url and url.endswith("/0"):
@@ -976,7 +992,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "totalQty": 2, "dpQty": 2}])
+                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2}])
             if url.endswith("/forever/orders"):
                 return _http_resp(200, [])
             return _http_resp(200, [])
@@ -1106,6 +1122,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         )
         # Simulate process dying before historical watcher migration was saved.
         self.assertEqual(self.watcher.pending[oid]["filled_qty"], 0)
+        self.client.get_authenticated_profile_id = MagicMock(return_value=FAKE_ACCT)
         self.client.get_fund_limits = MagicMock(return_value=(True, 10000.0, "OK"))
         self.client.get_trade_book = MagicMock(return_value=[])
         self.client.get_positions = MagicMock(return_value=[])

@@ -1,5 +1,7 @@
 name: PR87 real systemd and authenticated staging
 on:
+  push:
+    branches: [audit/owner-lot-reconciliation]
   pull_request:
     paths:
       - 'src/engine/tracker_*'
@@ -8,6 +10,7 @@ on:
       - 'src/control_center_entry.py'
       - 'src/control_center_backend.py'
       - 'tests/staging/**'
+      - 'tests/test_owner_lot_restart.py'
       - 'tests/test_tracker_v2_authenticated_acceptance.py'
       - '.github/workflows/tracker-v2-staging.yml'
   workflow_dispatch:

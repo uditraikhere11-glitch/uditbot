@@ -524,7 +524,16 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         broker.get_positions.return_value = [
             {"securityId": "11915", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 0}
         ]
-        broker.get_holdings.return_value = []  # successful, empty settled book
+        broker.get_holdings.return_value = []
+        watcher.check_once()
+        broker.cancel_super_order_leg.assert_not_called()
+        self.assertFalse(watcher.terminal_orders["SUP-MAN-1"].get("manual_exit_detected"))
+        broker.get_holdings.return_value = [{"securityId": "11915", "totalQty": 0}]
+        broker.get_trade_book.return_value = [{
+            "dhanClientId": "1100000001", "transactionType": "SELL", "securityId": "11915",
+            "exchangeSegment": "NSE_EQ", "productType": "CNC", "orderId": "EXTSELL01",
+            "exchangeTradeId": "EXTEXEC01", "tradedQuantity": 50, "tradedPrice": 15.55,
+        }]
         watcher.check_once()
         rec = watcher.terminal_orders["SUP-MAN-1"]
         self.assertTrue(rec["manual_exit_detected"])

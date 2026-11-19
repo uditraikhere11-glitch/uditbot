@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
+from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots
 from src.engine.holding_quantity import (
     QuantityUnverified, aggregate_holdings, observed_open_quantity,
 )
@@ -44,6 +45,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.broker = NS(
             cfg=NS(dhan_client_id="SYNTHETIC"),
+            get_order_book=Mock(return_value=[]), get_authenticated_profile_id=Mock(return_value="SYNTHETIC"),
             get_super_orders=Mock(return_value=[]),
             get_forever_orders=Mock(return_value=[]),
             get_trade_book=Mock(return_value=[]),
@@ -53,7 +55,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             reconciliation_gate=NS(halt_new_entries=Mock()),
         )
         self.db = NS(is_manual_risk_acknowledged=Mock(return_value=True),
-                     upsert_position_lifecycle=Mock())
+                     record_system_event=Mock(), upsert_position_lifecycle=Mock())
         self.w = ProtectionWatcher(
             broker=self.broker, journal_db=self.db,
             path=str(self.root / "watcher.json"),
@@ -64,6 +66,29 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             self.a["order_id"]: self.a,
             self.b["order_id"]: self.b,
         }
+
+        self.db.get_open_positions_lifecycle = lambda: [
+            dict(parent_order_id=r["order_id"], product_type="CNC", security_id="11915",
+                 exchange_segment="NSE_EQ", confirmed_open_qty=1) for r in (self.a, self.b)]
+        self.db.owner_lot_basis = lambda a, s, g, p, oid: (time.time() - 86400, [
+            dict(exchange_trade_id=oid, traded_quantity=1, traded_price=15.)])
+        self.db.owner_lot_review_reason = Mock(return_value=None)
+        self.broker.get_edis_owned_quantity = Mock(return_value=None)
+        self.history = [dict(dhanClientId="SYNTHETIC", securityId="11915", isin="TEST-ISIN",
+                         exchangeSegment="NSE_EQ", productType="CNC", orderId=r["order_id"],
+                         exchangeTradeId=r["order_id"], transactionType="BUY", tradedQuantity=1,
+                         tradedPrice=15.) for r in (self.a, self.b)]
+        self.broker.get_historical_trades = Mock(return_value=self.history)
+
+    def full_pass(self):
+        batch = {"verified": {}, "errors": {}, "share": False}
+        token = GATE_BOOKS.set(batch)
+        try:
+            prepare_owner_lots(self.broker, self.db, batch, self.broker.get_positions(),
+                               self.broker.get_trade_book(), time.time())
+            self.w.supervise_open_positions()
+        finally:
+            GATE_BOOKS.reset(token)
 
     def unreadable(self, status="UNAVAILABLE"):
         self.broker.get_holdings.return_value = BrokerReadFailure(
@@ -76,7 +101,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
     def healthy(self, qty=2, field="totalQty"):
         self.broker.get_positions.return_value = []
         self.broker.get_holdings.return_value = [
-            {"securityId": "11915", field: qty}
+            {"securityId": "11915", "isin": "TEST-ISIN", field: qty}
         ]
 
     def test_acknowledged_stale_manual_risk_keeps_budget_but_not_health(self):
@@ -121,7 +146,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
 
     def test_read_denial_cannot_invent_manual_exit_or_sell(self):
         self.unreadable()
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertFalse(item.get("manual_exit_detected"))
@@ -131,9 +156,9 @@ class YesbankTwoParentRecovery(unittest.TestCase):
 
     def test_live_two_share_recovery_after_denial_is_idempotent(self):
         self.unreadable()
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.healthy()
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("UNPROTECTED_MANUAL_RISK", item["position_state"])
             self.assertFalse(item["reconciliation_required"])
@@ -141,7 +166,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             self.assertFalse(item["unreadable_broker_response"])
             self.assertEqual(1, item["confirmed_position_open_qty"])
             self.assertEqual(0, item["protected_qty"] if "protected_qty" in item else 0)
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("UNPROTECTED_MANUAL_RISK", item["position_state"])
             self.assertEqual(0, item["exit_filled_qty"])
@@ -152,7 +177,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
                         reconciliation_required=True, manual_exit_detected=True,
                         unreadable_broker_response=True)
         self.healthy()
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("UNPROTECTED_MANUAL_RISK", item["position_state"])
             self.assertFalse(item["manual_exit_detected"])
@@ -174,7 +199,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             "orderId": "OWNER-MANUAL-EXIT-42", "tradedQuantity": 1,
             "tradedPrice": 19.0, "exchangeTradeId": "OWNER-TRD-42",
         }]
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertTrue(item["manual_exit_detected"])
@@ -193,7 +218,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             error="synthetic per-order Dhan GET denied",
             status_code=429,
         ))
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertTrue(item["reconciliation_required"])
@@ -210,7 +235,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
                 unreadable_broker_response=True,
             )
         self.healthy(qty=3)
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertTrue(item["reconciliation_required"])
@@ -232,7 +257,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             "productType": "CNC", "netQty": 2,
             "dhanClientId": "SYNTHETIC",
         }]
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertTrue(item["reconciliation_required"])
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
@@ -245,7 +270,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
                         unreadable_broker_response=True)
         self.db.is_manual_risk_acknowledged.return_value = False
         self.healthy()
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
             self.assertTrue(item["manual_exit_detected"])
@@ -253,24 +278,23 @@ class YesbankTwoParentRecovery(unittest.TestCase):
     def test_readable_holdings_without_durable_owner_ack_stays_blocked(self):
         self.db.is_manual_risk_acknowledged.return_value = False
         self.healthy()
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.assertTrue(all(r["reconciliation_required"] for r in (self.a, self.b)))
         self.assertTrue(all(r["position_state"] == "RECONCILIATION_REQUIRED" for r in (self.a, self.b)))
         self.assertFalse(any(r.get("manual_exit_detected") for r in (self.a, self.b)))
 
-    def test_confirmed_manual_reduction_never_makes_fake_sell(self):
+    def test_uncorroborated_shortfall_never_makes_fake_sell(self):
         self.healthy(1)
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
             self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
-            self.assertTrue(item["manual_exit_detected"])
-            self.assertTrue(item["manual_exit_evidence_verified"])
+            self.assertFalse(item.get("manual_exit_detected"))
+            self.assertFalse(item.get("manual_exit_evidence_verified"))
             self.assertEqual(0, item.get("exit_filled_qty"))
         self.healthy(2)
-        self.w.supervise_open_positions()
+        self.full_pass()
         for item in (self.a, self.b):
-            # Never auto-clear a genuine positive reduction signal.
-            self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
+            self.assertEqual("UNPROTECTED_MANUAL_RISK", item["position_state"])
 
     def test_zero_intraday_row_does_not_override_two_settled_shares(self):
         self.broker.get_positions.return_value = [{
@@ -282,19 +306,19 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             "securityId": "11915", "exchangeSegment": "NSE_EQ",
             "productType": "CNC", "netQty": 0
         }]
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.assertFalse(any(x.get("manual_exit_detected") for x in (self.a, self.b)))
 
     def test_dp_quantity_fallback(self):
         self.healthy(2, "dpQty")
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.assertFalse(any(x.get("manual_exit_detected") for x in (self.a, self.b)))
 
     def test_account_mismatch_stays_blocked(self):
         self.broker.get_holdings.return_value = [{
             "securityId": "11915", "totalQty": 2, "dhanClientId": "OTHER"
         }]
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.assertTrue(any(x.get("reconciliation_required") for x in (self.a, self.b)))
         self.assertFalse(any(x.get("manual_exit_detected") for x in (self.a, self.b)))
 
@@ -316,12 +340,15 @@ class YesbankTwoParentRecovery(unittest.TestCase):
 
     def test_persistence_failure_never_reports_recovery(self):
         self.unreadable()
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.db.upsert_position_lifecycle.side_effect = OSError("synthetic SQLite write error")
         self.healthy()
-        self.w.supervise_open_positions()
+        self.full_pass()
         self.assertTrue(all(x["reconciliation_required"] for x in (self.a, self.b)))
-        self.assertTrue(all(x["persistence_uncertain"] for x in (self.a, self.b)))
+        self.assertTrue(all(x["owner_readback_failed"] for x in (self.a, self.b)))
+        self.db.upsert_position_lifecycle.side_effect = None
+        self.full_pass()
+        self.assertTrue(all(x["position_state"] == "UNPROTECTED_MANUAL_RISK" for x in (self.a, self.b)))
 
 
 class HoldingsQuantityContract(unittest.TestCase):
