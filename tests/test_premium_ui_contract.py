@@ -85,5 +85,55 @@ class PresentationIntegrationContracts(unittest.TestCase):
         self.assertNotIn('<!--PREMIUM_STYLES-->', rendered)
 
 
+class ApprovedScreenshotReplicaContracts(unittest.TestCase):
+    """The approved 2x2 cards must wrap the real existing form fields."""
+    def test_four_screenshot_cards_and_advanced_preservation(self):
+        content = read('src/setup_app.py')
+        for title in ('Bot Configuration', 'Risk &amp; Protection', 'AMO Settings',
+                      'Market &amp; Data', 'Advanced Configuration'):
+            self.assertIn(title, content)
+        for field in ('rp-mode', 'rp-sources', 'rp-order-cap', 'rp-fno-budget',
+                      'rp-equity-sl', 'rp-equity-tp', 'rp-quote-age',
+                      'rp-price-policy', 'rp-scrip-refresh'):
+            self.assertIn('id="' + field + '"', content)
+        # Original full 6 sections and all known safety inputs stay in the template.
+        for section in ('setup-execution','setup-telegram','setup-broker','setup-sizing',
+                        'setup-risk','setup-protection'):
+            self.assertIn('id="' + section + '"', content)
+        for field in ('is_live_mode', 'equity_active', 'fno_active',
+                      'monitored_channel_ids', 'max_order_amount_inr',
+                      'equity_budget_inr', 'fno_capital_per_trade',
+                      'equity_sl_pct', 'equity_target_pct', 'fno_sl_pct',
+                      'fno_target_pct', 'dhan_pin', 'dhan_totp_secret',
+                      'csrf_token','expected_revision'):
+            self.assertIn('name="' + field + '"', content)
+        self.assertIn('/*PREMIUM_REPLICA_JS*/', content)
+        self.assertIn('.replace("/*PREMIUM_REPLICA_JS*/", premium_replica_js())', content)
+
+    def test_no_auto_trade_or_fabricated_verified_states(self):
+        script = read('src/premium_replica.js')
+        self.assertIn("json('/control/status')", script)
+        self.assertIn('data.runtime_verified===true', script)
+        self.assertIn('Reconciliation: not verified', script)
+        self.assertIn('OCO Guard: not verified', script)
+        self.assertIn("target.disabled=true", script)
+        self.assertIn('expected_revision:verifiedStatus.config_file_revision', script)
+        self.assertIn('csrf_token:form.elements.namedItem', script)
+        self.assertNotIn('/v2/orders', script)
+        self.assertNotIn('systemctl', script)
+        self.assertNotIn('trading_bot.service', script)
+
+    def test_existing_control_renderer_is_unchanged(self):
+        content = read('src/control_center_ui.py')
+        self.assertIn("requestJSON('/control/status')", content)
+        self.assertIn('/setup/service-control', content)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js unavailable')
+    def test_replica_js_syntax(self):
+        result = subprocess.run(['node', '--check', str(ROOT / 'src/premium_replica.js')],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
