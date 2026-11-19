@@ -76,3 +76,11 @@ body.prem-drawer-open{overflow:hidden}
 @media(min-width:1120px){.premium-setup body{padding:22px 25px 40px 277px}.premium-control main{width:calc(100% - 305px);margin:23px 24px 32px 277px;padding:0}.premium-designer main{width:calc(100% - 305px);margin:0 24px 0 277px}}
 @media(max-width:1119px){.premium-setup body{padding:18px}.premium-designer main{padding:20px}}
 @media(max-width:720px){.premium-setup body{padding:12px}.premium-setup .container{padding:20px 15px}.premium-setup .section-card{padding:18px}.premium-setup .grid-2,.premium-setup .grid-3{grid-template-columns:1fr}}
+/* Two-column card layout on wide desktops, without moving/removing any form fields. */
+@media(min-width:1500px){
+  .premium-setup form[action="/setup"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+  .premium-setup form[action="/setup"]>input[type="hidden"]{display:none}
+  .premium-setup form[action="/setup"]>.setup-section-jumps,.premium-setup form[action="/setup"]>label.toggle-row,.premium-setup form[action="/setup"]>.btn-submit{grid-column:1/-1}
+  .premium-setup form[action="/setup"]>.section-card{margin-bottom:0;min-width:0}
+  .premium-setup form[action="/setup"]>.btn-submit{justify-self:end}
+}
