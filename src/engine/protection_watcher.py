@@ -53,7 +53,7 @@ from src.engine.owner_lot_evidence import GATE_BOOKS, corroborated_external_sell
 from src.engine.holding_quantity import observed_open_quantity
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
-from src.journal.db import generate_correlation_id
+from src.journal.db import RejectedProtectionNeedsReview, generate_correlation_id
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
 from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only, has_urgent_obligation, supervision_preflight_priority
 
@@ -967,6 +967,8 @@ class ProtectionWatcher:
         avg_fill_price: float,
         verified_protected_qty: int = 0,
         verified_closed_qty: int = 0,
+        verified_sell_vwap: Optional[float] = None,
+        verified_realized_pnl: Optional[float] = None,
         confirmed_protection_ids: Optional[List[str]] = None,
         manual_risk_acknowledged: bool = False,
         is_amo: bool = False,
@@ -1027,6 +1029,12 @@ class ProtectionWatcher:
             rec["qty"] = req_q
             rec["filled_qty"] = fill_q
             rec["avg_fill_price"] = float(avg_fill_price or rec.get("avg_fill_price") or 0.0)
+            if float(avg_fill_price or 0.0) > 0.0:
+                rec["buy_vwap"] = float(avg_fill_price)
+            if verified_sell_vwap is not None and closed_q > 0:
+                rec["exit_vwap"] = float(verified_sell_vwap)
+            if verified_realized_pnl is not None and closed_q > 0:
+                rec["realized_pnl"] = float(verified_realized_pnl)
             rec["exit_filled_qty"] = closed_q
             rec["confirmed_position_open_qty"] = open_q
             # Never assume entry TRADED implies protected_qty > 0; require verified_protected_qty
@@ -1043,6 +1051,10 @@ class ProtectionWatcher:
                 rec["terminal_confirmed"] = False
 
             if open_q == 0 and fill_q > 0:
+                pending = rec.get("pending_oco")
+                if isinstance(pending, dict) and str(pending.get("state") or "").upper() in (
+                        "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"):
+                    rec["pending_oco"] = None
                 rec["position_state"] = PositionLifecycleState.POSITION_CLOSED.value
             elif prot_q >= open_q and open_q > 0:
                 rec["position_state"] = PositionLifecycleState.PROTECTED.value
@@ -1062,7 +1074,18 @@ class ProtectionWatcher:
                 self.pending[oid] = rec
 
             self._sync_position_lifecycle(rec)
-            self._save()
+            saved = self._save()
+            if closed_q and not saved:
+                raise RuntimeError("Verified exit watcher persistence failed")
+            if closed_q:
+                pending, terminal = self.journal_db.load_watcher_state()
+                with open(self.path, encoding="utf-8") as stream:
+                    disk_pending = json.load(stream)
+                with open(f"{self.path}.terminal.json", encoding="utf-8") as stream:
+                    disk_terminal = json.load(stream)
+                if ((pending.get(oid), terminal.get(oid)) != (self.pending.get(oid), self.terminal_orders.get(oid))
+                        or (disk_pending.get(oid), disk_terminal.get(oid)) != (pending.get(oid), terminal.get(oid))):
+                    raise RuntimeError("Verified exit watcher readback failed")
             return dict(rec)
 
     def check_once(self) -> bool:
@@ -1599,7 +1622,22 @@ class ProtectionWatcher:
     ) -> None:
         logger.critical(f"[Protection] ⚠️ {status_label}: {rec['symbol']} ({rec['order_id']}) {new_qty} units — {reason}")
         rec["protection_status"] = status_label
-        rec["retry_at"] = self.clock() + RETRY_AFTER_SEC
+        now = self.clock()
+        delay = RETRY_AFTER_SEC
+        rejected = "Forever OCO rejected (400):" in reason and "DH-906" in reason
+        alert_due = True
+        if rejected:
+            signature = [reason, new_qty, sl_trigger, sl_limit, target_price]
+            if rec.get("oco_rejection") == signature:
+                delay = min(900.0, 2 * float(rec.get("oco_retry_delay") or RETRY_AFTER_SEC))
+                alert_due = now >= float(rec.get("oco_alert_after") or 0)
+            else:
+                rec.pop("oco_alert_after", None)
+            rec["oco_rejection"] = signature
+            rec["oco_retry_delay"] = delay
+        else:
+            rec.pop("oco_rejection", None)
+        rec["retry_at"] = now + delay
 
         if self.journal_db:
             try:
@@ -1626,17 +1664,24 @@ class ProtectionWatcher:
             except Exception as e:
                 logger.warning(f"[Protection] Could not record {status_label} order to journal: {e}")
 
-            if hasattr(self.journal_db, "enqueue_outbox"):
+            if alert_due and hasattr(self.journal_db, "enqueue_outbox"):
                 try:
+                    guidance = ""
+                    if rejected and rec.get("product_type") in {"CNC", "MTF"}:
+                        guidance = (" Dhan permits Forever protection from the next trading day "
+                                    "for newly purchased shares and requires DDPI. "
+                                    "Check the position and Forever order book in Dhan.")
                     self.journal_db.enqueue_outbox(
                         "CRITICAL_PROTECTION_ALERT",
                         {
-                            "text": f"🚨 [{status_label}] {rec['symbol']} order {rec['order_id']} ({new_qty} units): {reason}",
+                            "text": f"🚨 [{status_label}] {rec['symbol']} order {rec['order_id']} ({new_qty} units): {reason}{guidance}",
                             "priority": "HIGH",
                             "order_id": rec["order_id"],
                             "symbol": rec["symbol"],
                         },
                     )
+                    if rejected:
+                        rec["oco_alert_after"] = now + 900
                 except Exception:
                     pass
 
@@ -1926,6 +1971,7 @@ class ProtectionWatcher:
             rec["protected_qty"] = int(rec.get("protected_qty") or 0) + int(confirmed_qty)
             rec["protected_value"] = float(rec.get("protected_value") or 0.0) + (float(executed_chunk_price) * int(confirmed_qty))
 
+        rec.pop("oco_rejection", None)
         rec["protection_status"] = leg_status_label
         rec["confirmed_sl_price"] = float(levels.sl_trigger)
         rec["confirmed_target_price"] = float(levels.target_price)
@@ -2361,6 +2407,14 @@ class ProtectionWatcher:
                         now=self.clock(),
                     )
                 self._save_strict()
+            except RejectedProtectionNeedsReview:
+                rec["pending_oco"] = None
+                rec["retry_at"] = self.clock() + 900
+                rec["reconciliation_required"] = True
+                gate = getattr(self.broker, "reconciliation_gate", None)
+                if gate is not None:
+                    gate.halt_new_entries(f"Verify remaining exposure after rejected Forever SELL for {rec['order_id']}")
+                return True
             except Exception as persist_err:
                 rec["pending_oco"] = None
                 logger.critical(

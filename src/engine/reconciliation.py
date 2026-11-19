@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -32,6 +33,9 @@ from datetime import datetime
 import threading
 import zoneinfo
 from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots
+from src.engine.unified_exit_reconciliation import (
+    ReconciliationEvidenceError, reconcile_verified_exits, _exchange_time, verified_flat_delivery_day,
+)
 from src.models import BrokerReadFailure, ProtectionRoute, infer_record_protection_route
 from src.broker.dhan_client import (
     DhanClient,
@@ -1594,6 +1598,7 @@ class StartupReconciliationGate:
                             symbol=str(trade.get("tradingSymbol") or trade.get("customSymbol") or ""),
                             traded_price=t_price,
                             traded_quantity=t_qty,
+                            traded_at=_exchange_time(trade["exchangeTime"]) if trade.get("exchangeTime") else None,
                             transaction_type=side,
                             security_id=str(trade.get("securityId") or ""),
                             exchange_segment=str(trade.get("exchangeSegment") or ""),
@@ -1699,6 +1704,27 @@ class StartupReconciliationGate:
             logger.warning(f"[RECONCILIATION] {self.last_error}. Remaining in fail-closed state.")
             return False, self.last_error
 
+        # A broker-verified SELL is allocated before owner-lot/watch checks.
+        # Any persisted change requires a fresh, independent whole-gate pass.
+        try:
+            linked, link_msg = reconcile_verified_exits(
+                broker=self.broker, db=self.db, watcher=self.watcher,
+                trade_book=trade_book, positions=positions, initial_holdings=self._active_pass_holdings,
+                read_required=self._read_required_broker_collection,
+            )
+        except ReconciliationEvidenceError as exc:
+            return self._fail_reconciliation_locked(
+                f"BUY/SELL reconciliation evidence blocked: {exc}", starting_halt_generation,
+            )
+        except Exception as exc:
+            logger.exception("[RECONCILIATION] Verified SELL allocation failed")
+            return self._fail_reconciliation_locked(
+                f"BUY/SELL reconciliation error: {type(exc).__name__}", starting_halt_generation,
+            )
+        if linked:
+            GATE_BOOKS.get()["repeat_after_readback"] = True
+            return self._fail_reconciliation_locked(link_msg, starting_halt_generation)
+
         # This earlier book is reusable only before the watcher runs.
         pre_watcher_holdings = self._active_pass_holdings
         pre_watcher_forever = self._active_pass_forever_orders
@@ -1734,7 +1760,26 @@ class StartupReconciliationGate:
 
         # 6a. Verify all open intraday broker positions are covered by active broker protection (Safety Correction C.B & CV13-05)
         used_forever = {}
-        pos_ok, pos_msg = self._verify_open_positions_protected(positions, used_forever)
+        coverage_positions = []
+        for position in positions:
+            if (isinstance(position, dict) and position.get("productType") == "CNC"
+                    and re.fullmatch(r"-[1-9][0-9]*", str(position.get("netQty")))
+                    and books.get("account")):
+                if self._active_pass_holdings is None:
+                    ok, rows, reason = self._read_required_broker_collection("get_holdings", "holdings")
+                    if not ok:
+                        return self._fail_reconciliation_locked(reason, starting_halt_generation)
+                    self._active_pass_holdings = rows
+                try:
+                    flat = verified_flat_delivery_day(position, positions, self._active_pass_holdings,
+                                                      trade_book, self.db, books["account"],
+                                                      self._read_required_broker_collection)
+                except (ValueError, TypeError, KeyError, sqlite3.Error):
+                    flat = False
+                if flat:
+                    continue
+            coverage_positions.append(position)
+        pos_ok, pos_msg = self._verify_open_positions_protected(coverage_positions, used_forever)
         if not pos_ok:
             self.state = ReconciliationState.BLOCKED
             self.last_error = pos_msg

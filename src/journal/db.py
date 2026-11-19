@@ -75,6 +75,10 @@ def generate_correlation_id(prefix: str = "ORD", symbol: str = "", now: Optional
     return corr[:30]
 
 
+class RejectedProtectionNeedsReview(Exception):
+    """A rejected Forever SELL requires exposure reconciliation before another attempt."""
+
+
 class JournalDB:
     def __init__(self, db_path: str, account_id: str = ""):
         self.db_path = db_path
@@ -227,6 +231,17 @@ class JournalDB:
                 traded_price REAL,
                 traded_quantity INTEGER,
                 traded_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS exit_allocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_order_id TEXT NOT NULL,
+                sell_order_id TEXT NOT NULL,
+                exchange_trade_id TEXT NOT NULL,
+                allocated_qty INTEGER NOT NULL,
+                traded_price REAL NOT NULL,
+                traded_at REAL NOT NULL,
+                UNIQUE(parent_order_id, exchange_trade_id)
             );
 
             CREATE TABLE IF NOT EXISTS broker_attested_historical_fills (
@@ -623,6 +638,16 @@ class JournalDB:
         att_id = str(attempt_id)[:40]
         b_oid = str(broker_order_id) if broker_order_id else None
         with self._get_conn() as conn:
+            if route == "FOREVER_OCO" and state == "SUBMITTING":
+                conn.execute("BEGIN IMMEDIATE")
+                prior = conn.execute("""
+                    SELECT 1 FROM protection_attempts
+                    WHERE account_id = ? AND parent_order_id = ? AND route = ?
+                      AND state = 'REJECTED' AND error_msg LIKE '%Forever OCO rejected (400)%DH-906%'
+                    LIMIT 1
+                """, (acct, str(parent_order_id), route)).fetchone()
+                if prior:
+                    raise RejectedProtectionNeedsReview(str(parent_order_id))
             conn.execute(
                 """
                 INSERT INTO protection_attempts (
@@ -1638,16 +1663,68 @@ class JournalDB:
             return intents[0]["created_at"], [dict(r) for r in fills]
 
     def get_sell_fills_for_parent(self, parent_order_id: str) -> List[Dict[str, Any]]:
-        """P0-A: Returns verified parent-linked SELL fills persisted for `parent_order_id`."""
+        """P0-A & P1-6: Returns canonical verified SELL fills for `parent_order_id`,
+        combining direct parent-linked rows in `fills` and committed `exit_allocations`
+        without double-counting any `exchange_trade_id`. Allocated rows expose their
+        exact `allocated_qty` in `traded_quantity` so downstream consumers never
+        double-count a shared multi-lot SELL across parents.
+        """
         p_oid = str(parent_order_id or "").strip()
         if not p_oid:
             return []
         with self._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM fills WHERE parent_order_id = ? AND UPPER(transaction_type) = 'SELL' AND is_verified_trade = 1 ORDER BY traded_at ASC, id ASC",
-                (p_oid,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+            direct_rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM fills WHERE parent_order_id = ? AND UPPER(transaction_type) = 'SELL' AND is_verified_trade = 1 ORDER BY traded_at ASC, id ASC",
+                    (p_oid,),
+                ).fetchall()
+            ]
+            alloc_rows = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT
+                        f.id, f.broker_order_id, f.exchange_trade_id, f.symbol,
+                        a.traded_price AS traded_price,
+                        a.allocated_qty AS traded_quantity,
+                        f.traded_quantity AS total_fill_quantity,
+                        a.allocated_qty AS allocated_qty,
+                        a.traded_at AS traded_at,
+                        f.transaction_type, f.security_id, f.exchange_segment,
+                        f.product_type, a.parent_order_id AS parent_order_id,
+                        f.is_verified_trade
+                    FROM exit_allocations a
+                    JOIN fills f ON f.exchange_trade_id = a.exchange_trade_id
+                    WHERE a.parent_order_id = ?
+                      AND f.is_verified_trade = 1
+                      AND UPPER(f.transaction_type) = 'SELL'
+                    ORDER BY a.traded_at ASC, a.id ASC
+                    """,
+                    (p_oid,),
+                ).fetchall()
+            ]
+        result: List[Dict[str, Any]] = []
+        seen_etids = set()
+        for r in direct_rows:
+            etid = str(r.get("exchange_trade_id") or "").strip()
+            if etid:
+                if etid in seen_etids:
+                    continue
+                seen_etids.add(etid)
+            result.append(r)
+        for ar in alloc_rows:
+            etid = str(ar.get("exchange_trade_id") or "").strip()
+            if etid and etid in seen_etids:
+                continue
+            if int(ar.get("traded_quantity") or 0) <= 0:
+                continue
+            if etid:
+                seen_etids.add(etid)
+            ar["allocation_source"] = "exit_allocations"
+            result.append(ar)
+        result.sort(key=lambda x: (float(x.get("traded_at") or 0.0), int(x.get("id") or 0)))
+        return result
 
     def get_position_accounting(self, parent_order_id: str) -> Dict[str, Any]:
         """
@@ -1656,10 +1733,23 @@ class JournalDB:
         (`parent_order_id = p_oid` and `is_verified_trade = 1`) are counted toward exit quantity and realized P&L.
         """
         p_oid = str(parent_order_id or "").strip()
+        alloc_rows = []
         with self._get_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM fills WHERE broker_order_id = ? OR parent_order_id = ? ORDER BY traded_at ASC, id ASC",
                 (p_oid, p_oid),
+            ).fetchall()
+            alloc_rows = conn.execute(
+                """
+                SELECT a.exchange_trade_id, a.allocated_qty, a.traded_price
+                FROM exit_allocations a
+                JOIN fills f ON f.exchange_trade_id = a.exchange_trade_id
+                WHERE a.parent_order_id = ?
+                  AND f.is_verified_trade = 1
+                  AND UPPER(f.transaction_type) = 'SELL'
+                ORDER BY a.traded_at ASC, a.id ASC
+                """,
+                (p_oid,),
             ).fetchall()
         buy_qty = 0
         buy_val = 0.0
@@ -1689,6 +1779,19 @@ class JournalDB:
                 buy_val += q * p
             if is_ver:
                 verified_trades += 1
+        for ar in alloc_rows:
+            etid = str(ar["exchange_trade_id"] or "").strip()
+            if etid and etid in seen_etids:
+                continue
+            aq = int(ar["allocated_qty"] or 0)
+            ap = float(ar["traded_price"] or 0.0)
+            if aq <= 0 or ap <= 0.0:
+                continue
+            if etid:
+                seen_etids.add(etid)
+            sell_qty += aq
+            sell_val += aq * ap
+            verified_trades += 1
         buy_vwap = round(buy_val / buy_qty, 4) if buy_qty > 0 else 0.0
         sell_vwap = round(sell_val / sell_qty, 4) if sell_qty > 0 else 0.0
         matched_exit_qty = min(buy_qty, sell_qty)

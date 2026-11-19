@@ -223,6 +223,7 @@ def format_order_outcome(
         sl_price = target_price = None
     protection_label = ("⚠️ No automatic SL/target — manage exits manually" if entry_only
                         else "✅ Verified Active" if protection_verified
+                        else "🚨 Unprotected — Forever OCO rejected" if meta.get("oco_rejected")
                         else "⏳ Pending Broker Verification")
     status = str(status).upper()
     complete = status == "TRADED" and filled_qty == requested_qty and execution_price is not None and execution_price > 0
@@ -514,6 +515,7 @@ class OrderStatusReporter:
         if not oid:
             return True
         meta = dict(meta, entry_only_amo=bool(rec.get("entry_only_amo") or meta.get("entry_only_amo")))
+        meta["oco_rejected"] = bool(rec.get("oco_rejection"))
         requested = int(rec.get("qty") or 0)
         filled = max(0, int(broker_order.get("filledQty") or 0))
         status = str(broker_order.get("orderStatus") or "").upper()
