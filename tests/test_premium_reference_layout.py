@@ -72,6 +72,7 @@ class ScreenshotReferenceContracts(unittest.TestCase):
         self.assertIn('if (fields.length !== 1)',self.js)
         self.assertIn('overview.hidden = false',self.js)
         self.assertIn('Advanced Configuration',self.template)
+        self.assertIn("form.addEventListener('invalid'",self.js)
 
     def test_all_original_secrets_remain_existing_form_fields(self):
         for key in ('tg_api_hash','tg_bot_token','dhan_pin','dhan_totp_secret','dhan_access_token'):
