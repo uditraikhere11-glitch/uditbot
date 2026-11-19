@@ -18,16 +18,20 @@ Local queued entries from older builds are never automatically dispatched.
 """
 
 from html import escape
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js
 
 
 def render_control_center(csrf_token: str) -> str:
     """Return HTML for the Control Center without executing any side effects."""
     safe_token = escape(str(csrf_token), quote=True)
-    return _HTML.replace("__CSRF_TOKEN__", safe_token)
+    return (_HTML.replace("__CSRF_TOKEN__", safe_token)
+            .replace("<!--PREMIUM_STYLES-->", premium_styles())
+            .replace("<!--PREMIUM_NAV-->", premium_nav("control"))
+            .replace("/*PREMIUM_NAV_JS*/", premium_nav_js()))
 
 
 _HTML = r'''<!doctype html>
-<html lang="en">
+<html lang="en" class="premium-control">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -66,13 +70,14 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
 .counts{font-size:13px;color:var(--muted)}.mode{font-size:13px;color:var(--muted)}
 @media(max-width:560px){main{padding:0 12px}section{padding:17px}.buttons{grid-template-columns:1fr}header{align-items:start}h1{font-size:21px}.tile{padding:12px}.value{font-size:17px}}
 </style>
+<!--PREMIUM_STYLES-->
 </head>
-<body><main>
+<body><!--PREMIUM_NAV--><main>
 <header>
   <div class="logo"><div class="logo-icon" aria-hidden="true">🤖</div><div>
     <h1>UDITBOT</h1><div class="subtitle">Control Center · Verified status, never assumed</div>
   </div></div>
-  <div style="display:flex;gap:8px;align-items:center"><a class="setup" href="/setup" aria-label="Open full Setup page">⚙ Setup</a><form action="/logout" method="post"><input type="hidden" name="csrf_token" value="__CSRF_TOKEN__"><button type="submit">Logout</button></form></div>
+  <div style="display:flex;gap:8px;align-items:center"><button id="premNavOpen" class="prem-nav-toggle" type="button" aria-controls="premNav" aria-expanded="false">☰ Menu</button><a class="setup" href="/setup" aria-label="Open full Setup page">⚙ Setup</a><form action="/logout" method="post"><input type="hidden" name="csrf_token" value="__CSRF_TOKEN__"><button type="submit">Logout</button></form></div>
 </header>
 <section aria-label="Bot operating state">
   <div class="grid">
@@ -115,6 +120,7 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
 </main>
 <script>
 'use strict';
+/*PREMIUM_NAV_JS*/
 const $=id=>document.getElementById(id);
 const csrf=document.querySelector('meta[name="control-csrf"]').content;
 let current=null;
