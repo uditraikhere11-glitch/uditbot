@@ -22,7 +22,7 @@
     if (busy) return;
     busy = true;
     if (!wide.matches) { clean(); busy = false; return; }
-    // Measure intrinsic card height at its actual half-column width. 
+    // Measure intrinsic card height at its actual half-column width.
     clean();
     form.classList.add('prem-balanced-columns');
     form.style.setProperty('--prem-grid-step', '6px');
