@@ -4,9 +4,10 @@ All client-authored values are assigned with textContent/value, never innerHTML.
 The preview shows illustrative data; the saved server template uses real event data.
 """
 from html import escape
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js
 
 PAGE = r"""<!doctype html>
-<html lang="en">
+<html lang="en" class="premium-designer">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -44,9 +45,12 @@ fieldset{border:none;margin:0;padding:0}.stack{display:flex;gap:8px;flex-wrap:wr
 @media(max-width:850px){.grid{grid-template-columns:1fr}.twocol{grid-template-columns:1fr}}
 @media(max-width:510px){.fieldrow{grid-template-columns:22px 1fr 65px;grid-auto-rows:auto}.fieldrow button{padding:5px}#available{grid-template-columns:1fr}}
 </style>
+<!--PREMIUM_STYLES-->
 </head>
 <body>
+<!--PREMIUM_NAV-->
 <main>
+<button id="premNavOpen" type="button" class="prem-nav-toggle" aria-controls="premNav" aria-expanded="false">☰ Menu</button>
   <div class="top">
     <div><h1>🎨 Telegram Message Designer</h1>
       <p>Choose fields, order, wording and emojis. Preview before saving. No restart required.</p></div>
@@ -110,6 +114,7 @@ fieldset{border:none;margin:0;padding:0}.stack{display:flex;gap:8px;flex-wrap:wr
   </div>
 </main>
 <script>
+/*PREMIUM_NAV_JS*/
 (function() {
 "use strict";
 var csrf = document.querySelector('meta[name="csrf-token"]').content;
@@ -272,4 +277,7 @@ bindFields();load();
 
 
 def render_page(csrf_token: str) -> str:
-    return PAGE.replace("__CSRF__", escape(csrf_token, quote=True))
+    return (PAGE.replace("__CSRF__", escape(csrf_token, quote=True))
+            .replace("<!--PREMIUM_STYLES-->", premium_styles())
+            .replace("<!--PREMIUM_NAV-->", premium_nav("designer"))
+            .replace("/*PREMIUM_NAV_JS*/", premium_nav_js()))
