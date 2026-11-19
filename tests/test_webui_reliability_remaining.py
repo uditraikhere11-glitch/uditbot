@@ -243,7 +243,8 @@ class WebUIFullMatrix(unittest.TestCase):
             self.assertEqual(p.stat().st_mode & 0o077, 0)
         from src.setup_app import HTML_TEMPLATE
         self.assertIn('id="simpleSaveStatus"', HTML_TEMPLATE)
-        self.assertIn("status.textContent = result.message", HTML_TEMPLATE)
+        self.assertIn("toastMessage.textContent = String(value)", HTML_TEMPLATE)
+        self.assertIn("result.status === 'RESTARTED' && result.restart_performed === true", HTML_TEMPLATE)
         self.assertNotIn('changesList.replaceChildren()', HTML_TEMPLATE)
 
     def test_ac17_legacy_sqlite_not_touched_by_notification_save(self):

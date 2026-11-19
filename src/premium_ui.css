@@ -1,0 +1,86 @@
+/* AuditBot premium WebUI: calm graphite, deep navy and restrained blue. */
+:root{--prem-canvas:#081321;--prem-surface:#142439;--prem-edge:#2e4965;--prem-blue:#6bb6e7;--prem-muted:#a0b4ca;--prem-green:#3ed9a9;--prem-red:#ef8795}
+.prem-nav-toggle{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border:1px solid #3a5574;border-radius:10px;background:#1b3450;color:#eef6ff;cursor:pointer;font-size:13px;font-weight:700}
+.prem-nav-toggle:hover{background:#2a4a6a}
+.prem-nav-backdrop{position:fixed;inset:0;background:rgba(3,9,20,.75);z-index:1100}
+.prem-nav-backdrop[hidden]{display:none}
+.prem-nav{position:fixed;z-index:1101;top:0;left:0;width:255px;height:100dvh;overflow:auto;padding:25px 15px;background:linear-gradient(165deg,#0e1d30,#0a1524);border-right:1px solid #29415a;box-shadow:12px 0 42px rgba(0,0,0,.28);visibility:hidden;transform:translateX(-103%);transition:transform .22s ease,visibility .22s ease}
+.prem-nav.open{visibility:visible;transform:none}
+.prem-brand{display:flex;align-items:center;gap:11px;border-bottom:1px solid #2a425d;padding:0 8px 21px;margin-bottom:22px}
+.prem-brand-icon{width:40px;height:40px;display:grid;place-items:center;font-size:26px;color:#f2faff;background:linear-gradient(140deg,#175381,#2788bf);border-radius:11px}
+.prem-brand strong{display:block;color:#eef6ff;font-size:21px;letter-spacing:-.04em}.prem-brand strong span{color:#62b8ed}
+.prem-brand small{display:block;color:#91a6bb;font-size:10px;letter-spacing:.09em;margin-top:3px}
+.prem-nav-group{font-size:10px;font-weight:800;letter-spacing:.15em;color:#8ba1b9;padding:4px 11px;margin:8px 0 9px}
+.prem-nav-group:not(:first-of-type){margin-top:22px}
+.prem-nav a{display:flex;align-items:center;gap:11px;padding:13px 12px;margin:4px 0;border:1px solid transparent;border-radius:11px;text-decoration:none;color:#c1d2e5;font-size:13px;font-weight:650}
+.prem-nav a span{width:24px;font-size:19px;text-align:center;color:#8eb7d7}
+.prem-nav a:hover{background:#1c3753;color:#f6faff}
+.prem-nav a[aria-current="page"]{background:linear-gradient(90deg,#185084,#123558);border-color:#346b9b;box-shadow:inset 3px 0 #65bdf0;color:#fff}
+.prem-nav-foot{color:#9ab1c6;font-size:11px;line-height:1.65;padding:14px;margin:28px 1px 0;border:1px solid #2c4966;border-radius:12px;background:#12283d}
+.prem-nav-close{position:absolute;right:11px;top:12px;padding:6px 9px;background:#1b344b;color:#eaf4ff;border:1px solid #3a5877;border-radius:8px;cursor:pointer}
+.prem-nav a:focus-visible,.prem-nav-toggle:focus-visible,.prem-nav-close:focus-visible,#toastDismiss:focus-visible{outline:2px solid #91cef5;outline-offset:3px}
+body.prem-drawer-open{overflow:hidden}
+@media(min-width:1120px){.prem-nav{transform:none!important;visibility:visible!important}.prem-nav-toggle,.prem-nav-close,.prem-nav-backdrop{display:none!important}}
+@media(prefers-reduced-motion:reduce){.prem-nav{transition:none}}
+/* Setup: same configuration form, now visually grouped and breathable. */
+.premium-setup body{display:block;justify-content:initial;padding:22px;background:radial-gradient(ellipse at 77% -5%,#142d4a,#091522 47%,#080f19 100%);color:#edf4fd}
+.premium-setup .container{max-width:1320px;background:#101d30;border-color:#2e4763;padding:32px;box-shadow:0 24px 65px #0007}
+.premium-setup .header{text-align:left;border-bottom:1px solid #2b4664;padding-bottom:20px;margin-bottom:20px}
+.premium-setup .header h1{font-size:clamp(23px,2.4vw,29px);letter-spacing:-.04em}
+.premium-setup .subtitle{line-height:1.6;color:#9eb4c9}.premium-setup .icon-badge{display:none}
+.premium-setup .section-card{position:relative;overflow:hidden;background:linear-gradient(165deg,#192c43,#101f32 85%);border-color:#304c69;border-radius:15px;box-shadow:0 10px 27px #02091925;margin-bottom:18px}
+.premium-setup .section-title{color:#e7f1fe;font-size:16px;letter-spacing:-.012em;border-bottom-color:#38536e;padding-bottom:14px}
+.premium-setup .section-title svg{stroke:#78bdea}
+.premium-setup .section-title:after{content:"";position:absolute;right:15px;top:5px;width:130px;height:50px;transform:skewX(-24deg);background:linear-gradient(125deg,transparent,#277ab91a);pointer-events:none}
+.premium-setup .grid-2,.premium-setup .grid-3{gap:14px}
+.premium-setup .input-wrap input,.premium-setup .input-wrap select{background:#0d1c2e;border-color:#3c5875;color:#f1f8ff;min-height:42px}
+.premium-setup .input-wrap input:focus,.premium-setup .input-wrap select:focus{border-color:#8ac6ef;box-shadow:0 0 0 3px #338acb33}
+.premium-setup .help-text{color:#9cacc1;line-height:1.5}.premium-setup label{color:#cbdbea}
+.premium-setup .toggle-row{background:#12243a;border-color:#334e6a}
+.premium-setup input:checked+.slider{background:#168f70}
+.premium-setup .btn-submit{width:auto;max-width:100%;min-width:230px;margin-left:auto;background:linear-gradient(110deg,#176da9,#2893dc);font-size:14px;padding:14px 24px;box-shadow:0 10px 25px #0d57824a}
+.premium-setup .btn-submit:hover{background:linear-gradient(110deg,#207eb9,#39a1e8)}
+.premium-setup .system-status-panel{background:#122438;border-color:#2d4864}
+.setup-section-jumps{position:sticky;top:8px;z-index:50;display:flex;gap:5px;overflow-x:auto;scrollbar-width:thin;border:1px solid #2e4863;padding:7px;background:#102034f2;backdrop-filter:blur(9px);border-radius:11px;margin-bottom:22px}
+.setup-section-jumps a{flex:none;color:#c0d1e2;text-decoration:none;font-size:12px;font-weight:650;border-radius:8px;padding:10px 13px}
+.setup-section-jumps a:hover,.setup-section-jumps a:focus-visible{background:#214568;color:#fff}
+.premium-setup form .section-card{scroll-margin-top:90px}
+/* Toast: genuinely fixed, no second body column or scrolling jump. */
+#simpleSaveStatus{position:fixed;top:20px;right:20px;z-index:1200;display:flex;gap:12px;align-items:flex-start;width:min(375px,calc(100vw - 30px));max-height:55dvh;overflow:auto;padding:15px;background:#152a40;border:1px solid #3c5c7b;border-left:3px solid #90b9db;border-radius:13px;box-shadow:0 20px 55px #0009;color:#f0f7ff;font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+#simpleSaveStatus[hidden]{display:none}
+#simpleSaveStatus.success{border-left-color:var(--prem-green)}#simpleSaveStatus.error{border-left-color:var(--prem-red)}#simpleSaveStatus.neutral{border-left-color:#96b4d4}
+#toastMessage{min-width:0;flex:1}#toastDismiss{border:0;background:transparent;color:#b5cee2;font-size:21px;line-height:1;cursor:pointer}
+.setup-post-confirmation{position:fixed;top:20px;right:20px;z-index:1200;width:min(375px,calc(100vw - 30px));background:#152a40;border:1px solid #3c5c7b;border-left:3px solid #96b4d4;border-radius:13px;box-shadow:0 20px 55px #0009;color:#f0f7ff;padding:15px;font-size:13px;line-height:1.55}
+.setup-post-confirmation.success{border-left-color:var(--prem-green)}.setup-post-confirmation[hidden]{display:none}
+/* Control Center: no change to operating-state or broker verification semantics. */
+.premium-control body{background:radial-gradient(ellipse at 73% -10%,#142e4c,#091622 55%,#070f1a 100%)}
+.premium-control main{max-width:1400px}.premium-control header{padding:15px 0 21px;border-bottom:1px solid #2b4560}
+.premium-control .logo-icon{background:linear-gradient(145deg,#155184,#278ac2);box-shadow:0 8px 25px #0005}
+.premium-control section{position:relative;overflow:hidden;border-color:#324e6b;background:linear-gradient(165deg,#182d45,#102236 86%);box-shadow:0 11px 29px #0003}
+.premium-control section:after{content:"";position:absolute;right:-23px;top:0;width:150px;height:60px;background:linear-gradient(115deg,transparent,#317ebc20);transform:skewX(-27deg);pointer-events:none}
+.premium-control .tile,.premium-control .status-note,.premium-control .check,.premium-control .order{background:#13253c;border-color:#34516f}
+.premium-control button,.premium-control a.setup{background:#1e3955;border-color:#395774}
+.premium-control button:hover:not(:disabled),.premium-control a.setup:hover{background:#294c6e}
+.premium-control .btn-start{background:#135c47;border-color:#248663}.premium-control .btn-stop{background:#5e2f3e;border-color:#985267}
+.premium-control .good{color:var(--prem-green)}.premium-control .bad{color:var(--prem-red)}
+/* Designer: same safe opt-in template editor, matched to other pages. */
+.premium-designer body{background:radial-gradient(ellipse at 80% -8%,#142d4a,#081523 59%)}
+.premium-designer main{max-width:1390px}
+.premium-designer .card{background:linear-gradient(155deg,#192d46,#102337);border-color:#365370;box-shadow:0 10px 28px #0003}
+.premium-designer input[type=text],.premium-designer textarea,.premium-designer select{background:#102034;border-color:#3e5c79}
+.premium-designer button{background:#1d3854;border-color:#3a5673}
+.premium-designer button:hover{background:#2a4f71}.premium-designer button.primary{background:linear-gradient(110deg,#1776b0,#2f9de0);color:#fff}
+.premium-designer input[type=checkbox]{accent-color:#1caa8c}
+.premium-designer #preview{background:#0d2033;border-color:#395672}
+.premium-designer .immutable{background:#242d39;border-left-color:#caaa6f;color:#eadabc}
+@media(min-width:1120px){.premium-setup body{padding:22px 25px 40px 277px}.premium-control main{width:calc(100% - 305px);margin:23px 24px 32px 277px;padding:0}.premium-designer main{width:calc(100% - 305px);margin:0 24px 0 277px}}
+@media(max-width:1119px){.premium-setup body{padding:18px}.premium-designer main{padding:20px}}
+@media(max-width:720px){.premium-setup body{padding:12px}.premium-setup .container{padding:20px 15px}.premium-setup .section-card{padding:18px}.premium-setup .grid-2,.premium-setup .grid-3{grid-template-columns:1fr}}
+/* Two-column card layout on wide desktops, without moving/removing any form fields. */
+@media(min-width:1500px){
+  .premium-setup form[action="/setup"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+  .premium-setup form[action="/setup"]>input[type="hidden"]{display:none}
+  .premium-setup form[action="/setup"]>.setup-section-jumps,.premium-setup form[action="/setup"]>label.toggle-row,.premium-setup form[action="/setup"]>.btn-submit{grid-column:1/-1}
+  .premium-setup form[action="/setup"]>.section-card{margin-bottom:0;min-width:0}
+  .premium-setup form[action="/setup"]>.btn-submit{justify-self:end}
+}
