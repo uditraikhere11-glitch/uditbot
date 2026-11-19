@@ -30,6 +30,12 @@
         moves.push({group, slot, label: slot.getAttribute('data-label')});
       }
       for (const name of ['is_live_mode','equity_active','fno_active','monitored_channel_ids']) single(name);
+      for (const name of ['equity_active','fno_active']) {
+        if (!single(name).closest('label.switch')) throw new Error('Missing checkbox switch ' + name);
+      }
+      if (form.querySelectorAll(':scope > .section-card').length !== 6) {
+        throw new Error('Legacy Setup section count changed');
+      }
       if (form.querySelectorAll('[name]').length < 25) throw new Error('Form contract incomplete');
     } catch (err) {
       // Fail safe: original full Setup form and its ordinary Save & Apply remain visible.
@@ -69,10 +75,6 @@
 
     // Advanced: move the same original sections, without omitting password fields.
     const oldSections = Array.from(form.querySelectorAll(':scope > .section-card'));
-    if (oldSections.length !== 6) {
-      console.error('Unexpected number of original Setup sections; advanced layout disabled');
-      return;
-    }
     const authLabel = form.querySelector(':scope > label.toggle-row');
     if (authLabel) {
       authLabel.classList.add('dash-live-confirm');
