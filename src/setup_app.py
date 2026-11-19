@@ -466,7 +466,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
         <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
         <input type="hidden" name="full_setup_form" value="1">
-      
+
       <!--APPROVED_REFERENCE_BOARD-->
       <div class="replica-footer">
         <button id="replicaReset" type="button" class="replica-reset">↶ &nbsp; Reset</button>
