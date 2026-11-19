@@ -1083,7 +1083,7 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
         saved_message = escape_html(str(info.get("reason") or "Configuration request recorded."), quote=True)
         saved_label = escape_html(saved_state.replace("_", " "), quote=True)
         tone = "success" if saved_state == "RESTARTED" and info.get("service_restarted") else "neutral"
-        banner = f"""<div class="setup-post-confirmation {tone}" role="status" aria-live="polite"><strong>{saved_label}</strong> — {saved_message}</div>"""
+        banner = f"""<div class="setup-post-confirmation {tone}" role="status" aria-live="polite"><strong>Audit bot Configuration Request Recorded</strong> · {saved_label} — {saved_message}</div>"""
 
     channels_str = ", ".join(str(cid) for cid in cfg.monitored_channel_ids) if cfg.monitored_channel_ids else ""
 
