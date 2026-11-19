@@ -133,14 +133,20 @@
     observer.observe(saveStatus, {attributes:true,attributeFilter:['hidden','class'],subtree:true,characterData:true,childList:true});
   }
   get('replicaAlertClose').addEventListener('click', () => { alertBox.hidden = true; window.clearTimeout(alertTimer); });
-  const advanced = get('replicaAdvanced');
-  advanced.open = false;
+  // The complete configuration lives in visible cards; never hide required
+  // controls or reveal them only after invalid form submission.
+  const fullSettings = get('replicaAdvanced');
   get('replicaSources').addEventListener('click', event => {
     event.preventDefault();
-    advanced.open = true;
     get('setup-telegram').scrollIntoView({behavior:'smooth', block:'start'});
   });
-  form.addEventListener('invalid', () => { advanced.open = true; }, true);
+  form.addEventListener('invalid', event => {
+    const targetCard = event.target.closest('.section-card');
+    if (targetCard && fullSettings && fullSettings.contains(targetCard)) {
+      targetCard.classList.add('replica-validation-focus');
+      window.setTimeout(() => targetCard.classList.remove('replica-validation-focus'), 2100);
+    }
+  }, true);
   initial = snapshot();
   refreshMirrors();
   // The top status bar reports only what the already-authenticated Control

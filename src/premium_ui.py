@@ -59,3 +59,45 @@ def approved_replica_styles() -> str:
 @lru_cache(maxsize=1)
 def approved_replica_js() -> str:
     return (_ASSET_DIR / 'approved_replica.js').read_text(encoding='utf-8')
+
+
+@lru_cache(maxsize=1)
+def systemwide_styles() -> str:
+    """Shared layout for all three real authenticated WebUI pages."""
+    return '<style>\n' + (_ASSET_DIR / 'systemwide_ui.css').read_text(encoding='utf-8') + '\n</style>'
+
+
+@lru_cache(maxsize=1)
+def systemwide_script() -> str:
+    """Read-only header/side-rail state used outside the Setup page."""
+    return (_ASSET_DIR / 'systemwide_ui.js').read_text(encoding='utf-8')
+
+
+def unified_header(page: str) -> str:
+    """Identical safe shell on Control Center and Telegram Designer.
+
+    Only the page's title/subtitle differs. Operational states are shown as
+    UNVERIFIED until the existing authenticated status endpoint responds.
+    """
+    spec = {
+        'control': ('Control Center', 'Verified service controls, orders and monitoring', '◈'),
+        'designer': ('Telegram Message Designer', 'Customize your notifications and preview each message', '✉'),
+    }
+    if page not in spec:
+        raise ValueError('Unsupported unified header')
+    title, subtitle, icon = spec[page]
+    return f'''<header class="replica-head system-unified-head">
+  <div class="replica-brandline">
+    <span class="replica-head-icon" aria-hidden="true">{icon}</span>
+    <div><h1>{escape(title)}</h1><p>{escape(subtitle)}</p></div>
+  </div>
+  <div class="replica-head-status" aria-live="polite">
+    <span id="replicaModePill" class="replica-pill" data-tone="neutral">◌ UNVERIFIED</span>
+    <span class="replica-separator" aria-hidden="true"></span>
+    <span class="replica-status">◇ Reconciliation: Not verified</span>
+    <span class="replica-separator" aria-hidden="true"></span>
+    <span class="replica-status">♢ OCO Guard: Not verified</span>
+    <span class="replica-separator" aria-hidden="true"></span>
+    <time id="replicaClock" class="replica-clock">IST</time>
+  </div>
+</header>'''
