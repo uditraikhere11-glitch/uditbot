@@ -398,7 +398,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="icon-badge">
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
       </div>
-      <h1>Setup &amp; Configuration</h1>
+      <h1 aria-label="Audit bot Setup &amp; Configuration">Setup &amp; Configuration</h1>
       <p class="subtitle">Configure trading parameters, DhanHQ access, Telegram channels and risk limits. Existing safety and service controls remain in force.</p>
     </div>
 
