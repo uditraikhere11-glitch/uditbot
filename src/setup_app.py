@@ -16,7 +16,7 @@ Safely reads from and writes to .env with chmod 0600 file permissions.
 import os
 import sys
 from html import escape as escape_html
-from src.premium_ui import premium_styles, premium_nav, premium_nav_js
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js, approved_replica_styles, approved_replica_js
 from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
@@ -65,6 +65,46 @@ from src.notifier.message_designer_routes import register_routes as register_mes
 register_message_designer_routes(app, SETUP_CSRF_TOKEN)
 
 
+
+
+APPROVED_REFERENCE_BOARD = r'''<div id="replicaBoard" class="replica-board" aria-label="Trading configuration overview">
+  <section class="replica-card replica-bot" aria-labelledby="replica-bot-heading">
+    <div class="replica-card-top"><div class="replica-card-icon" aria-hidden="true">♙</div><div class="replica-card-headings"><h2 id="replica-bot-heading">Bot Configuration</h2><p>Core trading operation and signal settings</p></div></div>
+    <div class="replica-rows">
+      <div class="replica-row"><span class="replica-label">Trading Mode</span><div class="replica-modes replica-field" role="group" aria-label="Saved trading mode, applied on Save & Apply"><button id="replicaLive" type="button" aria-pressed="false">◉ &nbsp; LIVE</button><button id="replicaTest" type="button" class="replica-test" aria-pressed="true">◯ &nbsp; TEST</button></div></div>
+      <div class="replica-row"><span class="replica-label">Trading Switch <a class="replica-link" href="/" aria-label="Manage running bot in Control Center">ⓘ</a></span><a id="replicaServiceState" href="/" class="replica-readonly-toggle" data-on="false" title="Manage the bot service in Control Center" aria-label="Open Control Center to manage the trading service"></a></div>
+      <div class="replica-row"><span class="replica-label">Signal Channels</span><div class="replica-field" style="text-align:right"><a class="replica-link" href="#setup-telegram" id="replicaSources">Edit monitored channels in Advanced</a></div></div>
+      <div class="replica-row"><label for="replicaPerOrder">Per Order Amount (₹)</label><div class="replica-field"><input id="replicaPerOrder" type="number" min="0.01" step="any" data-mirror="equity_budget_inr" disabled></div></div>
+    </div>
+  </section>
+  <section class="replica-card replica-risk" aria-labelledby="replica-risk-heading">
+    <div class="replica-card-top"><div class="replica-card-icon" aria-hidden="true">⬡</div><div class="replica-card-headings"><h2 id="replica-risk-heading">Risk &amp; Protection</h2><p>Position sizing and automatic exit protection</p></div></div>
+    <div class="replica-rows">
+      <div class="replica-row"><label for="replicaSl">Stop Loss (F&amp;O)</label><div class="replica-field replica-control-wrap"><input id="replicaSl" type="number" min="0.1" max="50" step="0.1" data-mirror="fno_sl_pct" disabled><span>%</span></div></div>
+      <div class="replica-row"><label for="replicaTp">Target (F&amp;O)</label><div class="replica-field replica-control-wrap"><input id="replicaTp" type="number" min="0.1" max="100" step="0.1" data-mirror="fno_target_pct" disabled><span>%</span></div></div>
+      <div class="replica-row"><label for="replicaLots">Max Lots (F&amp;O)</label><div class="replica-field"><input id="replicaLots" type="number" min="1" step="1" data-mirror="fno_max_lots" disabled></div></div>
+      <div class="replica-row"><label for="replicaFnoBudget">F&amp;O Budget (₹)</label><div class="replica-field"><input id="replicaFnoBudget" type="number" min="0" step="any" data-mirror="fno_capital_per_trade" disabled></div></div>
+      <div class="replica-row"><label for="replicaEquityBudget">Equity Budget (₹)</label><div class="replica-field"><input id="replicaEquityBudget" type="number" min="0.01" step="any" data-mirror="equity_budget_inr" disabled></div></div>
+    </div>
+  </section>
+  <section class="replica-card replica-amo" aria-labelledby="replica-amo-heading">
+    <div class="replica-card-top"><div class="replica-card-icon" aria-hidden="true">▣</div><div class="replica-card-headings"><h2 id="replica-amo-heading">AMO Settings</h2><p>After Market Order (AMO) configuration</p></div></div>
+    <div class="replica-rows">
+      <div class="replica-row"><span class="replica-label">Equity AMO</span><button id="replicaAMOEquity" class="replica-amo-switch" type="button" role="switch" aria-checked="false" data-on="false" disabled aria-label="Equity AMO: saved state unverified"></button></div>
+      <div class="replica-row"><span class="replica-label">F&amp;O AMO</span><button id="replicaAMOFno" class="replica-amo-switch" type="button" role="switch" aria-checked="false" data-on="false" disabled aria-label="F&O AMO: saved state unverified"></button></div>
+      <div class="replica-row"><span class="replica-label">AMO Dispatch Preference</span><div class="replica-field"><input type="text" value="Market Open (broker AMO)" readonly aria-label="AMO dispatch preference; controlled by broker" title="Native Dhan AMO dispatch is market open"></div></div>
+      <div id="replicaAMOFeedback" class="replica-amo-summary" style="grid-column:1/-1">Checking saved AMO settings…</div>
+    </div>
+  </section>
+  <section class="replica-card replica-market" aria-labelledby="replica-market-heading">
+    <div class="replica-card-top"><div class="replica-card-icon" aria-hidden="true">◈</div><div class="replica-card-headings"><h2 id="replica-market-heading">Market &amp; Data</h2><p>Quotes, data freshness and scrip master</p></div></div>
+    <div class="replica-rows">
+      <div class="replica-row"><label for="replicaQuoteAge">Quote Staleness</label><div class="replica-field replica-control-wrap"><input id="replicaQuoteAge" type="number" min="0.1" step="0.5" data-mirror="max_quote_age_sec" disabled><span>seconds</span></div></div>
+      <div class="replica-row"><label for="replicaPriceSource">Price Source Policy</label><div class="replica-field"><select id="replicaPriceSource" data-mirror="equity_cmp_execution_policy" disabled><option value="STRICT_TIMESTAMP">Strict timestamp</option><option value="DARVAS_HTTP_SUCCESS">Darvas HTTP response</option></select></div></div>
+      <div class="replica-row"><label for="replicaScripCache">Scrip Master Cache</label><div class="replica-field replica-control-wrap"><input id="replicaScripCache" type="number" min="1" step="1" data-mirror="scrip_master_max_age_sec" disabled><span>seconds</span></div></div>
+    </div>
+  </section>
+</div>'''
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -389,21 +429,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     /* Save status styling lives in the shared premium design system. */
   </style>
   <!--PREMIUM_STYLES-->
+  <!--APPROVED_REPLICA_STYLES-->
 </head>
 <body>
   <div class="container">
     <button id="premNavOpen" type="button" class="prem-nav-toggle" aria-controls="premNav" aria-expanded="false">☰ Menu</button>
     <!--PREMIUM_NAV-->
-    <div class="header">
-      <div class="icon-badge">
-        <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+    <div class="replica-head">
+      <div class="replica-brandline">
+        <span class="replica-head-icon" aria-hidden="true">⚙</span>
+        <div><h1 aria-label="Audit bot Setup &amp; Configuration">Setup &amp; Configuration</h1>
+          <p>Configure trading, risk, AMO and notification settings</p></div>
       </div>
-      <h1 aria-label="Audit bot Setup &amp; Configuration">Setup &amp; Configuration</h1>
-      <p class="subtitle">Configure trading parameters, DhanHQ access, Telegram channels and risk limits. Existing safety and service controls remain in force.</p>
+      <div class="replica-head-status" aria-live="polite">
+        <span id="replicaModePill" class="replica-pill" data-tone="neutral">◌ UNVERIFIED</span>
+        <span class="replica-separator" aria-hidden="true"></span>
+        <span class="replica-status">◇ Reconciliation: Not verified</span>
+        <span class="replica-separator" aria-hidden="true"></span>
+        <span class="replica-status">♢ OCO Guard: Not verified</span>
+        <span class="replica-separator" aria-hidden="true"></span>
+        <time id="replicaClock" class="replica-clock">IST</time>
+      </div>
     </div>
-
-    <!--SYSTEM_STATUS_BAR-->
-
+    <div class="replica-topline"><div id="replicaAlert" class="replica-alert" role="status" aria-live="polite" hidden>
+      <span class="replica-alert-icon" aria-hidden="true">✓</span>
+      <div><strong id="replicaAlertTitle">Settings</strong><small id="replicaAlertText">Update recorded.</small></div>
+      <button id="replicaAlertClose" type="button" aria-label="Dismiss notification">×</button>
+    </div></div>
     <!--STATUS_BANNER-->
 
     <form method="POST" action="/setup">
@@ -414,11 +466,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
         <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
         <input type="hidden" name="full_setup_form" value="1">
-        <label class="toggle-row" style="margin:12px 0;gap:12px;">
+      
+      <!--APPROVED_REFERENCE_BOARD-->
+      <div class="replica-footer">
+        <button id="replicaReset" type="button" class="replica-reset">↶ &nbsp; Reset</button>
+        <button id="replicaSaveOnly" type="button" class="replica-save" disabled title="Save without restart is available only when the bot is verified stopped">▣ &nbsp; Save</button>
+        <button id="replicaApply" type="submit" class="btn-submit"><span>✓</span> Save &amp; Apply</button>
+      </div>
+
+      <details id="replicaAdvanced" class="replica-advanced" open>
+        <summary>Advanced Configuration — Telegram, Dhan, account limits, and detailed protections</summary>
+        <div class="replica-advanced-body">
+                <label class="toggle-row" style="margin:12px 0;gap:12px;">
           <input type="checkbox" name="confirm_live" value="true" style="width:18px;height:18px;">
           I explicitly authorize switching TEST to LIVE. Actual broker orders may be placed.
         </label>
-      
+
       <!-- 1. Master Execution Mode & Segments -->
       <div id="setup-execution" class="section-card">
         <div class="section-title">
@@ -898,9 +961,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <button type="submit" class="btn-submit">
-        <span>💾</span> Save & Apply
-      </button>
+        </div>
+      </details>
+      <div class="replica-extras">
+        <div id="replicaPending" class="replica-info" role="status">All displayed values come from saved configuration</div>
+        <details class="replica-diagnostics"><summary>Runtime diagnostics and existing status details</summary>
+          <!--SYSTEM_STATUS_BAR-->
+        </details>
+      </div>
     </form>
   </div>
 
@@ -908,6 +976,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 document.addEventListener('DOMContentLoaded', function () {
   /*PREMIUM_NAV_JS*/
+  /*APPROVED_REPLICA_JS*/
   const form = document.querySelector('form[action="/setup"]');
   if (!form) return;
   const button = form.querySelector('button[type="submit"]');
@@ -1090,6 +1159,9 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     html = (
         HTML_TEMPLATE.replace("<!--PREMIUM_STYLES-->", premium_styles())
         .replace("<!--PREMIUM_NAV-->", premium_nav("setup"))
+        .replace("<!--APPROVED_REPLICA_STYLES-->", approved_replica_styles())
+        .replace("<!--APPROVED_REFERENCE_BOARD-->", APPROVED_REFERENCE_BOARD)
+        .replace("/*APPROVED_REPLICA_JS*/", approved_replica_js())
         .replace("/*PREMIUM_NAV_JS*/", premium_nav_js())
         .replace("<!--STATUS_BANNER-->", banner)
         .replace("<!--SYSTEM_STATUS_BAR-->", status_bar)
