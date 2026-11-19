@@ -107,12 +107,12 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
   <div class="status-note">AMO preference: <b>Market Open</b>. Both Equity and F&amp;O send orders to Dhan immediately after hours. Dhan order ID confirms receipt, not a fill. F&amp;O AMO has NO automatic SL/target; review any filled position manually. Legacy local F&amp;O entries are never dispatched. Switching OFF does not cancel submitted Dhan orders.</div>
   <div id="amo-feedback" role="status" aria-live="polite">AMO settings have not been changed.</div>
 </section>
-<section aria-label="AMO order reconciliation">
+<section id="amo-orders" aria-label="AMO order reconciliation">
   <div class="section-header"><h2>AMO Order Status</h2><button id="refresh-orders" type="button">↻ Refresh</button></div>
   <div id="order-counts" class="counts">Waiting for verified order information…</div>
   <div id="orders" aria-live="polite"></div>
 </section>
-<section aria-label="Health check results">
+<section id="system-health" aria-label="Health check results">
   <div class="section-header"><h2>System Health</h2><small>Read-only checks</small></div>
   <div id="health-state" role="status" aria-live="polite">Select Health Check to check service, broker, token, Telegram and safety gates.</div>
   <div id="checks"></div>
