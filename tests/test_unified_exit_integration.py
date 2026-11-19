@@ -4,6 +4,8 @@ Uses REAL JournalDB (SQLite WAL), REAL ProtectionWatcher (JSON + SQLite persiste
 and restart reload), REAL StartupReconciliationGate.run_startup_reconciliation(),
 REAL holding_quantity, and REAL ReadGovernor — zero network calls, zero live mutations.
 """
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
@@ -225,8 +227,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
             trade_book=[],
             order_book=[],
             positions=[],
-            holdings=[{"securityId": "11915", "totalQty": 2, "isin": "INE528G01035", "dhanClientId": ACCOUNT},
-                      {"securityId": "5264", "totalQty": 0, "dpQty": 0}],
+            holdings=[{"securityId": "11915", "totalQty": 2, "isin": "INE528G01035", "dhanClientId": ACCOUNT}],
             hist_trades=[*owner_trades, _trade("HIST-SELL-1", "S-HIST-1", "SELL", 1, hist_sell_ts, 420.0)],
         )
         watcher = ProtectionWatcher(broker=broker, path=self.watcher_path, dry_run=False, journal_db=self.db)
@@ -244,7 +245,122 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self.assertEqual(gate.state, ReconciliationState.HEALTHY)
         self.assertTrue(gate.is_accepting_entries)
 
-    def test_delivery_sale_requires_explicit_zero_after_restart(self):
+    def _gate(self, broker):
+        watcher = ProtectionWatcher(broker, path=self.watcher_path, journal_db=self.db)
+        gate = StartupReconciliationGate(broker, self.db, watcher, self.stop_mgr)
+        broker.reconciliation_gate = gate
+        return gate
+
+    def _round_trip(self, parent, ts, qty, exit_order):
+        self._seed_pdsl_open_buy(buy_oid=parent, buy_ts=ts, buy_qty=qty)
+        trades = [_trade(parent, f"B-{parent}", "BUY", qty, ts + timedelta(seconds=2), 402.5),
+                  _trade(exit_order, f"S-{parent}", "SELL", qty, ts + timedelta(seconds=5), 415)]
+        return trades, [dict(row, orderStatus="TRADED", filledQty=qty) for row in trades]
+
+    def test_reentry_ignores_only_verified_closed_lot(self):
+        ts = datetime.now(IST).replace(hour=9, minute=0, second=0)
+        trades, orders = self._round_trip("B1", ts, 2, "S1")
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[])
+        gate = self._gate(broker)
+        self.assertEqual(gate.run_startup_reconciliation()[0], True)
+        t2, o2 = self._round_trip("B2", ts + timedelta(hours=1), 3, "S2")
+        broker.get_trade_book.return_value.extend(t2)
+        broker.get_order_book.return_value.extend(o2)
+        broker.get_trade_book.return_value.append(dict(t2[0], orderId="manual", exchangeTradeId="unknown"))
+        self.assertFalse(gate.run_startup_reconciliation()[0])
+        broker.get_trade_book.return_value.pop()
+        ok, reason = gate.run_startup_reconciliation()
+        self.assertTrue(ok, reason)
+        for oid in ("B1", "B2"):
+            self.assertEqual(self.db.get_position_lifecycle(oid)["confirmed_open_qty"], 0)
+
+    def test_four_simultaneous_gate_checks_link_once(self):
+        trades, orders = self._round_trip("CONCURRENT", datetime.now(IST) - timedelta(minutes=1), 2, "EXIT")
+        gate = self._gate(self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[]))
+        barrier = Barrier(4)
+
+        def check():
+            barrier.wait(timeout=5)
+            return gate.run_startup_reconciliation()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(check) for _ in range(4)]
+            outcomes = [future.result(timeout=15) for future in futures]
+        self.assertTrue(any(ok for ok, reason in outcomes), outcomes)
+        self.assertTrue(gate.run_startup_reconciliation()[0])
+        with self.db._get_conn() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM system_events WHERE event_type='UNIFIED_EXIT_LINKED' "
+                "AND description='CONCURRENT'").fetchone()[0], 1)
+        self.assertEqual(self.db.get_position_accounting("CONCURRENT")["sell_filled_qty"], 2)
+
+    def test_shared_super_id_requires_matching_terminal_leg(self):
+        trades, orders = self._round_trip("SUP1", datetime.now(IST) - timedelta(minutes=1), 1, "SUP1")
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[])
+        gate = self._gate(broker)
+        self.assertFalse(gate.run_startup_reconciliation()[0])
+        broker.get_super_orders.return_value.append(dict(orders[0], orderStatus="CLOSED", legDetails=[
+            dict(orderId="SUP1", legName="STOP_LOSS_LEG", orderStatus="TRADED", quantity=1),
+            dict(orderId="SUP1", legName="TARGET_LEG", orderStatus="CANCELLED", quantity=1)]))
+        ok, reason = gate.run_startup_reconciliation()
+        self.assertTrue(ok, reason)
+        self.assertEqual(self.db.get_position_lifecycle("SUP1")["sell_filled_qty"], 1)
+
+    def test_cancelled_partial_buy_fully_exited_persists(self):
+        trades, orders = self._round_trip("PART", datetime.now(IST) - timedelta(minutes=1), 4, "SELL4")
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE order_intents SET quantity=10, state='CANCELLED' WHERE broker_order_id='PART'")
+        orders[0].update(orderStatus="CANCELLED", quantity=10)
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[])
+        for _ in range(2):
+            ok, reason = self._gate(broker).run_startup_reconciliation()
+            self.assertTrue(ok, reason)
+            self.assertEqual(self.db.get_position_lifecycle("PART")["sell_filled_qty"], 4)
+            pending, terminal = self.db.load_watcher_state()
+            self.assertNotIn("PART", pending)
+            self.assertEqual(terminal["PART"]["state"], "CANCELLED")
+
+    def test_historical_mtf_full_exit_requires_absent_position(self):
+        ts = datetime.now(IST) - timedelta(days=3)
+        self._seed_pdsl_open_buy(buy_oid="MTFB", buy_ts=ts, buy_qty=5)
+        with self.db._get_conn() as conn:
+            for table in ("order_intents", "fills", "positions_lifecycle"):
+                conn.execute(f"UPDATE {table} SET product_type='MTF'")
+        sell = _trade("MTFS", "MTF-FILL", "SELL", 5, ts + timedelta(days=1), 410, prod="MTF")
+        row = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="MTF", netQty=0)
+        broker = self._make_broker(trade_book=[], order_book=[], positions=[row], holdings=[], hist_trades=[sell])
+        gate = self._gate(broker)
+        self.assertFalse(gate.run_startup_reconciliation()[0])
+        broker.get_positions.return_value.clear()
+        ok, reason = gate.run_startup_reconciliation()
+        self.assertTrue(ok, reason)
+
+    def test_split_dp_and_t1_delivery_sale_on_second_pass(self):
+        ts = datetime.now(IST) - timedelta(days=2)
+        self._seed_pdsl_open_buy(buy_oid="B5", buy_ts=ts, buy_qty=5)
+        sell = _trade("S5", "S5-FILL", "SELL", 5, datetime.now(IST), 410)
+        position = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=-5)
+        broker = self._make_broker(trade_book=[sell], order_book=[dict(sell, orderStatus="TRADED", filledQty=5)],
+                                   positions=[position], holdings=[dict(securityId="5264", dpQty=2, t1Qty=3)])
+        for _ in range(2):
+            ok, reason = self._gate(broker).run_startup_reconciliation()
+            self.assertTrue(ok, reason)
+        broker.get_trade_book.return_value.clear()
+        self.assertFalse(self._gate(broker).run_startup_reconciliation()[0])
+
+    def test_open_fno_lot_with_zero_or_missing_position_blocks(self):
+        self._seed_pdsl_open_buy(buy_oid="OPTION", buy_qty=75)
+        with self.db._get_conn() as conn:
+            for table in ("order_intents", "fills", "positions_lifecycle"):
+                conn.execute(f"UPDATE {table} SET exchange_segment='NSE_FNO', product_type='MARGIN'")
+        position = dict(securityId="5264", exchangeSegment="NSE_FNO", productType="MARGIN", netQty=0)
+        for snapshot in ([], [position]):
+            broker = self._make_broker(trade_book=[], order_book=[], positions=snapshot, holdings=[])
+            ok, reason = self._gate(broker).run_startup_reconciliation()
+            self.assertFalse(ok)
+            self.assertIn("exposure mismatch", reason)
+
+    def test_delivery_sale_requires_sufficient_explicit_holdings_after_restart(self):
         self._seed_pdsl_open_buy(buy_ts=datetime.now(IST) - timedelta(days=2))
         sell = _trade("SELL-D", "EXEC-D", "SELL", 1, datetime.now(IST), 417.75)
         position = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC",
@@ -257,6 +373,8 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self.assertFalse(gate.run_startup_reconciliation()[0])
         self.assertEqual(self.db.get_position_lifecycle("23126111920108")["confirmed_open_qty"], 1)
         broker.get_holdings.return_value = BrokerReadList([dict(securityId="5264", totalQty=0, dpQty=0)])
+        self.assertFalse(gate.run_startup_reconciliation()[0])
+        broker.get_holdings.return_value = BrokerReadList([dict(securityId="5264", dpQty=0, t1Qty=1)])
         ok, reason = gate.run_startup_reconciliation()
         self.assertTrue(ok, reason)
         self.assertEqual(self.db.get_position_lifecycle("23126111920108")["confirmed_open_qty"], 0)

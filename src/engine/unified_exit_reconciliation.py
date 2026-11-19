@@ -249,7 +249,7 @@ def _verify_protective_orders_safe(
     key: tuple,
     account: str,
     broker_evidence: Dict[str, dict],
-) -> None:
+) -> Set[str]:
     """UREC-005, P0-4 & P1-5: Schema-aware, order-ID-bound verification of protective orders.
 
     - `_CLOSED` (`CANCELLED`, `CANCELED`, `REJECTED`, `EXPIRED`) is terminal/safe.
@@ -324,6 +324,7 @@ def _verify_protective_orders_safe(
                 f"Forever TRADED protective leg ({gid}) is not corroborated by verified SELL fills for its own order ID"
             )
 
+    shared_super_exits = set()
     for row in super_orders:
         if str(row.get("securityId") or "").strip().upper() != key[0]:
             continue
@@ -362,6 +363,9 @@ def _verify_protective_orders_safe(
         if len(traded_exit_legs) != 1:
             raise ReconciliationEvidenceError("Outstanding or ambiguous protective order requires verification")
         super_oids = _extract_leg_order_ids(traded_exit_legs[0])
+        parent_oid = str(row.get("orderId") or "").strip()
+        if not super_oids and parent_oid:
+            super_oids = {parent_oid}
         matched_super_sell = sum(
             v["qty"]
             for v in broker_evidence.values()
@@ -371,6 +375,9 @@ def _verify_protective_orders_safe(
             raise ReconciliationEvidenceError(
                 "Super Order TRADED protective leg is not corroborated by verified SELL fills for its own order ID"
             )
+        if parent_oid in super_oids:
+            shared_super_exits.add(parent_oid)
+    return shared_super_exits
 
 
 def _signed_cnc_delivery_sell_reconciles(
@@ -389,7 +396,7 @@ def _signed_cnc_delivery_sell_reconciles(
     exposure from `netQty < 0` + omitted holdings row).
     Requires an explicit holdings row for `key[0]` AND exact signed day trade
     corroboration (`today_buys - today_sells == net_day`) AND exact holdings
-    agreement (`settled + net_day == projected` or `settled == projected`).
+    agreement (`settled + net_day == projected`).
     """
     if key[2] not in ("CNC", "MTF"):
         return False
@@ -415,6 +422,9 @@ def _signed_cnc_delivery_sell_reconciles(
     if len(matches) != 1 or matches[0] >= 0:
         return False
     net_day = matches[0]
+    if any(datetime.fromtimestamp(v["when"], IST).date() != datetime.now(IST).date()
+           for v in broker_evidence.values() if v.get("from_today")):
+        return False
     today_buys = sum(v["qty"] for v in broker_evidence.values() if v.get("side") == "BUY" and v.get("from_today"))
     today_sells = sum(v["qty"] for v in broker_evidence.values() if v.get("side") == "SELL" and v.get("from_today"))
     if today_buys - today_sells != net_day:
@@ -427,15 +437,17 @@ def _signed_cnc_delivery_sell_reconciles(
     if key[0] not in holdings_map:
         return False
     settled = holdings_map[key[0]]
-    return (settled + net_day == projected) or (settled == projected)
+    return settled >= -net_day and settled + net_day == projected
 
 
 def verified_flat_delivery_day(broker_position, positions, holdings, trades, db, account, read_required):
     """A negative day balance may represent delivery stock sold from a prior day."""
     key = _identity(broker_position)
-    if key[2] != "CNC" or not account or db.account_id != account:
+    if key[1] not in ("NSE_EQ", "BSE_EQ"):
         return False
-    if aggregate_holdings(holdings, account_id=account).get(key[0]) != 0:
+    if key[2] not in ("CNC", "MTF") or not account or db.account_id != account:
+        return False
+    if key[0] not in aggregate_holdings(holdings, account_id=account):
         return False
     evidence = {}
     parents = set()
@@ -446,7 +458,7 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
         if side not in ("BUY", "SELL"):
             return False
         fill = _broker_trade(row, account, key, side)
-        if fill["eid"] in evidence:
+        if datetime.fromtimestamp(fill["when"], IST).date() != datetime.now(IST).date() or fill["eid"] in evidence:
             return False
         evidence[fill["eid"]] = dict(fill, side=side, from_today=True)
         if side == "SELL":
@@ -467,11 +479,22 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
                 else:
                     parents.add(record[0])
         else:
+            record = db.get_fill_by_exchange_trade_id(fill["eid"])
+            if (not record or not record["is_verified_trade"] or record["transaction_type"] != "BUY"
+                    or record["broker_order_id"] != fill["oid"] or _identity(record, journal=True) != key
+                    or record["traded_quantity"] != fill["qty"] or record["traded_price"] != fill["price"]):
+                return False
             parents.add(fill["oid"])
+    open_qty = 0
+    for row in db.get_open_positions_lifecycle():
+        if _identity(row, journal=True) == key:
+            if row["account_id"] != account:
+                return False
+            open_qty += _integer(row["confirmed_open_qty"])
     for parent in parents:
         lot = db.get_position_lifecycle(parent)
         if (not lot or lot["account_id"] != account or _identity(lot, journal=True) != key
-                or lot["position_state"] != "POSITION_CLOSED" or lot["confirmed_open_qty"] != 0):
+                or db.get_position_accounting(parent)["confirmed_open_qty"] != lot["confirmed_open_qty"]):
             return False
     if not parents:
         return False
@@ -483,7 +506,7 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
         super_orders=_read(read_required, "get_super_orders", "Super orders"),
         key=key, account=account, broker_evidence=evidence)
     return _signed_cnc_delivery_sell_reconciles(
-        positions=positions, holdings=holdings, key=key, account=account, projected=0, broker_evidence=evidence)
+        positions=positions, holdings=holdings, key=key, account=account, projected=open_qty, broker_evidence=evidence)
 
 
 def _verify_fill_level_chronology(
@@ -572,6 +595,7 @@ def _sync_parent_lot_to_watcher(
         segment=key[1],
         product_type=key[2],
         requested_qty=_integer(d["intent"]["quantity"], positive=True),
+        entry_terminal_status=d.get("entry_terminal_status") or d["intent"].get("state"),
         filled_qty=buy_qty,
         avg_fill_price=float(acct["buy_vwap"]),
         verified_closed_qty=buy_qty - lot_proj,
@@ -668,12 +692,7 @@ def reconcile_verified_exits(
                 intent_dates[p_oid] = float(i_row["created_at"])
 
     keys = {_identity(r, journal=True) for r in live}
-    groups: Dict[tuple, list] = {}
-    for r in exits:
-        key = _identity(r, journal=True)
-        if key in keys:
-            groups.setdefault(key, []).append(r)
-
+    committed_shared_fills = set()
     pending_sync: Dict[str, Tuple[int, tuple]] = {}
     for ev in events:
         try:
@@ -685,6 +704,19 @@ def reconcile_verified_exits(
         if payload.get("account") != account or key not in keys or oid in pending_sync:
             raise ReconciliationEvidenceError("Pending recovery identity is ambiguous")
         pending_sync[oid] = (int(ev["id"]), key)
+        committed_shared_fills.update((oid, eid) for eid in payload.get("sell_exchange_trade_ids", []))
+
+    groups: Dict[tuple, list] = {}
+    for r in exits:
+        key = _identity(r, journal=True)
+        if key in keys and r["broker_order_id"] == r["parent_order_id"]:
+            if (r["parent_order_id"], r["exchange_trade_id"]) in committed_shared_fills:
+                continue
+            lot = db.get_position_lifecycle(r["parent_order_id"])
+            if lot and lot["position_state"] == "POSITION_CLOSED" and lot["confirmed_open_qty"] == 0:
+                continue
+        if key in keys:
+            groups.setdefault(key, []).append(r)
 
     # UREC-002 (contract-scoped): Bounded historical SELL discovery per contract
     discovered_by_key: Dict[tuple, Dict[str, dict]] = {}
@@ -919,7 +951,8 @@ def reconcile_verified_exits(
             for eid, item in sorted(discovered.items())
         ]
         all_candidates = candidates + discovered_rows
-        exits_for_contract = all_candidates + all_already_linked
+        candidate_ids = {r["id"] for r in candidates}
+        exits_for_contract = all_candidates + [r for r in all_already_linked if r["id"] not in candidate_ids]
         if not exits_for_contract:
             continue
 
@@ -940,6 +973,38 @@ def reconcile_verified_exits(
                 f"Ambiguous bot-owned BUY parents for {key}: partial SELL cannot be allocated without FIFO guessing"
             )
 
+        # Prior closed lots may reappear in the same daily books on a later entry.
+        closed_fills = {}
+        closed_order_qty = {}
+        matched_closed_fills = set()
+        matched_closed_qty = {}
+        closed_proof = {}
+        with db._get_conn() as conn:
+            closed = conn.execute(
+                "SELECT parent_order_id, buy_filled_qty FROM positions_lifecycle WHERE account_id=? AND security_id=? "
+                "AND exchange_segment=? AND product_type=? AND position_state='POSITION_CLOSED' "
+                "AND confirmed_open_qty=0 AND buy_filled_qty=sell_filled_qty AND buy_filled_qty>0",
+                (account, *key)).fetchall()
+            for lot in closed:
+                parent = lot[0]
+                if parent in parent_oids:
+                    continue
+                buys = [dict(r) for r in conn.execute(
+                    "SELECT * FROM fills WHERE broker_order_id=? AND transaction_type='BUY' AND is_verified_trade=1",
+                    (parent,))]
+                sells = db.get_sell_fills_for_parent(parent)
+                if (sum(r["traded_quantity"] for r in buys) != lot["buy_filled_qty"]
+                        or sum(r["traded_quantity"] for r in sells) != lot["buy_filled_qty"]):
+                    continue
+                for r in buys + sells:
+                    if _identity(r, journal=True) != key:
+                        raise ReconciliationEvidenceError("Closed execution contract mismatch")
+                    identity = (r["broker_order_id"], r["transaction_type"])
+                    eid = r["exchange_trade_id"]
+                    qty, price = closed_fills.get((identity, eid), (0, r["traded_price"]))
+                    closed_fills[identity, eid] = (qty + r["traded_quantity"], price)
+                    closed_order_qty[identity] = closed_order_qty.get(identity, 0) + r["traded_quantity"]
+
         # Build today's broker trade evidence
         broker_evidence: Dict[str, dict] = {}
         for row in trade_book:
@@ -954,6 +1019,18 @@ def reconcile_verified_exits(
                 raise ReconciliationEvidenceError("Unsupported traded side")
             normalized = _broker_trade(row, account, key, side)
             eid = normalized["eid"]
+            closed_match = closed_fills.get(((normalized["oid"], side), eid))
+            if closed_match == (normalized["qty"], normalized["price"]):
+                identity = (normalized["oid"], side)
+                if eid in broker_evidence:
+                    raise ReconciliationEvidenceError("Conflicting duplicate exchange execution")
+                closed_proof[eid] = dict(normalized, side=side)
+                if eid not in matched_closed_fills:
+                    matched_closed_qty[identity] = matched_closed_qty.get(identity, 0) + normalized["qty"]
+                    matched_closed_fills.add(eid)
+                continue
+            if eid in closed_proof:
+                raise ReconciliationEvidenceError("Conflicting duplicate exchange execution")
             if eid in broker_evidence and {k2: v2 for k2, v2 in broker_evidence[eid].items() if k2 not in ("side", "from_today", "from_history")} != normalized:
                 raise ReconciliationEvidenceError("Conflicting duplicate exchange execution")
             broker_evidence[eid] = {**normalized, "side": side, "from_today": True, "from_history": False}
@@ -985,13 +1062,22 @@ def reconcile_verified_exits(
         )
 
         # UREC-005, P0-4 & P1-5: Schema-aware, order-ID-bound protective order verification
-        _verify_protective_orders_safe(
+        shared_super_exits = _verify_protective_orders_safe(
             forever=forever,
             super_orders=super_orders,
             key=key,
             account=account,
-            broker_evidence=broker_evidence,
+            broker_evidence={**closed_proof, **broker_evidence},
         )
+
+        shared_ids = parent_oids & {str(r["broker_order_id"]) for r in exits_for_contract}
+        buy_eids = {r["exchange_trade_id"] for d in lot_details for r in d["buys"]}
+        if buy_eids & exit_eids:
+            raise ReconciliationEvidenceError("BUY and SELL share an exchange trade ID")
+        if shared_ids and len(matching_lots) > 1:
+            raise ReconciliationEvidenceError("Shared Super exit cannot be pooled across BUY parents")
+        if shared_ids - shared_super_exits:
+            raise ReconciliationEvidenceError("Shared BUY/SELL order ID lacks verified Super exit")
 
         for row in order_book:
             if str(row.get("securityId") or "").strip().upper() != key[0]:
@@ -1018,13 +1104,14 @@ def reconcile_verified_exits(
             per_order[proof["oid"]] = per_order.get(proof["oid"], 0) + proof["qty"]
             per_order_eids.setdefault(proof["oid"], []).append(eid)
 
-        ob_index: Dict[str, dict] = {}
+        ob_index = {}
         for ob in order_book:
             ob_id = str(ob.get("orderId") or "").strip()
-            if ob_id and ob_id in ob_index:
+            order_key = (ob_id, str(ob.get("transactionType") or "").upper())
+            if ob_id and order_key in ob_index:
                 raise ReconciliationEvidenceError("Duplicate broker orderbook order ID")
             if ob_id:
-                ob_index[ob_id] = ob
+                ob_index[order_key] = ob
 
         evidence_oids = {v["oid"] for v in broker_evidence.values()}
         for ob in order_book:
@@ -1042,6 +1129,11 @@ def reconcile_verified_exits(
                 filled = _integer(raw_filled)
                 if ob_status == "REJECTED" and filled > 0:
                     raise ReconciliationEvidenceError("Rejected order reports positive filled quantity")
+            if (filled > 0 and matched_closed_qty.get((ob_id, ob_side)) == filled
+                    and closed_order_qty.get((ob_id, ob_side)) == filled
+                    and str(ob.get("dhanClientId") or account) == account
+                    and ob_status in _FINISHED):
+                continue
             if filled > 0:
                 if ob_side == "BUY" and ob_id not in parent_oids:
                     raise ReconciliationEvidenceError("Competing broker BUY fill requires allocation review")
@@ -1051,13 +1143,14 @@ def reconcile_verified_exits(
                     raise ReconciliationEvidenceError("Broker order with unknown executed side")
             if ob_side == "BUY" and ob_id in parent_oids:
                 lot_match = next(d for d in lot_details if d["oid"] == ob_id)
+                lot_match["entry_terminal_status"] = ob_status
                 if filled != lot_match["buy_qty"]:
                     raise ReconciliationEvidenceError("Original broker BUY fill count disagrees with journal")
 
         # UREC-001: Validate today's SELL orders in order_book; do NOT require archived
         # prior-day historically verified SELL orders to appear in today's rolled-over orderbook.
         for sell_oid, q in per_order.items():
-            row = ob_index.get(sell_oid)
+            row = ob_index.get((sell_oid, "SELL"))
             if row is not None:
                 if str(row.get("transactionType") or "").upper() != "SELL" or _identity(row) != key:
                     raise ReconciliationEvidenceError("SELL orderbook identity mismatch")
@@ -1065,7 +1158,7 @@ def reconcile_verified_exits(
                     raise ReconciliationEvidenceError("SELL orderbook account mismatch")
                 if _integer(row.get("filledQty")) != q:
                     raise ReconciliationEvidenceError("SELL orderbook partial fill count differs from tradebook")
-            elif any(str(r["broker_order_id"]) == sell_oid for r in all_candidates):
+            elif sell_oid not in shared_ids and any(str(r["broker_order_id"]) == sell_oid for r in all_candidates):
                 order_proofs = [broker_evidence[eid] for eid in per_order_eids.get(sell_oid, [])]
                 all_archived_prior_day = bool(order_proofs) and all(
                     p.get("from_history") and datetime.fromtimestamp(p["when"], IST).date() < today_ist
@@ -1095,6 +1188,7 @@ def reconcile_verified_exits(
             )
             signed_delivery_ok = (
                 source == "NEGATIVE_CNC_POSITION_REVIEW"
+                and key[1] in ("NSE_EQ", "BSE_EQ")
                 and _signed_cnc_delivery_sell_reconciles(
                     positions=positions,
                     holdings=holdings,
@@ -1104,7 +1198,15 @@ def reconcile_verified_exits(
                     broker_evidence=broker_evidence,
                 )
             )
-            if not (same_day_full_round_trip or signed_delivery_ok):
+            prior_day_full_exit = (
+                projected_total == 0 and source == "SETTLED_HOLDING_NOT_REPORTED"
+                and key[2] in ("CNC", "MTF")
+                and not any(_identity(row) == key for row in positions if str(row.get("securityId")) == key[0])
+                and all(broker_evidence[eid]["from_history"] and
+                        datetime.fromtimestamp(broker_evidence[eid]["when"], IST).date() < today_ist
+                        for eid in exit_eids)
+            )
+            if not (same_day_full_round_trip or signed_delivery_ok or prior_day_full_exit):
                 raise ReconciliationEvidenceError(
                     f"Broker exposure does not match verified fills: expected={projected_total}, "
                     f"observed={observed}, status={source}"

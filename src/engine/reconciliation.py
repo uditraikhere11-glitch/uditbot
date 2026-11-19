@@ -1159,6 +1159,22 @@ class StartupReconciliationGate:
         except Exception as exc:
             return False, f"Cannot verify settled holdings: positions_lifecycle query failed: {exc}"
 
+        from src.engine.holding_quantity import observed_open_quantity
+
+        required = {}
+        for row in open_lifecycle_rows:
+            key = tuple(str(row.get(field) or "").upper() for field in
+                        ("security_id", "exchange_segment", "product_type"))
+            qty = int(row.get("confirmed_open_qty") or 0)
+            if qty > 0 and key[2] not in ("CNC", "MTF"):
+                required[key] = required.get(key, 0) + qty
+        for (security, segment, product), qty in required.items():
+            observed, status = observed_open_quantity(
+                intraday_positions, None, security_id=security, segment=segment, product=product,
+                account_id=str(getattr(self.db, "account_id", "") or ""))
+            if status != "VERIFIED_POSITIONS" or observed < qty:
+                return False, f"Open lot exposure mismatch for {security}/{segment}/{product}: expected={qty}, observed={observed}"
+
         # Filter to CNC/MTF bot-owned open positions that were historically reconciled (or settled into holdings)
         bot_settled_candidates = [
             row for row in open_lifecycle_rows
@@ -1762,7 +1778,7 @@ class StartupReconciliationGate:
         used_forever = {}
         coverage_positions = []
         for position in positions:
-            if (isinstance(position, dict) and position.get("productType") == "CNC"
+            if (isinstance(position, dict) and position.get("productType") in ("CNC", "MTF")
                     and re.fullmatch(r"-[1-9][0-9]*", str(position.get("netQty")))
                     and books.get("account")):
                 if self._active_pass_holdings is None:
