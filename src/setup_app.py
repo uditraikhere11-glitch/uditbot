@@ -9,13 +9,14 @@ Enables operators to inspect, configure, and switch trading parameters anywhere,
 - Capital & Position Sizing (Equity Budget, Product Type CNC/MTF, Options Budget, Max Lots)
 - Risk Management Controls (Max Order Amount, Min Funds, Daily Loss Limit, Max Trades, Exposure, Max Positions)
 - Protection & Timing Parameters (SL %, Target %, Buffer %, Signal Age, Dedup Window)
-Includes post-save visual confirmation card and step-by-step next operational actions.
+Uses an authenticated premium workspace, navigation and compact Save & Apply confirmations.
 Safely reads from and writes to .env with chmod 0600 file permissions.
 """
 
 import os
 import sys
 from html import escape as escape_html
+from src.premium_ui import premium_styles, premium_nav, premium_nav_js
 from src.notifier.dhan_response import normalize_group_name
 from typing import Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException
@@ -67,7 +68,7 @@ register_message_designer_routes(app, SETUP_CSRF_TOKEN)
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="premium-setup">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -250,84 +251,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border: 1px solid #334155;
     }
 
-    /* Operational Next Steps Guide (Scoped .guide-* to prevent layout disorientation) */
-    .guide-card {
-      background: #141c2e;
-      border: 1px solid #24324f;
-      border-radius: 14px;
-      padding: 22px 24px;
-      margin-bottom: 26px;
-      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.25);
-    }
-    .guide-title {
-      font-size: 15px;
-      font-weight: 700;
-      color: #38bdf8;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 18px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid #1e293b;
-    }
-    .guide-list {
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-    .guide-row {
-      display: flex !important;
-      flex-direction: row !important;
-      align-items: flex-start !important;
-      text-align: left !important;
-      gap: 16px;
-    }
-    .guide-num {
-      width: 28px;
-      height: 28px;
-      background: linear-gradient(135deg, #1d4ed8, #2563eb);
-      color: #ffffff;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 13px;
-      font-weight: 700;
-      flex-shrink: 0;
-      margin-top: 2px;
-      box-shadow: 0 2px 6px rgba(37, 99, 235, 0.4);
-    }
-    .guide-body {
-      flex: 1;
-      text-align: left !important;
-    }
-    .guide-body h5 {
-      font-size: 14px;
-      font-weight: 600;
-      color: #f8fafc;
-      margin-bottom: 3px;
-      text-align: left !important;
-    }
-    .guide-body p {
-      font-size: 12px;
-      color: #94a3b8;
-      line-height: 1.5;
-      margin: 0;
-      text-align: left !important;
-    }
-    .guide-code {
-      display: inline-block;
-      background: #090d16;
-      border: 1px solid #1e293b;
-      padding: 3px 8px;
-      border-radius: 5px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      color: #38bdf8;
-      font-size: 11px;
-      font-weight: 600;
-      margin-top: 4px;
-    }
-
     .section-card {
       background: #161f33;
       border: 1px solid #243049;
@@ -463,32 +386,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-live { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
     .badge-test { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
 
-    #simpleSaveStatus { display:none; margin-top:14px; padding:14px 16px; border-radius:10px; background:#172334; color:#e2e8f0; border-left:4px solid #3b82f6; }
-    #simpleSaveStatus.success { border-left-color:#10b981; }
-    #simpleSaveStatus.error { border-left-color:#ef4444; }
+    /* Save status styling lives in the shared premium design system. */
   </style>
+  <!--PREMIUM_STYLES-->
 </head>
 <body>
   <div class="container">
+    <button id="premNavOpen" type="button" class="prem-nav-toggle" aria-controls="premNav" aria-expanded="false">☰ Menu</button>
+    <!--PREMIUM_NAV-->
     <div class="header">
       <div class="icon-badge">
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
       </div>
-      <h1>Audit bot Setup &amp; Operations Control</h1>
-      <p class="subtitle">AuditBot Trading &amp; Safety Control Center &mdash; Configure trading parameters, DhanHQ credentials, Telegram channels, and risk controls for Audit bot.</p>
+      <h1>Setup &amp; Configuration</h1>
+      <p class="subtitle">Configure trading parameters, DhanHQ access, Telegram channels and risk limits. Existing safety and service controls remain in force.</p>
     </div>
 
     <!--SYSTEM_STATUS_BAR-->
-    <div class="section-card" style="margin-top:12px; padding:15px 20px">
-      <a href="/setup/telegram-designer" style="font-weight:750; color:#93c5fd; text-decoration:none">🎨 Open Telegram Message Designer →</a>
-      <p class="help-text" style="margin:7px 0 0">Choose notification fields, layout, order, custom titles and emojis; preview and save without restarting trading.</p>
-    </div>
 
     <!--STATUS_BANNER-->
 
-    <!--NEXT_STEPS_GUIDE-->
-
     <form method="POST" action="/setup">
+      <nav class="setup-section-jumps" aria-label="Setup sections">
+        <a href="#setup-execution">Execution</a><a href="#setup-telegram">Telegram</a><a href="#setup-broker">Dhan Broker</a>
+        <a href="#setup-sizing">Sizing</a><a href="#setup-risk">Risk Controls</a><a href="#setup-protection">Protection</a>
+      </nav>
       <input type="hidden" name="csrf_token" value="<!--CSRF_TOKEN-->">
         <input type="hidden" name="expected_revision" value="<!--CONFIG_REVISION-->">
         <input type="hidden" name="full_setup_form" value="1">
@@ -498,7 +420,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </label>
       
       <!-- 1. Master Execution Mode & Segments -->
-      <div class="section-card">
+      <div id="setup-execution" class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
           Execution Mode & Segments
@@ -540,7 +462,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- 2. Bot Configuration & Operator Details -->
-      <div class="section-card">
+      <div id="setup-telegram" class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           Bot Configuration & Signal Ingestion
@@ -635,7 +557,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- 3. DhanHQ Exchange Credentials -->
-      <div class="section-card">
+      <div id="setup-broker" class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           Exchange Credentials (DhanHQ v2)
@@ -677,7 +599,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- 4. Capital Sizing & Trade Defaults -->
-      <div class="section-card">
+      <div id="setup-sizing" class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><line x1="12" y1="6" x2="12" y2="8"/><line x1="12" y1="16" x2="12" y2="18"/></svg>
           Capital Sizing & Product Defaults
@@ -793,7 +715,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- 5. Risk Management & Circuit Breakers -->
-      <div class="section-card">
+      <div id="setup-risk" class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
           Risk Management & Circuit Breakers
@@ -876,7 +798,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- 6. Protection & Timing Parameters -->
-      <div class="section-card">
+      <div id="setup-protection" class="section-card">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           Protection & Timing Rules (Forever OCO)
@@ -982,13 +904,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </form>
   </div>
 
-  <div id="simpleSaveStatus" role="status" aria-live="polite"></div>
+  <div id="simpleSaveStatus" role="status" aria-live="polite" hidden><span id="toastMessage"></span><button type="button" id="toastDismiss" aria-label="Dismiss notification">×</button></div>
 <script>
 document.addEventListener('DOMContentLoaded', function () {
+  /*PREMIUM_NAV_JS*/
   const form = document.querySelector('form[action="/setup"]');
   if (!form) return;
   const button = form.querySelector('button[type="submit"]');
   const status = document.getElementById('simpleSaveStatus');
+  const toastMessage = document.getElementById('toastMessage');
+  const toastDismiss = document.getElementById('toastDismiss');
+  let toastTimer;
+  function showToast(value,tone,autoDismissMs) {
+    clearTimeout(toastTimer);
+    status.className = tone;
+    toastMessage.textContent = String(value);
+    status.hidden = false;
+    if (autoDismissMs) toastTimer = setTimeout(() => { status.hidden = true; }, autoDismissMs);
+  }
+  toastDismiss.addEventListener('click', () => { clearTimeout(toastTimer); status.hidden = true; });
+  const fallbackToast = document.querySelector('.setup-post-confirmation');
+  if (fallbackToast) setTimeout(() => { fallbackToast.hidden = true; }, 5200);
   form.addEventListener('submit', async function (event) {
     event.preventDefault();
     if (button.disabled) return;
@@ -999,9 +935,7 @@ document.addEventListener('DOMContentLoaded', function () {
       if (livePermission) livePermission.checked = true;
     }
     button.disabled = true;
-    status.style.display = 'block';
-    status.className = '';
-    status.textContent = 'Saving settings and applying changes...';
+    showToast('Saving settings and applying changes…','neutral',0);
     try {
       const response = await fetch('/setup/save-apply', {
         method: 'POST',
@@ -1012,16 +946,13 @@ document.addEventListener('DOMContentLoaded', function () {
       if (!response.ok || !result.ok) throw Error(result.message || result.error || 'Save failed');
       const rev = form.querySelector('input[name="expected_revision"]');
       if (rev && result.revision) rev.value = result.revision;
-      status.className = 'success';
-      status.textContent = result.message;
-      if (result.saved) window.alert(result.message);
+      const verified = result.status === 'RESTARTED' && result.restart_performed === true;
+      showToast(result.message || 'Save & Apply completed.', verified ? 'success' : 'neutral', 5200);
     } catch (error) {
-      status.className = 'error';
-      status.textContent = String(error.message || error) +
-        ' Refresh this page before trying another change.';
+      showToast(String(error.message || error) +
+        ' Check service status and refresh before trying another change.', 'error', 0);
     } finally {
       button.disabled = false;
-      status.scrollIntoView({block: 'nearest', behavior: 'smooth'});
     }
   });
 });
@@ -1143,93 +1074,25 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     """
 
     banner = ""
-    next_steps = ""
     if saved:
         info = saved_info or {}
         mode_val = escape_html(str(info.get("mode", cfg.trading_mode.value)), quote=True)
         badge_cls = "badge-live" if mode_val == "LIVE" else "badge-test"
         
-        banner = f"""
-        <div class="banner-success">
-          <div style="width: 100%;">
-            <div class="banner-header">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-              <span>Audit bot Configuration Request Recorded</span>
-            </div>
-            <p style="font-size: 13px; color: #a7f3d0; margin-bottom: 8px;">
-              {escape_html(str(info.get("state", "UNKNOWN")), quote=True)} — {f"Restart verified in <strong>{mode_val}</strong> mode." if info.get("service_restarted") else "A requested change may be queued for a broker-safe transition or saved for next controlled start. Only VERIFIED means active."}
-            </p>
-            <div class="summary-grid">
-              <div class="summary-chip">
-                <div class="chip-label">Operating Mode</div>
-                <div class="chip-value"><span class="badge {badge_cls}">{mode_val}</span></div>
-              </div>
-              <div class="summary-chip">
-                <div class="chip-label">Operator</div>
-                <div class="chip-value">{escape_html(str(info.get('operator', getattr(cfg, 'operator_name', 'Udit'))), quote=True)}</div>
-              </div>
-              <div class="summary-chip">
-                <div class="chip-label">Bot Instance</div>
-                <div class="chip-value">{escape_html(str(info.get('instance', getattr(cfg, 'instance_name', 'Audit bot'))), quote=True)}</div>
-              </div>
-              <div class="summary-chip">
-                <div class="chip-label">Dhan Client ID</div>
-                <div class="chip-value">{escape_html(_mask_account_id(info.get('dhan_id', cfg.dhan_client_id or '')), quote=True)}</div>
-              </div>
-              <div class="summary-chip">
-                <div class="chip-label">Telegram Log Group</div>
-                <div class="chip-value">{escape_html(str(info.get('log_group', cfg.log_group_id or 'Not Set')), quote=True)}</div>
-              </div>
-              <div class="summary-chip">
-                <div class="chip-label">Monitored Channels</div>
-                <div class="chip-value">{len(cfg.monitored_channel_ids)} Active</div>
-              </div>
-            </div>
-          </div>
-        </div>
-        """
-
-    # Always render the Next Steps card aligned with AuditBot CLI & systemd
-    next_steps = f"""
-    <div class="guide-card">
-      <div class="guide-title">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        Next Operational Steps: Running &amp; Verifying AuditBot
-      </div>
-      <div class="guide-list">
-        <div class="guide-row">
-          <div class="guide-num">1</div>
-          <div class="guide-body">
-            <h5>Service Management &amp; Status Verification</h5>
-            <p>Inspect running status or restart the trading service from your terminal:</p>
-            <div class="guide-code">./bot status</div> &nbsp; <div class="guide-code">./bot restart</div>
-          </div>
-        </div>
-        <div class="guide-row">
-          <div class="guide-num">2</div>
-          <div class="guide-body">
-            <h5>Live Telegram Ingestion &amp; Execution Logs</h5>
-            <p>Stream real-time Telegram signal parsing and order execution logs:</p>
-            <div class="guide-code">./bot service-logs</div>
-          </div>
-        </div>
-        <div class="guide-row">
-          <div class="guide-num">3</div>
-          <div class="guide-body">
-            <h5>Darvas CMP Execution &amp; Automated Protection</h5>
-            <p>Signals in monitored channels route via Darvas market pricing (<code>{getattr(cfg, 'equity_cmp_execution_policy', 'DARVAS_HTTP_SUCCESS')}</code>). In <strong>TEST</strong> mode, simulated cards are logged safely; in <strong>LIVE</strong> mode, orders execute with verified Forever OCO / Super Order protection.</p>
-          </div>
-        </div>
-      </div>
-    </div>
-    """
+        saved_state = str(info.get("state", "UNKNOWN"))
+        saved_message = escape_html(str(info.get("reason") or "Configuration request recorded."), quote=True)
+        saved_label = escape_html(saved_state.replace("_", " "), quote=True)
+        tone = "success" if saved_state == "RESTARTED" and info.get("service_restarted") else "neutral"
+        banner = f"""<div class="setup-post-confirmation {tone}" role="status" aria-live="polite"><strong>{saved_label}</strong> — {saved_message}</div>"""
 
     channels_str = ", ".join(str(cid) for cid in cfg.monitored_channel_ids) if cfg.monitored_channel_ids else ""
 
     html = (
-        HTML_TEMPLATE.replace("<!--STATUS_BANNER-->", banner)
+        HTML_TEMPLATE.replace("<!--PREMIUM_STYLES-->", premium_styles())
+        .replace("<!--PREMIUM_NAV-->", premium_nav("setup"))
+        .replace("/*PREMIUM_NAV_JS*/", premium_nav_js())
+        .replace("<!--STATUS_BANNER-->", banner)
         .replace("<!--SYSTEM_STATUS_BAR-->", status_bar)
-        .replace("<!--NEXT_STEPS_GUIDE-->", next_steps)
         # Mode & Products
         .replace("<!--LIVE_CHECKED-->", "checked" if cfg.trading_mode.value == "LIVE" else "")
         .replace("<!--EQUITY_CHECKED-->", "checked" if cfg.equity_active else "")
