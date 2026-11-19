@@ -65,13 +65,23 @@ jobs:
                      'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           assert set(paths).issubset(allowed), f'Unexpected changed file(s): {set(paths) - set(allowed)}'
-          manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head, 'files': {}}
+          manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head,
+                      'files': {}, 'removed_files': []}
           out = Path('review-out')
           out.mkdir(exist_ok=True)
           zip_path = out / ('AuditBot_PR' + os.environ['PR_NUMBER'] + '_ChangedFiles.zip')
           with ZipFile(zip_path, 'w', ZIP_DEFLATED, compresslevel=9) as archive:
               for path in paths:
                   file = Path(path)
+                  if not file.exists():
+                      # UI-only removal of obsolete, unreferenced proxy assets.
+                      assert path in ('src/approved_replica.css', 'src/approved_replica.js')
+                      subprocess.run(['git', 'cat-file', '-e', base + ':' + path], check=True)
+                      assert subprocess.run(['git', 'cat-file', '-e', head + ':' + path],
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL).returncode != 0
+                      manifest['removed_files'].append(path)
+                      continue
                   assert file.is_file() and not file.is_symlink(), f'Unsafe file: {path}'
                   raw = file.read_bytes()
                   manifest['files'][path] = hashlib.sha256(raw).hexdigest()
