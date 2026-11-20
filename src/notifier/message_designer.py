@@ -216,6 +216,13 @@ _CHANGE_LABELS = {
     "SL_PCT": "SL", "TARGET_PCT": "Target",
     "FNO_CAPITAL_PER_TRADE": "F&O Capital Per Trade",
     "EQUITY_BUDGET_INR": "Equity Budget",
+    "EQUITY_AMO_ENABLED": "Equity AMO",
+    "FNO_AMO_ENABLED": "F&O AMO",
+    "DHAN_TOTP_SECRET": "Dhan TOTP Secret",
+    "DHAN_PIN": "Dhan PIN",
+    "TG_BOT_TOKEN": "Telegram Bot Token",
+    "TG_API_HASH": "Telegram API Hash",
+    "BOT_INSTANCE_NAME": "Bot Instance Name",
 }
 
 
