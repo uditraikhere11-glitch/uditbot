@@ -515,7 +515,7 @@ def apply_settings(
                         {
                             "instance": new_values.get("INSTANCE_NAME") or "AuditBot",
                             "changed_keys": ", ".join(keys),
-                            "mode": "LIVE" if str(new_values.get("IS_LIVE_MODE", "")).lower() in ("true", "1", "yes") else "TEST",
+                            "mode": str(new_values.get("TRADING_MODE", "UNKNOWN")),
                         },
                         [message],
                         str(data_root),
