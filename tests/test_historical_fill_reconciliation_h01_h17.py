@@ -864,10 +864,10 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             unprotected_positions_count=1,
             is_stopped=False,
         )
-        self.assertIn("LISTENER RUNNING", startup_card)
-        self.assertIn("RECONCILIATION PENDING (2)", startup_card)
-        self.assertIn("PROTECTION UNVERIFIED", startup_card)
-        self.assertIn("NEW ENTRIES BLOCKED", startup_card)
+        self.assertIn("Listener: Active 2 channels", startup_card)
+        self.assertIn("Reconciliation Pending (2)", startup_card)
+        self.assertIn("Protection Watcher: Unverified", startup_card)
+        self.assertIn("New Entries Gate: Blocked", startup_card)
         self.assertNotIn("Actively listening for trade signals", startup_card)
 
         sun_1700 = datetime.datetime(2026, 11, 15, 17, 0, 5, tzinfo=IST)
