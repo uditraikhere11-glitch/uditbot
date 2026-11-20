@@ -157,16 +157,16 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             unprotected_positions_count=1, is_stopped=False,
         )
         self.assertTrue(card.startswith("🚀 <b>Custom startup</b>"))
-        self.assertIn("New Entries Gate: <code>NEW ENTRIES BLOCKED</code>", card)
-        self.assertIn("Reconciliation: <code>RECONCILIATION PENDING (1)", card)
-        self.assertIn("Protection Watcher: <code>PROTECTION UNVERIFIED</code>", card)
+        self.assertIn("New Entries Gate: NEW ENTRIES BLOCKED", card)
+        self.assertIn("Reconciliation: RECONCILIATION PENDING (1)", card)
+        self.assertIn("Protection Watcher: PROTECTION UNVERIFIED", card)
 
     def test_startup_default_remains_unchanged_when_disabled(self):
         card = format_startup_online_card(
             self.cfg, allowed_chats_count=2, reconciliation_ok=True,
         )
         self.assertTrue(card.startswith("🟢 <b>Synthetic AuditBot Online</b>"))
-        self.assertIn("New Entries Gate: <code>OPEN (ACCEPTING SIGNALS)</code>", card)
+        self.assertIn("New Entries Gate: OPEN (ACCEPTING SIGNALS)", card)
 
     def test_settings_notification_cosmetic_only(self):
         self._enable(
@@ -221,10 +221,68 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         queued = json.loads(rows[0][0])["text"]
         self.assertIn("<b>Verified Settings</b>", queued)
-        self.assertIn(
-            "Settings updated. Trading bot restarted and the new configuration was verified.",
-            queued,
+        self.assertIn("Trading bot: RESTARTED", queued)
+        self.assertIn("Configuration: VERIFIED", queued)
+        self.assertNotIn("Settings updated. Trading bot restarted", queued)
+
+    def test_startup_default_is_readable_and_not_repeated(self):
+        card = format_startup_online_card(
+            self.cfg, allowed_chats_count=2, reconciliation_ok=True,
         )
+        self.assertEqual(card.count("Listener:"), 1)
+        self.assertEqual(card.count("Reconciliation:"), 1)
+        self.assertEqual(card.count("New Entries Gate:"), 1)
+        self.assertIn("Listener: LISTENER RUNNING — 2 authorized channels", card)
+        self.assertIn("Mode: LIVE", card)
+        self.assertNotIn("<code>", card)
+        self.assertNotIn("Status: Actively listening", card)
+        self.assertNotIn("channels (monitored channels only)", card)
+
+    def test_startup_fields_customize_existing_rows_without_duplicate(self):
+        self._enable(
+            "startup", title="Status Overview", fields=[
+                {"key": "mode", "label": "Bot Mode", "emoji": "⚙️"},
+                {"key": "channels", "label": "Signal Channels", "emoji": "📡"},
+            ],
+        )
+        card = format_startup_online_card(
+            self.cfg, allowed_chats_count=2, reconciliation_ok=True,
+        )
+        self.assertIn("⚙️ Bot Mode: LIVE", card)
+        self.assertIn("📡 Signal Channels: LISTENER RUNNING — 2 authorized channels", card)
+        self.assertEqual(card.count("LIVE"), 1)
+        self.assertEqual(card.count("authorized channels"), 1)
+        self.assertNotIn("<code>", card)
+
+    def test_startup_legacy_selected_fields_do_not_duplicate_essential_status(self):
+        self._enable(
+            "startup", title="Synthetic AuditBot Online",
+            fields=[
+                {"key": "instance", "label": "Bot Instance", "emoji": "•"},
+                {"key": "mode", "label": "Mode", "emoji": "•"},
+                {"key": "channels", "label": "Monitored", "emoji": "•"},
+            ],
+        )
+        card = format_startup_online_card(
+            self.cfg, allowed_chats_count=2, reconciliation_ok=False,
+            reconciliation_msg="Review required", is_stopped=True,
+        )
+        self.assertEqual(card.count("LIVE"), 1)
+        self.assertNotIn("Bot Instance:", card)
+        self.assertIn("New Entries Gate: NEW ENTRIES BLOCKED", card)
+        self.assertNotIn("OPEN (ACCEPTING SIGNALS)", card)
+        self.assertNotIn("<code>", card)
+
+    def test_settings_default_notification_no_long_repeated_sentence(self):
+        from src.notifier import message_designer as md
+        self.assertIsNone(md.render(
+            "settings_update", {}, ["Trading bot: RESTARTED", "Configuration: VERIFIED"],
+            self.data_dir,
+        ))
+        # Disabled templates preserve the code-owned concise default.
+        default_card = "✅ <b>Settings Updated</b>\\nTrading bot: RESTARTED\\nConfiguration: VERIFIED"
+        self.assertEqual(default_card.count("Settings Updated"), 1)
+        self.assertNotIn("Settings updated. Trading bot restarted", default_card)
 
     def test_existing_saved_templates_migrate_without_reset(self):
         old = designer.defaults()
