@@ -36,7 +36,7 @@ class RunningHandoffDiagnosisTests(unittest.TestCase):
         self.gate = SafetyDecision(
             allowed=True,
             code="NO_ACTIVE_BROKER_OPERATION",
-            message="clear",
+            reason="clear",
             evidence={"producer_pid": 1234, "producer_starttime": 9001},
         )
 
