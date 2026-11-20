@@ -1,5 +1,6 @@
 """F&O AMO goes to documented /orders; never mutates a live broker in tests."""
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ class FrozenBrokerClock(unittest.TestCase):
 
 
 class NativeBrokerFnoAmoTests(FrozenBrokerClock):
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_posts_exact_fno_amo_schema(self):
         c=client()
         with patch("src.engine.market.market_status",return_value=(False,"Market Closed Post-Hours")), \
@@ -102,6 +104,7 @@ class NativeBrokerFnoAmoTests(FrozenBrokerClock):
         self.assertFalse(ok)
         c.session.post.assert_not_called()
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_unknown_broker_id_does_not_resubmit(self):
         c=client(oid="")
         c._reconcile_uncertain_submission=MagicMock(return_value=(False,None,"outcome UNKNOWN"))
@@ -168,6 +171,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
         self.assertFalse(ok)
         c.session.post.assert_not_called()
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_fno_1530_ist_allowed(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -185,6 +189,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
         self.assertFalse(ok)
         c.session.post.assert_not_called()
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_missing_or_invalid_order_ids_are_uncertain(self):
         for bad_id in (None, '', 'None', 'ABCDEF', '123', '१२३४५६७८'):
             with self.subTest(bad_id=bad_id):
@@ -205,6 +210,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
         self.assertIsNone(oid)
         c._reconcile_uncertain_submission.assert_not_called()
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_broker_status_missing_is_unknown_not_accepted(self):
         c=client(status='')
         ok,oid,_=self.invoke(c)
@@ -212,6 +218,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
         self.assertEqual(oid,'112111182198')
         self.assertTrue(c.stop_manager.finalize_mutation.call_args.kwargs['keep_persisted_if_uncertain'])
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_fno_0914_ist_allowed(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -232,6 +239,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
             ok,_,_=self.invoke(c)
         self.assertFalse(ok)
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_equity_amo_unaffected_by_fno_toggle(self):
         from src.models import ProductType
         c=client(fno=False,equity=True)
@@ -263,6 +271,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
         self.assertFalse(ok)
         c.session.post.assert_not_called()
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_http_5xx_never_resubmits(self):
         c=client();c.session.post.return_value.status_code=503
         c._reconcile_uncertain_submission=MagicMock(return_value=(False,None,'outcome UNKNOWN'))
@@ -271,6 +280,7 @@ class FnoAmoEdgeSafetyTests(FrozenBrokerClock):
         c.session.post.assert_called_once()
         self.assertTrue(c.stop_manager.finalize_mutation.call_args.kwargs['keep_persisted_if_uncertain'])
 
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_network_timeout_never_resubmits(self):
         c=client();c.session.post.side_effect=TimeoutError('timeout')
         ok,_,_=self.invoke(c)
