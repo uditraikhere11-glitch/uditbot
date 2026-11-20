@@ -289,12 +289,14 @@ def apply_settings(
         if path.is_symlink():
             raise ConfigurationConflict("Configuration symlinked during save")
         if real_runtime:
-            # Single direct-save entry point also repairs proven stale
-            # config/status records; broker barriers are never blindly reset.
+            # Historical configuration records are immutable audit evidence.
+            # A pending, corrupted or ambiguous old operation blocks a new
+            # write; never replay, rewrite or silently clear those records.
             tracker = ConfigChangeTracker(data_dir=str(data_root))
-            tracker.reconcile_stale_control_records(str(path))
-            if tracker.has_unresolved_pending_operation() or os.path.exists(tracker.deferred_env_file):
-                raise ConfigurationConflict("A previous deferred settings operation needs reconciliation.")
+            if (tracker.has_unresolved_pending_operation()
+                    or os.path.exists(tracker.deferred_env_file)
+                    or os.path.exists(tracker.deferred_meta_file)):
+                raise ConfigurationConflict("Historical deferred settings evidence needs separate review.")
         if admission_check is not None:
             admission_check()
         with path.open("r", encoding="utf-8", newline="") as fh:
@@ -328,6 +330,15 @@ def apply_settings(
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
         if state == "active" and _owner_stop_requested(path, old_values):
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
+        if real_runtime:
+            from src.engine.tracker_v2_safety import preview_legacy_tracker_migration
+            migration = preview_legacy_tracker_migration(
+                data_root, allow_owner_stopped=(state == "inactive"),
+            )
+            if not migration.allowed:
+                raise ConfigurationConflict(
+                    "Prior configuration/Owner STOP safety evidence unresolved: " + migration.code
+                )
         # Validate completed-V2 journal compatibility before any broker fence
         # or file write; do not claim a successor until the file is committed.
         _retire_previous_transaction(data_root, path, old_values, actual_revision)

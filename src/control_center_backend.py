@@ -137,11 +137,17 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         if tx is not None and tx.get("phase") not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
             v2_blocked = True
             v2_recheck = bool(
-                os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1"
-                and tx.get("phase") == "ACK_UNCERTAIN"
-                and fence is not None and fence.get("active") is True
+                tx.get("phase") in ("RESTART_ISSUED", "VERIFYING", "ACK_UNCERTAIN")
+                and fence is not None and fence.get("change_id") == tx.get("change_id")
+                and isinstance(fence.get("active"), bool)
                 and newest is not None and newest.change_id == tx.get("change_id")
             )
+        if (tx is not None and tx.get("phase") == "VERIFIED"
+                and newest is not None and newest.change_id == tx.get("change_id")
+                and newest.runtime_verified is not True):
+            v2_blocked = True
+            v2_recheck = bool(fence is not None and fence.get("change_id") == tx.get("change_id")
+                              and fence.get("active") is False)
     except (ValueError, OSError):
         v2_blocked = True
     verified = verified and not v2_blocked
@@ -308,6 +314,26 @@ def build_amo_orders(data_dir: str = "data") -> Dict[str, Any]:
 def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
     """Register additive endpoints; existing Setup form and service API stay intact."""
 
+    def resume_deferred_owner_stop_on_webui_startup() -> None:
+        """After WebUI restart, resume *only* an outstanding owner STOP.
+
+        Do not create a settings coordinator, replay historical config, or
+        start trading. An owner who requested STOP remains authoritative.
+        """
+        if not os.path.isfile(".env") or os.path.islink(".env"):
+            return
+        _, env_path, data_dir = _config_and_paths()
+        tracker = ConfigChangeTracker(data_dir=data_dir)
+        control = tracker.get_service_control_record()
+        if (isinstance(control, dict) and not control.get("_corrupted")
+                and control.get("deferred_stop_pending") is True
+                and str(control.get("desired_service_state") or "").upper() == "STOPPED"):
+            tracker.start_coordinator_daemon(
+                env_path=env_path, stop_when_idle=True,
+            )
+
+    app.add_event_handler("startup", resume_deferred_owner_stop_on_webui_startup)
+
     @app.get("/control/status")
     def get_control_status():
         try:
@@ -364,13 +390,12 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             cfg, env_path, data_dir = _config_and_paths()
             if not os.path.isfile(env_path) or os.path.islink(env_path):
                 return _json({"error": "Configuration file must be a regular file"}, 409)
-            # Reconcile only stale display/service records; broker mutation
-            # barriers and Owner STOP instructions remain independent.
+            # Historical tracker records are read-only audit evidence.
             tracker = ConfigChangeTracker(data_dir=data_dir)
             def _admission_check():
                 # Called from apply_settings while holding the SAME global
                 # config_operation.lock as validation, CAS, save and restart.
-                tracker.reconcile_stale_control_records(env_path)
+                # Never rewrite a legacy configuration record on an AMO save.
                 if _pending(tracker):
                     raise ConfigurationConflict("Existing configuration operation is still active")
                 if _owner_stop_pending(tracker):
@@ -470,8 +495,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
         try:
             cfg, env_path, data_dir = _config_and_paths()
             tracker = ConfigChangeTracker(data_dir=data_dir)
-            from src.engine.tracker_v2_integration import recover_v2_late_ack
-            result = recover_v2_late_ack(
+            from src.engine.prior_restart_recovery import recover_prior_restart
+            result = recover_prior_restart(
                 tracker, env_path, requested_change_id=body.get("change_id"),
             )
             return _json({

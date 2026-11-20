@@ -19,179 +19,58 @@ from src.engine import simple_save_apply as direct
 from src.engine.runtime_evidence import SafetyDecision
 
 
-class StaleServiceRecoveryTests(unittest.TestCase):
+class RetiredStaleStatusSafetyTests(unittest.TestCase):
+    """Stale historical records must remain unchanged and block new writes."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.data = self.root / "data"
-        self.data.mkdir()
+        self.data.mkdir(mode=0o700)
         self.env = self.root / ".env"
         self.env.write_text(
             "TRADING_MODE=TEST\nDHAN_CLIENT_ID=FAKE_ID\n"
             f"DATA_DIR={self.data}\nEQUITY_AMO_ENABLED=false\n"
         )
         self.tracker = ConfigChangeTracker(data_dir=str(self.data))
-        self.cfg = AppConfig.from_env(env=parse_env_dict(str(self.env)), env_file="")
-        self.hash = compute_config_version(self.cfg)
-        self.control = {
-            "desired_service_state": "RUNNING",
-            "last_action": "OWNER_START",
-            "observed_state": "STARTING",
-            "deferred_stop_pending": False,
-        }
-        write_json_atomic(self.tracker.service_control_file, self.control)
         self.record = ConfigChangeRecord(
-            change_id="TEST-STUCK-PR98",
+            change_id="RETIRED-UNRESOLVED-RECORD",
             state=ConfigApplyState.APPLYING,
             operation_state=OperationState.APPLYING.value,
-            requested_file_revision=revision(self.env.read_text()),
-            proposed_version_hash=self.hash,
-            previous_mode="TEST",
-            requested_mode="TEST",
         )
         self.tracker.save_change_record(self.record)
 
-    def stopped(self):
-        with patch("src.engine.config_manager.inspect_systemd_service_properties",
-                   return_value={"ActiveState": "inactive", "MainPID": 0}):
-            return self.tracker.reconcile_stale_control_records(str(self.env))
+    def test_old_stale_coordinator_is_not_callable(self):
+        self.assertFalse(hasattr(self.tracker, "reconcile_stale_control_records"))
 
-    def running(self, *, gate=True, pid=201):
-        decision = SafetyDecision(
-            gate, "NO_ACTIVE_BROKER_OPERATION" if gate else "UNRESOLVED_BROKER_MUTATION",
-            "simulated", {"producer_pid": pid, "producer_starttime": 555},
-        )
-        with patch("src.engine.config_manager.inspect_systemd_service_properties",
-                   return_value={"ActiveState": "active", "MainPID": 201}), \
-             patch.object(self.tracker, "is_active_version_confirmed",
-                          return_value=(True, {"pid": 201, "process_starttime": 555}, "Verified")), \
-             patch("src.engine.runtime_evidence.evaluate_active_broker_operation_gate",
-                   return_value=decision), \
-             patch("src.engine.runtime_evidence.read_private_json",
-                   return_value={"account_id": "FAKE_ID", "active": [], "unresolved": []}):
-            return self.tracker.reconcile_stale_control_records(str(self.env))
+    def test_old_record_is_immutable_during_owner_stop_tick(self):
+        before = Path(self.tracker.state_file).read_bytes()
+        result = self.tracker.run_control_coordinator_tick()
+        self.assertIsNone(result["queued_executed"])
+        self.assertEqual(Path(self.tracker.state_file).read_bytes(), before)
 
-    def test_stopped_process_resolves_stale_states_without_restart(self):
-        out = self.stopped()
-        self.assertTrue(out["resolved"], out)
-        self.assertEqual(self.tracker.get_change_record().state,
-                         ConfigApplyState.SAVED_FOR_NEXT_START)
-        self.assertEqual(self.tracker.get_service_control_record()["observed_state"],
-                         "STOPPED_OTHER")
-        self.assertEqual(self.tracker.get_service_control_record()["desired_service_state"],
-                         "RUNNING")
-
-    def test_running_exact_pid_hash_and_empty_handoff_recovers(self):
-        out = self.running()
-        self.assertTrue(out["resolved"], out)
-        self.assertEqual(self.tracker.get_change_record().state,
-                         ConfigApplyState.APPLIED_VERIFIED)
-        self.assertEqual(self.tracker.get_service_control_record()["observed_state"],
-                         "RUNNING")
-
-    def test_unresolved_broker_operation_blocks_repair(self):
-        out = self.running(gate=False)
-        self.assertFalse(out["resolved"])
-        self.assertEqual(self.tracker.get_change_record().state,
-                         ConfigApplyState.APPLYING)
-
-    def test_wrong_broker_producer_pid_blocks_repair(self):
-        out = self.running(pid=299)
-        self.assertFalse(out["resolved"])
-        self.assertEqual(self.tracker.get_change_record().state,
-                         ConfigApplyState.APPLYING)
-
-    def test_mismatched_requested_file_never_verified(self):
-        self.record.requested_file_revision = "0" * 64
-        self.record.proposed_version_hash = "f" * 64
-        self.tracker.save_change_record(self.record)
-        self.stopped()
-        self.assertEqual(self.tracker.get_change_record().state,
-                         ConfigApplyState.APPLYING)
-
-    def test_v2_stopped_journal_becomes_terminal_without_second_restart(self):
-        target = self.data / "config_restart_v2"
-        target.mkdir()
-        write_json_atomic(str(target / "current_transaction.json"), {
-            "phase": "ACK_UNCERTAIN",
-            "request_id": "previous-restart",
-            "restart_issued": True,
-            "requested_file_revision": revision(self.env.read_text()),
-        })
-        out = self.stopped()
-        self.assertNotIn("v2", out)
-        self.assertEqual(
-            json.loads((target / "current_transaction.json").read_text())["phase"],
-            "ACK_UNCERTAIN",
-        )
-        self.assertEqual(
-            json.loads((target / "current_transaction.json").read_text())["restart_issued"],
-            True,
-        )
-
-    def test_v2_active_barrier_never_auto_cleared(self):
-        target = self.data / "config_restart_v2"
-        target.mkdir()
-        write_json_atomic(str(target / "current_transaction.json"), {
-            "phase": "ACK_UNCERTAIN",
-            "requested_file_revision": revision(self.env.read_text()),
-        })
-        write_json_atomic(str(target / "apply_barrier.json"), {
-            "active": True, "owner_pid": 101, "owner_starttime": 123,
-        })
-        out = self.running()
-        self.assertNotIn("v2", out)
-        self.assertTrue(json.loads((target / "apply_barrier.json").read_text())["active"])
-        self.assertEqual(
-            json.loads((target / "current_transaction.json").read_text())["phase"],
-            "ACK_UNCERTAIN",
-        )
-
-    def test_v2_mismatched_env_never_auto_resolved(self):
-        target = self.data / "config_restart_v2"
-        target.mkdir()
-        write_json_atomic(str(target / "current_transaction.json"), {
-            "phase": "ACK_UNCERTAIN",
-            "requested_file_revision": "9" * 64,
-        })
-        self.stopped()
-        self.assertEqual(
-            json.loads((target / "current_transaction.json").read_text())["phase"],
-            "ACK_UNCERTAIN",
-        )
+    def test_old_applying_record_cannot_be_silently_accepted_as_clean(self):
+        from src.engine.tracker_v2_safety import preview_legacy_tracker_migration
+        decision = preview_legacy_tracker_migration(self.data)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "LEGACY_CHANGE_IN_PROGRESS")
 
     def test_terminal_saved_for_next_start_not_busy(self):
         self.record.state = ConfigApplyState.SAVED_FOR_NEXT_START
         self.record.operation_state = OperationState.SAVED_FOR_NEXT_START.value
         self.tracker.save_change_record(self.record)
-        self.stopped()
-        self.assertEqual(self.tracker.get_change_record().state,
-                         ConfigApplyState.SAVED_FOR_NEXT_START)
-
-    def test_saved_for_next_start_matching_pending_envelope_is_terminal(self):
-        self.record.state = ConfigApplyState.SAVED_FOR_NEXT_START
-        self.record.operation_state = OperationState.SAVED_FOR_NEXT_START.value
-        self.tracker.save_change_record(self.record)
-        write_json_atomic(self.tracker.pending_op_file, {
-            "change_id": self.record.change_id, "status": "QUEUED",
-        })
         self.assertFalse(self.tracker.has_unresolved_pending_operation())
+
+    def test_different_pending_envelope_is_not_discarded(self):
+        self.record.state = ConfigApplyState.SAVED_FOR_NEXT_START
+        self.tracker.save_change_record(self.record)
         write_json_atomic(self.tracker.pending_op_file, {
             "change_id": "OTHER-CHANGE", "status": "QUEUED",
         })
         self.assertTrue(self.tracker.has_unresolved_pending_operation())
-
-    def test_active_owner_stop_intent_is_not_overwritten(self):
-        self.control["desired_service_state"] = "STOPPED"
-        write_json_atomic(self.tracker.service_control_file, self.control)
-        self.running()
-        self.assertEqual(
-            self.tracker.get_service_control_record()["desired_service_state"], "STOPPED",
-        )
-        self.assertEqual(
-            self.tracker.get_service_control_record()["observed_state"], "STARTING",
-        )
+        before = Path(self.tracker.pending_op_file).read_bytes()
+        self.tracker.run_control_coordinator_tick()
+        self.assertEqual(Path(self.tracker.pending_op_file).read_bytes(), before)
 
 
 class AbortedBrokerFenceTests(unittest.TestCase):

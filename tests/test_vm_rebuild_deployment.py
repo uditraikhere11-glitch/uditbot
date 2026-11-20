@@ -154,28 +154,25 @@ class VMRebuildDeploymentTests(unittest.TestCase):
         self.assertIn('DRIFT_WARN: Legacy /etc/sudoers.d/auditbot-web exists', self.audit)
         self.assertIn('DRIFT_WARN: Public 0.0.0.0:80', self.audit)
 
-    def test_config_manager_uses_noninteractive_sudo_and_preserves_stopped_service(self):
-        """Verifies Save/Apply uses sudo -n /usr/bin/systemctl restart trading_bot.service and preserves STOPPED state."""
-        self.assertIn('"/usr/bin/systemctl"', self.cfg_mgr)
-        self.assertIn('"-n"', self.cfg_mgr)
-        from src.engine.config_manager import ConfigApplyState, execute_configuration_update
+    def test_direct_save_apply_preserves_stopped_service(self):
+        """The sole settings writer saves a stopped service without restart."""
+        from src.engine.simple_save_apply import apply_settings
+        from src.engine.config_patch import revision
+        from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
-            env_p = os.path.join(tmpdir, ".env")
-            data_d = os.path.join(tmpdir, "data")
-            os.makedirs(data_d, exist_ok=True)
-            with open(env_p, "w") as f:
-                f.write("TRADING_MODE=TEST\nEQUITY_BUDGET_INR=25000\n")
-            restart_calls = []
-            rec = execute_configuration_update(
-                form_params={"TRADING_MODE": "TEST", "EQUITY_BUDGET_INR": 30000.0},
-                env_content="TRADING_MODE=TEST\nEQUITY_BUDGET_INR=30000.0\n",
-                data_dir=data_d,
-                env_path=env_p,
-                check_service_fn=lambda: False,
-                systemctl_restart_fn=lambda: (restart_calls.append(1) or True),
-            )
-            self.assertEqual(rec.state, ConfigApplyState.SAVED_FOR_NEXT_START)
-            self.assertEqual(len(restart_calls), 0, "Stopped service must NEVER be restarted on Save/Apply")
+            env_p = Path(tmpdir) / ".env"
+            env_p.write_text("TRADING_MODE=TEST\nEQUITY_BUDGET_INR=25000.0\n")
+            called = []
+            with patch.dict(os.environ, {"AUDITBOT_TEST_ISOLATION": "1"}):
+                result = apply_settings(
+                    {"equity_budget_inr": 30000.0}, env_path=env_p,
+                    expected_revision=revision(env_p.read_text()),
+                    state_reader=lambda: "inactive",
+                    restart=lambda: called.append("restart"),
+                )
+            self.assertEqual(result.status, "SAVED_STOPPED")
+            self.assertEqual(called, [])
+            self.assertIn("30000", env_p.read_text())
 
     def test_CR01_failed_or_incomplete_restore_leaves_zero_partial_files_and_allows_retry(self):
         """
@@ -468,56 +465,33 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             self.assertIn('TG_SESSION_STRING="1', env_text)
             self.assertEqual(stat.S_IMODE(os.stat(env_p).st_mode), 0o600)
 
-    def test_webui_save_apply_reaches_applied_verified_and_rolls_back_on_restart_failure(self):
-        # Verifies Save/Apply reaches APPLIED_VERIFIED when active service acknowledges hash, and rolls back .env on failure.
-        from src.engine.config_manager import (
-            ConfigApplyState,
-            ConfigChangeTracker,
-            compute_config_version,
-            execute_configuration_update,
-        )
+    def test_direct_save_apply_one_restart_and_uncertain_failure_keeps_saved_file(self):
+        """After an uncertain restart, never misrepresent a live rollback."""
+        from src.engine.simple_save_apply import apply_settings
+        from src.engine.config_patch import ConfigurationConflict, revision
+        from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
-            env_p = os.path.join(tmpdir, ".env")
-            data_d = os.path.join(tmpdir, "data")
-            os.makedirs(data_d, exist_ok=True)
-            orig_env = "TRADING_MODE=TEST\nEQUITY_BUDGET_INR=25000.0\n"
-            with open(env_p, "w") as f:
-                f.write(orig_env)
-
-            new_params = {"TRADING_MODE": "TEST", "EQUITY_BUDGET_INR": 35000.0}
-            new_env = "TRADING_MODE=TEST\nEQUITY_BUDGET_INR=35000.0\n"
-            tracker = ConfigChangeTracker(data_dir=data_d)
-
-            def _sim_restart_ok():
-                tracker.record_active_running_version(compute_config_version(new_params), trading_mode="TEST")
-                return True
-
-            rec_ok = execute_configuration_update(
-                form_params=new_params,
-                env_content=new_env,
-                data_dir=data_d,
-                env_path=env_p,
-                check_service_fn=lambda: True,
-                systemctl_restart_fn=_sim_restart_ok,
-                verify_delay_sec=0.05,
-            )
-            self.assertEqual(rec_ok.state, ConfigApplyState.APPLIED_VERIFIED)
-            self.assertFalse(rec_ok.rolled_back)
-
-            fail_params = {"TRADING_MODE": "TEST", "EQUITY_BUDGET_INR": 45000.0}
-            fail_env = "TRADING_MODE=TEST\nEQUITY_BUDGET_INR=45000.0\n"
-            rec_fail = execute_configuration_update(
-                form_params=fail_params,
-                env_content=fail_env,
-                data_dir=data_d,
-                env_path=env_p,
-                check_service_fn=lambda: True,
-                systemctl_restart_fn=lambda: False,
-                verify_delay_sec=0.05,
-            )
-            self.assertEqual(rec_fail.state, ConfigApplyState.APPLY_FAILED)
-            self.assertTrue(rec_fail.rolled_back)
-            self.assertIn("35000.0", Path(env_p).read_text())
+            env_p = Path(tmpdir) / ".env"
+            env_p.write_text("TRADING_MODE=TEST\nEQUITY_BUDGET_INR=25000.0\n")
+            calls = []
+            with patch.dict(os.environ, {"AUDITBOT_TEST_ISOLATION": "1"}):
+                ok = apply_settings(
+                    {"equity_budget_inr": 35000.0}, env_path=env_p,
+                    expected_revision=revision(env_p.read_text()),
+                    state_reader=lambda: "active",
+                    restart=lambda: calls.append("restart"),
+                )
+                self.assertEqual(ok.status, "RESTARTED")
+                self.assertEqual(calls, ["restart"])
+                with self.assertRaises(ConfigurationConflict):
+                    apply_settings(
+                        {"equity_budget_inr": 45000.0}, env_path=env_p,
+                        expected_revision=revision(env_p.read_text()),
+                        state_reader=lambda: "active",
+                        restart=lambda: (_ for _ in ()).throw(ConfigurationConflict("uncertain")),
+                    )
+            self.assertIn("45000", env_p.read_text())
+            self.assertEqual(calls, ["restart"])
 
     def test_R01_missing_or_empty_journal_rejected_in_backup_and_restore_with_retry_and_exception_flag(self):
         # R-01 Regression Test:
