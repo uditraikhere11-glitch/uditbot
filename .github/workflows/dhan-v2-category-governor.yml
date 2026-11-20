@@ -17,6 +17,9 @@ permissions:
 jobs:
   category-release-tests:
     runs-on: ubuntu-latest
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
