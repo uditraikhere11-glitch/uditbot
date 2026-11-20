@@ -19,6 +19,9 @@ permissions:
 jobs:
   offline-runner:
     runs-on: ubuntu-latest
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     timeout-minutes: 15
     strategy:
       fail-fast: false
