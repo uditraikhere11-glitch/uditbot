@@ -15,6 +15,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, Mock, patch
 
 from src.config import AppConfig, APP_ROOT
@@ -281,6 +282,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     # Appendix B #12 / V12-13: HTTP 500 preserved as uncertain (UNKNOWN) & in-flight retained
     # ------------------------------------------------------------------
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_12_v12_13_http_500_preserved_as_uncertain(self):
         c = DhanClient(self.cfg, self.stop)
         c.session.post = Mock(return_value=SimpleNamespace(status_code=500, text="Internal Server Error"))
@@ -320,6 +322,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     # Appendix B #14 / V12-16: Instrument tick_size forwarded to place_forever_oco
     # ------------------------------------------------------------------
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_14_v12_16_tick_size_forwarded_to_place_forever_oco(self):
         c = DhanClient(self.cfg, self.stop)
         c.order_status = Mock(return_value={"orderStatus": "TRADED", "filledQty": 10, "averageTradedPrice": 10.01})
@@ -403,6 +406,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     # V12-12: Super Order preserves full 30-character correlation ID
     # ------------------------------------------------------------------
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_17_v12_12_super_order_preserves_full_30_char_correlation_id(self):
         c = DhanClient(self.cfg, self.stop)
         captured = {}
