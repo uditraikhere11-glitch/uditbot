@@ -280,7 +280,11 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             self.data_dir,
         ))
         # Disabled templates preserve the code-owned concise default.
-        default_card = "✅ <b>Settings Updated</b>\\nTrading bot: RESTARTED\\nConfiguration: VERIFIED"
+        default_card = chr(10).join([
+            "✅ <b>Settings Updated</b>",
+            "Trading bot: RESTARTED",
+            "Configuration: VERIFIED",
+        ])
         self.assertEqual(default_card.count("Settings Updated"), 1)
         self.assertNotIn("Settings updated. Trading bot restarted", default_card)
 
