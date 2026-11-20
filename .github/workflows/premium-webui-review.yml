@@ -38,7 +38,37 @@ jobs:
           python -m unittest -v tests.test_premium_ui_contract tests.test_control_center_ui_contract tests.test_message_designer tests.test_approved_replica_contract
           git diff --check -- . ':!src/setup_app.py'
           python -m unittest -v tests.test_approved_replica_contract
+      - name: Classify UI-only PR packaging scope
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+
+          allowed = {
+              'src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
+              'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
+              'src/approved_replica.css', 'src/approved_replica.js',
+              'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py',
+              'tests/test_webui_integrated_acceptance.py', 'tests/test_webui_reliability_remaining.py',
+              '.github/workflows/premium-webui-review.yml',
+          }
+          base, head = os.environ['BASE_SHA'], os.environ['HEAD_SHA']
+          paths = set(subprocess.check_output(
+              ['git', 'diff', '--name-only', base, head], text=True
+          ).splitlines())
+          ui_only = bool(paths) and paths.issubset(allowed)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write('ui_only=' + str(ui_only).lower() + '\n')
+          if not ui_only:
+              print('Mixed-scope PR: premium UI tests ran; the UI-only artifact gate is not applicable.')
+              print('The shared retirement release workflow packages the complete changed-files diff.')
+          PY
       - name: Create exact changed-files ZIP and independent patch
+        if: steps.scope.outputs.ui_only == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -120,6 +150,7 @@ jobs:
               encoding='utf-8')
           PY
       - uses: actions/upload-artifact@v4
+        if: steps.scope.outputs.ui_only == 'true'
         with:
           name: AuditBot-Premium-UI-PR-${{ github.event.pull_request.number }}-ChangedFiles
           path: review-out/*
