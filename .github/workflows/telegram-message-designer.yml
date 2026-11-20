@@ -9,6 +9,9 @@ on:
       - "src/main.py"
       - "src/setup_app.py"
       - "tests/test_message_designer.py"
+      - "tests/test_health_and_system_message_designer.py"
+      - "src/cli.py"
+      - "src/engine/simple_save_apply.py"
       - ".github/workflows/telegram-message-designer.yml"
 
 permissions:
@@ -28,6 +31,6 @@ jobs:
       - name: Install offline dependencies
         run: python -m pip install -r requirements.txt 'httpx==0.28.1'
       - name: Compile imported modules
-        run: python -m compileall -q src/notifier src/main.py src/setup_app.py
+        run: python -m compileall -q src/notifier src/main.py src/setup_app.py src/cli.py src/engine/simple_save_apply.py tests/test_health_and_system_message_designer.py
       - name: Customization and existing acknowledgement tests
-        run: python -m unittest -v tests.test_message_designer tests.test_dhan_amo_ack_response
+        run: python -m unittest -v tests.test_message_designer tests.test_dhan_amo_ack_response tests.test_health_and_system_message_designer tests.test_dhan_1700_ist_final tests.test_r03_daily_health_reliability
