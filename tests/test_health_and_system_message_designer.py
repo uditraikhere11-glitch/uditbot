@@ -227,6 +227,8 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         self.assertIn("<b>Verified Settings</b>", queued)
         self.assertIn("Trading bot: Restarted", queued)
         self.assertIn("Configuration: Verified", queued)
+        self.assertIn("Changed Settings (1):", queued)
+        self.assertIn("Equity AMO: Disabled → Enabled", queued)
         self.assertNotIn("Settings updated. Trading bot restarted", queued)
 
     def test_startup_default_is_readable_and_not_repeated(self):
@@ -303,7 +305,7 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             "BOT_INSTANCE_NAME": ("OLD_NAME", "NEW_NAME"),
         }
         lines = designer.format_changed_settings(changed)
-        message = "\\n".join(lines)
+        message = chr(10).join(lines)
         self.assertIn("Changed Settings (7):", message)
         self.assertIn("• Equity SL: 3% → 4%", message)
         self.assertIn("• F&O Target: 3% → 5%", message)
@@ -313,13 +315,13 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             "NEW_BOT_TOKEN", "OLD_NAME", "NEW_NAME",
         ):
             self.assertNotIn(secret, message)
-        self.assertIn("Dhan Totp Secret: Updated (values hidden)", message)
+        self.assertIn("Dhan TOTP Secret: Updated (values hidden)", message)
 
     def test_setting_diff_rejects_invalid_previous_value_without_leak(self):
         lines = designer.format_changed_settings({
             "EQUITY_SL_PCT": ("not-a-valid-number", "4")
         })
-        message = "\\n".join(lines)
+        message = chr(10).join(lines)
         self.assertNotIn("not-a-valid-number", message)
         self.assertIn("Updated (values hidden)", message)
 
