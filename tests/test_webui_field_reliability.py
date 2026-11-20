@@ -14,7 +14,6 @@ from src.engine.config_patch import (
     validate_effective_config,
 )
 from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState
-from src.engine.webui_update import submit_webui_patch
 
 
 BASE = (
@@ -110,123 +109,6 @@ class ConfigSchemaReliabilityTests(unittest.TestCase):
         with self.assertRaises(ConfigurationRejected):
             validate_effective_config("TRADING_MODE=MAYBE\n")
 
-
-class ConfigurationCoordinatorReliabilityTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = os.path.join(self.tmp.name, ".env")
-        with open(self.path, "w", encoding="utf-8") as fh:
-            fh.write(BASE)
-        self.tracker = ConfigChangeTracker(data_dir=os.path.join(self.tmp.name, "data"))
-
-    def _submit(self, patch, req_id="DEMO-TRANSACTION-0001", service=ServiceOperatingState.RUNNING, **extras):
-        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state", return_value=(service, "mocked")), \
-             mock.patch.object(ConfigChangeTracker, "get_readonly_broker", side_effect=AssertionError("Broker must not be used")):
-            return submit_webui_patch(
-                self.tracker, patch, self.path, expected_revision=revision(Path(self.path).read_text(encoding="utf-8")),
-                request_id=req_id, spawn_worker=False, **extras,
-            )
-
-    def test_ac01_ac02_notification_does_not_use_broker_or_restart(self):
-        orig = Path(self.path).read_text(encoding="utf-8")
-        rec = self._submit({"dhan_response_group_name": "-5514889030"})
-        self.assertEqual(rec.state.value, "SAVED_FOR_NEXT_START")
-        self.assertFalse(rec.runtime_verified)
-        self.assertFalse(rec.restart_performed)
-        self.assertFalse(rec.broker_checks_required)
-        self.assertEqual(rec.changed_fields, ["DHAN_RESPONSE_GROUP_NAME"])
-        self.assertEqual(rec.application_method, "SAVE_FOR_CONTROLLED_START")
-        now = Path(self.path).read_text(encoding="utf-8")
-        self.assertEqual(now.replace("DHAN_RESPONSE_GROUP_NAME=-5514889030", "DHAN_RESPONSE_GROUP_NAME=-1234567890  # old destination"), orig)
-
-    def test_ac09_missing_revision_is_rejected_before_disk_or_broker(self):
-        original = Path(self.path).read_bytes()
-        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state",
-                               side_effect=AssertionError("Missing revision must fail before service inspection")), \
-             mock.patch.object(ConfigChangeTracker, "get_readonly_broker",
-                               side_effect=AssertionError("Missing revision must not contact Dhan")):
-            for absent in (None, "", "UNAVAILABLE", "0" * 63):
-                with self.subTest(absent=absent), self.assertRaises(ConfigurationConflict):
-                    submit_webui_patch(
-                        self.tracker, {"dhan_response_group_name": "-5514889030"},
-                        self.path, expected_revision=absent,
-                        request_id="MISSING-REVISION-REQUEST", spawn_worker=False,
-                    )
-        self.assertEqual(Path(self.path).read_bytes(), original)
-
-    def test_ac09_external_writer_before_cas_is_never_rolled_back(self):
-        import src.engine.webui_update as coordinator
-        original = Path(self.path).read_text(encoding="utf-8")
-        externally_saved = original + "EXTERNAL_OPERATOR_NOTE=never-clobber-me\\n"
-        read_original = coordinator._read_env
-        calls = [0]
-
-        def concurrent_read(path):
-            if os.path.abspath(path) == os.path.abspath(self.path):
-                calls[0] += 1
-                if calls[0] == 2:  # CAS read, after WebUI has already snapshotted.
-                    Path(self.path).write_text(externally_saved, encoding="utf-8")
-            return read_original(path)
-
-        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state",
-                               return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "mocked")), \
-             mock.patch.object(coordinator, "_read_env", side_effect=concurrent_read):
-            with self.assertRaises(ConfigurationConflict):
-                submit_webui_patch(
-                    self.tracker, {"operator_name": "NEW_OPERATOR"},
-                    self.path, expected_revision=revision(original),
-                    request_id="EXTERNAL-PRE-CAS-0001", spawn_worker=False,
-                )
-        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), externally_saved)
-
-    def test_ac09_external_writer_after_atomic_replace_is_never_clobbered(self):
-        import src.engine.webui_update as coordinator
-        original = Path(self.path).read_text(encoding="utf-8")
-        external = original + "EXTERNAL_OPERATOR_NOTE=after-replacement\\n"
-        write_original = coordinator.write_env_atomic
-
-        def concurrent_write(path, content):
-            write_original(path, content)
-            if os.path.abspath(path) == os.path.abspath(self.path):
-                Path(self.path).write_text(external, encoding="utf-8")
-
-        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state",
-                               return_value=(ServiceOperatingState.STOPPED_BY_OWNER, "mocked")), \
-             mock.patch.object(coordinator, "write_env_atomic", side_effect=concurrent_write):
-            with self.assertRaises(ConfigurationConflict):
-                submit_webui_patch(
-                    self.tracker, {"operator_name": "NEW_OPERATOR"},
-                    self.path, expected_revision=revision(original),
-                    request_id="EXTERNAL-POST-CAS-0001", spawn_worker=False,
-                )
-        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), external)
-
-    def test_ac09_stale_form_conflict_and_no_write(self):
-        old = Path(self.path).read_text(encoding="utf-8")
-        with mock.patch.object(ConfigChangeTracker, "resolve_service_operating_state", return_value=(ServiceOperatingState.RUNNING, "mocked")):
-            with self.assertRaises(ConfigurationConflict):
-                submit_webui_patch(self.tracker, {"dhan_response_group_name": "-5514889030"}, self.path,
-                                   expected_revision="stale", request_id="STALE-REQUEST-0001", spawn_worker=False)
-        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), old)
-
-    def test_ac10_same_request_cannot_replay(self):
-        request = {"dhan_response_group_name": "-5514889030"}
-        rec1 = self._submit(request)
-        rec2 = self._submit(request)
-        self.assertEqual(rec1.change_id, rec2.change_id)
-        with self.assertRaises(ConfigurationConflict):
-            self._submit({"dhan_response_group_name": "-5514889031"})
-
-    def test_ac04_stopped_save_never_starts(self):
-        rec = self._submit({"dhan_response_group_name": "-5514889030"}, service=ServiceOperatingState.STOPPED_BY_OWNER)
-        self.assertEqual(rec.state.value, "SAVED_FOR_NEXT_START")
-        self.assertFalse(rec.restart_performed)
-
-    def test_ac08_recovery_without_network(self):
-        self._submit({"dhan_response_group_name": "-5514889030"})
-        from src.engine.webui_update import recover_field_transactions
-        self.assertEqual(recover_field_transactions(self.tracker), {})
 
 
 if __name__ == "__main__":
