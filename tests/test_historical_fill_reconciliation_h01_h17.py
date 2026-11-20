@@ -865,7 +865,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             is_stopped=False,
         )
         self.assertIn("Listener: Active 2 channels", startup_card)
-        self.assertIn("Reconciliation Pending (2)", startup_card)
+        self.assertIn("Reconciliation: Pending (2)", startup_card)
         self.assertIn("Protection Watcher: Unverified", startup_card)
         self.assertIn("New Entries Gate: Blocked", startup_card)
         self.assertNotIn("Actively listening for trade signals", startup_card)
