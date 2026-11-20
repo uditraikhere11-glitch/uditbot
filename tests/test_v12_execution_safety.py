@@ -28,6 +28,7 @@ from datetime import date
 import os
 import tempfile
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, patch
 
 from src.config import AppConfig
@@ -426,6 +427,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     # ------------------------------------------------------------------
     @patch("requests.Session.get")
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_14_super_order_token_error_ambiguous_outcome_zero_resubmission(self, mock_post, mock_get):
         client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
 

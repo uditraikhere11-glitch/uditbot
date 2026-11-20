@@ -16,6 +16,7 @@ import stat
 import tempfile
 import time
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, patch
 import requests
 
@@ -115,6 +116,7 @@ class TestHardenedReproductionGates(unittest.TestCase):
         self.assertEqual(st["stopped_by"], "SYSTEM_FAIL_CLOSED")
 
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_h06_forever_oco_payload_semantics(self, mock_post):
         """H-06: Verifies Forever OCO fields strictly follow Dhan documentation (SELL: Leg 0 = SL, Leg 1 = Target)."""
         mock_resp = MagicMock()
@@ -213,6 +215,7 @@ class TestHardenedReproductionGates(unittest.TestCase):
     # =========================================================================
 
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_regression_01_correct_sell_oco_mapping(self, mock_post):
         """02-E.1: Correct SELL OCO mapping for entry 1000, SL trigger 970, SL limit 960, target 1030, qty 15."""
         mock_resp = MagicMock()
@@ -425,6 +428,7 @@ class TestHardenedReproductionGates(unittest.TestCase):
         mock_post.assert_not_called()
 
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_regression_07_dhan_http_rejection_reported_accurately(self, mock_post):
         """02-E.7: Dhan HTTP rejection (e.g. RMS 400 error) is reported accurately."""
         mock_resp = MagicMock()
@@ -449,6 +453,7 @@ class TestHardenedReproductionGates(unittest.TestCase):
         self.assertIn("RMS Limit Exceeded", msg)
 
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_regression_08_dhan_timeout_no_duplicate_post(self, mock_post):
         """02-E.8: Dhan timeout does not result in an automatic duplicate protection POST."""
         mock_post.side_effect = requests.exceptions.Timeout("Connection timed out waiting for Dhan gateway")
@@ -471,6 +476,7 @@ class TestHardenedReproductionGates(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
 
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_regression_09_http_acceptance_not_represented_as_active(self, mock_post):
         """02-E.9: HTTP acceptance or returned order ID is not represented as broker-confirmed ACTIVE protection."""
         # Case A: 200 OK with PENDING status returns order ID but caller must verify async active state

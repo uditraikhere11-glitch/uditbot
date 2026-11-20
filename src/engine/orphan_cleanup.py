@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import quote
 
 from src.broker.dhan_client import BASE_URL, verify_forever_oco_group
+from src.engine.broker_handoff import BrokerMutationNotSubmitted
 from src.engine.reconciliation import validate_position_record
 from src.models import TradingMode
 
@@ -202,8 +203,12 @@ def _cancel_forever(broker: Any, order_id: str) -> Tuple[bool, str]:
     if broker.cfg.trading_mode != TradingMode.LIVE:
         return False, "TEST mode cannot send real cancellation"
     try:
-        response = broker.session.delete(
-            f"{BASE_URL}/forever/orders/{order_id}", headers=broker._headers(), timeout=5
+        guarded = getattr(broker, "_broker_mutating_http", None)
+        if not callable(guarded):
+            return False, "Fenced broker ORDER transport unavailable; no cancellation sent"
+        response = guarded(
+            "DELETE", f"{BASE_URL}/forever/orders/{order_id}",
+            headers=broker._headers(), timeout=5,
         )
         if response.status_code not in (200, 202):
             return False, f"Forever cancel HTTP {response.status_code}"
@@ -227,6 +232,8 @@ def _cancel_forever(broker: Any, order_id: str) -> Tuple[bool, str]:
             f"Forever cancel broker-confirmed for {order_id}" if state == "CANCELLED"
             else f"Forever cancel requested (HTTP {response.status_code}); verify broker book"
         )
+    except BrokerMutationNotSubmitted as exc:
+        return False, f"Forever cancel BLOCKED before broker transport: {exc}"
     except Exception as exc:
         return False, f"Forever cancel outcome UNKNOWN: {type(exc).__name__}: {exc}"
 

@@ -7,6 +7,9 @@ permissions:
   contents: read
 jobs:
   combined-release:
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -28,6 +31,8 @@ jobs:
           git merge --no-edit "$DESIGNER_SHA"
       - name: Install real runtime dependencies
         run: python -m pip install -r requirements-test.txt
+      - name: Activate offline network perimeter after dependency installation
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
       - name: Compile integrated tree
         run: python -B -m compileall -q run.py src tests
       - name: Mandatory release gates

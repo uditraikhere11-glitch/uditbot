@@ -3,6 +3,7 @@
 import tempfile
 import os
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +80,7 @@ class TestBrokerAMOPayload(unittest.TestCase):
 
     @patch("src.engine.config_manager.ConfigChangeTracker")
     @patch("src.engine.market.market_status", return_value=(False, "Market Pre-Open / Closed (00:41:34 IST < 09:15:00)"))
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_amo_payload_explicit(self, mock_status, mock_tracker):
         mock_tracker.return_value.is_live_entry_blocked_by_transition.return_value = (False, "OK")
         ok, oid, _ = self.client.place_order(_order(True))
@@ -90,6 +92,7 @@ class TestBrokerAMOPayload(unittest.TestCase):
         self.assertEqual(payload["orderType"], "LIMIT")
 
     @patch("src.engine.config_manager.ConfigChangeTracker")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_normal_order_never_sets_amo(self, mock_tracker):
         mock_tracker.return_value.is_live_entry_blocked_by_transition.return_value = (False, "OK")
         ok, _, _ = self.client.place_order(_order(False))

@@ -23,6 +23,7 @@ import io
 import os
 import tempfile
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, patch
 import requests
 
@@ -107,6 +108,7 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
         self.assertTrue(stop_mgr.is_stopped())
 
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_safe_02_concurrent_stop_vs_post_and_timeout_in_flight(self, mock_post):
         stop_mgr = EmergencyStopManager(self.stop_file, expected_account_id="1113731536")
         stop_mgr.provision_initial_clean_state(operator="Udit", account_id="1113731536")
@@ -175,6 +177,7 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
     @patch("src.main.market_status", return_value=(True, "Market Open"))
     @patch("requests.Session.get")
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_journal_02_timeout_persists_unknown_not_rejected(self, mock_post, mock_get, _mock_mkt):
         cfg = AppConfig(
             trading_mode=TradingMode.LIVE,

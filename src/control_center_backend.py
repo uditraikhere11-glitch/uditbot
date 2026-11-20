@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from src.config import AppConfig, parse_env_dict
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
+from src.engine.runtime_evidence import read_private_json
 from src.engine.simple_save_apply import apply_settings
 from src.engine.config_manager import (
     ConfigApplyState,
@@ -128,22 +129,27 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     newest = tracker.get_change_record()
     v2_blocked = False
     v2_recheck = False
-    if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
-        from src.engine.tracker_v2_safety import read_private_json
-        try:
-            tx = read_private_json(os.path.join(data_dir, "config_restart_v2", "current_transaction.json"), missing_ok=True)
-            fence = read_private_json(os.path.join(data_dir, "config_restart_v2", "apply_barrier.json"), missing_ok=True)
-            if fence is not None and fence.get("active") is not False:
-                v2_blocked = True
-            if tx is not None and tx.get("phase") not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
-                v2_blocked = True
-                v2_recheck = bool(
-                    tx.get("phase") == "ACK_UNCERTAIN"
-                    and fence is not None and fence.get("active") is True
-                    and newest is not None and newest.change_id == tx.get("change_id")
-                )
-        except (ValueError, OSError):
+    try:
+        tx = read_private_json(os.path.join(data_dir, "config_restart_v2", "current_transaction.json"), missing_ok=True)
+        fence = read_private_json(os.path.join(data_dir, "config_restart_v2", "apply_barrier.json"), missing_ok=True)
+        if fence is not None and fence.get("active") is not False:
             v2_blocked = True
+        if tx is not None and tx.get("phase") not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
+            v2_blocked = True
+            v2_recheck = bool(
+                tx.get("phase") in ("RESTART_ISSUED", "VERIFYING", "ACK_UNCERTAIN")
+                and fence is not None and fence.get("change_id") == tx.get("change_id")
+                and isinstance(fence.get("active"), bool)
+                and newest is not None and newest.change_id == tx.get("change_id")
+            )
+        if (tx is not None and tx.get("phase") == "VERIFIED"
+                and newest is not None and newest.change_id == tx.get("change_id")
+                and newest.runtime_verified is not True):
+            v2_blocked = True
+            v2_recheck = bool(fence is not None and fence.get("change_id") == tx.get("change_id")
+                              and fence.get("active") is False)
+    except (ValueError, OSError):
+        v2_blocked = True
     verified = verified and not v2_blocked
     pending = _pending(tracker)
     stopping = _owner_stop_pending(tracker)
@@ -172,7 +178,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         "saved_mode": str(raw.get("saved_mode") or "UNKNOWN"),
         "running_mode": str(raw.get("running_mode") or "UNKNOWN"),
         "runtime_verified": verified,
-        "warning": "V2 restart verification pending; use Verify pending restart (never reissues restart)" if v2_blocked else "Control requests blocked while configuration/safety gate is unresolved" if pending or stopping else "",
+        "warning": "Restart verification pending; inspect the saved transaction and broker fence" if v2_blocked else "Control requests blocked while configuration/safety gate is unresolved" if pending or stopping else "",
         "tracker_v2_apply_blocked": v2_blocked,
         "tracker_v2_late_ack_pending": v2_recheck,
         "equity_amo_saved": saved,
@@ -308,6 +314,36 @@ def build_amo_orders(data_dir: str = "data") -> Dict[str, Any]:
 def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
     """Register additive endpoints; existing Setup form and service API stay intact."""
 
+    def resume_deferred_owner_stop_on_webui_startup() -> None:
+        """After WebUI restart, resume *only* an outstanding owner STOP.
+
+        Do not create a settings coordinator, replay historical config, or
+        start trading. An owner who requested STOP remains authoritative.
+        """
+        if not os.path.isfile(".env") or os.path.islink(".env"):
+            return
+        _, env_path, data_dir = _config_and_paths()
+        tracker = ConfigChangeTracker(data_dir=data_dir)
+        control = tracker.get_service_control_record()
+        if (isinstance(control, dict) and not control.get("_corrupted")
+                and control.get("deferred_stop_pending") is True
+                and str(control.get("desired_service_state") or "").upper() == "STOPPED"):
+            tracker.start_coordinator_daemon(
+                env_path=env_path, stop_when_idle=True,
+            )
+
+    # FastAPI versions used on Python 3.14 no longer expose the app-level
+    # add_event_handler method. Register the same idempotent STOP-only hook
+    # through the router when necessary; never start settings replay here.
+    add_handler = getattr(app, "add_event_handler", None)
+    if callable(add_handler):
+        add_handler("startup", resume_deferred_owner_stop_on_webui_startup)
+    else:
+        startup_hooks = getattr(getattr(app, "router", None), "on_startup", None)
+        if not isinstance(startup_hooks, list):
+            raise RuntimeError("WebUI cannot safely register Owner STOP recovery")
+        startup_hooks.append(resume_deferred_owner_stop_on_webui_startup)
+
     @app.get("/control/status")
     def get_control_status():
         try:
@@ -364,13 +400,12 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             cfg, env_path, data_dir = _config_and_paths()
             if not os.path.isfile(env_path) or os.path.islink(env_path):
                 return _json({"error": "Configuration file must be a regular file"}, 409)
-            # Reconcile only stale display/service records; broker mutation
-            # barriers and Owner STOP instructions remain independent.
+            # Historical tracker records are read-only audit evidence.
             tracker = ConfigChangeTracker(data_dir=data_dir)
             def _admission_check():
                 # Called from apply_settings while holding the SAME global
                 # config_operation.lock as validation, CAS, save and restart.
-                tracker.reconcile_stale_control_records(env_path)
+                # Never rewrite a legacy configuration record on an AMO save.
                 if _pending(tracker):
                     raise ConfigurationConflict("Existing configuration operation is still active")
                 if _owner_stop_pending(tracker):
@@ -470,8 +505,8 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
         try:
             cfg, env_path, data_dir = _config_and_paths()
             tracker = ConfigChangeTracker(data_dir=data_dir)
-            from src.engine.tracker_v2_integration import recover_v2_late_ack
-            result = recover_v2_late_ack(
+            from src.engine.prior_restart_recovery import recover_prior_restart
+            result = recover_prior_restart(
                 tracker, env_path, requested_change_id=body.get("change_id"),
             )
             return _json({

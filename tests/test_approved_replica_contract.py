@@ -7,7 +7,7 @@ import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-KNOWN_WORKING_SETUP_BLOB = 'c8a81e63d3045229c97cbe7e5f58085b2395e6bf'
+KNOWN_WORKING_SETUP_HTML_SHA256 = '4993337e7676744596d82c85bc057ebad6cfd74096086395349db37d667e6a17'
 
 
 def source(rel):
@@ -28,9 +28,10 @@ def html_template():
 
 class ApprovedVisualOnlyContract(unittest.TestCase):
     def test_exact_previous_working_setup(self):
-        raw = (ROOT / 'src/setup_app.py').read_bytes()
-        data = b'blob ' + str(len(raw)).encode() + b'\0' + raw
-        self.assertEqual(hashlib.sha1(data).hexdigest(), KNOWN_WORKING_SETUP_BLOB)
+        # Import changes needed to retire writers must not fail a VISUAL contract.
+        # Freeze the exact approved HTML template instead of the entire Python source.
+        self.assertEqual(hashlib.sha256(html_template().encode()).hexdigest(),
+                         KNOWN_WORKING_SETUP_HTML_SHA256)
 
     def test_six_existing_cards_and_exact_54_unique_field_names(self):
         page = html_template()

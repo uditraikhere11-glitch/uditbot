@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import requests
 from src.broker.dhan_client import DhanClient
 from src.broker.read_governor import ReadGovernor
+from src.engine.broker_handoff import register_producer
 
 
 def response(code=200, payload='[]', retry=None):
@@ -23,6 +24,7 @@ class DhanCategoryTransportTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.now = 100000.
         self.g = ReadGovernor(self.tmp.name, 'ACCOUNT_A', clock=lambda: self.now)
+        register_producer(self.tmp.name, 'ACCOUNT_A')  # Real disposable mutation ledger for transport tests.
         c = DhanClient.__new__(DhanClient)
         c.cfg = NS(dhan_client_id='ACCOUNT_A', data_dir=self.tmp.name)
         c._read_governor = self.g

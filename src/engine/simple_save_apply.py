@@ -22,9 +22,10 @@ from src.engine.config_manager import (
     ConfigChangeTracker, compute_config_version, inspect_systemd_service_properties,
     is_isolated_test_environment, write_json_atomic,
 )
-from src.engine.tracker_v2_safety import (
+from src.engine.runtime_evidence import (
     evaluate_active_broker_operation_gate, read_private_json,
 )
+from src.engine.prior_settings import prior_settings_lock
 from src.engine.broker_handoff import (
     acquire_apply_barrier, release_apply_barrier, release_aborted_apply_barrier, BrokerHandoffBlocked,
 )
@@ -129,7 +130,11 @@ def _owner_stop_requested(env_file: Path, cfg: Mapping[str, str]) -> bool:
 
 
 def _positive_running_restart_proof(path: Path, old_values: Mapping[str, str]) -> dict[str, Any]:
-    """Require matching systemd/ACK/account/empty broker handoff before restart."""
+    """Prove old service, credentials and broker fence; diagnose without mutating.
+
+    A missing/stale producer record is NOT an empty mutation ledger. Never
+    register a producer from the WebUI or bypass an ambiguous broker outcome.
+    """
     cfg = AppConfig.from_env(env=dict(old_values), env_file="")
     data = Path(cfg.data_dir).expanduser()
     if not data.is_absolute():
@@ -139,23 +144,81 @@ def _positive_running_restart_proof(path: Path, old_values: Mapping[str, str]) -
     props = inspect_systemd_service_properties("trading_bot.service")
     main_pid = int(props.get("MainPID") or 0)
     if props.get("ActiveState") != "active" or main_pid <= 0:
-        raise ConfigurationConflict("Trading service state changed; restart refused")
+        raise ConfigurationConflict("RUNNING_SERVICE_UNVERIFIED: Trading service changed; no restart issued")
     ok, ack, _ = tracker.is_active_version_confirmed(
         expected_hashes={compute_config_version(cfg)},
         expected_mode=str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper(),
         require_systemd_active=True,
     )
     if not ok or not isinstance(ack, dict) or ack.get("pid") != main_pid:
-        raise ConfigurationConflict("Current runtime PID and saved version not verified")
+        raise ConfigurationConflict(
+            "RUNTIME_ACK_UNVERIFIED: Running PID, mode, configuration hash or starttime "
+            "cannot be confirmed; no restart issued"
+        )
+
+    # The running process must have acknowledged the SAME credentials, not
+    # merely an equal non-secret configuration hash. Never create/rekey
+    # credential evidence from a WebUI preflight.
+    from src.engine.tracker_credentials import CredentialEvidenceError, fingerprint_existing
+    try:
+        expected_fp = fingerprint_existing(cfg, str(data))
+    except (CredentialEvidenceError, OSError, ValueError):
+        raise ConfigurationConflict(
+            "CREDENTIAL_EVIDENCE_UNAVAILABLE: Runtime credential key cannot be read; "
+            "controlled service verification required"
+        ) from None
+    actual_fp = ack.get("credential_fingerprint")
+    if not isinstance(actual_fp, str) or not actual_fp:
+        raise ConfigurationConflict(
+            "RUNTIME_CREDENTIAL_ACK_MISSING: Running process did not acknowledge its "
+            "credentials; deploy a verified producer before Save & Apply"
+        )
+    import hmac
+    if not hmac.compare_digest(actual_fp, expected_fp):
+        raise ConfigurationConflict(
+            "RUNTIME_CREDENTIAL_MISMATCH: Running credentials differ from saved "
+            "configuration; do not restart until account/session evidence is reconciled"
+        )
+
+    # Never conflate an empty mutation list with a valid, currently registered
+    # producer. Keep every rejection visible as a non-secret reason code.
     gate = evaluate_active_broker_operation_gate(data, require_handoff=True)
-    ledger = read_private_json(data / "active_broker_mutations.json", missing_ok=True)
-    if (not gate.allowed or gate.code != "NO_ACTIVE_BROKER_OPERATION"
-            or not isinstance(ledger, dict)
-            or ledger.get("account_id") != cfg.dhan_client_id
-            or gate.evidence.get("producer_pid") != main_pid
-            or gate.evidence.get("producer_starttime") != ack.get("process_starttime")):
-        raise ConfigurationConflict("Broker mutation handoff is active, unresolved or unverifiable")
-    # Do not erase an Emergency Stop, an active order, or a prior barrier.
+    if not gate.allowed or gate.code != "NO_ACTIVE_BROKER_OPERATION":
+        code = str(gate.code or "SAFETY_RECORD_UNVERIFIABLE")
+        raise ConfigurationConflict(
+            f"BROKER_HANDOFF_{code}: Broker mutation safety evidence blocks this "
+            "restart; review producer, active orders, uncertainty and service state"
+        )
+    try:
+        ledger = read_private_json(data / "active_broker_mutations.json", missing_ok=False)
+        barrier = read_private_json(data / "config_restart_v2" / "apply_barrier.json", missing_ok=True)
+    except (OSError, ValueError):
+        raise ConfigurationConflict(
+            "BROKER_HANDOFF_RECORD_UNREADABLE: Broker evidence cannot be verified; "
+            "no restart issued"
+        ) from None
+    if ledger.get("account_id") != cfg.dhan_client_id:
+        raise ConfigurationConflict(
+            "BROKER_HANDOFF_ACCOUNT_MISMATCH: Registered broker account differs "
+            "from saved configuration; no restart issued"
+        )
+    if gate.evidence.get("producer_pid") != main_pid:
+        raise ConfigurationConflict(
+            "BROKER_HANDOFF_PRODUCER_PID_MISMATCH: Registered broker producer is "
+            "not the running trading service; controlled cutover required"
+        )
+    if gate.evidence.get("producer_starttime") != ack.get("process_starttime"):
+        raise ConfigurationConflict(
+            "BROKER_HANDOFF_STARTTIME_MISMATCH: Broker producer identity is stale; "
+            "no restart issued"
+        )
+    if barrier is not None and barrier.get("active") is not False:
+        raise ConfigurationConflict(
+            "BROKER_RESTART_BARRIER_UNRESOLVED: Prior restart fence is active or "
+            "unverifiable; verify the issued restart, never clear it blindly"
+        )
+    # acquire_apply_barrier() subsequently repeats admission under the SAME
+    # broker interprocess lock used by ORDER POST/PUT/DELETE.
     return {"data": data, "account": cfg.dhan_client_id,
             "pid": main_pid, "starttime": ack["process_starttime"],
             "old_hash": compute_config_version(cfg)}
@@ -167,8 +230,14 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
     tracker = ConfigChangeTracker(data_dir=str(handoff["data"]))
     expected = compute_config_version(cfg)
     mode = str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper()
-    from src.engine.tracker_credentials import fingerprint
-    expected_credentials = fingerprint(cfg, handoff["data"])
+    from src.engine.tracker_credentials import CredentialEvidenceError, fingerprint_existing
+    try:
+        expected_credentials = fingerprint_existing(cfg, str(handoff["data"]))
+    except (CredentialEvidenceError, OSError, ValueError):
+        raise ConfigurationConflict(
+            "RUNTIME_CREDENTIAL_EVIDENCE_UNAVAILABLE: Settings saved and a restart may "
+            "have been issued; broker fence retained for verified recovery"
+        ) from None
     deadline = time.monotonic() + 15
     while True:
         ok, ack, _ = tracker.is_active_version_confirmed(
@@ -196,6 +265,8 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
 
 def _retire_previous_transaction(data: Path, path: Path, values: Mapping[str, str], current: str) -> None:
     folder = data / "config_restart_v2"
+    if folder.is_symlink():
+        raise ConfigurationConflict("Unsafe previous settings directory.")
     journal = folder / "current_transaction.json"
     if not journal.exists() and not journal.is_symlink():
         fence = read_private_json(folder / "apply_barrier.json", missing_ok=True)
@@ -203,12 +274,13 @@ def _retire_previous_transaction(data: Path, path: Path, values: Mapping[str, st
             raise ConfigurationConflict("Broker restart fence is unresolved.")
         return
     # An old WebUI process may still hold the V2 transaction lock during rollout.
-    from src.engine.tracker_v2_candidate import CandidateCoordinator
-    with CandidateCoordinator(data, path)._exclusive():
+    with prior_settings_lock(folder):
         tx = read_private_json(journal, missing_ok=True)
-        if tx is None:
-            return
         barrier = read_private_json(folder / "apply_barrier.json", missing_ok=True)
+        if tx is None:
+            if barrier is not None and barrier.get("active") is not False:
+                raise ConfigurationConflict("Broker restart fence is unresolved.")
+            return
         phase = tx.get("phase")
         prepared = (phase == "PREPARED" and tx.get("restart_issued") is False
                     and tx.get("previous_file_revision") == current)
@@ -285,12 +357,14 @@ def apply_settings(
         if path.is_symlink():
             raise ConfigurationConflict("Configuration symlinked during save")
         if real_runtime:
-            # Single direct-save entry point also repairs proven stale
-            # config/status records; broker barriers are never blindly reset.
+            # Historical configuration records are immutable audit evidence.
+            # A pending, corrupted or ambiguous old operation blocks a new
+            # write; never replay, rewrite or silently clear those records.
             tracker = ConfigChangeTracker(data_dir=str(data_root))
-            tracker.reconcile_stale_control_records(str(path))
-            if tracker.has_unresolved_pending_operation() or os.path.exists(tracker.deferred_env_file):
-                raise ConfigurationConflict("A previous deferred settings operation needs reconciliation.")
+            if (tracker.has_unresolved_pending_operation()
+                    or os.path.exists(tracker.deferred_env_file)
+                    or os.path.exists(tracker.deferred_meta_file)):
+                raise ConfigurationConflict("Historical deferred settings evidence needs separate review.")
         if admission_check is not None:
             admission_check()
         with path.open("r", encoding="utf-8", newline="") as fh:
@@ -324,6 +398,15 @@ def apply_settings(
             raise ConfigurationConflict("Trading service state uncertain; no settings changed")
         if state == "active" and _owner_stop_requested(path, old_values):
             raise ConfigurationConflict("Owner STOP is pending; refusing a configuration restart")
+        if real_runtime:
+            from src.engine.tracker_v2_safety import preview_legacy_tracker_migration
+            migration = preview_legacy_tracker_migration(
+                data_root, allow_owner_stopped=(state == "inactive"),
+            )
+            if not migration.allowed:
+                raise ConfigurationConflict(
+                    "Prior configuration/Owner STOP safety evidence unresolved: " + migration.code
+                )
         # Validate completed-V2 journal compatibility before any broker fence
         # or file write; do not claim a successor until the file is committed.
         _retire_previous_transaction(data_root, path, old_values, actual_revision)

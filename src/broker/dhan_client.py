@@ -807,12 +807,15 @@ def verify_super_order_record(
 
 
 class DhanClient:
+    _require_broker_handoff = False
+
     def __init__(
         self,
         config: AppConfig,
         stop_manager: Optional[EmergencyStopManager] = None,
         reconciliation_gate: Optional[Any] = None,
         auto_generate_token: bool = True,
+        *, require_broker_handoff: bool = False,
     ):
         self.cfg = config
         from src.broker.read_governor import ReadGovernor
@@ -821,6 +824,7 @@ class DhanClient:
         )
         # The scheduled force-refresh must not perform a first implicit TOTP
         # login just because the token file is missing.
+        self._require_broker_handoff = require_broker_handoff
         self._auto_generate_token = auto_generate_token
         self.session = configure_yahoo_http(requests.Session())
         self.stop_manager = stop_manager or EmergencyStopManager(
@@ -1159,7 +1163,7 @@ class DhanClient:
         }
 
     def _broker_mutating_http(self, method: str, url: str, **kwargs):
-        """Account-scoped Dhan ORDER admission, then original V2 broker handoff.
+        """Account-scoped Dhan ORDER admission with unconditional broker handoff.
 
         A local 429 is returned BEFORE the network mutation; never retry an
         ambiguous response or bypass the protection handoff for a real send.
@@ -1180,39 +1184,31 @@ class DhanClient:
                     modification_order_id=ReadGovernor.modification_order_id(method, url),
                 )
 
-        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
-            # Legacy mode has no V2 mutation fence; reserve before the HTTP call.
-            try:
-                admit_before_network()
-            except (ReadDeferred, OSError, sqlite3.Error) as exc:
-                return self._read_deferral_response(exc)
-            result = fn(url, **kwargs)
-        else:
-            # The ledger and configuration fence are admitted FIRST. A refused
-            # fence never consumes the governor's 25-modification allowance.
-            # A locally refused governor request has no broker transport and
-            # must finalize the handoff as definitely NOT sent.
-            from src.engine.broker_handoff import (
-                broker_mutation, BrokerHandoffBlocked, BrokerMutationNotSubmitted,
-            )
-            sent = False
-            try:
-                with broker_mutation(self.cfg.data_dir, self.cfg.dhan_client_id, method) as finish:
-                    try:
-                        admit_before_network()
-                    except (ReadDeferred, OSError, sqlite3.Error) as exc:
-                        finish(True)  # Known no-send; do not create UNKNOWN mutation.
-                        return self._read_deferral_response(exc)
-                    sent = True
-                    result = fn(url, **kwargs)
-                    status = getattr(result, "status_code", None)
-                    finish(type(status) is int and (
-                        200 <= status < 400 or status in (400, 404, 409, 422)
-                    ))
-            except BrokerHandoffBlocked as exc:
-                if not sent:
-                    raise BrokerMutationNotSubmitted(str(exc)) from exc
-                raise
+        # The independent broker ledger and configuration fence are admitted FIRST. A refused
+        # fence never consumes the governor's 25-modification allowance.
+        # A locally refused governor request has no broker transport and
+        # must finalize the handoff as definitely NOT sent.
+        from src.engine.broker_handoff import (
+            broker_mutation, BrokerHandoffBlocked, BrokerMutationNotSubmitted,
+        )
+        sent = False
+        try:
+            with broker_mutation(self.cfg.data_dir, self.cfg.dhan_client_id, method) as finish:
+                try:
+                    admit_before_network()
+                except (ReadDeferred, OSError, sqlite3.Error) as exc:
+                    finish(True)  # Known no-send; do not create UNKNOWN mutation.
+                    return self._read_deferral_response(exc)
+                sent = True
+                result = fn(url, **kwargs)
+                status = getattr(result, "status_code", None)
+                finish(type(status) is int and (
+                    200 <= status < 400 or status in (400, 404, 409, 422)
+                ))
+        except BrokerHandoffBlocked as exc:
+            if not sent:
+                raise BrokerMutationNotSubmitted(str(exc)) from exc
+            raise
         if governor is not None and getattr(result, "headers", {}).get("X-AuditBot-Local-Deferral") != "1":
             try:
                 if self._is_rate_limited_response(result):

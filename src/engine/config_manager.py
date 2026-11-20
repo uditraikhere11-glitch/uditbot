@@ -11,12 +11,8 @@ Implements & Repairs:
                exact, defensible parent-to-protection linkage (`parent_order_id`, `correlation_id`, `forever_order_id`,
                `orderId`, `security_id`, `exchange_segment`, `product_type`), preventing cross-trade OCO credit,
                double-counting, or stale watcher bypass when broker protection is missing, partial, cancelled, or expired.
-- F02-03 (P1): Persistent automatic background coordinator (`start_coordinator_daemon` / `ensure_coordinator_daemon`)
-               in the WebUI/control process that monitors deferred configuration and Stop requests, wakes on watcher
-               readiness, reconciles obligations, and applies/restarts exactly once without manual API intervention.
-- F02-04 (P1): Complete interrupted-operation recovery in `run_control_coordinator_tick()` handling `QUEUED`,
-               `IN_PROGRESS`, `APPLYING`, `VERIFYING`, `WAITING_FOR_ORDER`, and `READY_TO_APPLY` without stranding
-               requests or blindly repeating `systemctl restart`.
+- Tracker retirement: the coordinator is retained only to honor deferred Owner STOP.
+               The retired settings queue, restart writer and deferred replay are never executed.
 - F02-05 (P1): Independent post-stop systemd verification (`_poll_for_service_stopped`) in `control_service("stop")`,
                persisting `STOPPED_BY_OWNER` only after systemd confirms the service reached `inactive` state.
 - F02-06 (P2): Pure read-only status inspection (`inspect_transition_gate_status(read_only=True)`) separated from
@@ -2053,151 +2049,6 @@ class ConfigChangeTracker:
             except Exception as e:
                 logger.error(f"Failed to persist configuration change record: {e}")
 
-    def reconcile_stale_control_records(
-        self, env_path: str = ".env",
-        check_service_fn: Optional[Callable[[], Any]] = None,
-    ) -> Dict[str, Any]:
-        """Repair stale *display/control* states from positive systemd evidence.
-
-        Never deletes an operation, changes the owner DESIRED state, clears a
-        broker/transition barrier, or asserts broker-position reconciliation.
-        A live process requires PID/starttime, config hash and an empty,
-        account-scoped, registered broker mutation handoff.
-        """
-        from src.config import AppConfig, parse_env_dict
-        from src.engine.tracker_v2_safety import (
-            evaluate_active_broker_operation_gate, read_private_json,
-        )
-        from src.engine.config_patch import revision
-        result: Dict[str, Any] = {"resolved": False, "reason": "No eligible stale state"}
-        try:
-            cfg = AppConfig.from_env(
-                env=parse_env_dict(env_path), env_file="",
-            )
-            mode = str(getattr(cfg.trading_mode, "value", cfg.trading_mode)).upper()
-            current_hash = compute_config_version(cfg)
-            with open(env_path, "r", encoding="utf-8", newline="") as f:
-                file_revision = revision(f.read())
-            props = inspect_systemd_service_properties(
-                "trading_bot.service", check_fn=check_service_fn,
-            )
-            state = str(props.get("ActiveState") or "").lower()
-            main_pid = props.get("MainPID")
-            if type(main_pid) is not int:
-                try:
-                    main_pid = int(main_pid or 0)
-                except (ValueError, TypeError):
-                    return {"resolved": False, "reason": "Untrusted MainPID"}
-            stopped = state == "inactive" and main_pid == 0
-            verified = False
-            if state == "active" and main_pid > 0:
-                valid, ack, _ = self.is_active_version_confirmed(
-                    expected_hashes={current_hash}, expected_mode=mode,
-                    check_service_fn=check_service_fn, require_systemd_active=True,
-                )
-                gate = evaluate_active_broker_operation_gate(
-                    self.data_dir, require_handoff=True,
-                )
-                ledger = read_private_json(
-                    os.path.join(self.data_dir, "active_broker_mutations.json"),
-                    missing_ok=True,
-                )
-                verified = bool(
-                    valid and isinstance(ack, dict) and gate.allowed
-                    and gate.code == "NO_ACTIVE_BROKER_OPERATION"
-                    and isinstance(ledger, dict)
-                    and ledger.get("account_id") == cfg.dhan_client_id
-                    and gate.evidence.get("producer_pid") == main_pid
-                    and gate.evidence.get("producer_starttime") == ack.get("process_starttime")
-                )
-            if not stopped and not verified:
-                return {"resolved": False, "reason": "Systemd/ACK/broker handoff not positively verified"}
-
-            # The caller holds the configuration operation lock. These updates
-            # are monotonic evidence reconciliation, not a second restart.
-            record = self.get_change_record()
-            busy = {
-                "STARTING", "APPLYING", "WAITING_FOR_ACTIVE_OPERATION",
-                "VERIFYING", "SAFETY_CHECK_PENDING",
-                "WAITING_FOR_SAFE_APPLY",
-            }
-            if record is not None and (
-                str(record.state.value).upper() in busy
-                or str(record.operation_state).upper() in busy
-            ):
-                # Never certify a different .env or a different requested version.
-                if (
-                    record.requested_file_revision == file_revision
-                    and record.proposed_version_hash == current_hash
-                ):
-                    record.state = (
-                        ConfigApplyState.SAVED_FOR_NEXT_START if stopped
-                        else ConfigApplyState.APPLIED_VERIFIED
-                    )
-                    record.operation_state = (
-                        OperationState.SAVED_FOR_NEXT_START.value if stopped
-                        else OperationState.APPLIED_VERIFIED.value
-                    )
-                    record.runtime_verified = verified
-                    record.restart_performed = verified and bool(record.restart_required)
-                    record.running_mode = "STOPPED" if stopped else mode
-                    record.service_state = (
-                        ServiceOperatingState.STOPPED_OTHER.value if stopped
-                        else ServiceOperatingState.RUNNING.value
-                    )
-                    record.saved_mode = mode
-                    record.blocked_reason = ""
-                    record.reason = (
-                        "Previous save reconciled to stopped service; no restart issued"
-                        if stopped else "Prior restart verified against current systemd PID and broker handoff"
-                    )
-                    record.progress_percent = 100
-                    record.current_step = "PERSISTED" if stopped else "VERIFIED"
-                    if verified:
-                        record.effective_version_hash = current_hash
-                        record.verified_at = time.time()
-                    self.save_change_record(record)
-                    check = self.get_change_record(record.change_id)
-                    if check is None or check.state != record.state:
-                        return {"resolved": False, "reason": "Configuration reconciliation readback failed"}
-                    result["configuration"] = record.state.value
-                    result["resolved"] = True
-
-            control = self.get_service_control_record()
-            if control.get("_corrupted"):
-                return {"resolved": False, "reason": "Owner control record corrupted"}
-            desired = str(control.get("desired_service_state") or "").upper()
-            observed = str(control.get("observed_state") or "").upper()
-            stale_control = observed in {
-                "STARTING", "APPLYING", "WAITING_FOR_ACTIVE_OPERATION",
-            }
-            # Owner STOP priority: never change a STOPPED intention to RUNNING.
-            if stale_control and (stopped or (verified and desired != "STOPPED")):
-                updated = dict(control)
-                updated["observed_state"] = (
-                    "STOPPED_BY_OWNER" if stopped and desired == "STOPPED"
-                    else "STOPPED_OTHER" if stopped else "RUNNING"
-                )
-                if stopped:
-                    updated["deferred_stop_pending"] = False
-                    updated["stop_ready_to_apply"] = False
-                updated["reconciled_at"] = time.time()
-                write_json_atomic(self.service_control_file, updated)
-                check = self.get_service_control_record()
-                if check.get("observed_state") != updated["observed_state"]:
-                    return {"resolved": False, "reason": "Owner state reconciliation readback failed"}
-                result["service"] = updated["observed_state"]
-                result["resolved"] = True
-
-            # Never infer completion of a V2 restart from service state alone.
-            # In particular, ACK_UNCERTAIN and in-flight phases retain their
-            # durable evidence and require the V2 recovery coordinator.
-            return result
-        except (OSError, ValueError, TypeError) as exc:
-            logger.warning("Stale tracker state not reconciled: %s", type(exc).__name__)
-            return {"resolved": False, "reason": "Safety evidence unreadable"}
-
-
     def has_unresolved_pending_operation(self) -> bool:
         """A terminal saved change is not a forever-blocking old queue file.
 
@@ -2207,7 +2058,7 @@ class ConfigChangeTracker:
         if not os.path.exists(self.pending_op_file):
             return False
         try:
-            from src.engine.tracker_v2_safety import read_private_json
+            from src.engine.runtime_evidence import read_private_json
             pending = read_private_json(self.pending_op_file, missing_ok=False)
             rec = self.get_change_record()
             return not bool(
@@ -4193,235 +4044,29 @@ class ConfigChangeTracker:
     # B07, F02-03 & F02-04: Durable Deferred State Machine & Autonomous Coordinator
     # =========================================================================
 
-    def save_deferred_metadata(self, meta: Dict[str, Any]) -> None:
-        with self._lock:
-            try:
-                write_json_atomic(self.deferred_meta_file, meta)
-            except Exception as e:
-                logger.error(f"Failed to save deferred metadata: {e}")
-
-    def get_deferred_metadata(self) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            if not os.path.exists(self.deferred_meta_file):
-                return None
-            try:
-                with open(self.deferred_meta_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else None
-            except Exception:
-                return None
-
-    def clear_deferred_artifacts(self, clear_gate: bool = False) -> None:
-        """
-        B01: Removes staged deferred files (`deferred_config.env`, `deferred_config_meta.json`).
-        By default (`clear_gate=False`), does NOT release `mode_transition_gate.json`.
-        """
-        with self._lock:
-            for p in (self.deferred_env_file, self.deferred_meta_file):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-            if clear_gate:
-                self.set_transition_gate(False)
-
     def record_watcher_obligations_resolved(self, db_path: Optional[str] = None) -> bool:
-        """
-        B07 & F02-03: Called by `ProtectionWatcher.check_once()` in the trading process when all
-        tracked orders have reached terminal protected/closed states.
-        Records transition readiness in durable state (`READY_TO_APPLY` / `stop_ready_to_apply`),
-        wakes any active coordinator daemon event, and NEVER executes `systemctl` or self-restarts!
+        """Watcher readiness can advance only an existing deferred OWNER STOP.
+
+        Never replay, alter, or complete a historical settings transaction.
+        Readiness is advisory: the independent Owner STOP monitor still runs
+        the full broker/journal/position safety gate before calling systemctl.
         """
         with self._lock:
-            updated = False
-            meta = self.get_deferred_metadata()
-            if isinstance(meta, dict):
-                meta["watcher_obligations_clear"] = True
-                meta["watcher_ready_at"] = time.time()
-                if db_path:
-                    meta["db_path"] = db_path
-                self.save_deferred_metadata(meta)
-                updated = True
-
-            rec = self.get_change_record()
-            if rec and rec.state == ConfigApplyState.WAITING_FOR_SAFE_APPLY:
-                rec.operation_state = OperationState.READY_TO_APPLY.value
-                rec.reason = "All tracked LIVE orders resolved; ready for control coordinator to apply."
-                self.save_change_record(rec)
-                updated = True
-
             ctrl = self.get_service_control_record()
-            if isinstance(ctrl, dict) and ctrl.get("deferred_stop_pending"):
-                ctrl["stop_ready_to_apply"] = True
-                ctrl["stop_ready_at"] = time.time()
-                try:
-                    write_json_atomic(self.service_control_file, ctrl)
-                    updated = True
-                except Exception:
-                    pass
-
+            if (not isinstance(ctrl, dict) or ctrl.get("_corrupted")
+                    or ctrl.get("deferred_stop_pending") is not True
+                    or str(ctrl.get("desired_service_state") or "").upper() != "STOPPED"):
+                return False
+            ctrl["stop_ready_to_apply"] = True
+            ctrl["stop_ready_at"] = time.time()
+            try:
+                write_json_atomic(self.service_control_file, ctrl)
+            except (OSError, ValueError):
+                return False
             wake_ev = _COORDINATOR_WAKE_EVENTS.get(self.data_dir)
             if wake_ev is not None:
                 wake_ev.set()
-            return updated
-
-    def cancel_deferred_change(self, change_id: Optional[str] = None, reason: str = "Cancelled by owner") -> Dict[str, Any]:
-        """
-        Section F: Cancels a deferred configuration change only if it has not crossed the
-        irreversible `APPLYING` / `VERIFYING` boundary.
-        """
-        with self.operation_lock(operation_type="CANCEL_DEFERRED", operation_id=change_id or "CANCEL"):
-            rec = self.get_change_record(change_id)
-            if not rec:
-                return {"ok": False, "cancelled": False, "reason": "No matching configuration change record found."}
-            if rec.state in (ConfigApplyState.APPLYING, ConfigApplyState.APPLIED_VERIFIED) or rec.operation_state in (
-                OperationState.APPLYING.value,
-                OperationState.VERIFYING.value,
-                OperationState.APPLIED_VERIFIED.value,
-            ):
-                return {
-                    "ok": False,
-                    "cancelled": False,
-                    "change_id": rec.change_id,
-                    "state": rec.state.value,
-                    "operation_state": rec.operation_state,
-                    "reason": "Operation has already crossed the application boundary and cannot be cancelled.",
-                }
-            if rec.state != ConfigApplyState.WAITING_FOR_SAFE_APPLY and rec.operation_state not in (
-                OperationState.REQUESTED.value,
-                OperationState.VALIDATED.value,
-                OperationState.STAGED.value,
-                OperationState.WAITING_FOR_ORDER.value,
-                OperationState.READY_TO_APPLY.value,
-            ):
-                return {
-                    "ok": False,
-                    "cancelled": False,
-                    "change_id": rec.change_id,
-                    "state": rec.state.value,
-                    "operation_state": rec.operation_state,
-                    "reason": f"Operation {rec.change_id} is not in a cancellable deferred state ({rec.state.value}).",
-                }
-
-            rec.state = ConfigApplyState.REJECTED
-            rec.operation_state = OperationState.CANCELLED.value
-            rec.reason = reason
-            rec.auto_resume = False
-            self.clear_deferred_artifacts(clear_gate=False)
-            self.save_change_record(rec)
-
-            ctrl = self.get_service_control_record()
-            if not (isinstance(ctrl, dict) and ctrl.get("deferred_stop_pending")):
-                self.set_transition_gate(False, change_id=rec.change_id, reason=reason)
-
-            return {
-                "ok": True,
-                "cancelled": True,
-                "change_id": rec.change_id,
-                "state": rec.state.value,
-                "operation_state": rec.operation_state,
-                "reason": reason,
-            }
-
-    def try_auto_resume_deferred_update(
-        self,
-        env_path: str = ".env",
-        stop_state_path: Optional[str] = None,
-        db_path: Optional[str] = None,
-        broker: Optional[Any] = None,
-        notifier: Optional[Any] = None,
-        systemctl_restart_fn: Optional[Callable[[], bool]] = None,
-        check_service_fn: Optional[Callable[[], Any]] = None,
-        verify_delay_sec: float = 0.05,
-        expected_change_id: Optional[str] = None,
-    ) -> Optional[ConfigChangeRecord]:
-        """
-        B07, B08 & F02-03: Control-coordinator method that checks if a deferred configuration
-        request (`WAITING_FOR_SAFE_APPLY` / `WAITING_FOR_ORDER` / `READY_TO_APPLY`) exists,
-        reconciles broker & journal state, and if all safety conditions are now satisfied,
-        atomically claims and applies the deferred configuration under its original `change_id`.
-        """
-        lock = self.operation_lock(
-            operation_type="AUTO_RESUME_DEFERRED",
-            operation_id=expected_change_id or "AUTO-RESUME",
-            blocking=False,
-        )
-        if not lock.acquire():
-            return None
-        try:
-            rec = self.get_change_record()
-            if not rec or rec.state != ConfigApplyState.WAITING_FOR_SAFE_APPLY:
-                return None
-            if expected_change_id and rec.change_id != expected_change_id:
-                return None
-            if rec.superseded_by:
-                return None
-            if not os.path.exists(self.deferred_env_file):
-                return None
-
-            meta = self.get_deferred_metadata() or {}
-            if meta.get("change_id") and meta.get("change_id") != rec.change_id:
-                return None
-            if meta.get("sequence_id") and rec.sequence_id and int(meta["sequence_id"]) < int(rec.sequence_id):
-                return None
-
-            actual_env_path = meta.get("env_path") or env_path
-            actual_stop_path = stop_state_path or meta.get("stop_state_path") or os.path.join(self.data_dir, "emergency_stop.json")
-            actual_db_path = db_path or meta.get("db_path") or os.path.join(self.data_dir, "trade_journal.db")
-
-            with open(self.deferred_env_file, "r", encoding="utf-8") as f:
-                deferred_env_content = f.read()
-
-            parsed_def_env = parse_env_content_string(deferred_env_content)
-            target_is_live = (str(parsed_def_env.get("TRADING_MODE", "TEST")).upper() == "LIVE")
-
-            is_safe, safety_reason, blocked_code, block_count = self.evaluate_trading_safety_gate_detailed(
-                db_path=actual_db_path,
-                stop_state_path=actual_stop_path,
-                is_service_running=True,
-                is_live_mode=True,
-                target_is_live=target_is_live,
-                broker=broker,
-                env_path=actual_env_path,
-            )
-            if not is_safe:
-                rec.reason = safety_reason
-                rec.blocked_reason = blocked_code
-                rec.blocking_order_count = block_count
-                rec.operation_state = OperationState.WAITING_FOR_ORDER.value
-                self.save_change_record(rec)
-                return rec
-
-            is_valid, val_reason = self.validate_inputs(parsed_def_env)
-            if not is_valid:
-                rec.state = ConfigApplyState.REJECTED
-                rec.operation_state = OperationState.FAILED.value
-                rec.reason = val_reason
-                rec.failed_stage = "VALIDATING"
-                self.clear_deferred_artifacts(clear_gate=False)
-                self.save_change_record(rec)
-                return rec
-
-            rec.operation_state = OperationState.READY_TO_APPLY.value
-            self.save_change_record(rec)
-
-            return execute_configuration_update(
-                form_params=parsed_def_env,
-                env_content=deferred_env_content,
-                data_dir=self.data_dir,
-                env_path=actual_env_path,
-                stop_state_path=actual_stop_path,
-                db_path=actual_db_path,
-                notifier=notifier,
-                systemctl_restart_fn=systemctl_restart_fn,
-                check_service_fn=check_service_fn,
-                verify_delay_sec=verify_delay_sec,
-                existing_change_id=rec.change_id,
-                broker=broker,
-            )
-        finally:
-            lock.release()
+            return True
 
     def try_auto_complete_deferred_stop(
         self,
@@ -4442,7 +4087,9 @@ class ConfigChangeTracker:
             return None
         try:
             ctrl = self.get_service_control_record()
-            if not isinstance(ctrl, dict) or not ctrl.get("deferred_stop_pending"):
+            if (not isinstance(ctrl, dict) or ctrl.get("_corrupted")
+                    or ctrl.get("deferred_stop_pending") is not True
+                    or str(ctrl.get("desired_service_state") or "").upper() != "STOPPED"):
                 return None
             return self.control_service(
                 action="stop",
@@ -4457,200 +4104,6 @@ class ConfigChangeTracker:
         finally:
             lock.release()
 
-    def _recover_or_verify_restarting_record(
-        self,
-        rec: ConfigChangeRecord,
-        check_service_fn: Optional[Callable[[], Any]] = None,
-        startup_verification_window_sec: Optional[float] = None,
-        remove_pending_op_on_terminal: bool = False,
-    ) -> Tuple[str, ConfigChangeRecord]:
-        """
-        F03-04: Bounded startup verification recovery for interrupted `APPLYING` / `VERIFYING` operations:
-        1. Persists restart attempt identity (`restart_attempt_id`), initiation timestamp (`restart_initiated_at`),
-           verification deadline (`verification_deadline_at`), and observed systemd evidence (`observed_systemd_state`).
-        2. Inspects actual systemd service state (`inspect_systemd_service_properties`).
-        3. Allows a bounded, configurable startup verification window (`startup_verification_window_sec`) rather than
-           failing after 50 ms when the newly restarted process is still initializing.
-        4. Never issues a duplicate `systemctl restart` for an already-initiated restart attempt.
-        5. Continues waiting (`STILL_VERIFYING`) when systemd indicates legitimate startup progress (`activating` /
-           `reloading` or `active` before post-restart runtime acknowledgement arrives within the window).
-        6. Immediately detects and fails closed (`FAILED`) on genuine service failure (`failed` / `inactive` /
-           non-zero `ExecMainStatus`) or when a fresh post-restart acknowledgement reports the wrong mode,
-           wrong configuration hash, or mismatched `MainPID`.
-        7. Preserves the LIVE transition gate until `APPLIED_VERIFIED` is confirmed.
-        """
-        now = time.time()
-        init_ts = float(rec.restart_initiated_at or rec.applied_at or rec.requested_at or now)
-        rec.restart_initiated_at = init_ts
-        rec.applied_at = init_ts
-        if not rec.restart_attempt_id:
-            rec.restart_attempt_id = f"RST-{rec.change_id}-{int(init_ts * 1000)}"
-        rec.restart_performed = True
-
-        if startup_verification_window_sec is not None:
-            window_sec = max(0.05, float(startup_verification_window_sec))
-            deadline_ts = init_ts + window_sec
-        elif rec.startup_verification_window_sec and rec.startup_verification_window_sec > 0.0:
-            window_sec = float(rec.startup_verification_window_sec)
-            deadline_ts = float(rec.verification_deadline_at or (init_ts + window_sec))
-        else:
-            window_sec = float(self.startup_verification_window_sec)
-            deadline_ts = float(rec.verification_deadline_at or (init_ts + window_sec))
-
-        rec.startup_verification_window_sec = window_sec
-        rec.verification_deadline_at = deadline_ts
-
-        # F03-04 Requirement 9: Preserve the LIVE transition gate while verification is unresolved
-        involves_live_transition = (
-            rec.previous_mode == "LIVE"
-            or rec.running_mode == "LIVE"
-            or rec.requested_mode == "TEST"
-        )
-        if involves_live_transition:
-            self.set_transition_gate(
-                active=True,
-                change_id=rec.change_id,
-                target_mode=rec.requested_mode,
-                reason=f"Recovering and verifying {rec.previous_mode} -> {rec.requested_mode} restart ({rec.restart_attempt_id})",
-            )
-
-        svc_props = inspect_systemd_service_properties("trading_bot.service", check_fn=check_service_fn)
-        act_st = str(svc_props.get("ActiveState") or "unknown").lower()
-        sub_st = str(svc_props.get("SubState") or "").lower()
-        res_st = str(svc_props.get("Result") or "").lower()
-        exec_code = int(svc_props.get("ExecMainStatus") or 0)
-        main_pid = int(svc_props.get("MainPID") or 0)
-        explicit_pid = bool(svc_props.get("_explicit_main_pid", False)) or not is_isolated_test_environment()
-        rec.observed_systemd_state = f"{act_st}/{sub_st}"
-
-        def _mark_terminal_failure(err_message: str) -> Tuple[str, ConfigChangeRecord]:
-            rec.state = ConfigApplyState.APPLY_FAILED
-            rec.operation_state = OperationState.FAILED.value
-            rec.failed_stage = "VERIFIED"
-            rec.progress_percent = 90
-            rec.runtime_verified = False
-            rec.error_msg = err_message
-            rec.reason = err_message
-            if involves_live_transition:
-                self.set_transition_gate(
-                    active=True,
-                    change_id=rec.change_id,
-                    target_mode=rec.requested_mode,
-                    reason=f"Post-restart verification failed ({err_message}); LIVE entries remain blocked",
-                )
-            self.save_change_record(rec)
-            if remove_pending_op_on_terminal and os.path.exists(self.pending_op_file):
-                try:
-                    os.remove(self.pending_op_file)
-                except OSError:
-                    pass
-            return "FAILED", rec
-
-        # F03-04 Requirement 7: Detect genuinely failed or inactive service unit immediately
-        if (
-            act_st in ("failed", "inactive", "deactivating")
-            or sub_st == "failed"
-            or (res_st and res_st not in ("", "success"))
-            or exec_code != 0
-        ):
-            return _mark_terminal_failure(
-                f"Service failed during startup verification (ActiveState={act_st}, SubState={sub_st}, Result={res_st}, ExecMainStatus={exec_code})"
-            )
-
-        if act_st == "active" and explicit_pid and main_pid <= 0:
-            return _mark_terminal_failure(
-                f"Systemd did not report a valid MainPID ({main_pid}) for active service"
-            )
-
-        # If systemd is active, check if runtime acknowledgement is already confirmed
-        if act_st == "active":
-            ok_v, info_v, err_v = self.is_active_version_confirmed(
-                expected_hashes={rec.proposed_version_hash} if rec.proposed_version_hash else set(),
-                expected_mode=rec.requested_mode,
-                min_acknowledged_at=init_ts,
-                check_service_fn=check_service_fn,
-                require_systemd_active=True,
-            )
-            if ok_v:
-                rec.state = ConfigApplyState.APPLIED_VERIFIED
-                rec.operation_state = OperationState.APPLIED_VERIFIED.value
-                rec.verified_at = now
-                rec.effective_version_hash = (info_v or {}).get("version_hash") or rec.proposed_version_hash
-                rec.progress_percent = 100
-                rec.current_step = "VERIFIED"
-                rec.running_mode = rec.requested_mode
-                rec.service_state = ServiceOperatingState.RUNNING.value
-                rec.runtime_verified = True
-                rec.error_msg = ""
-                rec.reason = f"Recovered after coordinator interruption: verified {rec.requested_mode} runtime."
-                self.set_transition_gate(
-                    active=False,
-                    change_id=rec.change_id,
-                    target_mode=rec.requested_mode,
-                    reason=rec.reason,
-                )
-                self.record_service_control_intent(
-                    desired_service_state="RUNNING",
-                    last_action="CONFIG_APPLY_RESTART",
-                    reason=f"Verified configuration {rec.change_id} in {rec.requested_mode} mode",
-                    requested_mode=rec.requested_mode,
-                    observed_state=ServiceOperatingState.RUNNING.value,
-                )
-                self.save_change_record(rec)
-                if remove_pending_op_on_terminal and os.path.exists(self.pending_op_file):
-                    try:
-                        os.remove(self.pending_op_file)
-                    except OSError:
-                        pass
-                return "VERIFIED", rec
-
-            # Check whether a FRESH post-restart acknowledgement arrived with an authoritative mismatch
-            raw_info = self.get_active_running_version(require_live_pid=False)
-            if isinstance(raw_info, dict):
-                ack_at = float(raw_info.get("acknowledged_at") or 0.0)
-                ack_h = str(raw_info.get("version_hash") or "").strip()
-                ack_m = str(raw_info.get("trading_mode") or "").strip().upper()
-                is_unchanged_pre_restart_file = (
-                    bool(rec.previous_version_hash)
-                    and ack_h == rec.previous_version_hash
-                    and ack_m == str(rec.previous_mode or "").strip().upper()
-                )
-                is_fresh_post_restart_ack = (ack_at >= init_ts - 0.001) and not is_unchanged_pre_restart_file
-                if is_fresh_post_restart_ack:
-                    # A new post-restart acknowledgement was written, but failed verification
-                    # (dead/recycled PID, MainPID mismatch, wrong mode, or wrong configuration hash) -> fail immediately!
-                    return _mark_terminal_failure(
-                        f"Post-restart runtime verification failed: {err_v}"
-                    )
-
-        # If verification deadline has elapsed without confirmation -> persist terminal failure (Requirement 10)
-        if now >= deadline_ts:
-            _, _, err_final = self.is_active_version_confirmed(
-                expected_hashes={rec.proposed_version_hash} if rec.proposed_version_hash else set(),
-                expected_mode=rec.requested_mode,
-                min_acknowledged_at=init_ts,
-                check_service_fn=check_service_fn,
-                require_systemd_active=True,
-            )
-            return _mark_terminal_failure(
-                f"Startup verification window ({window_sec:.2f}s) expired without valid runtime acknowledgement: {err_final}"
-            )
-
-        # F03-04 Requirements 3, 5 & 6: Still within startup verification window and service is starting/initializing ->
-        # keep waiting in APPLYING / VERIFYING without issuing a duplicate restart!
-        rec.state = ConfigApplyState.APPLYING
-        rec.operation_state = OperationState.VERIFYING.value
-        rec.current_step = "APPLYING"
-        rec.progress_percent = 90
-        rec.runtime_verified = False
-        remaining_s = max(0.0, deadline_ts - now)
-        rec.reason = (
-            f"Waiting for restarted trading process to finish initializing and acknowledge {rec.requested_mode} "
-            f"configuration ({remaining_s:.2f}s remaining in startup window, systemd={rec.observed_systemd_state})."
-        )
-        self.save_change_record(rec)
-        return "STILL_VERIFYING", rec
-
     def run_control_coordinator_tick(
         self,
         env_path: str = ".env",
@@ -4664,209 +4117,32 @@ class ConfigChangeTracker:
         verify_delay_sec: float = 0.05,
         startup_verification_window_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """Owner-STOP-only compatibility tick; historical settings are read-only.
+
+        Kept callable for already-running watcher/control clients across the
+        transition. It NEVER accesses pending_config_operation.json to execute
+        or remove it, touches .env, or calls the former settings writer.
         """
-        B07, B08, B11, F02-03, F02-04, F02-06 & F03-04:
-        Single control-coordinator tick executed by the WebUI/control process to:
-        0. Reconcile and recover any missing/inconsistent transition gate record on disk (F02-06).
-        1. Recover and execute any `QUEUED` or interrupted `IN_PROGRESS` configuration operation
-           in `pending_config_operation.json` without stranding or duplicate restarts (F02-04 & F03-04).
-        2. Reconcile any stranded `REQUESTED` / `VALIDATED` / `STAGED` / `APPLYING` / `VERIFYING`
-           change record in `config_change_state.json` after a coordinator crash within the bounded
-           startup verification window (F02-04 & F03-04).
-        3. Resume any ready deferred configuration update (`WAITING_FOR_ORDER` / `READY_TO_APPLY`).
-        4. Complete any deferred Owner Stop (`deferred_stop_pending=True`).
-        """
-        outcomes: Dict[str, Any] = {
-            "queued_executed": None,
-            "recovered_interrupted": None,
-            "resumed_deferred": None,
-            "completed_stop": None,
-        }
-
-        # First recover field-scoped save transactions. Otherwise a crash
-        # after atomic .env replacement but before status persistence can be
-        # incorrectly converted to APPLY_FAILED by the legacy 15-second timer.
-        # This is local journal recovery only (no broker or service actions).
-        from src.engine.webui_update import recover_field_transactions
-        outcomes["field_recovery"] = recover_field_transactions(self)
-
-        # 0. Explicit gate recovery inside authorized coordinator (F02-06)
-        self.reconcile_and_recover_transition_gate()
-
-        # 1. Process or recover QUEUED and interrupted IN_PROGRESS envelopes in pending_config_operation.json (F02-04 & F03-04)
-        if os.path.exists(self.pending_op_file):
-            lock = self.operation_lock(operation_type="COORDINATOR_QUEUED", blocking=False)
-            if lock.acquire():
-                try:
-                    if os.path.exists(self.pending_op_file):
-                        with open(self.pending_op_file, "r", encoding="utf-8") as pf:
-                            op_data = json.load(pf)
-                        if isinstance(op_data, dict):
-                            op_status = str(op_data.get("status") or "").upper()
-                            op_cid = str(op_data.get("change_id") or "")
-                            existing_rec = self.get_change_record(op_cid) if op_cid else self.get_change_record()
-
-                            if existing_rec and existing_rec.state in (
-                                ConfigApplyState.APPLIED_VERIFIED,
-                                ConfigApplyState.SAVED_FOR_NEXT_START,
-                                ConfigApplyState.APPLY_FAILED,
-                                ConfigApplyState.REJECTED,
-                                ConfigApplyState.WAITING_FOR_SAFE_APPLY,
-                            ):
-                                try:
-                                    os.remove(self.pending_op_file)
-                                except OSError:
-                                    pass
-                            elif existing_rec and (
-                                existing_rec.state == ConfigApplyState.APPLYING
-                                or existing_rec.operation_state in (OperationState.APPLYING.value, OperationState.VERIFYING.value)
-                                or existing_rec.restart_performed
-                            ):
-                                # F03-04: Interrupted IN_PROGRESS after systemctl restart was already initiated ->
-                                # DO NOT repeat systemctl restart, and DO NOT fail prematurely while within startup window!
-                                ver_status, updated_rec = self._recover_or_verify_restarting_record(
-                                    rec=existing_rec,
-                                    check_service_fn=check_service_fn,
-                                    startup_verification_window_sec=startup_verification_window_sec,
-                                    remove_pending_op_on_terminal=True,
-                                )
-                                outcomes["recovered_interrupted"] = updated_rec
-                                outcomes["verification_status"] = ver_status
-                            elif op_status in ("QUEUED", "IN_PROGRESS"):
-                                was_interrupted_in_progress = (op_status == "IN_PROGRESS")
-                                op_data["status"] = "IN_PROGRESS"
-                                op_data["started_at"] = time.time()
-                                op_data["worker_pid"] = os.getpid()
-                                op_data["worker_starttime"] = _get_os_process_starttime(os.getpid())
-                                write_json_atomic(self.pending_op_file, op_data)
-                                rec_q = execute_configuration_update(
-                                    form_params=op_data.get("form_params") or {},
-                                    env_content=op_data.get("env_content") or "",
-                                    data_dir=self.data_dir,
-                                    env_path=op_data.get("env_path") or env_path,
-                                    stop_state_path=op_data.get("stop_state_path") or stop_state_path,
-                                    db_path=op_data.get("db_path") or db_path,
-                                    notifier=notifier,
-                                    systemctl_restart_fn=systemctl_restart_fn,
-                                    check_service_fn=check_service_fn,
-                                    verify_delay_sec=verify_delay_sec,
-                                    existing_change_id=op_cid or None,
-                                    broker=broker,
-                                )
-                                try:
-                                    os.remove(self.pending_op_file)
-                                except OSError:
-                                    pass
-                                outcomes["queued_executed"] = rec_q
-                                if was_interrupted_in_progress:
-                                    outcomes["recovered_interrupted"] = rec_q
-                except Exception as e:
-                    logger.warning(f"Coordinator queued/in-progress operation error: {e}")
-                finally:
-                    lock.release()
-
-        # 2. Check for interrupted in-progress operation in config_change_state.json without pending_op_file (F02-04 & F03-04)
-        rec = self.get_change_record()
-        if (
-            rec
-            and outcomes["recovered_interrupted"] is None
-            and rec.state in (
-                ConfigApplyState.REQUEST_RECEIVED,
-                ConfigApplyState.VALIDATING,
-                ConfigApplyState.SAVED,
-                ConfigApplyState.SAFETY_CHECK_PENDING,
-                ConfigApplyState.APPLYING,
-            )
-        ):
-            lock = self.operation_lock(operation_type="COORDINATOR_RECOVER", blocking=False)
-            if lock.acquire():
-                try:
-                    rec = self.get_change_record()
-                    if rec and rec.state in (
-                        ConfigApplyState.REQUEST_RECEIVED,
-                        ConfigApplyState.VALIDATING,
-                        ConfigApplyState.SAVED,
-                        ConfigApplyState.SAFETY_CHECK_PENDING,
-                        ConfigApplyState.APPLYING,
-                    ):
-                        if (
-                            rec.state == ConfigApplyState.APPLYING
-                            or rec.operation_state in (OperationState.APPLYING.value, OperationState.VERIFYING.value)
-                            or rec.restart_performed
-                        ):
-                            ver_status, updated_rec = self._recover_or_verify_restarting_record(
-                                rec=rec,
-                                check_service_fn=check_service_fn,
-                                startup_verification_window_sec=startup_verification_window_sec,
-                                remove_pending_op_on_terminal=True,
-                            )
-                            outcomes["recovered_interrupted"] = updated_rec
-                            outcomes["verification_status"] = ver_status
-                        elif os.path.exists(self.deferred_env_file):
-                            rec.state = ConfigApplyState.WAITING_FOR_SAFE_APPLY
-                            rec.operation_state = OperationState.READY_TO_APPLY.value
-                            self.save_change_record(rec)
-                        else:
-                            eff_win = float(startup_verification_window_sec or rec.startup_verification_window_sec or self.startup_verification_window_sec)
-                            age = time.time() - float(rec.requested_at or 0.0)
-                            if age >= eff_win:
-                                rec.state = ConfigApplyState.APPLY_FAILED
-                                rec.operation_state = OperationState.FAILED.value
-                                rec.failed_stage = rec.current_step or "VALIDATING"
-                                rec.runtime_verified = False
-                                rec.error_msg = f"Coordinator interrupted during {rec.operation_state} before staging completed; please resubmit."
-                                rec.reason = rec.error_msg
-                                self.save_change_record(rec)
-                                outcomes["recovered_interrupted"] = rec
-                finally:
-                    lock.release()
-
-        # 3. Check deferred configuration update (WAITING_FOR_ORDER / READY_TO_APPLY)
-        resumed = self.try_auto_resume_deferred_update(
-            env_path=env_path,
-            stop_state_path=stop_state_path,
-            db_path=db_path,
-            broker=broker,
-            notifier=notifier,
-            systemctl_restart_fn=systemctl_restart_fn,
-            check_service_fn=check_service_fn,
-            verify_delay_sec=verify_delay_sec,
+        outcomes = {"queued_executed": None, "recovered_interrupted": None,
+                    "resumed_deferred": None, "completed_stop": None}
+        ctrl = self.get_service_control_record()
+        if (not isinstance(ctrl, dict) or ctrl.get("_corrupted")
+                or ctrl.get("deferred_stop_pending") is not True
+                or str(ctrl.get("desired_service_state") or "").upper() != "STOPPED"):
+            return outcomes
+        outcomes["completed_stop"] = self.try_auto_complete_deferred_stop(
+            env_path=env_path, stop_state_path=stop_state_path,
+            db_path=db_path, broker=broker,
+            systemctl_fn=systemctl_fn, check_service_fn=check_service_fn,
         )
-        if resumed is not None:
-            outcomes["resumed_deferred"] = resumed
-
-        # 4. Check deferred Owner Stop
-        stopped = self.try_auto_complete_deferred_stop(
-            env_path=env_path,
-            stop_state_path=stop_state_path,
-            db_path=db_path,
-            broker=broker,
-            systemctl_fn=systemctl_fn,
-            check_service_fn=check_service_fn,
-        )
-        if stopped is not None:
-            outcomes["completed_stop"] = stopped
-
         return outcomes
 
     def _has_active_or_deferred_work(self) -> bool:
-        """Returns True if any queued, in-progress, deferred config change, or deferred Stop remains non-terminal."""
-        if os.path.exists(self.pending_op_file) or os.path.exists(self.deferred_env_file):
-            return True
-        rec = self.get_change_record()
-        if rec and rec.state in (
-            ConfigApplyState.REQUEST_RECEIVED,
-            ConfigApplyState.VALIDATING,
-            ConfigApplyState.SAVED,
-            ConfigApplyState.SAFETY_CHECK_PENDING,
-            ConfigApplyState.WAITING_FOR_SAFE_APPLY,
-            ConfigApplyState.APPLYING,
-        ):
-            return True
+        """Only an outstanding Owner STOP keeps the control monitor active."""
         ctrl = self.get_service_control_record()
-        if isinstance(ctrl, dict) and ctrl.get("deferred_stop_pending"):
-            return True
-        return False
+        return bool(isinstance(ctrl, dict) and not ctrl.get("_corrupted")
+                    and ctrl.get("deferred_stop_pending") is True
+                    and str(ctrl.get("desired_service_state") or "").upper() == "STOPPED")
 
     def start_coordinator_daemon(
         self,
@@ -4883,11 +4159,9 @@ class ConfigChangeTracker:
         stop_when_idle: bool = False,
     ) -> threading.Thread:
         """
-        F02-03: Starts or updates the persistent automatic background coordinator thread for `self.data_dir`.
-        - Inspects durable pending operations immediately on startup.
-        - Re-evaluates deferred requests (`WAITING_FOR_ORDER` / `READY_TO_APPLY` / `deferred_stop_pending`)
-          at a controlled interval or immediately when woken by `record_watcher_obligations_resolved()`.
-        - Executes a ready transition/stop at most once under `CrossProcessOperationLock`.
+        Compatibility monitor for deferred Owner STOP only.
+        Historical settings work remains on disk but is NEVER executed.
+        The monitor rechecks the full broker/journal safety gate before stop.
         """
         interval = poll_interval_sec if poll_interval_sec is not None else (0.03 if is_isolated_test_environment() else 0.5)
         abs_env = os.path.abspath(env_path)
@@ -4903,8 +4177,6 @@ class ConfigChangeTracker:
                 ctx["broker"] = broker
             if notifier is not None:
                 ctx["notifier"] = notifier
-            if systemctl_restart_fn is not None:
-                ctx["systemctl_restart_fn"] = systemctl_restart_fn
             if systemctl_fn is not None:
                 ctx["systemctl_fn"] = systemctl_fn
             if check_service_fn is not None:
@@ -4941,7 +4213,6 @@ class ConfigChangeTracker:
                                 db_path=c_now.get("db_path", abs_db),
                                 broker=c_now.get("broker"),
                                 notifier=c_now.get("notifier"),
-                                systemctl_restart_fn=c_now.get("systemctl_restart_fn"),
                                 systemctl_fn=c_now.get("systemctl_fn"),
                                 check_service_fn=c_now.get("check_service_fn"),
                                 verify_delay_sec=c_now.get("verify_delay_sec", verify_delay_sec),
@@ -4976,86 +4247,6 @@ class ConfigChangeTracker:
                 wake_ev.set()
         if th is not None and th.is_alive() and th is not threading.current_thread():
             th.join(timeout=join_timeout)
-
-    def enqueue_durable_configuration_update(
-        self,
-        form_params: Dict[str, Any],
-        env_content: str,
-        env_path: str = ".env",
-        stop_state_path: Optional[str] = None,
-        db_path: Optional[str] = None,
-        notifier: Optional[Any] = None,
-        systemctl_restart_fn: Optional[Callable[[], bool]] = None,
-        check_service_fn: Optional[Callable[[], Any]] = None,
-        verify_delay_sec: float = 0.05,
-        broker: Optional[Any] = None,
-        spawn_worker: bool = True,
-        webui_request: Optional[Dict[str, str]] = None,
-    ) -> ConfigChangeRecord:
-        """
-        B11 & F02-03: Durably persists the configuration request (`15% RECEIVED`) and queues it in
-        `pending_config_operation.json` before starting/waking the persistent coordinator daemon,
-        so `/setup/submit-async` returns `change_id` immediately, survives crashes, and automatically
-        completes deferred transitions when blocking LIVE orders finish.
-        """
-        abs_env_path = os.path.abspath(env_path)
-        abs_stop_path = os.path.abspath(stop_state_path or os.path.join(self.data_dir, "emergency_stop.json"))
-        abs_db_path = os.path.abspath(db_path or os.path.join(self.data_dir, "trade_journal.db"))
-
-        with self.operation_lock(operation_type="ENQUEUE_CONFIG_UPDATE"):
-            _, init_rec, precreated_ctx = prepare_configuration_change_record(
-                form_params=form_params,
-                env_content=env_content,
-                data_dir=self.data_dir,
-                env_path=abs_env_path,
-                stop_state_path=abs_stop_path,
-                check_service_fn=check_service_fn,
-            )
-            op_payload = {
-                "change_id": init_rec.change_id,
-                "sequence_id": init_rec.sequence_id,
-                "status": "QUEUED",
-                "form_params": form_params,
-                "env_content": env_content,
-                "env_path": abs_env_path,
-                "stop_state_path": abs_stop_path,
-                "db_path": abs_db_path,
-                "created_at": time.time(),
-            }
-            if webui_request:
-                op_payload["webui_request_id"] = str(webui_request["request_id"])
-                op_payload["webui_payload_sha256"] = str(webui_request["payload_sha256"])
-            write_json_atomic(self.pending_op_file, op_payload)
-            if webui_request:
-                # Persist the idempotency association under the same operation
-                # lock and BEFORE returning to Setup. A crash immediately
-                # after enqueue cannot cause an identical request to be replayed.
-                # The queued envelope itself contains fallback provenance when
-                # a crash interrupts the small gap between atomic file writes.
-                write_json_atomic(webui_request["index_path"], {
-                    "request_id": webui_request["request_id"],
-                    "payload_sha256": webui_request["payload_sha256"],
-                    "change_id": init_rec.change_id,
-                })
-
-        if spawn_worker:
-            self.start_coordinator_daemon(
-                env_path=abs_env_path,
-                stop_state_path=abs_stop_path,
-                db_path=abs_db_path,
-                broker=broker,
-                notifier=notifier,
-                systemctl_restart_fn=systemctl_restart_fn,
-                check_service_fn=check_service_fn,
-                verify_delay_sec=verify_delay_sec,
-                stop_when_idle=True,
-            )
-
-        return init_rec
-
-    # =========================================================================
-    # B06, B09, B10, F02-01, F02-05 & F02-06: Authoritative Service Control
-    # =========================================================================
 
     def _poll_for_service_stopped(
         self,
@@ -5160,7 +4351,28 @@ class ConfigChangeTracker:
             }
 
         with self.operation_lock(operation_type=f"SERVICE_{act_clean.upper()}", operation_id=f"SVC-{act_clean.upper()}"):
-            self.reconcile_stale_control_records(env_path, check_service_fn=check_service_fn)
+            # Retired configuration histories are immutable. START/RESTART
+            # cannot replay or supersede an already-issued uncertain restart.
+            # Owner STOP retains precedence and remains independently usable.
+            if act_clean in ("start", "restart"):
+                from src.engine.runtime_evidence import read_private_json
+                try:
+                    tx = read_private_json(os.path.join(
+                        self.data_dir, "config_restart_v2", "current_transaction.json"
+                    ), missing_ok=True)
+                    barrier = read_private_json(os.path.join(
+                        self.data_dir, "config_restart_v2", "apply_barrier.json"
+                    ), missing_ok=True)
+                except (OSError, ValueError):
+                    return {"ok": False, "action": act_clean,
+                            "blocked_reason": "PRIOR_RESTART_EVIDENCE_UNREADABLE",
+                            "message": "Historical restart/barrier evidence requires independent review"}
+                if ((tx is not None and tx.get("phase") not in
+                     ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"))
+                        or (barrier is not None and barrier.get("active") is not False)):
+                    return {"ok": False, "action": act_clean,
+                            "blocked_reason": "PRIOR_RESTART_UNRESOLVED",
+                            "message": "Verify prior restart without issuing another start/restart"}
             svc_state, svc_detail = self.resolve_service_operating_state(check_fn=check_service_fn)
             live_ver = self.get_active_running_version(require_live_pid=True) or {}
             running_mode = str(live_ver.get("trading_mode") or "UNKNOWN").upper() if svc_state == ServiceOperatingState.RUNNING else "STOPPED"
@@ -5229,6 +4441,15 @@ class ConfigChangeTracker:
                         requested_mode=saved_mode,
                         observed_state=ServiceOperatingState.RUNNING.value,
                         deferred_stop_pending=True,
+                    )
+                    # The Owner STOP daemon is independent of retired config
+                    # replay and can resume the outstanding STOP after a restart.
+                    self.start_coordinator_daemon(
+                        env_path=env_path, stop_state_path=actual_stop_path,
+                        db_path=actual_db_path, broker=broker,
+                        systemctl_fn=systemctl_fn,
+                        check_service_fn=check_service_fn,
+                        stop_when_idle=True,
                     )
                     return {
                         "ok": False,
@@ -5716,735 +4937,3 @@ class ConfigChangeTracker:
         return False
 
 
-def prepare_configuration_change_record(
-    form_params: Dict[str, Any],
-    env_content: str,
-    data_dir: str = "data",
-    env_path: str = ".env",
-    stop_state_path: Optional[str] = None,
-    check_service_fn: Optional[Callable[[], Any]] = None,
-    existing_change_id: Optional[str] = None,
-) -> Tuple[ConfigChangeTracker, ConfigChangeRecord, Dict[str, Any]]:
-    """
-    B03, B08, B11 & Section D:
-    Separates:
-    - Saved configuration on disk (`env_path`)
-    - Requested configuration (`env_content` + `form_params`)
-    - Actual verified running configuration (`active_config_version.json` + systemd status)
-    Creates and persists the initial 15% checkpoint `ConfigChangeRecord` (`REQUEST_RECEIVED` / `REQUESTED`),
-    superseding any older waiting deferred request if a new change is submitted.
-    """
-    tracker = ConfigChangeTracker(data_dir=data_dir)
-    actual_stop_path = stop_state_path or os.path.join(tracker.data_dir, "emergency_stop.json")
-
-    change_id = existing_change_id or tracker.generate_change_id()
-    seq_id = tracker.next_sequence_id()
-
-    prev_rec = tracker.get_change_record()
-    if (
-        prev_rec is not None
-        and existing_change_id is None
-        and prev_rec.change_id != change_id
-        and prev_rec.state == ConfigApplyState.WAITING_FOR_SAFE_APPLY
-    ):
-        prev_rec.superseded_by = change_id
-        prev_rec.operation_state = OperationState.CANCELLED.value
-        tracker.save_change_record(prev_rec)
-
-    from src.config import AppConfig, parse_env_dict
-
-    previous_env_raw: Optional[str] = None
-    parsed_old_env: Dict[str, str] = {}
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                previous_env_raw = f.read()
-            parsed_old_env = parse_env_dict(env_path)
-        except Exception:
-            previous_env_raw = None
-
-    old_cfg = AppConfig.from_env(env=parsed_old_env, env_file="") if os.path.exists(env_path) else AppConfig()
-    old_env_dict = asdict(old_cfg)
-
-    parsed_new_env = parse_env_content_string(env_content)
-    combined_new_params: Dict[str, Any] = dict(form_params or {})
-    for k_env, v_env in parsed_new_env.items():
-        k_low = k_env.strip().lower()
-        if (
-            k_low not in _EXCLUDED_NON_HASH_FIELDS
-            and k_env not in combined_new_params
-            and k_low not in combined_new_params
-            and (k_low in SECRET_FIELDS or any(s in k_low for s in ("token", "pin", "secret", "password", "session_string", "hash")))
-        ):
-            combined_new_params[k_env] = v_env
-
-    saved_version_hash = compute_config_version(old_env_dict)
-    merged_for_hash = dict(old_env_dict)
-    merged_for_hash.update(parsed_new_env)
-    merged_for_hash.update(form_params or {})
-    new_runtime_dict = dict(parsed_new_env)
-    new_runtime_dict.update(form_params or {})
-    if not any(str(k).strip().lower() in ("trading_mode", "is_live_mode") for k in new_runtime_dict.keys()):
-        new_runtime_dict["trading_mode"] = old_env_dict.get("trading_mode", "TEST")
-    canonical_proposed_hash = compute_config_version(new_runtime_dict)
-    merged_proposed_hash = compute_config_version(merged_for_hash)
-
-    changes_summary, is_token_only = tracker.compare_configurations(old_env_dict, combined_new_params)
-    has_non_secret_change = any("[REDACTED_UPDATE]" not in c for c in changes_summary)
-    has_secret_change = any("[REDACTED_UPDATE]" in c for c in changes_summary)
-    is_disk_identical = (not has_non_secret_change and not has_secret_change)
-
-    norm_proposed = normalize_configuration_dict(merged_for_hash)
-    new_mode = str(norm_proposed.get("trading_mode", "TEST")).upper()
-    new_is_live = (new_mode == "LIVE")
-
-    saved_mode = str(getattr(old_cfg.trading_mode, "value", old_cfg.trading_mode)).upper()
-    saved_is_live = (saved_mode == "LIVE")
-
-    svc_op_state, _ = tracker.resolve_service_operating_state(check_fn=check_service_fn)
-    is_active = (svc_op_state == ServiceOperatingState.RUNNING)
-
-    live_ver_info = tracker.get_active_running_version(require_live_pid=True)
-    raw_ver_info = tracker.get_active_running_version(require_live_pid=False)
-    expected_canonical_hashes = {canonical_proposed_hash, merged_proposed_hash}
-
-    runtime_currently_verified = False
-    has_runtime_drift = False
-    if is_active:
-        if isinstance(live_ver_info, dict):
-            running_mode = str(live_ver_info.get("trading_mode") or "UNKNOWN").upper()
-            running_hash = str(live_ver_info.get("version_hash") or "")
-            ok_curr, _, _ = tracker.is_active_version_confirmed(
-                expected_hashes=expected_canonical_hashes,
-                expected_mode=new_mode,
-                check_service_fn=check_service_fn,
-                require_systemd_active=True,
-            )
-            runtime_currently_verified = ok_curr
-            if not ok_curr:
-                has_runtime_drift = True
-                if running_mode in ("LIVE", "TEST") and running_mode != new_mode:
-                    mode_diff_str = f"trading_mode: {running_mode} -> {new_mode}"
-                    if mode_diff_str not in changes_summary:
-                        changes_summary.insert(0, mode_diff_str)
-                        has_non_secret_change = True
-                elif running_hash and running_hash not in expected_canonical_hashes and not changes_summary:
-                    changes_summary.append(
-                        f"runtime_config_drift: {live_ver_info.get('short_version', running_hash[:8])} -> v-{canonical_proposed_hash[:8]}"
-                    )
-                    has_non_secret_change = True
-        else:
-            running_mode = "UNKNOWN"
-            has_runtime_drift = True
-    else:
-        running_mode = "STOPPED"
-
-    is_identical_verified_save = bool(
-        is_disk_identical
-        and is_active
-        and runtime_currently_verified
-        and not has_runtime_drift
-    )
-
-    effective_previous_mode = (
-        running_mode
-        if (is_active and running_mode in ("LIVE", "TEST") and running_mode != saved_mode)
-        else saved_mode
-    )
-    effective_old_is_live = (saved_is_live or (is_active and running_mode == "LIVE"))
-
-    proposed_version_hash = (
-        canonical_proposed_hash
-        if (has_non_secret_change or has_runtime_drift)
-        else saved_version_hash
-    )
-    previous_version_hash = (
-        str(live_ver_info.get("version_hash"))
-        if (is_active and isinstance(live_ver_info, dict) and live_ver_info.get("version_hash") and is_disk_identical and has_runtime_drift)
-        else saved_version_hash
-    )
-
-    is_stopped_state = False
-    if os.path.exists(actual_stop_path):
-        try:
-            with open(actual_stop_path, "r", encoding="utf-8") as f:
-                is_stopped_state = bool(json.load(f).get("is_stopped", False))
-        except Exception:
-            is_stopped_state = True
-
-    if is_stopped_state and (new_is_live or (effective_old_is_live and new_is_live)):
-        svc_status = "BLOCKED"
-    elif is_stopped_state and not new_is_live:
-        svc_status = "BLOCKED" if effective_old_is_live else "TEST"
-    elif not is_active:
-        svc_status = "STOPPED"
-    else:
-        svc_status = "LIVE" if new_is_live else ("LIVE" if effective_old_is_live else "TEST")
-
-    has_explicit_mode_drift = bool(is_active and isinstance(live_ver_info, dict) and running_mode in ("LIVE", "TEST") and running_mode != new_mode)
-    restart_req = bool(is_active and not is_identical_verified_save and not (is_token_only and not has_explicit_mode_drift))
-
-    record = ConfigChangeRecord(
-        change_id=change_id,
-        state=ConfigApplyState.REQUEST_RECEIVED,
-        requested_at=time.time(),
-        previous_version_hash=previous_version_hash,
-        proposed_version_hash=proposed_version_hash,
-        service_status=svc_status,
-        changes_summary=changes_summary,
-        is_token_only_refresh=bool(is_token_only and not has_explicit_mode_drift),
-        progress_percent=15,
-        current_step="RECEIVED",
-        operation_state=OperationState.REQUESTED.value,
-        previous_mode=effective_previous_mode,
-        requested_mode=new_mode,
-        saved_mode=saved_mode,
-        running_mode=running_mode,
-        service_state=svc_op_state.value,
-        restart_required=restart_req,
-        restart_performed=False,
-        runtime_verified=False,
-        sequence_id=seq_id,
-    )
-    tracker.save_change_record(record)
-
-    ctx = {
-        "previous_env_raw": previous_env_raw,
-        "old_env_dict": old_env_dict,
-        "combined_new_params": combined_new_params,
-        "canonical_proposed_hash": canonical_proposed_hash,
-        "merged_proposed_hash": merged_proposed_hash,
-        "expected_canonical_hashes": {proposed_version_hash, canonical_proposed_hash, merged_proposed_hash},
-        "has_non_secret_change": has_non_secret_change,
-        "has_secret_change": has_secret_change,
-        "is_disk_identical": is_disk_identical,
-        "is_identical_verified_save": is_identical_verified_save,
-        "has_runtime_drift": has_runtime_drift,
-        "runtime_currently_verified": runtime_currently_verified,
-        "is_active": is_active,
-        "svc_op_state": svc_op_state,
-        "is_stopped_state": is_stopped_state,
-        "saved_mode": saved_mode,
-        "running_mode": running_mode,
-        "old_mode": effective_previous_mode,
-        "new_mode": new_mode,
-        "old_is_live": effective_old_is_live,
-        "new_is_live": new_is_live,
-    }
-    return tracker, record, ctx
-
-
-def execute_configuration_update(
-    form_params: Dict[str, Any],
-    env_content: str,
-    data_dir: str = "data",
-    env_path: str = ".env",
-    stop_state_path: Optional[str] = None,
-    db_path: Optional[str] = None,
-    notifier: Optional[Any] = None,
-    systemctl_restart_fn: Optional[Callable[[], bool]] = None,
-    check_service_fn: Optional[Callable[[], Any]] = None,
-    verify_delay_sec: float = 0.05,
-    rollback_on_apply_failure: bool = True,
-    existing_change_id: Optional[str] = None,
-    broker: Optional[Any] = None,
-    precreated_record: Optional[Tuple[ConfigChangeTracker, ConfigChangeRecord, Dict[str, Any]]] = None,
-    auto_coordinator: bool = False,
-) -> ConfigChangeRecord:
-    """
-    Central serialized orchestration function for AuditBot V14 WebUI Configuration Management.
-    """
-    base_tracker = ConfigChangeTracker(data_dir=data_dir)
-    with base_tracker.operation_lock(
-        operation_type="EXECUTE_CONFIG_UPDATE",
-        operation_id=existing_change_id or "CFG-UPDATE",
-    ):
-        actual_stop_path = stop_state_path or os.path.join(base_tracker.data_dir, "emergency_stop.json")
-        actual_db_path = db_path or os.path.join(base_tracker.data_dir, "trade_journal.db")
-
-        if precreated_record is not None:
-            tracker, record, ctx = precreated_record
-        else:
-            tracker, record, ctx = prepare_configuration_change_record(
-                form_params=form_params,
-                env_content=env_content,
-                data_dir=data_dir,
-                env_path=env_path,
-                stop_state_path=actual_stop_path,
-                check_service_fn=check_service_fn,
-                existing_change_id=existing_change_id,
-            )
-
-        # Telegram session schema repair and credential exports are explicit
-        # maintenance operations, never side effects of configuration saves.
-
-        previous_env_raw = ctx["previous_env_raw"]
-        combined_new_params = ctx["combined_new_params"]
-        expected_canonical_hashes = ctx["expected_canonical_hashes"]
-        has_non_secret_change = ctx["has_non_secret_change"]
-        has_secret_change = ctx["has_secret_change"]
-        is_identical_verified_save = ctx["is_identical_verified_save"]
-        has_runtime_drift = ctx["has_runtime_drift"]
-        is_active = ctx["is_active"]
-        svc_op_state = ctx["svc_op_state"]
-        is_stopped_state = ctx["is_stopped_state"]
-        saved_mode = ctx["saved_mode"]
-        running_mode = ctx["running_mode"]
-        old_mode = ctx["old_mode"]
-        new_mode = ctx["new_mode"]
-        old_is_live = ctx["old_is_live"]
-        new_is_live = ctx["new_is_live"]
-
-        # ---------------------------------------------------------------------
-        # Checkpoint 35%: Input Validation (VALIDATING / VALIDATED)
-        # ---------------------------------------------------------------------
-        record.state = ConfigApplyState.VALIDATING
-        record.operation_state = OperationState.REQUESTED.value
-        record.current_step = "VALIDATING"
-        tracker.save_change_record(record)
-
-        is_valid, val_reason = tracker.validate_inputs(combined_new_params)
-        if not is_valid:
-            record.state = ConfigApplyState.REJECTED
-            record.operation_state = OperationState.FAILED.value
-            record.reason = val_reason
-            record.failed_stage = "VALIDATING"
-            record.progress_percent = 15
-            tracker.save_change_record(record)
-            return record
-
-        record.validated_at = time.time()
-        record.operation_state = OperationState.VALIDATED.value
-        record.progress_percent = 35
-        record.current_step = "VALIDATING"
-        tracker.save_change_record(record)
-
-        if svc_op_state == ServiceOperatingState.UNKNOWN:
-            record.state = ConfigApplyState.APPLY_FAILED
-            record.operation_state = OperationState.FAILED.value
-            record.failed_stage = "SAFETY_GATE"
-            record.blocked_reason = "SERVICE_STATUS_UNKNOWN"
-            record.progress_percent = 35
-            record.error_msg = "Cannot verify systemd service status (status query timed out or failed); refusing unsafe configuration mutation."
-            record.reason = record.error_msg
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # Case A: Service is not running -> Save Only (SAVED_FOR_NEXT_START)
-        # ---------------------------------------------------------------------
-        if not is_active:
-            try:
-                write_env_atomic(env_path, env_content)
-                tracker.clear_deferred_artifacts(clear_gate=True)
-                record.state = ConfigApplyState.SAVED
-                record.operation_state = OperationState.STAGED.value
-                record.saved_at = time.time()
-                record.saved_mode = new_mode
-                record.progress_percent = 55
-                record.current_step = "PERSISTED"
-                tracker.save_change_record(record)
-            except Exception as e:
-                record.state = ConfigApplyState.APPLY_FAILED
-                record.operation_state = OperationState.FAILED.value
-                record.failed_stage = "PERSISTED"
-                record.progress_percent = 35
-                record.error_msg = f"Failed to write configuration file safely: {e}"
-                tracker.save_change_record(record)
-                tracker.dispatch_telegram_update(record, notifier=notifier)
-                return record
-
-            record.state = ConfigApplyState.SAVED_FOR_NEXT_START
-            record.operation_state = OperationState.SAVED_FOR_NEXT_START.value
-            record.progress_percent = 100
-            record.current_step = "PERSISTED"
-            record.runtime_verified = False
-            record.restart_performed = False
-            if svc_op_state == ServiceOperatingState.STOPPED_BY_OWNER:
-                record.reason = (
-                    f"Settings saved ({new_mode} mode). Bot is currently Stopped by Owner; "
-                    f"service was not started and running configuration verification was not performed."
-                )
-            elif svc_op_state == ServiceOperatingState.FAILED:
-                record.reason = (
-                    f"Settings saved ({new_mode} mode). Note: Trading bot stopped unexpectedly; "
-                    f"use Start Bot when ready to launch and verify."
-                )
-            else:
-                record.reason = (
-                    f"Service is stopped; configuration saved ({new_mode} mode) without launching the bot. "
-                    f"Running configuration verification was not performed."
-                )
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # B03: Identical configuration Save AND Verified Matching Runtime -> No Restart
-        # ---------------------------------------------------------------------
-        if is_identical_verified_save:
-            record.state = ConfigApplyState.APPLIED_VERIFIED
-            record.operation_state = OperationState.APPLIED_VERIFIED.value
-            record.saved_at = time.time()
-            record.safety_checked_at = time.time()
-            record.verified_at = time.time()
-            record.effective_version_hash = record.proposed_version_hash
-            record.progress_percent = 100
-            record.current_step = "VERIFIED"
-            record.saved_mode = new_mode
-            record.running_mode = new_mode
-            record.restart_required = False
-            record.restart_performed = False
-            record.runtime_verified = True
-            record.reason = "No settings changed; requested configuration matches both saved and verified running configuration."
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # Token-only refresh exemption (when no mode mismatch exists)
-        # ---------------------------------------------------------------------
-        if record.is_token_only_refresh:
-            try:
-                write_env_atomic(env_path, env_content)
-            except Exception as e:
-                record.state = ConfigApplyState.APPLY_FAILED
-                record.operation_state = OperationState.FAILED.value
-                record.failed_stage = "PERSISTED"
-                record.progress_percent = 35
-                record.error_msg = f"Failed to write configuration file safely: {e}"
-                tracker.save_change_record(record)
-                tracker.dispatch_telegram_update(record, notifier=notifier)
-                return record
-
-            record.state = ConfigApplyState.APPLIED_VERIFIED
-            record.operation_state = OperationState.APPLIED_VERIFIED.value
-            record.saved_at = time.time()
-            record.verified_at = time.time()
-            record.effective_version_hash = record.proposed_version_hash
-            record.progress_percent = 100
-            record.current_step = "VERIFIED"
-            record.saved_mode = new_mode
-            record.running_mode = new_mode
-            record.restart_required = False
-            record.restart_performed = False
-            record.runtime_verified = True
-            record.reason = "Token updated via shared token coordinator; zero listener interruption required."
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # B01 Steps 2 & 3: If transitioning LIVE -> TEST, durably activate
-        # the transition gate BEFORE safety evaluation, staging, or restart!
-        # ---------------------------------------------------------------------
-        is_live_to_test_transition = bool((old_is_live or running_mode == "LIVE") and not new_is_live)
-        if is_live_to_test_transition:
-            gate_res = tracker.set_transition_gate(
-                active=True,
-                change_id=record.change_id,
-                target_mode="TEST",
-                reason=f"LIVE -> TEST transition {record.change_id} in progress",
-            )
-            if not gate_res.ok:
-                record.state = ConfigApplyState.APPLY_FAILED
-                record.operation_state = OperationState.FAILED.value
-                record.failed_stage = "PERSISTED"
-                record.blocked_reason = "TRANSITION_GATE_WRITE_FAILED"
-                record.progress_percent = 35
-                record.error_msg = f"Failed to activate LIVE -> TEST transition gate (failing closed): {gate_res.reason}"
-                record.reason = record.error_msg
-                tracker.save_change_record(record)
-                tracker.dispatch_telegram_update(record, notifier=notifier)
-                return record
-
-            gate_blocked, _ = tracker.is_live_entry_blocked_by_transition()
-            if not gate_blocked:
-                record.state = ConfigApplyState.APPLY_FAILED
-                record.operation_state = OperationState.FAILED.value
-                record.failed_stage = "PERSISTED"
-                record.blocked_reason = "TRANSITION_GATE_VERIFICATION_FAILED"
-                record.progress_percent = 35
-                record.error_msg = "Transition gate activation could not be verified (failing closed)."
-                record.reason = record.error_msg
-                tracker.save_change_record(record)
-                tracker.dispatch_telegram_update(record, notifier=notifier)
-                return record
-
-        # ---------------------------------------------------------------------
-        # Checkpoint 55%: Configuration Durably Staged (`PERSISTED` / `STAGED`)
-        # ---------------------------------------------------------------------
-        try:
-            write_env_atomic(tracker.deferred_env_file, env_content)
-            tracker.save_deferred_metadata({
-                "change_id": record.change_id,
-                "sequence_id": record.sequence_id,
-                "requested_mode": new_mode,
-                "previous_mode": old_mode,
-                "env_path": env_path,
-                "stop_state_path": actual_stop_path,
-                "db_path": actual_db_path,
-                "saved_at": time.time(),
-            })
-            record.saved_at = time.time()
-            record.operation_state = OperationState.STAGED.value
-            record.progress_percent = 55
-            record.current_step = "PERSISTED"
-            tracker.save_change_record(record)
-        except Exception as e:
-            record.state = ConfigApplyState.APPLY_FAILED
-            record.operation_state = OperationState.FAILED.value
-            record.failed_stage = "PERSISTED"
-            record.progress_percent = 35
-            record.error_msg = f"Failed to stage configuration safely: {e}"
-            record.reason = record.error_msg
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # Checkpoint 75%: Evaluate Trading Safety Gate (`SAFETY_GATE`)
-        # ---------------------------------------------------------------------
-        record.state = ConfigApplyState.SAFETY_CHECK_PENDING
-        record.safety_checked_at = time.time()
-        record.progress_percent = 75
-        record.current_step = "SAFETY_GATE"
-        tracker.save_change_record(record)
-
-        involves_live = bool(old_is_live or new_is_live or is_stopped_state or running_mode == "LIVE")
-        is_safe, safety_reason, blocked_code, block_count = tracker.evaluate_trading_safety_gate_detailed(
-            actual_db_path,
-            actual_stop_path,
-            is_service_running=True,
-            is_live_mode=involves_live,
-            target_is_live=new_is_live,
-            broker=broker,
-            env_path=env_path,
-        )
-
-        if not is_safe:
-            if is_live_to_test_transition:
-                tracker.set_transition_gate(
-                    active=True,
-                    change_id=record.change_id,
-                    target_mode="TEST",
-                    reason=safety_reason,
-                )
-                record.reason = (
-                    f"75% — Waiting for Existing LIVE Order: Your TEST mode request has been saved. "
-                    f"AuditBot is waiting for an existing LIVE order to finish or be safely reconciled ({safety_reason}). "
-                    f"New LIVE entries are paused. The bot will switch to TEST automatically when safe."
-                )
-                record.auto_resume = True
-            else:
-                record.reason = safety_reason
-                record.auto_resume = (blocked_code in ("LIVE_ORDER_IN_PROGRESS", "UNPROTECTED_POSITION", "BROKER_RECONCILIATION_FAILED", "JOURNAL_MISSING", "JOURNAL_ERROR"))
-
-            record.state = ConfigApplyState.WAITING_FOR_SAFE_APPLY
-            record.operation_state = OperationState.WAITING_FOR_ORDER.value
-            record.progress_percent = 75
-            record.current_step = "SAFETY_GATE"
-            record.blocked_reason = blocked_code or "SAFETY_GATE_BLOCKED"
-            record.blocking_order_count = block_count
-            record.saved_mode = saved_mode
-            record.running_mode = running_mode if running_mode in ("LIVE", "TEST") else ("LIVE" if old_is_live else "TEST")
-            record.runtime_verified = False
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-
-            if auto_coordinator:
-                tracker.start_coordinator_daemon(
-                    env_path=env_path,
-                    stop_state_path=actual_stop_path,
-                    db_path=actual_db_path,
-                    broker=broker,
-                    notifier=notifier,
-                    systemctl_restart_fn=systemctl_restart_fn,
-                    check_service_fn=check_service_fn,
-                    verify_delay_sec=verify_delay_sec,
-                    stop_when_idle=True,
-                )
-            return record
-
-        # ---------------------------------------------------------------------
-        # Safety gate passed -> Persist configuration to active .env atomically
-        # B01 CRITICAL: Keep transition gate active until post-restart verification!
-        # ---------------------------------------------------------------------
-        try:
-            write_env_atomic(env_path, env_content)
-            tracker.clear_deferred_artifacts(clear_gate=False)
-            record.state = ConfigApplyState.SAVED
-            record.operation_state = OperationState.READY_TO_APPLY.value
-            record.saved_at = time.time()
-            record.saved_mode = new_mode
-            record.blocked_reason = ""
-            record.blocking_order_count = 0
-            record.progress_percent = 75
-            record.current_step = "SAFETY_GATE"
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-        except Exception as e:
-            record.state = ConfigApplyState.APPLY_FAILED
-            record.operation_state = OperationState.FAILED.value
-            record.failed_stage = "PERSISTED"
-            record.progress_percent = 55
-            record.error_msg = f"Failed to write configuration file safely: {e}"
-            record.reason = record.error_msg
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # Recheck service activity immediately before performing any restart
-        # ---------------------------------------------------------------------
-        recheck_state, _ = tracker.resolve_service_operating_state(check_fn=check_service_fn)
-        if recheck_state != ServiceOperatingState.RUNNING:
-            if not is_live_to_test_transition or recheck_state == ServiceOperatingState.STOPPED_BY_OWNER:
-                tracker.set_transition_gate(False, change_id=record.change_id, target_mode=new_mode, reason="Service stopped before restart")
-            record.state = ConfigApplyState.SAVED_FOR_NEXT_START
-            record.operation_state = OperationState.SAVED_FOR_NEXT_START.value
-            record.service_status = "STOPPED"
-            record.service_state = recheck_state.value
-            record.running_mode = "STOPPED"
-            record.progress_percent = 100
-            record.current_step = "PERSISTED"
-            record.restart_performed = False
-            record.runtime_verified = False
-            record.reason = "Service stopped before apply; configuration saved for next startup without launching the bot."
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # Checkpoint 90%: Safe Restart / Application Initiated (`APPLYING`)
-        # F03-04: Persist restart attempt identity, initiation timestamp, deadline & pre-restart PID evidence
-        # ---------------------------------------------------------------------
-        pre_ver_info = tracker.get_active_running_version(require_live_pid=False) or {}
-        restart_initiated_at = time.time()
-        window_sec = float(record.startup_verification_window_sec or tracker.startup_verification_window_sec)
-        record.state = ConfigApplyState.APPLYING
-        record.operation_state = OperationState.APPLYING.value
-        record.applied_at = restart_initiated_at
-        record.restart_initiated_at = restart_initiated_at
-        record.restart_attempt_id = record.restart_attempt_id or f"RST-{record.change_id}-{int(restart_initiated_at * 1000)}"
-        record.startup_verification_window_sec = window_sec
-        record.verification_deadline_at = restart_initiated_at + window_sec
-        record.pre_restart_pid = int(pre_ver_info.get("pid") or 0)
-        record.pre_restart_starttime = pre_ver_info.get("process_starttime")
-        record.progress_percent = 90
-        record.current_step = "APPLYING"
-        tracker.save_change_record(record)
-
-        restart_ok = False
-        if systemctl_restart_fn is not None:
-            try:
-                restart_ok = bool(systemctl_restart_fn())
-            except Exception as e:
-                logger.warning(f"Custom restart runner exception: {e}")
-                restart_ok = False
-        elif not is_isolated_test_environment():
-            restart_ok = tracker._invoke_systemctl("restart", "trading_bot.service")
-        else:
-            restart_ok = True
-            tracker.record_active_running_version(record.proposed_version_hash, trading_mode=new_mode)
-
-        if not restart_ok:
-            record.state = ConfigApplyState.APPLY_FAILED
-            record.operation_state = OperationState.FAILED.value
-            record.failed_stage = "APPLYING"
-            record.progress_percent = 75
-            record.runtime_verified = False
-            record.error_msg = "systemctl restart failed or timed out"
-            record.reason = record.error_msg
-            if is_live_to_test_transition or old_is_live:
-                tracker.set_transition_gate(
-                    active=True,
-                    change_id=record.change_id,
-                    target_mode=new_mode,
-                    reason=f"Restart failed during {old_mode} -> {new_mode}; blocking new LIVE entries until runtime is reconciled",
-                )
-            if rollback_on_apply_failure and previous_env_raw is not None:
-                try:
-                    write_env_atomic(env_path, previous_env_raw)
-                    record.rolled_back = True
-                    record.saved_mode = saved_mode
-                except Exception:
-                    pass
-            tracker.save_change_record(record)
-            tracker.dispatch_telegram_update(record, notifier=notifier)
-            return record
-
-        # ---------------------------------------------------------------------
-        # Checkpoint 90% -> 100%: Strict Runtime Verification (`VERIFYING` -> `VERIFIED`)
-        # F02-01: Always pass expected_canonical_hashes, expected_mode=new_mode,
-        # min_acknowledged_at=restart_initiated_at, check_service_fn=check_service_fn!
-        # ---------------------------------------------------------------------
-        record.restart_performed = True
-        record.operation_state = OperationState.VERIFYING.value
-        record.progress_percent = 90
-        record.current_step = "APPLYING"
-        tracker.save_change_record(record)
-
-        verified_ok, active_info, verify_err = tracker._poll_for_runtime_verification(
-            expected_hashes=expected_canonical_hashes,
-            expected_mode=new_mode,
-            min_acknowledged_at=restart_initiated_at,
-            verify_delay_sec=verify_delay_sec,
-            check_service_fn=check_service_fn,
-        )
-        ack_hash = active_info.get("version_hash") if isinstance(active_info, dict) else None
-
-        if verified_ok:
-            tracker.set_transition_gate(
-                active=False,
-                change_id=record.change_id,
-                target_mode=new_mode,
-                reason=f"Verified running process in {new_mode} mode",
-            )
-            record.state = ConfigApplyState.APPLIED_VERIFIED
-            record.operation_state = OperationState.APPLIED_VERIFIED.value
-            record.verified_at = time.time()
-            record.effective_version_hash = ack_hash or record.proposed_version_hash
-            record.progress_percent = 100
-            record.current_step = "VERIFIED"
-            record.saved_mode = new_mode
-            record.running_mode = new_mode
-            record.service_status = "BLOCKED" if is_stopped_state else new_mode
-            record.service_state = ServiceOperatingState.RUNNING.value
-            record.runtime_verified = True
-            record.reason = f"Running process confirmed proposed configuration version ({new_mode} mode)."
-            tracker.record_service_control_intent(
-                desired_service_state="RUNNING",
-                last_action="CONFIG_APPLY_RESTART",
-                reason=f"Verified configuration {record.change_id} in {new_mode} mode",
-                requested_mode=new_mode,
-                observed_state=ServiceOperatingState.RUNNING.value,
-            )
-        else:
-            record.state = ConfigApplyState.APPLY_FAILED
-            record.operation_state = OperationState.FAILED.value
-            record.failed_stage = "VERIFIED"
-            record.progress_percent = 90
-            act_v = active_info.get("short_version") if isinstance(active_info, dict) else "None"
-            record.error_msg = verify_err or f"Running service acknowledged {act_v} instead of proposed version"
-            record.reason = record.error_msg
-            record.runtime_verified = False
-            if is_live_to_test_transition or old_is_live:
-                tracker.set_transition_gate(
-                    active=True,
-                    change_id=record.change_id,
-                    target_mode=new_mode,
-                    reason=f"Runtime verification failed ({record.error_msg}); LIVE entries remain blocked",
-                )
-            if rollback_on_apply_failure and previous_env_raw is not None:
-                try:
-                    write_env_atomic(env_path, previous_env_raw)
-                    record.rolled_back = True
-                    record.saved_mode = saved_mode
-                except Exception:
-                    pass
-
-        tracker.save_change_record(record)
-        tracker.dispatch_telegram_update(record, notifier=notifier)
-        return record

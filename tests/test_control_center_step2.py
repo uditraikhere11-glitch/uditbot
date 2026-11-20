@@ -126,6 +126,15 @@ class ControlApiTests(unittest.TestCase):
         self.broker_patch.start()
         self.addCleanup(self.state_patch.stop)
         self.addCleanup(self.broker_patch.stop)
+        # Save & Apply inspects systemd independently of the legacy status reader.
+        # Reject any restart attempt in this owner-stopped fixture.
+        def stopped_service(command, **kwargs):
+            self.assertEqual(command, ["systemctl", "show", "trading_bot.service", "-p", "ActiveState", "--value"])
+            from subprocess import CompletedProcess
+            return CompletedProcess(command, 0, "inactive\n", "")
+        service = patch("src.engine.simple_save_apply.subprocess")
+        service.start().run.side_effect = stopped_service
+        self.addCleanup(service.stop)
         self.app = FastAPI()
         register_control_center_routes(self.app, "test-csrf")
         self.client = TestClient(self.app)

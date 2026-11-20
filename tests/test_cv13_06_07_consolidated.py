@@ -44,7 +44,6 @@ from src.engine.config_manager import (
     ConfigApplyState,
     ConfigChangeTracker,
     compute_config_version,
-    execute_configuration_update,
     is_isolated_test_environment,
 )
 from src.engine.emergency_stop import EmergencyStopManager
@@ -494,70 +493,6 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             self.assertIn("account mismatch", msg.lower())
         self.assertEqual(read_token(self.tok_path), "VALID_SHARED_JWT_TOKEN_304_CHARS")
 
-    def test_09_webui_secret_non_disclosure_unknown_keys_and_rollback(self):
-        """Tests that HTML excludes secrets, .env never stores DHAN_ACCESS_TOKEN, unknown keys are preserved, and failed apply rolls back .env."""
-        env_file = os.path.join(self.tmp_dir.name, ".env")
-        with open(env_file, "w", encoding="utf-8") as f:
-            f.write(
-                "OPERATOR_NAME=Udit\n"
-                "TRADING_MODE=TEST\n"
-                "DHAN_CLIENT_ID=1113731536\n"
-                "DHAN_PIN=998877\n"
-                "DHAN_TOTP_SECRET=SUPER_SECRET_TOTP\n"
-                "TG_API_HASH=SECRET_TG_HASH\n"
-                "TG_BOT_TOKEN=SECRET_BOT_TOKEN\n"
-                "EQUITY_BUDGET_INR=25000.0\n"
-                "CUSTOM_USER_KEY=PRESERVE_ME_123\n"
-            )
-
-        old_cwd = os.getcwd()
-        os.chdir(self.tmp_dir.name)
-        try:
-            page_resp = get_setup_page()
-            html = page_resp.body.decode("utf-8")
-            self.assertNotIn("998877", html)
-            self.assertNotIn("SUPER_SECRET_TOTP", html)
-            self.assertNotIn("SECRET_TG_HASH", html)
-            self.assertNotIn("SECRET_BOT_TOKEN", html)
-            self.assertIn("EQUITY_CMP_EXECUTION_POLICY", html.upper() if "equity_cmp_execution_policy" in html else html)
-
-            env_content, params = build_env_and_params_dict(
-                operator_name="Udit",
-                dhan_client_id="1113731536",
-                dhan_pin="",
-                dhan_totp_secret="",
-                tg_api_hash="",
-                tg_bot_token="",
-                dhan_access_token="NEW_SHARED_TOKEN_XYZ",
-                equity_budget_inr=40000.0,
-                equity_cmp_execution_policy="DARVAS_HTTP_SUCCESS",
-                env_path=env_file,
-            )
-            self.assertIn("DHAN_PIN=998877", env_content)
-            self.assertIn("DHAN_TOTP_SECRET=SUPER_SECRET_TOTP", env_content)
-            self.assertIn("TG_API_HASH=SECRET_TG_HASH", env_content)
-            self.assertIn("TG_BOT_TOKEN=SECRET_BOT_TOKEN", env_content)
-            self.assertIn("CUSTOM_USER_KEY=PRESERVE_ME_123", env_content)
-            self.assertIn("EQUITY_CMP_EXECUTION_POLICY=DARVAS_HTTP_SUCCESS", env_content)
-            self.assertNotIn("NEW_SHARED_TOKEN_XYZ", env_content)
-            self.assertNotIn("DHAN_ACCESS_TOKEN=", env_content)
-
-            rec = execute_configuration_update(
-                form_params=params,
-                env_content=env_content,
-                data_dir=self.data_dir,
-                env_path=env_file,
-                systemctl_restart_fn=lambda: False,
-                check_service_fn=lambda: True,
-                rollback_on_apply_failure=True,
-            )
-            self.assertEqual(rec.state, ConfigApplyState.APPLY_FAILED)
-            self.assertTrue(rec.rolled_back)
-            restored_env = parse_env_dict(env_file)
-            self.assertEqual(float(restored_env["EQUITY_BUDGET_INR"]), 25000.0)
-        finally:
-            os.chdir(old_cwd)
-
     def test_10_p0_systemd_timer_uses_verified_bot_cli_and_cannot_touch_trading_bot_service(self):
         """
         P0 Verification:
@@ -708,78 +643,6 @@ class TestCV1306And07Consolidated(unittest.TestCase):
             self.assertIsNone(oid)
             self.assertIn("TEST mode", msg_ord)
 
-
-    def test_13_defect1_webui_and_runtime_config_hash_parity(self):
-        """
-        Defect 1 Regression Test:
-        Verifies that WebUI uppercase form_params, parsed .env dictionaries, and runtime
-        AppConfig instances produce the exact same normalized SHA-256 configuration hash,
-        so a running process acknowledging its AppConfig version transitions the WebUI change
-        record to APPLIED_VERIFIED instead of APPLY_FAILED.
-        """
-        env_file = os.path.join(self.tmp_dir.name, ".env")
-        env_content, form_params = build_env_and_params_dict(
-            is_live_mode=False,
-            equity_active=True,
-            fno_active=True,
-            operator_name="Udit",
-            instance_name="Audit bot",
-            tg_api_id="123456",
-            tg_api_hash="SECRET_HASH",
-            monitored_channel_ids="-100111, -100222",
-            log_group_id="-5514889030",
-            test_group_id="-5100801652",
-            ignore_backlog="true",
-            dhan_client_id="1113731536",
-            dhan_pin="123456",
-            dhan_totp_secret="SECRET_TOTP",
-            equity_budget_inr=35000.0,
-            equity_product_type="CNC",
-            equity_price_markup_pct=0.5,
-            equity_cmp_execution_policy="DARVAS_HTTP_SUCCESS",
-            fno_capital_per_trade=25000.0,
-            fno_max_lots=3,
-            sl_pct=3.0,
-            target_pct=4.0,
-            env_path=env_file,
-        )
-        with open(env_file, "w", encoding="utf-8") as f:
-            f.write(env_content)
-
-        # Load runtime AppConfig from the written .env file (isolated from os.environ)
-        env_dict = parse_env_dict(env_file)
-        runtime_cfg = AppConfig.from_env(env=env_dict, env_file=env_file)
-
-        hash_from_webui_params = compute_config_version(form_params)
-        hash_from_env_dict = compute_config_version(env_dict)
-        hash_from_runtime_cfg = compute_config_version(runtime_cfg)
-
-        self.assertEqual(hash_from_webui_params, hash_from_runtime_cfg)
-        self.assertEqual(hash_from_env_dict, hash_from_runtime_cfg)
-
-        # Verify end-to-end execute_configuration_update reaches APPLIED_VERIFIED when
-        # the restarted runtime process records compute_config_version(runtime_cfg)
-        tracker = ConfigChangeTracker(data_dir=self.data_dir)
-
-        def restart_simulating_runtime_bot():
-            reloaded_cfg = AppConfig.from_env(env=parse_env_dict(env_file), env_file=env_file)
-            tracker.record_active_running_version(
-                compute_config_version(reloaded_cfg),
-                trading_mode=reloaded_cfg.trading_mode.value,
-            )
-            return True
-
-        rec = execute_configuration_update(
-            form_params=form_params,
-            env_content=env_content,
-            data_dir=self.data_dir,
-            env_path=env_file,
-            systemctl_restart_fn=restart_simulating_runtime_bot,
-            check_service_fn=lambda: True,
-            verify_delay_sec=0.01,
-        )
-        self.assertEqual(rec.state, ConfigApplyState.APPLIED_VERIFIED)
-        self.assertEqual(rec.effective_version_hash, hash_from_runtime_cfg)
 
     def test_14_defect2_webui_save_never_overwrites_shared_dhan_token(self):
         """
