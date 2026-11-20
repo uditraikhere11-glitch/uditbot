@@ -41,7 +41,7 @@ jobs:
           python -m unittest -q tests.test_always_on_broker_fence_retirement tests.test_tracker_broker_handoff tests.test_orphan_oco_cleanup
       - name: Save and apply and safety regressions
         run: |
-          python -m unittest -q tests.test_simple_save_apply tests.test_pr98_stale_recovery tests.test_settings_host_migration
+          python -m unittest -q tests.test_simple_save_apply tests.test_pr98_stale_recovery tests.test_settings_host_migration tests.test_save_apply_handoff_diagnostics
           python -m unittest -q tests.test_control_center_step2 tests.test_tracker_v2_authenticated_acceptance
       - name: Package exact changed-files review artifact
         run: |
