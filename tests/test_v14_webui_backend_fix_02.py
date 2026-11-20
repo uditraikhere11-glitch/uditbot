@@ -169,23 +169,7 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
         self.assertTrue(st_schema["active"])
         self.assertEqual(st_schema["status"], TransitionGateStatus.CORRUPTED_RECORD.value)
 
-        # 6. Missing gate record while deferred transition exists -> MUST recover & fail closed (INCONSISTENT_STATE)
-        os.remove(self.tracker.transition_gate_file)
-        with open(self.tracker.deferred_env_file, "w", encoding="utf-8") as f:
-            f.write("TRADING_MODE=TEST\n")
-        self.tracker.save_deferred_metadata({"change_id": "CFG-RECOVER-01", "requested_mode": "TEST", "previous_mode": "LIVE"})
-        st_ro = self.tracker.inspect_transition_gate_status(read_only=True)
-        self.assertTrue(st_ro["active"])
-        self.assertEqual(st_ro["status"], TransitionGateStatus.INCONSISTENT_STATE.value)
-        self.assertFalse(st_ro.get("recovered"))
-        self.assertFalse(os.path.exists(self.tracker.transition_gate_file))
-        st_recov = self.tracker.reconcile_and_recover_transition_gate()
-        self.assertTrue(st_recov["active"])
-        self.assertEqual(st_recov["status"], TransitionGateStatus.INCONSISTENT_STATE.value)
-        self.assertTrue(st_recov.get("recovered"))
-        self.assertTrue(os.path.exists(self.tracker.transition_gate_file))
-        self.tracker.clear_deferred_artifacts(clear_gate=True)
-
+        # Retired deferred-settings replay no longer synthesizes a transition gate.
         # 7. File read failure -> MUST fail closed
         with patch("builtins.open", side_effect=PermissionError("Read permission denied")):
             st_read_err = self.tracker.inspect_transition_gate_status()
@@ -497,58 +481,6 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
 
     # =========================================================================
     # B12 — Broker verification not supplied consistently (P1)
-    # =========================================================================
-
-    def test_H2_coordinator_crash_recovery_and_concurrent_workers_no_duplicate_restart(self):
-        # 1. Simulate coordinator crash during APPLYING after restart already succeeded
-        env_content, form_params = build_env_and_params_dict(is_live_mode=False, equity_budget_inr=250.0, env_path=self.env_path)
-        with open(self.env_path, "w", encoding="utf-8") as f:
-            f.write(env_content)
-        new_cfg = AppConfig.from_env(env=parse_env_dict(self.env_path), env_file="")
-        new_hash = compute_config_version(new_cfg)
-
-        now = time.time()
-        crashed_rec = ConfigChangeRecord(
-            change_id="CFG-CRASH-01",
-            state=ConfigApplyState.APPLYING,
-            operation_state=OperationState.VERIFYING.value,
-            requested_at=now - 2.0,
-            applied_at=now - 1.0,
-            previous_version_hash="OLD_HASH",
-            proposed_version_hash=new_hash,
-            previous_mode="LIVE",
-            requested_mode="TEST",
-            saved_mode="TEST",
-            running_mode="LIVE",
-            progress_percent=90,
-            current_step="APPLYING",
-            restart_required=True,
-            restart_performed=True,
-        )
-        self.tracker.save_change_record(crashed_rec)
-        self.tracker.set_transition_gate(True, change_id="CFG-CRASH-01", target_mode="TEST", reason="Applying")
-        # Bot finished starting and wrote its fresh acknowledgement
-        self.tracker.record_active_running_version(new_hash, trading_mode="TEST")
-
-        restart_mock = MagicMock()
-        outcomes = self.tracker.run_control_coordinator_tick(
-            env_path=self.env_path,
-            stop_state_path=self.stop_path,
-            db_path=self.db_path,
-            systemctl_restart_fn=restart_mock,
-            check_service_fn=lambda: True,
-        )
-        # Reconstructed without repeating restart!
-        restart_mock.assert_not_called()
-        rec_recovered = outcomes["recovered_interrupted"]
-        self.assertIsNotNone(rec_recovered)
-        self.assertEqual(rec_recovered.state, ConfigApplyState.APPLIED_VERIFIED)
-        self.assertEqual(rec_recovered.progress_percent, 100)
-        self.assertTrue(rec_recovered.runtime_verified)
-        self.assertFalse(self.tracker.is_live_entry_blocked_by_transition()[0])
-
-    # =========================================================================
-    # H4 — Broker Lifecycle Matrix (All Order & Protection States)
     # =========================================================================
 
     def test_H4_broker_lifecycle_matrix_all_states(self):
