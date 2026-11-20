@@ -12,6 +12,7 @@ from datetime import date
 import os
 import tempfile
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, patch
 
 from src.config import AppConfig
@@ -244,6 +245,7 @@ class TestDarvasMergedFeatures(unittest.TestCase):
 
     @patch("requests.Session.put")
     @patch("requests.Session.post")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_dhan_super_order_place_and_reanchor_on_fill(self, mock_post, mock_put):
         with tempfile.TemporaryDirectory() as tmpdir:
             stop_file = os.path.join(tmpdir, "stop.json")
