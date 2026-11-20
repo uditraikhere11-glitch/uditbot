@@ -332,7 +332,17 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                 env_path=env_path, stop_when_idle=True,
             )
 
-    app.add_event_handler("startup", resume_deferred_owner_stop_on_webui_startup)
+    # FastAPI versions used on Python 3.14 no longer expose the app-level
+    # add_event_handler method. Register the same idempotent STOP-only hook
+    # through the router when necessary; never start settings replay here.
+    add_handler = getattr(app, "add_event_handler", None)
+    if callable(add_handler):
+        add_handler("startup", resume_deferred_owner_stop_on_webui_startup)
+    else:
+        startup_hooks = getattr(getattr(app, "router", None), "on_startup", None)
+        if not isinstance(startup_hooks, list):
+            raise RuntimeError("WebUI cannot safely register Owner STOP recovery")
+        startup_hooks.append(resume_deferred_owner_stop_on_webui_startup)
 
     @app.get("/control/status")
     def get_control_status():
