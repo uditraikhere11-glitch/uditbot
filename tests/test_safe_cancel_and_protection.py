@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, patch
 import requests
 
@@ -176,6 +177,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
     # =========================================================================
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_01_http_202_acknowledged_state_cancel_pending(self, mock_delete):
         """C03-01: Dhan returns HTTP 202 -> Request acknowledged; state transitions to CANCEL_PENDING."""
         mock_resp = MagicMock()
@@ -208,6 +210,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         self.assertEqual(watcher.pending[oid]["state"], OrderLifecycleState.CANCEL_PENDING.value)
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_02_http_200_valid_response_acknowledged(self, mock_delete):
         """C03-02: Dhan returns HTTP 200 with compatible response -> Acknowledged."""
         mock_resp = MagicMock()
@@ -230,6 +233,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         self.assertIn("HTTP 200", msg)
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_03_http_400_rejected_not_cancelled(self, mock_delete):
         """C03-03: Dhan returns HTTP 400 -> Rejected, order state is NOT terminal CANCELLED."""
         mock_resp = MagicMock()
@@ -256,6 +260,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         self.assertFalse(watcher.pending[oid].get("cancel_uncertain", False))
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_04_http_401_authentication_failure(self, mock_delete):
         """C03-04: Dhan returns HTTP 401 -> Authentication failure; no claim of cancellation."""
         mock_resp = MagicMock()
@@ -278,6 +283,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         self.assertIn("Dhan auth error (401)", msg)
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_05_http_429_rate_limit_error(self, mock_delete):
         """C03-05: Dhan returns HTTP 429 -> Rate-limit error; original order remains unresolved in previous state."""
         mock_resp = MagicMock()
@@ -306,6 +312,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         self.assertEqual(watcher.pending[oid]["state"], OrderLifecycleState.PART_FILLED.value)
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_06_http_500_broker_error(self, mock_delete):
         """C03-06: Dhan returns HTTP 500 -> Broker error; no assumption of terminal state."""
         mock_resp = MagicMock()
@@ -328,6 +335,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         self.assertIn("500", msg)
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_07_network_timeout_no_automatic_second_cancel_or_retry(self, mock_delete):
         """C03-07: Network timeout produces unknown outcome; no automatic second cancellation or retry."""
         mock_delete.side_effect = requests.exceptions.Timeout("Connection timed out waiting for Dhan DELETE")
@@ -463,6 +471,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         mock_delete.assert_not_called()
 
     @patch("requests.Session.delete")
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_14_emergency_stop_active_authorized_cancel_permitted(self, mock_delete):
         """C03-14: Emergency STOP active still permits authorized risk-reducing cancellations while blocking new entries."""
         mock_resp = MagicMock()
