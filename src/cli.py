@@ -596,7 +596,7 @@ def format_startup_online_card(
             f"New Entries Gate: Open"
         ))
 
-    rec_status = f"Reconciliation Pending ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "Healthy"
+    rec_status = f"Pending ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "Healthy"
     if reconciliation_msg:
         rec_status = f"{rec_status} — {html.escape(str(reconciliation_msg))}"
     prot_status = (
