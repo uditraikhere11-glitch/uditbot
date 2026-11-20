@@ -200,7 +200,13 @@ class DirectBrokerRestartTests(unittest.TestCase):
         import sqlite3
         with sqlite3.connect(self.proof["data"] / "trade_journal.db") as db:
             rows = db.execute("select payload from outbox where event_type='SETTINGS_RESTART_VERIFIED'").fetchall()
-        self.assertEqual([json.loads(raw)["text"] for raw, in rows], [out.message])
+        queued = [json.loads(raw)["text"] for raw, in rows]
+        self.assertEqual(len(queued), 1)
+        self.assertIn("<b>Settings Updated</b>", queued[0])
+        self.assertIn("Trading bot: RESTARTED", queued[0])
+        self.assertIn("Configuration: VERIFIED", queued[0])
+        # The user-facing WebUI message is retained for API compatibility.
+        self.assertIn("Settings updated. Trading bot restarted", out.message)
 
     def test_terminal_v2_journal_tracks_direct_save_without_trusting_external_writes(self):
         from src.engine.tracker_v2_safety import inspect_transaction_recovery
