@@ -35,6 +35,10 @@ FIELDS = {
     "fill_price": "Execution Price",
     "trade_value": "Trade Value",
     "protection": "Protection",
+    "instance": "Bot Instance",
+    "event_time": "Report Time",
+    "changed_keys": "Updated Settings",
+    "channels": "Monitored Channels",
 }
 
 EVENTS = {
@@ -88,7 +92,24 @@ EVENTS = {
         "allowed": ["symbol", "contract", "segment", "quantity", "filled_qty",
                     "broker_status", "source"],
     },
+    "settings_update": {
+        "title": "Settings Update Confirmation",
+        "fields": ["instance", "changed_keys"],
+        "allowed": ["instance", "changed_keys", "mode"],
+    },
+    "dhan_health": {
+        "title": "Dhan TOTP — 5 PM Health Check",
+        "fields": ["instance", "event_time", "mode"],
+        "allowed": ["instance", "event_time", "mode"],
+    },
+    "startup": {
+        "title": "AuditBot Startup",
+        "fields": ["instance", "mode", "channels"],
+        "allowed": ["instance", "mode", "channels"],
+    },
 }
+
+SYSTEM_EVENTS = frozenset(("settings_update", "dhan_health", "startup"))
 
 EMOJIS = ["•", "🌙", "✅", "⏳", "⚠️", "📈", "📉", "📊", "📌", "🔔",
           "💰", "💵", "🎯", "🛡️", "🕒", "📅", "⚡", "📩", "🚀", "🔢", "🏷️", ""]
@@ -101,6 +122,8 @@ SAMPLE_VALUES = {
     "mode": "LIVE", "signal_time": "18:42 IST", "response_ms": "286 ms",
     "filled_qty": "75", "fill_price": "₹120.60", "trade_value": "₹9,045.00",
     "protection": "Pending verification",
+    "instance": "AuditBot", "event_time": "20 Nov 2026, 17:00 IST",
+    "changed_keys": "EQUITY_SL_PCT, EQUITY_TARGET_PCT", "channels": "3",
 }
 
 
@@ -133,10 +156,16 @@ def validate(data: Any) -> dict:
     if not isinstance(data, dict) or data.get("version") != 1:
         raise ValueError("Unsupported Telegram template schema version")
     source = data.get("templates")
-    if not isinstance(source, dict) or set(source) != set(EVENTS):
+    legacy_events = set(EVENTS) - SYSTEM_EVENTS
+    if (not isinstance(source, dict) or set(source) - set(EVENTS)
+            or not legacy_events.issubset(source)):
         raise ValueError("Template categories missing or unsupported")
     output = defaults()
     for event, definition in EVENTS.items():
+        if event not in source:
+            # Older saved designer files contain only the eight trade templates.
+            # Preserve their customization and fill new categories as disabled.
+            continue
         raw = source[event]
         if not isinstance(raw, dict):
             raise ValueError("Invalid template: " + event)
@@ -253,7 +282,7 @@ def render(event: str, values: Mapping[str, Any], required_lines: list[str],
     # Locked status always last. Replace only the code-owned leading status emoji.
     icon_status = escape(cfg["status_emoji"], quote=False)
     for i, line in enumerate(required_lines):
-        if i == 0 and any(line.startswith(icon + " ") for icon in ("✅", "❌", "⏳", "⚠️")):
+        if event not in SYSTEM_EVENTS and i == 0 and any(line.startswith(icon + " ") for icon in ("✅", "❌", "⏳", "⚠️")):
             _, rest = line.split(" ", 1)
             rendered.append((icon_status + " " if icon_status else "") + rest)
         else:
