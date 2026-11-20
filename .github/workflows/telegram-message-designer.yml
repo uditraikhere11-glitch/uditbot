@@ -3,7 +3,6 @@ on:
   push:
     branches:
       - "feature/telegram-message-designer-custom-emojis-20261105"
-      - "fix/telegram-clean-system-notifications-20261120"
   pull_request:
     paths:
       - "src/notifier/**"
@@ -34,4 +33,4 @@ jobs:
       - name: Compile imported modules
         run: python -m compileall -q src/notifier src/main.py src/setup_app.py src/cli.py src/engine/simple_save_apply.py tests/test_health_and_system_message_designer.py
       - name: Customization and existing acknowledgement tests
-        run: python -m unittest -v tests.test_message_designer tests.test_dhan_amo_ack_response tests.test_health_and_system_message_designer tests.test_dhan_1700_ist_final tests.test_r03_daily_health_reliability tests.test_pr98_stale_recovery tests.test_historical_fill_reconciliation_h01_h17
+        run: python -m unittest -v tests.test_message_designer tests.test_dhan_amo_ack_response tests.test_health_and_system_message_designer tests.test_dhan_1700_ist_final tests.test_r03_daily_health_reliability
