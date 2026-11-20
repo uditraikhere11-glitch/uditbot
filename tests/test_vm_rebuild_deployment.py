@@ -2,6 +2,7 @@
 Covers ChatGPT baseline checks plus CR-01, H-02, H-03, H-04, and H-05 remediations.
 No sudo/systemd/network writes; no real credentials, orders, or live tests.
 """
+import json
 import os
 from pathlib import Path
 import shutil
@@ -359,6 +360,16 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             (fake_repo / "data" / "scrip_master.csv").write_text("DUMMY_50MB_CSV")
             (fake_repo / "data" / "listener.lock").write_text("99999")
 
+            restart_dir = fake_repo / "data" / "config_restart_v2"
+            restart_dir.mkdir(mode=0o700)
+            records = {
+                "apply_barrier.json": {"active": True, "change_id": "SAVE-synthetic"},
+                "current_transaction.json": {"phase": "ACK_UNCERTAIN"},
+            }
+            for name, record in records.items():
+                (restart_dir / name).write_text(json.dumps(record))
+                (restart_dir / name).chmod(0o600)
+
             pass_file = tmp_path / "passphrase.txt"
             pass_file.write_text("test-only-synthetic-passphrase-2026\n")
             os.chmod(pass_file, 0o600)
@@ -413,6 +424,11 @@ class VMRebuildDeploymentTests(unittest.TestCase):
             self.assertFalse((new_repo / "data" / "scrip_master.csv").exists())
             self.assertFalse((new_repo / "data" / "listener.lock").exists())
             self.assertTrue((new_repo / "data" / "tg_userbot.session").is_file())
+
+            for name, record in records.items():
+                restored = new_repo / "data" / "config_restart_v2" / name
+                self.assertEqual(json.loads(restored.read_text()), record)
+                self.assertEqual(stat.S_IMODE(restored.stat().st_mode), 0o600)
 
             r_conn = sqlite3.connect(str(new_repo / "data" / "trade_journal.db"))
             qc = r_conn.execute("PRAGMA quick_check;").fetchone()[0]

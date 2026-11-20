@@ -807,12 +807,15 @@ def verify_super_order_record(
 
 
 class DhanClient:
+    _require_broker_handoff = False
+
     def __init__(
         self,
         config: AppConfig,
         stop_manager: Optional[EmergencyStopManager] = None,
         reconciliation_gate: Optional[Any] = None,
         auto_generate_token: bool = True,
+        *, require_broker_handoff: bool = False,
     ):
         self.cfg = config
         from src.broker.read_governor import ReadGovernor
@@ -821,6 +824,7 @@ class DhanClient:
         )
         # The scheduled force-refresh must not perform a first implicit TOTP
         # login just because the token file is missing.
+        self._require_broker_handoff = require_broker_handoff
         self._auto_generate_token = auto_generate_token
         self.session = configure_yahoo_http(requests.Session())
         self.stop_manager = stop_manager or EmergencyStopManager(
@@ -1180,7 +1184,7 @@ class DhanClient:
                     modification_order_id=ReadGovernor.modification_order_id(method, url),
                 )
 
-        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
+        if not self._require_broker_handoff and os.environ.get("UDITBOT_TRACKER_V2_ENABLE") != "1":
             # Legacy mode has no V2 mutation fence; reserve before the HTTP call.
             try:
                 admit_before_network()

@@ -2,7 +2,7 @@
 
 This module does not execute broker actions, restart services, repair Telegram
 sessions, or load credentials into a log. It also does not apply a proposal:
-callers must use the durable ConfigChangeTracker coordinator.
+the Setup and Control Center settings routes use simple_save_apply.apply_settings.
 """
 from __future__ import annotations
 

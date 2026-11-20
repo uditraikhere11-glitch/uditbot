@@ -39,6 +39,7 @@ fi
 TMP="$(mktemp -d)"
 COMMITTED=0
 CREATED_LIVE_FILES=()
+CREATED_RESTART_DIR=0
 cleanup_and_rollback() {
     local rc=$?
     if [[ "$COMMITTED" != "1" && "${#CREATED_LIVE_FILES[@]}" -gt 0 ]]; then
@@ -46,6 +47,9 @@ cleanup_and_rollback() {
             rm -f -- "$f" 2>/dev/null || true
         done
         echo "RESTORE ROLLED BACK: cleaned up partial files so restore can be safely retried." >&2
+    fi
+    if [[ "$COMMITTED" != "1" && "$CREATED_RESTART_DIR" == "1" ]]; then
+        rmdir -- "$REPO_DIR/data/config_restart_v2" || true
     fi
     rm -rf -- "$TMP" 2>/dev/null || true
     exit "$rc"
@@ -68,6 +72,9 @@ allow_missing_journal = (os.environ.get('ALLOW_MISSING_JOURNAL', '0') == '1')
 FORBIDDEN_NAMES = {'holidays.json', 'scrip_master.csv', 'listener.lock', 'emergency_stop.json.lock'}
 FORBIDDEN_SUFFIXES = ('.lock', '.tmp', '.swp', '-wal', '-shm', '-journal')
 
+restart_records = {'apply_barrier.json', 'current_transaction.json'}
+restart_dir_parts = ('runtime', 'data', 'config_restart_v2')
+
 with tarfile.open(archive, 'r:gz') as tf:
     members = tf.getmembers()
     if not members:
@@ -86,7 +93,11 @@ with tarfile.open(archive, 'r:gz') as tf:
             raise SystemExit(f'Unsafe backup entry: {m.name}')
         if not (m.isfile() or m.isdir()):
             raise SystemExit('Unexpected archive entry type')
-        if len(path.parts) > 3:
+        if path.parts == restart_dir_parts and not m.isdir():
+            raise SystemExit('Invalid restart state directory')
+        restart_record = (path.parts[:-1] == restart_dir_parts and path.name in restart_records
+                          and m.isfile() and 0 < m.size <= 256 * 1024)
+        if len(path.parts) > 3 and not restart_record:
             raise SystemExit(f'Unsupported nested archive path: {m.name}')
         if len(path.parts) >= 2 and path.parts[1] not in ('.env', 'data', 'home'):
             raise SystemExit(f'Unexpected top-level runtime member: {m.name}')
@@ -122,6 +133,11 @@ if not allow_missing_journal:
 
 # Validate SQLite integrity_check/quick_check on any SQLite files (trade_journal.db, tg_userbot.session) in staging before live install
 for db_candidate in data_dir.iterdir():
+    if db_candidate.name == 'config_restart_v2' and db_candidate.is_dir():
+        for record in db_candidate.iterdir():
+            if record.name not in restart_records or not isinstance(json.loads(record.read_bytes()), dict):
+                raise SystemExit('Invalid archived restart evidence')
+        continue
     if not db_candidate.is_file():
         raise SystemExit(f'Non-regular file inside runtime/data: {db_candidate.name}')
     raw_head = db_candidate.read_bytes()[:16]
@@ -180,6 +196,18 @@ while IFS= read -r -d '' item; do
     cp -p -- "$item" "$REPO_DIR/data/$base_name"
     chmod 0600 "$REPO_DIR/data/$base_name"
 done < <(find "$TMP/runtime/data" -mindepth 1 -maxdepth 1 -type f -print0)
+if [[ -d "$TMP/runtime/data/config_restart_v2" ]]; then
+    mkdir -m 0700 -- "$REPO_DIR/data/config_restart_v2"
+    CREATED_RESTART_DIR=1
+    for name in current_transaction.json apply_barrier.json; do
+        source_record="$TMP/runtime/data/config_restart_v2/$name"
+        if [[ -f "$source_record" ]]; then
+            dest_record="$REPO_DIR/data/config_restart_v2/$name"
+            CREATED_LIVE_FILES+=("$dest_record")
+            install -m 0600 -- "$source_record" "$dest_record"
+        fi
+    done
+fi
 chmod 0700 "$REPO_DIR/data"
 
 if [[ -f "$TMP/runtime/home/.dhan_token" ]]; then

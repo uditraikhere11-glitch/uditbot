@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from src.config import AppConfig, parse_env_dict
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
+from src.engine.runtime_evidence import read_private_json
 from src.engine.simple_save_apply import apply_settings
 from src.engine.config_manager import (
     ConfigApplyState,
@@ -128,22 +129,21 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     newest = tracker.get_change_record()
     v2_blocked = False
     v2_recheck = False
-    if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
-        from src.engine.tracker_v2_safety import read_private_json
-        try:
-            tx = read_private_json(os.path.join(data_dir, "config_restart_v2", "current_transaction.json"), missing_ok=True)
-            fence = read_private_json(os.path.join(data_dir, "config_restart_v2", "apply_barrier.json"), missing_ok=True)
-            if fence is not None and fence.get("active") is not False:
-                v2_blocked = True
-            if tx is not None and tx.get("phase") not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
-                v2_blocked = True
-                v2_recheck = bool(
-                    tx.get("phase") == "ACK_UNCERTAIN"
-                    and fence is not None and fence.get("active") is True
-                    and newest is not None and newest.change_id == tx.get("change_id")
-                )
-        except (ValueError, OSError):
+    try:
+        tx = read_private_json(os.path.join(data_dir, "config_restart_v2", "current_transaction.json"), missing_ok=True)
+        fence = read_private_json(os.path.join(data_dir, "config_restart_v2", "apply_barrier.json"), missing_ok=True)
+        if fence is not None and fence.get("active") is not False:
             v2_blocked = True
+        if tx is not None and tx.get("phase") not in ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"):
+            v2_blocked = True
+            v2_recheck = bool(
+                os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1"
+                and tx.get("phase") == "ACK_UNCERTAIN"
+                and fence is not None and fence.get("active") is True
+                and newest is not None and newest.change_id == tx.get("change_id")
+            )
+    except (ValueError, OSError):
+        v2_blocked = True
     verified = verified and not v2_blocked
     pending = _pending(tracker)
     stopping = _owner_stop_pending(tracker)
@@ -172,7 +172,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         "saved_mode": str(raw.get("saved_mode") or "UNKNOWN"),
         "running_mode": str(raw.get("running_mode") or "UNKNOWN"),
         "runtime_verified": verified,
-        "warning": "V2 restart verification pending; use Verify pending restart (never reissues restart)" if v2_blocked else "Control requests blocked while configuration/safety gate is unresolved" if pending or stopping else "",
+        "warning": "Restart verification pending; inspect the saved transaction and broker fence" if v2_blocked else "Control requests blocked while configuration/safety gate is unresolved" if pending or stopping else "",
         "tracker_v2_apply_blocked": v2_blocked,
         "tracker_v2_late_ack_pending": v2_recheck,
         "equity_amo_saved": saved,

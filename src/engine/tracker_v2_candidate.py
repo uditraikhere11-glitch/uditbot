@@ -7,12 +7,11 @@ callbacks. All ambiguous states remain blocked. The default is review-only.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from src.engine.prior_settings import prior_settings_lock, ChangeBlocked
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
-import fcntl
 import json
 import os
 import re
@@ -26,10 +25,6 @@ from src.engine.tracker_v2_safety import (
     inspect_transaction_recovery, preview_legacy_tracker_migration,
     read_private_json, verify_runtime_ack,
 )
-
-
-class ChangeBlocked(RuntimeError):
-    """An update cannot proceed without operator recovery or verified safety."""
 
 
 @dataclass(frozen=True)
@@ -102,18 +97,8 @@ class CandidateCoordinator:
         self.lock = self.txdir / '.transaction.lock'
         self.barrier = self.txdir / 'apply_barrier.json'
 
-    @contextmanager
     def _exclusive(self):
-        self.txdir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if self.txdir.stat().st_mode & 0o022:
-            raise ChangeBlocked('Tracker transaction directory is insecure')
-        fd = os.open(self.lock, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+        return prior_settings_lock(self.txdir)
 
     def read_status(self) -> SafetyDecision:
         """No side effects; unverified status is never green by inference."""

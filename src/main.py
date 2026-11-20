@@ -104,7 +104,7 @@ def _is_transport_uncertainty(msg: str) -> bool:
 
 
 class TradingBotPipeline:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, *, service_process: bool = False):
         self.cfg = config
         self._pipeline_lock = threading.Lock()
         self._amo_queue = None
@@ -124,11 +124,13 @@ class TradingBotPipeline:
             expected_account_id=config.dhan_client_id,
         )
         self.risk_manager = RiskManager(config, stop_manager=self.stop_manager)
-        self.broker = DhanClient(config, stop_manager=self.stop_manager)
-        # Opt-in tracker V2: register the real trading process, never a WebUI
-        # status reader. Corrupt/unknown prior broker mutations fail startup
-        # closed; no automatic cleanup of broker evidence is permitted.
-        if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1":
+        self._broker_handoff = service_process or os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1"
+        self.broker = DhanClient(config, stop_manager=self.stop_manager,
+                                 require_broker_handoff=self._broker_handoff)
+        # A service publishes its own PID. An unconfigured TEST installation
+        # can start without an account, but cannot send a fenced broker order.
+        if self._broker_handoff and (config.dhan_client_id or config.trading_mode == TradingMode.LIVE
+                                     or os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1"):
             from src.engine.broker_handoff import register_producer
             register_producer(config.data_dir, config.dhan_client_id)
         self.notifier = TelegramNotifier(config)
@@ -162,7 +164,7 @@ class TradingBotPipeline:
             from src.engine.config_manager import ConfigChangeTracker, compute_config_version
             tracker = ConfigChangeTracker(data_dir=config.data_dir)
             from src.engine.tracker_credentials import fingerprint
-            fp = fingerprint(config, config.data_dir) if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1" else ""
+            fp = fingerprint(config, config.data_dir) if self._broker_handoff else ""
             tracker.record_active_running_version(
                 version_hash=compute_config_version(config),
                 trading_mode=config.trading_mode.value,
@@ -192,7 +194,7 @@ class TradingBotPipeline:
                 from src.engine.config_manager import ConfigChangeTracker, compute_config_version
                 tracker = ConfigChangeTracker(data_dir=self.cfg.data_dir)
                 from src.engine.tracker_credentials import fingerprint
-                fp = fingerprint(self.cfg, self.cfg.data_dir) if os.environ.get("UDITBOT_TRACKER_V2_ENABLE") == "1" else ""
+                fp = fingerprint(self.cfg, self.cfg.data_dir) if self._broker_handoff else ""
                 tracker.record_active_running_version(
                     version_hash=compute_config_version(self.cfg),
                     trading_mode=self.cfg.trading_mode.value,
@@ -1886,7 +1888,7 @@ def run():
         asyncio.run(interactive_login(cfg))
         return
 
-    pipeline = TradingBotPipeline(cfg)
+    pipeline = TradingBotPipeline(cfg, service_process=True)
     asyncio.run(start_telegram_listener(pipeline))
 
 

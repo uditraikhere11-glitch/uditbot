@@ -101,7 +101,7 @@ print("=" * 60)
 
 # V12-01: TradingBotPipeline.__init__ loads scrip_master.csv once into pipeline.resolver;
 # only reload if resolver is still empty.
-pipeline = TradingBotPipeline(cfg)
+pipeline = TradingBotPipeline(cfg, service_process=True)
 scrip_file = os.path.join(cfg.data_dir, "scrip_master.csv")
 if not pipeline.resolver._equities and not pipeline.resolver._options_list:
     pipeline.resolver.load_dhan_master(scrip_file)

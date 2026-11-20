@@ -2065,7 +2065,7 @@ class ConfigChangeTracker:
         account-scoped, registered broker mutation handoff.
         """
         from src.config import AppConfig, parse_env_dict
-        from src.engine.tracker_v2_safety import (
+        from src.engine.runtime_evidence import (
             evaluate_active_broker_operation_gate, read_private_json,
         )
         from src.engine.config_patch import revision
@@ -2207,7 +2207,7 @@ class ConfigChangeTracker:
         if not os.path.exists(self.pending_op_file):
             return False
         try:
-            from src.engine.tracker_v2_safety import read_private_json
+            from src.engine.runtime_evidence import read_private_json
             pending = read_private_json(self.pending_op_file, missing_ok=False)
             rec = self.get_change_record()
             return not bool(

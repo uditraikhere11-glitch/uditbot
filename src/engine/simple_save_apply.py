@@ -22,9 +22,10 @@ from src.engine.config_manager import (
     ConfigChangeTracker, compute_config_version, inspect_systemd_service_properties,
     is_isolated_test_environment, write_json_atomic,
 )
-from src.engine.tracker_v2_safety import (
+from src.engine.runtime_evidence import (
     evaluate_active_broker_operation_gate, read_private_json,
 )
+from src.engine.prior_settings import prior_settings_lock
 from src.engine.broker_handoff import (
     acquire_apply_barrier, release_apply_barrier, release_aborted_apply_barrier, BrokerHandoffBlocked,
 )
@@ -196,6 +197,8 @@ def _verify_new_runtime(handoff: dict[str, Any], new_values: Mapping[str, str]) 
 
 def _retire_previous_transaction(data: Path, path: Path, values: Mapping[str, str], current: str) -> None:
     folder = data / "config_restart_v2"
+    if folder.is_symlink():
+        raise ConfigurationConflict("Unsafe previous settings directory.")
     journal = folder / "current_transaction.json"
     if not journal.exists() and not journal.is_symlink():
         fence = read_private_json(folder / "apply_barrier.json", missing_ok=True)
@@ -203,12 +206,13 @@ def _retire_previous_transaction(data: Path, path: Path, values: Mapping[str, st
             raise ConfigurationConflict("Broker restart fence is unresolved.")
         return
     # An old WebUI process may still hold the V2 transaction lock during rollout.
-    from src.engine.tracker_v2_candidate import CandidateCoordinator
-    with CandidateCoordinator(data, path)._exclusive():
+    with prior_settings_lock(folder):
         tx = read_private_json(journal, missing_ok=True)
-        if tx is None:
-            return
         barrier = read_private_json(folder / "apply_barrier.json", missing_ok=True)
+        if tx is None:
+            if barrier is not None and barrier.get("active") is not False:
+                raise ConfigurationConflict("Broker restart fence is unresolved.")
+            return
         phase = tx.get("phase")
         prepared = (phase == "PREPARED" and tx.get("restart_issued") is False
                     and tx.get("previous_file_revision") == current)

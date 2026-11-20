@@ -51,7 +51,7 @@ mkdir -p "$TMP/runtime/data" "$TMP/runtime/home"
 cp -p "$REPO_DIR/.env" "$TMP/runtime/.env"
 # Query configured locations from existing config, but don't print secrets.
 ALLOW_MISSING_JOURNAL="$ALLOW_MISSING_JOURNAL" REPO_DIR="$REPO_DIR" STAGING="$TMP/runtime" "$PYTHON_BIN" - <<'PY'
-import os, shutil, sqlite3
+import json, os, shutil, sqlite3
 from pathlib import Path
 from src.config import AppConfig
 root = Path(os.environ['REPO_DIR'])
@@ -85,6 +85,22 @@ for item in data.iterdir():
         and not item.name.endswith(EXCLUDED_SUFFIXES)
     ):
         shutil.copy2(item, stage/'data'/item.name)
+
+# These two nested records are shared by the old and current settings paths.
+# Losing the barrier on restore would make an uncertain restart look clear.
+from src.engine.runtime_evidence import read_private_json
+restart_dir = data / 'config_restart_v2'
+if restart_dir.is_symlink():
+    raise SystemExit('Unsafe restart state directory')
+for name in ('current_transaction.json', 'apply_barrier.json'):
+    record = read_private_json(restart_dir / name, missing_ok=True)
+    if record is not None:
+        saved = stage / 'data' / restart_dir.name
+        saved.mkdir(mode=0o700, exist_ok=True)
+        encoded = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf8')
+        if len(encoded) > 256 * 1024:
+            raise SystemExit('Restart evidence exceeds restore size limit')
+        (saved / name).write_bytes(encoded)
 
 def _sqlite_consistent_backup(src_path: Path, dst_path: Path, require_valid_schema: bool = False) -> None:
     if not src_path.is_file():

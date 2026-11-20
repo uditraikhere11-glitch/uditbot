@@ -16,7 +16,7 @@ from src.engine.config_manager import (
     OperationState, compute_config_version, write_json_atomic,
 )
 from src.engine import simple_save_apply as direct
-from src.engine.tracker_v2_safety import SafetyDecision
+from src.engine.runtime_evidence import SafetyDecision
 
 
 class StaleServiceRecoveryTests(unittest.TestCase):
@@ -66,9 +66,9 @@ class StaleServiceRecoveryTests(unittest.TestCase):
                    return_value={"ActiveState": "active", "MainPID": 201}), \
              patch.object(self.tracker, "is_active_version_confirmed",
                           return_value=(True, {"pid": 201, "process_starttime": 555}, "Verified")), \
-             patch("src.engine.tracker_v2_safety.evaluate_active_broker_operation_gate",
+             patch("src.engine.runtime_evidence.evaluate_active_broker_operation_gate",
                    return_value=decision), \
-             patch("src.engine.tracker_v2_safety.read_private_json",
+             patch("src.engine.runtime_evidence.read_private_json",
                    return_value={"account_id": "FAKE_ID", "active": [], "unresolved": []}):
             return self.tracker.reconcile_stale_control_records(str(self.env))
 

@@ -31,7 +31,6 @@ from src.engine.config_manager import is_isolated_test_environment
 SETUP_CSRF_TOKEN = secrets.token_hex(16)
 from src.engine.config_manager import (
     ConfigChangeTracker,
-    execute_configuration_update,
     compute_config_version,
     check_service_is_active,
 )
