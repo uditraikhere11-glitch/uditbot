@@ -1,45 +1,58 @@
-name: Tracker A01-A11 candidate isolation and regressions
+name: Shared broker fence and settings-retirement review (offline)
 on:
+  push:
+    branches:
+      - review/shared-config-retirement-fence-20261120
   pull_request:
     paths:
-      - 'src/engine/tracker_*'
-      - 'tests/test_tracker_*'
-      - 'src/engine/simple_save_apply.py'
-      - 'src/engine/runtime_evidence.py'
-      - 'src/engine/prior_settings.py'
-      - 'src/engine/broker_handoff.py'
+      - 'src/engine/**'
+      - 'src/broker/dhan_client.py'
       - 'src/control_center_backend.py'
       - 'src/main.py'
-      - 'src/broker/dhan_client.py'
-      - 'deploy/backup_runtime.sh'
-      - 'deploy/restore_runtime.sh'
-      - 'run.py'
-      - 'tests/test_settings_host_migration.py'
+      - 'tests/**'
+      - 'tools/audit_tracker_retirement.py'
       - '.github/workflows/tracker-a01-a11-review.yml'
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  tracker-isolation:
+  focused-retirement:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 12
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install existing repository dependencies
+      - name: Install test dependencies
         run: python -m pip install -r requirements-test.txt
-      - name: Syntax verification
-        run: python -m compileall -q src/engine/runtime_evidence.py src/engine/prior_settings.py src/engine/tracker_v2_candidate.py src/engine/tracker_v2_safety.py src/engine/broker_handoff.py src/engine/tracker_credentials.py src/engine/tracker_v2_integration.py
-      - name: Review-only offline regressions
-        env:
-          AUDITBOT_TEST_ISOLATION: '1'
+      - name: Prove obsolete writers are absent and broker fence exists
+        run: python tools/audit_tracker_retirement.py --mode release
+      - name: Compile the current (not legacy) settings and broker paths
+        run: python -m compileall -q src/engine/config_manager.py src/engine/simple_save_apply.py src/engine/prior_restart_recovery.py src/engine/broker_handoff.py src/engine/prior_settings.py src/engine/runtime_evidence.py src/control_center_backend.py src/broker/dhan_client.py src/engine/orphan_cleanup.py src/main.py
+      - name: Isolated Owner STOP and late restart readback
         run: |
-          python -m unittest -v tests.test_settings_host_migration tests.test_simple_save_apply tests.test_pr98_stale_recovery tests.test_vm_rebuild_deployment.VMRebuildDeploymentTests.test_end_to_end_encrypted_backup_and_restore_roundtrip
-          python -m unittest discover -s tests -p 'test_tracker*.py' -v
-      - name: VM-like permissive umask 0002 tracker regression
-        env:
-          AUDITBOT_TEST_ISOLATION: '1'
+          python -m unittest -q tests.test_tracker_retirement_owner_stop tests.test_prior_restart_recovery_offline
+          python -m unittest -q tests.test_always_on_broker_fence_retirement tests.test_tracker_broker_handoff tests.test_orphan_oco_cleanup
+      - name: Save and apply and safety regressions
         run: |
-          umask 0002
-          python -m unittest -q tests.test_tracker_v2_review tests.test_tracker_v2_stress_matrix
+          python -m unittest -q tests.test_simple_save_apply tests.test_pr98_stale_recovery tests.test_settings_host_migration
+          python -m unittest -q tests.test_control_center_step2 tests.test_tracker_v2_authenticated_acceptance
+  full-offline-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 24
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Run complete offline unit-test discovery
+        run: python -m unittest discover -s tests -p 'test_*.py' -q
