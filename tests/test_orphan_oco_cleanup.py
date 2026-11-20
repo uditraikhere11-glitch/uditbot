@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from src.engine.orphan_cleanup import clean_orphaned_forever_orders
+from src.engine.broker_handoff import BrokerMutationNotSubmitted
 from src.models import BrokerReadFailure, BrokerReadList, TradingMode
 
 
@@ -73,6 +74,11 @@ class CleanupTests(unittest.TestCase):
             session=SimpleNamespace(delete=Mock(return_value=SimpleNamespace(status_code=202))),
             _headers=Mock(return_value={"access-token": "FAKE"}),
         )
+        # The production transport enforces broker-mutation admission first.
+        # This fake delegates the *already admitted* test call to its mock session.
+        self.broker._broker_mutating_http = Mock(
+            side_effect=lambda method, url, **kwargs: self.broker.session.delete(url, **kwargs)
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -93,6 +99,9 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(out["cancel_requested"], [OCO_ID], out)
         self.assertEqual(self.broker.get_positions.call_count, 2)
         self.assertEqual(self.broker.get_holdings.call_count, 2)
+        self.broker._broker_mutating_http.assert_called_once()
+        self.assertEqual(self.broker._broker_mutating_http.call_args.args[:2],
+                         ("DELETE", "https://api.dhan.co/v2/forever/orders/F-42"))
         self.broker.session.delete.assert_called_once()
         self.assertEqual(
             self.broker.session.delete.call_args.args[0],
@@ -230,6 +239,23 @@ class CleanupTests(unittest.TestCase):
             row["orderStatus"] = "CANCELLED"
         self.broker.get_forever_orders.return_value = BrokerReadList(rows)
         self.assertEqual(self.run_scan(execute=True)["cancel_requested"], [])
+        self.broker.session.delete.assert_not_called()
+
+
+    def test_missing_guarded_transport_blocks_before_direct_session(self):
+        self.broker._broker_mutating_http = None
+        out = self.run_scan(execute=True)
+        self.assertEqual(out["cancel_requested"], [])
+        self.assertEqual(len(out["failed"]), 1)
+        self.assertIn("Fenced broker ORDER transport unavailable", out["failed"][0]["reason"])
+        self.broker.session.delete.assert_not_called()
+
+    def test_fenced_transport_rejection_does_not_send_cancel(self):
+        self.broker._broker_mutating_http.side_effect = BrokerMutationNotSubmitted("barrier held")
+        out = self.run_scan(execute=True)
+        self.assertEqual(out["cancel_requested"], [])
+        self.assertEqual(len(out["failed"]), 1)
+        self.assertIn("BLOCKED before broker transport", out["failed"][0]["reason"])
         self.broker.session.delete.assert_not_called()
 
 
