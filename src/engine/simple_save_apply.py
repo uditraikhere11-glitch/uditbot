@@ -148,6 +148,20 @@ def _positive_running_restart_proof(path: Path, old_values: Mapping[str, str]) -
     )
     if not ok or not isinstance(ack, dict) or ack.get("pid") != main_pid:
         raise ConfigurationConflict("Current runtime PID and saved version not verified")
+    gate = evaluate_active_broker_operation_gate(data, require_handoff=True)
+    if not gate.allowed or gate.code != "NO_ACTIVE_BROKER_OPERATION":
+        # An old/unregistered producer is different from an UNKNOWN broker
+        # mutation. Neither is permission to clear the fence or restart.
+        code = str(gate.code or "BROKER_HANDOFF_UNVERIFIED")
+        advice = (
+            "Controlled stopped-service cutover required; retain historical evidence."
+            if code in ("NO_RUNTIME_HANDOFF", "HANDOFF_UNVERIFIED", "HANDOFF_IDENTITY_UNKNOWN")
+            else "Inspect broker mutation evidence and reconcile uncertainty before trying again."
+        )
+        raise ConfigurationConflict(
+            "Broker mutation handoff is active, unresolved or unverifiable "
+            "(" + code + "). " + advice + " Settings unchanged; no restart issued."
+        )
     # The same canonical HMAC is published by the trading process and read
     # by the WebUI. An older runtime may lack this acknowledgement entirely;
     # that requires a stopped-service cutover, never an assumed-safe restart.
@@ -165,20 +179,6 @@ def _positive_running_restart_proof(path: Path, old_values: Mapping[str, str]) -
         raise ConfigurationConflict(
             code + ": Running credentials cannot be verified against this saved configuration. "
             "Do not restart or reset safety records; use the controlled stopped-service cutover."
-        )
-    gate = evaluate_active_broker_operation_gate(data, require_handoff=True)
-    if not gate.allowed or gate.code != "NO_ACTIVE_BROKER_OPERATION":
-        # An old/unregistered producer is different from an UNKNOWN broker
-        # mutation. Neither is permission to clear the fence or restart.
-        code = str(gate.code or "BROKER_HANDOFF_UNVERIFIED")
-        advice = (
-            "Controlled stopped-service cutover required; retain historical evidence."
-            if code in ("NO_RUNTIME_HANDOFF", "HANDOFF_UNVERIFIED", "HANDOFF_IDENTITY_UNKNOWN")
-            else "Inspect broker mutation evidence and reconcile uncertainty before trying again."
-        )
-        raise ConfigurationConflict(
-            "Broker mutation handoff is active, unresolved or unverifiable "
-            "(" + code + "). " + advice + " Settings unchanged; no restart issued."
         )
     ledger = read_private_json(data / "active_broker_mutations.json", missing_ok=True)
     if not isinstance(ledger, dict) or ledger.get("account_id") != cfg.dhan_client_id:
