@@ -509,7 +509,19 @@ def apply_settings(
                 # The WebUI result message above stays unchanged. Telegram gets
                 # one concise card without repeating the same sentence under
                 # an optional designer heading. Only confirmed outcomes get here.
-                lines = ("Trading bot: RESTARTED", "Configuration: VERIFIED")
+                try:
+                    from src.notifier.message_designer import format_changed_settings
+                    change_lines = format_changed_settings(changed)
+                except Exception:
+                    # A notification formatting failure must not hide a
+                    # confirmed save or expose original sensitive values.
+                    change_lines = [f"Changed Settings ({len(keys)}):"]
+                    change_lines.extend(f"• {key}: Updated (values hidden)" for key in keys)
+                lines = (
+                    "Trading bot: Restarted",
+                    "Configuration: Verified",
+                    *change_lines,
+                )
                 telegram_text = "✅ <b>Settings Updated</b>\n" + "\n".join(lines)
                 try:
                     from src.notifier.message_designer import render as render_designed_message
