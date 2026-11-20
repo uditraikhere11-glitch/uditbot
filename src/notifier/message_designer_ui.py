@@ -88,7 +88,7 @@ fieldset{border:none;margin:0;padding:0}.stack{display:flex;gap:8px;flex-wrap:wr
       <h3>Available fields</h3><div id="available"></div>
       <label for="footer">Optional custom note</label>
       <textarea id="footer" rows="2" maxlength="240" placeholder="Your own short note ..."></textarea>
-      <p class="hint">The bot appends mandatory broker-status and safety notices after your note.</p>
+      <p class="hint">Live bot status values remain fixed. For startup messages, Mode and Listener field labels edit those existing rows rather than repeating them. Previously sent Telegram messages cannot be altered here.</p>
       <div class="toolbar" style="margin-top:18px">
         <button type="button" id="preset-compact">Minimal preset</button>
         <button type="button" id="preset-standard">Standard preset</button>
@@ -202,7 +202,13 @@ var mandatory = {
   partial:["⏳ Status: Partially Executed","Filled: 25/75","🛡️ Protection: Pending Broker Verification"],
   final:["❌ Status: Order CANCELLED","Filled: 0/75"],
   unverified:["⚠️ Status: Fill Verification Pending","No confirmed execution yet."],
-  settings_update:["Settings updated. Trading bot restarted and the new configuration was verified."],
+  settings_update:[
+    "Trading bot: Restarted",
+    "Configuration: Verified",
+    "Changed Settings (2):",
+    "• Equity SL: 3% → 4%",
+    "• F&O Target: 3% → 5%"
+  ],
   dhan_health:[
     "🔑 Dhan authentication: ✅ VERIFIED",
     "🔄 Token renewal: ✅ SUCCESS",
@@ -215,25 +221,52 @@ var mandatory = {
     "📊 Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED"
   ],
   startup:[
-    "Listener: LISTENER RUNNING (3 channels)",
-    "Reconciliation: HEALTHY",
-    "Protection Watcher: ACTIVE (VERIFIED)",
-    "New Entries Gate: OPEN (ACCEPTING SIGNALS)",
-    "Status: Actively listening for trade signals"
+    "Mode: LIVE",
+    "Listener: Active 2 channels",
+    "Reconciliation: Healthy",
+    "Protection Watcher: Active and Verified",
+    "New Entries Gate: Open"
   ]
 };
 function preview(){
   if(!state||!defs)return;
-  var x=cfg(),lines=[],entries=[];
+  var x=cfg(),lines=[],entries=[],locked=mandatory[current].slice();
   lines.push((x.title_emoji?x.title_emoji+" ":"")+x.title);
-  x.fields.forEach(function(f){var val=samples[f.key];if(val!==undefined&&val!==null&&val!=="")entries.push((f.emoji?f.emoji+" ":"")+f.label+": "+val)});
+  x.fields.forEach(function(f){
+    var val=samples[f.key];
+    if(val===undefined||val===null||val==="")return;
+    if(current==="settings_update"&&f.key==="changed_keys"){
+      for(var i=0;i<locked.length;i++){
+        if(locked[i].startsWith("Changed Settings (")){
+          locked[i]=((f.emoji&&f.emoji!=="•")?f.emoji+" ":"")+
+            (f.label||"Changed Settings")+" "+locked[i].slice("Changed Settings ".length);
+          break;
+        }
+      }
+      return;
+    }
+    if(current==="startup"&&(f.key==="mode"||f.key==="channels")){
+      var prefix=f.key==="mode"?"Mode: ":"Listener: ";
+      for(var i=0;i<locked.length;i++){
+        if(locked[i].startsWith(prefix)){
+          locked[i]=((f.emoji&&f.emoji!=="•")?f.emoji+" ":"")+
+            (f.label||(f.key==="mode"?"Mode":"Listener"))+": "+locked[i].slice(prefix.length);
+          break;
+        }
+      }
+      return;
+    }
+    if(current==="startup"&&f.key==="instance"&&
+       x.title.toLowerCase().includes(String(val).toLowerCase()))return;
+    if(current==="dhan_health"&&["instance","event_time","mode"].includes(f.key))return;
+    entries.push((f.emoji?f.emoji+" ":"")+f.label+": "+val);
+  });
   if(x.style==="compact"){for(var i=0;i<entries.length;i+=2)lines.push(entries.slice(i,i+2).join(" | "))}
   else lines=lines.concat(entries);
   if(x.separator==="line")lines.push("─────────────");
-  if(x.separator==="dots")lines.push("••••••••••••");
+  if(x.separator==="dots")lines.push("••••••••••");
   if(x.style==="detailed")lines.push("");
   if(x.footer)lines.push(x.footer);
-  var locked=mandatory[current].slice();
   if(locked.length&&x.status_emoji&&!["settings_update","dhan_health","startup"].includes(current)){
     // Replace only the primary status icon for order cards; system safety icons are locked.
     locked[0]=x.status_emoji+" "+locked[0].replace(/^(✅|❌|⏳|⚠️)\s*/u,"");

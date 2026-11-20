@@ -506,8 +506,23 @@ def apply_settings(
             try:
                 journal = Path(new_values.get("JOURNAL_DB_PATH") or data_root / "trade_journal.db")
                 db = JournalDB(str(path.parent / journal), account_id=new_values.get("DHAN_CLIENT_ID", ""))
-                # Formatting is opt-in and must never suppress a verified save notice.
-                # Only names of edited fields are exposed; never send credential values.
+                # The WebUI result message above stays unchanged. Telegram gets
+                # one concise card without repeating the same sentence under
+                # an optional designer heading. Only confirmed outcomes get here.
+                try:
+                    from src.notifier.message_designer import format_changed_settings
+                    change_lines = format_changed_settings(changed)
+                except Exception:
+                    # A notification formatting failure must not hide a
+                    # confirmed save or expose original sensitive values.
+                    change_lines = [f"Changed Settings ({len(keys)}):"]
+                    change_lines.extend(f"• {key}: Updated (values hidden)" for key in keys)
+                lines = (
+                    "Trading bot: Restarted",
+                    "Configuration: Verified",
+                    *change_lines,
+                )
+                telegram_text = "✅ <b>Settings Updated</b>\n" + "\n".join(lines)
                 try:
                     from src.notifier.message_designer import render as render_designed_message
                     styled = render_designed_message(
@@ -517,12 +532,14 @@ def apply_settings(
                             "changed_keys": ", ".join(keys),
                             "mode": str(new_values.get("TRADING_MODE", "UNKNOWN")),
                         },
-                        [message],
+                        list(lines),
                         str(data_root),
                     )
+                    if styled is not None:
+                        telegram_text = styled
                 except Exception:
-                    styled = None  # Revert to the proven, mandatory original card.
-                db.enqueue_outbox("SETTINGS_RESTART_VERIFIED", {"text": styled if styled is not None else message})
+                    pass  # Keep the confirmed default, never lose the notice.
+                db.enqueue_outbox("SETTINGS_RESTART_VERIFIED", {"text": telegram_text})
             except Exception:
                 message += " The Telegram confirmation could not be queued."
         return SaveApplyResult("RESTARTED", message, True, True, new_revision, keys)

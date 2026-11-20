@@ -94,17 +94,17 @@ EVENTS = {
     },
     "settings_update": {
         "title": "Settings Update Confirmation",
-        "fields": ["instance", "changed_keys"],
+        "fields": ["changed_keys"],
         "allowed": ["instance", "changed_keys", "mode"],
     },
     "dhan_health": {
         "title": "Dhan TOTP — 5 PM Health Check",
-        "fields": ["instance", "event_time", "mode"],
+        "fields": [],
         "allowed": ["instance", "event_time", "mode"],
     },
     "startup": {
         "title": "AuditBot Startup",
-        "fields": ["instance", "mode", "channels"],
+        "fields": ["mode", "channels"],
         "allowed": ["instance", "mode", "channels"],
     },
 }
@@ -204,6 +204,72 @@ def validate(data: Any) -> dict:
     return output
 
 
+# No credential, account, Telegram destination, or free-form operator text
+# is ever written to the public Telegram change history as a value.
+_PRIVATE_SETTINGS = frozenset((
+    "TG_API_ID", "LOG_GROUP_ID", "TEST_GROUP_ID", "DHAN_CLIENT_ID",
+))
+_CHANGE_LABELS = {
+    "TRADING_MODE": "Trading Mode",
+    "EQUITY_SL_PCT": "Equity SL", "EQUITY_TARGET_PCT": "Equity Target",
+    "FNO_SL_PCT": "F&O SL", "FNO_TARGET_PCT": "F&O Target",
+    "SL_PCT": "SL", "TARGET_PCT": "Target",
+    "FNO_CAPITAL_PER_TRADE": "F&O Capital Per Trade",
+    "EQUITY_BUDGET_INR": "Equity Budget",
+    "EQUITY_AMO_ENABLED": "Equity AMO",
+    "FNO_AMO_ENABLED": "F&O AMO",
+    "DHAN_TOTP_SECRET": "Dhan TOTP Secret",
+    "DHAN_PIN": "Dhan PIN",
+    "TG_BOT_TOKEN": "Telegram Bot Token",
+    "TG_API_HASH": "Telegram API Hash",
+    "BOT_INSTANCE_NAME": "Bot Instance Name",
+}
+
+
+def format_changed_settings(changes: Mapping[str, tuple[str, str]]) -> list[str]:
+    """Summarize the *effective, verified* before/after config diff safely.
+
+    Names of every changed setting are retained; only schema-validated,
+    non-sensitive scalar values may appear in Telegram. Never log either
+    raw values or a redacted shadow of an access token.
+    """
+    from src.engine.config_patch import ENV_REGISTRY, ConfigurationRejected, normalize
+
+    entries = []
+    for key in sorted(changes):
+        spec = ENV_REGISTRY.get(key)
+        label = _CHANGE_LABELS.get(
+            key,
+            key.replace("_", " ").title().replace("Fno", "F&O").replace("Pct", "%"),
+        )
+        label = escape(label, quote=False)
+        old_value, new_value = changes[key]
+        allowed = bool(
+            spec is not None and key not in _PRIVATE_SETTINGS
+            and not spec.secret and spec.value_type in ("number", "integer", "bool", "mode", "enum")
+        )
+        if not allowed:
+            entries.append("• " + label + ": Updated (values hidden)")
+            continue
+        try:
+            before = normalize(spec, old_value)
+            after = normalize(spec, new_value)
+        except (ConfigurationRejected, ValueError, TypeError):
+            entries.append("• " + label + ": Updated (values hidden)")
+            continue
+        if spec.value_type == "bool":
+            before = "Enabled" if before == "true" else "Disabled"
+            after = "Enabled" if after == "true" else "Disabled"
+        elif key.endswith("_PCT"):
+            before += "%"
+            after += "%"
+        entries.append(
+            "• " + label + ": " + escape(before, quote=False)
+            + " → " + escape(after, quote=False)
+        )
+    return [f"Changed Settings ({len(entries)}):", *entries]
+
+
 def file_path(data_dir: str | None = None) -> str:
     base = data_dir or os.environ.get("DATA_DIR") or os.path.join(os.getcwd(), "data")
     return os.path.join(os.path.abspath(base), FILENAME)
@@ -259,13 +325,41 @@ def render(event: str, values: Mapping[str, Any], required_lines: list[str],
     heading = (icon + " " if icon else "") + "<b>" + title + "</b>"
     rendered = [heading]
     entries = []
+    locked_lines = list(required_lines)
     for field in cfg["fields"]:
-        raw_value = values.get(field["key"])
+        key = field["key"]
+        raw_value = values.get(key)
         if raw_value is None or raw_value == "":
             continue
         icon_text = escape(field["emoji"], quote=False)
         label = escape(field["label"], quote=False)
         value = escape(str(raw_value), quote=False)
+        if event == "settings_update" and key == "changed_keys":
+            for row_index, line in enumerate(locked_lines):
+                if line.startswith("Changed Settings ("):
+                    locked_lines[row_index] = (
+                        ((icon_text + " ") if icon_text and icon_text != "•" else "")
+                        + label + " " + line[len("Changed Settings "):]
+                    )
+                    break
+            continue  # Always show the exact verified diff once, not a second list.
+        if event == "startup" and key in ("mode", "channels"):
+            # These are real rows in the immutable startup card, not extra
+            # metadata rows. Change their presentation in place, preserving
+            # the original, code-generated mode and listener evidence.
+            prefix = "Mode: " if key == "mode" else "Listener: "
+            for row_index, line in enumerate(locked_lines):
+                if line.startswith(prefix):
+                    locked_lines[row_index] = (
+                        ((icon_text + " ") if icon_text and icon_text != "•" else "")
+                        + label + ": " + line[len(prefix):]
+                    )
+                    break
+            continue
+        if event == "startup" and key == "instance" and value.casefold() in title.casefold():
+            continue  # The bot name is already in the operator's heading.
+        if event == "dhan_health" and key in ("instance", "event_time", "mode"):
+            continue  # Report already carries these authoritative facts.
         entries.append(((icon_text + " ") if icon_text else "") + label + ": " + value)
     if cfg["style"] == "compact":
         rendered += [" | ".join(entries[i:i + 2]) for i in range(0, len(entries), 2)]
@@ -281,7 +375,7 @@ def render(event: str, values: Mapping[str, Any], required_lines: list[str],
         rendered.append(escape(cfg["footer"], quote=False))
     # Locked status always last. Replace only the code-owned leading status emoji.
     icon_status = escape(cfg["status_emoji"], quote=False)
-    for i, line in enumerate(required_lines):
+    for i, line in enumerate(locked_lines):
         if event not in SYSTEM_EVENTS and i == 0 and any(line.startswith(icon + " ") for icon in ("✅", "❌", "⏳", "⚠️")):
             _, rest = line.split(" ", 1)
             rendered.append((icon_status + " " if icon_status else "") + rest)

@@ -5,6 +5,7 @@ Never contacts Dhan/Telegram or accesses production configuration/databases.
 """
 import datetime as dt
 import json
+from html import unescape
 import os
 import tempfile
 import unittest
@@ -157,30 +158,34 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             unprotected_positions_count=1, is_stopped=False,
         )
         self.assertTrue(card.startswith("🚀 <b>Custom startup</b>"))
-        self.assertIn("New Entries Gate: <code>NEW ENTRIES BLOCKED</code>", card)
-        self.assertIn("Reconciliation: <code>RECONCILIATION PENDING (1)", card)
-        self.assertIn("Protection Watcher: <code>PROTECTION UNVERIFIED</code>", card)
+        self.assertIn("New Entries Gate: Blocked", card)
+        self.assertIn("Reconciliation: Pending (1)", card)
+        self.assertIn("Protection Watcher: Unverified", card)
 
     def test_startup_default_remains_unchanged_when_disabled(self):
         card = format_startup_online_card(
             self.cfg, allowed_chats_count=2, reconciliation_ok=True,
         )
         self.assertTrue(card.startswith("🟢 <b>Synthetic AuditBot Online</b>"))
-        self.assertIn("New Entries Gate: <code>OPEN (ACCEPTING SIGNALS)</code>", card)
+        self.assertIn("New Entries Gate: Open", card)
 
     def test_settings_notification_cosmetic_only(self):
         self._enable(
             "settings_update", title="<Updated>", title_emoji="📣",
             fields=[{"key": "changed_keys", "label": "Settings", "emoji": "⚙️"}],
         )
-        required = "Settings updated. Trading bot restarted and the new configuration was verified."
+        required = [
+            "Trading bot: Restarted", "Configuration: Verified",
+            "Changed Settings (1):", "• Equity SL: 3% → 4%",
+        ]
         card = designer.render(
-            "settings_update", {"changed_keys": "EQUITY_SL_PCT"}, [required],
+            "settings_update", {"changed_keys": "EQUITY_SL_PCT"}, required,
             self.data_dir,
         )
         self.assertTrue(card.startswith("📣 <b>&lt;Updated&gt;</b>"))
-        self.assertIn("⚙️ Settings: EQUITY_SL_PCT", card)
-        self.assertIn(required, card)
+        self.assertIn("⚙️ Settings (1):", card)
+        self.assertEqual(card.count("Equity SL: 3% → 4%"), 1)
+        self.assertIn("Configuration: Verified", card)
 
     def test_verified_save_apply_queues_designed_telegram_confirmation(self):
         import pathlib
@@ -221,10 +226,112 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         queued = json.loads(rows[0][0])["text"]
         self.assertIn("<b>Verified Settings</b>", queued)
-        self.assertIn(
-            "Settings updated. Trading bot restarted and the new configuration was verified.",
-            queued,
+        self.assertIn("Trading bot: Restarted", queued)
+        self.assertIn("Configuration: Verified", queued)
+        self.assertIn("Changed Settings (1):", queued)
+        self.assertIn("Equity AMO: Disabled → Enabled", queued)
+        self.assertNotIn("Settings updated. Trading bot restarted", queued)
+
+    def test_startup_default_is_readable_and_not_repeated(self):
+        card = format_startup_online_card(
+            self.cfg, allowed_chats_count=2, reconciliation_ok=True,
         )
+        self.assertEqual(card.count("Listener:"), 1)
+        self.assertEqual(card.count("Reconciliation:"), 1)
+        self.assertEqual(card.count("New Entries Gate:"), 1)
+        self.assertIn("Listener: Active 2 channels", card)
+        self.assertIn("Mode: LIVE", card)
+        self.assertNotIn("<code>", card)
+        self.assertNotIn("Status: Actively listening", card)
+        self.assertNotIn("channels (monitored channels only)", card)
+
+    def test_startup_fields_customize_existing_rows_without_duplicate(self):
+        self._enable(
+            "startup", title="Status Overview", fields=[
+                {"key": "mode", "label": "Bot Mode", "emoji": "⚙️"},
+                {"key": "channels", "label": "Signal Channels", "emoji": "📡"},
+            ],
+        )
+        card = format_startup_online_card(
+            self.cfg, allowed_chats_count=2, reconciliation_ok=True,
+        )
+        self.assertIn("⚙️ Bot Mode: LIVE", card)
+        self.assertIn("📡 Signal Channels: Active 2 channels", card)
+        self.assertEqual(card.count("LIVE"), 1)
+        self.assertEqual(card.count("Active 2 channels"), 1)
+        self.assertNotIn("<code>", card)
+
+    def test_startup_legacy_selected_fields_do_not_duplicate_essential_status(self):
+        self._enable(
+            "startup", title="Synthetic AuditBot Online",
+            fields=[
+                {"key": "instance", "label": "Bot Instance", "emoji": "•"},
+                {"key": "mode", "label": "Mode", "emoji": "•"},
+                {"key": "channels", "label": "Monitored", "emoji": "•"},
+            ],
+        )
+        card = format_startup_online_card(
+            self.cfg, allowed_chats_count=2, reconciliation_ok=False,
+            reconciliation_msg="Review required", is_stopped=True,
+        )
+        self.assertEqual(card.count("LIVE"), 1)
+        self.assertNotIn("Bot Instance:", card)
+        self.assertIn("New Entries Gate: Blocked", card)
+        self.assertNotIn("OPEN (ACCEPTING SIGNALS)", card)
+        self.assertNotIn("<code>", card)
+
+    def test_settings_default_notification_no_long_repeated_sentence(self):
+        from src.notifier import message_designer as md
+        self.assertIsNone(md.render(
+            "settings_update", {}, ["Trading bot: Restarted", "Configuration: Verified"],
+            self.data_dir,
+        ))
+        # Disabled templates preserve the code-owned concise default.
+        default_card = chr(10).join([
+            "✅ <b>Settings Updated</b>",
+            "Trading bot: Restarted",
+            "Configuration: Verified",
+        ])
+        self.assertEqual(default_card.count("Settings Updated"), 1)
+        self.assertNotIn("Settings updated. Trading bot restarted", default_card)
+
+    def test_verified_setting_diff_is_recorded_and_secrets_are_redacted(self):
+        changed = {
+            "EQUITY_SL_PCT": ("3", "4"),
+            "FNO_TARGET_PCT": ("3", "5"),
+            "DHAN_TOTP_SECRET": ("OLD_TOTP_SECRET", "NEW_TOTP_SECRET"),
+            "DHAN_CLIENT_ID": ("9000000001", "9000000002"),
+            "TG_API_ID": ("123456", "456789"),
+            "TG_BOT_TOKEN": ("OLD_BOT_TOKEN", "NEW_BOT_TOKEN"),
+            "BOT_INSTANCE_NAME": ("OLD_NAME", "NEW_NAME"),
+        }
+        lines = designer.format_changed_settings(changed)
+        message = chr(10).join(lines)
+        self.assertIn("Changed Settings (7):", message)
+        self.assertIn("• Equity SL: 3% → 4%", message)
+        self.assertIn("• F&amp;O Target: 3% → 5%", message)
+        self.assertIn("• F&O Target: 3% → 5%", unescape(message))
+        for secret in (
+            "OLD_TOTP_SECRET", "NEW_TOTP_SECRET", "9000000001",
+            "9000000002", "123456", "456789", "OLD_BOT_TOKEN",
+            "NEW_BOT_TOKEN", "OLD_NAME", "NEW_NAME",
+        ):
+            self.assertNotIn(secret, message)
+        self.assertIn("Dhan TOTP Secret: Updated (values hidden)", message)
+
+    def test_setting_diff_rejects_invalid_previous_value_without_leak(self):
+        lines = designer.format_changed_settings({
+            "EQUITY_SL_PCT": ("not-a-valid-number", "4")
+        })
+        message = chr(10).join(lines)
+        self.assertNotIn("not-a-valid-number", message)
+        self.assertIn("Updated (values hidden)", message)
+
+    def test_bool_setting_diff_uses_readable_values(self):
+        lines = designer.format_changed_settings({
+            "EQUITY_AMO_ENABLED": ("false", "true"),
+        })
+        self.assertTrue(any("Disabled → Enabled" in line for line in lines))
 
     def test_existing_saved_templates_migrate_without_reset(self):
         old = designer.defaults()
