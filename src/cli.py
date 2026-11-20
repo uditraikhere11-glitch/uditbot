@@ -569,7 +569,6 @@ def format_startup_online_card(
     name = html.escape(str(getattr(cfg, "instance_name", "Audit bot") or "Audit bot"))
     configured_mode = getattr(cfg, "trading_mode", "UNKNOWN")
     mode = html.escape(str(getattr(configured_mode, "value", configured_mode)))
-    channel_note = " (monitored channels only)" if mode == "LIVE" else " (including test channel)"
     unres_n = int(unresolved_intents_count or 0)
     unprot_n = int(unprotected_positions_count or 0)
     entries_open = bool(reconciliation_ok and not is_stopped and unres_n == 0 and unprot_n == 0)
@@ -590,12 +589,11 @@ def format_startup_online_card(
     if entries_open:
         return _styled_startup((
             f"🟢 <b>{name} Online</b>\n"
-            f"Mode: <code>{mode}</code>\n"
-            f"Listener: <code>LISTENER RUNNING</code> ({allowed_chats_count} channels{channel_note})\n"
-            f"Reconciliation: <code>HEALTHY</code>\n"
-            f"Protection Watcher: <code>ACTIVE (VERIFIED)</code>\n"
-            f"New Entries Gate: <code>OPEN (ACCEPTING SIGNALS)</code>\n"
-            f"Status: Actively listening for trade signals"
+            f"Mode: {mode}\n"
+            f"Listener: LISTENER RUNNING — {allowed_chats_count} authorized channels\n"
+            f"Reconciliation: HEALTHY\n"
+            f"Protection Watcher: ACTIVE (VERIFIED)\n"
+            f"New Entries Gate: OPEN (ACCEPTING SIGNALS)"
         ))
 
     rec_status = f"RECONCILIATION PENDING ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "HEALTHY"
@@ -608,12 +606,11 @@ def format_startup_online_card(
     )
     return _styled_startup((
         f"🟡 <b>{name} Online — New Entries Blocked</b>\n"
-        f"Mode: <code>{mode}</code>\n"
-        f"Listener: <code>LISTENER RUNNING</code> ({allowed_chats_count} channels{channel_note})\n"
-        f"Reconciliation: <code>{rec_status}</code>\n"
-        f"Protection Watcher: <code>{prot_status}</code>\n"
-        f"New Entries Gate: <code>NEW ENTRIES BLOCKED</code>\n"
-        f"Status: Listener running; new trading entries are BLOCKED until reconciliation/protection is verified"
+        f"Mode: {mode}\n"
+        f"Listener: LISTENER RUNNING — {allowed_chats_count} authorized channels\n"
+        f"Reconciliation: {rec_status}\n"
+        f"Protection Watcher: {prot_status}\n"
+        f"New Entries Gate: NEW ENTRIES BLOCKED"
     ))
 
 
