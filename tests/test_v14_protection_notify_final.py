@@ -11,6 +11,7 @@ import os
 import tempfile
 from types import SimpleNamespace
 import unittest
+from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, Mock, patch
 
 from fastapi.testclient import TestClient
@@ -285,6 +286,7 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
     # ------------------------------------------------------------------
     # Scenario 5 (P0-04): Partial/non-atomic Super Order leg modification failure
     # ------------------------------------------------------------------
+    @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_05_p0_04_partial_super_order_leg_modification_persists_per_leg_state(self):
         client = DhanClient(self.cfg, self.stop)
         put_calls = []
