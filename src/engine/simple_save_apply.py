@@ -506,7 +506,23 @@ def apply_settings(
             try:
                 journal = Path(new_values.get("JOURNAL_DB_PATH") or data_root / "trade_journal.db")
                 db = JournalDB(str(path.parent / journal), account_id=new_values.get("DHAN_CLIENT_ID", ""))
-                db.enqueue_outbox("SETTINGS_RESTART_VERIFIED", {"text": message})
+                # Formatting is opt-in and must never suppress a verified save notice.
+                # Only names of edited fields are exposed; never send credential values.
+                try:
+                    from src.notifier.message_designer import render as render_designed_message
+                    styled = render_designed_message(
+                        "settings_update",
+                        {
+                            "instance": new_values.get("INSTANCE_NAME") or "AuditBot",
+                            "changed_keys": ", ".join(keys),
+                            "mode": "LIVE" if str(new_values.get("IS_LIVE_MODE", "")).lower() in ("true", "1", "yes") else "TEST",
+                        },
+                        [message],
+                        str(data_root),
+                    )
+                except Exception:
+                    styled = None  # Revert to the proven, mandatory original card.
+                db.enqueue_outbox("SETTINGS_RESTART_VERIFIED", {"text": styled if styled is not None else message})
             except Exception:
                 message += " The Telegram confirmation could not be queued."
         return SaveApplyResult("RESTARTED", message, True, True, new_revision, keys)
