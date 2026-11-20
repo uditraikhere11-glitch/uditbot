@@ -590,27 +590,27 @@ def format_startup_online_card(
         return _styled_startup((
             f"🟢 <b>{name} Online</b>\n"
             f"Mode: {mode}\n"
-            f"Listener: LISTENER RUNNING — {allowed_chats_count} authorized channels\n"
-            f"Reconciliation: HEALTHY\n"
-            f"Protection Watcher: ACTIVE (VERIFIED)\n"
-            f"New Entries Gate: OPEN (ACCEPTING SIGNALS)"
+            f"Listener: Active {allowed_chats_count} channel{'s' if allowed_chats_count != 1 else ''}\n"
+            f"Reconciliation: Healthy\n"
+            f"Protection Watcher: Active and Verified\n"
+            f"New Entries Gate: Open"
         ))
 
-    rec_status = f"RECONCILIATION PENDING ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "HEALTHY"
+    rec_status = f"Reconciliation Pending ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "Healthy"
     if reconciliation_msg:
         rec_status = f"{rec_status} — {html.escape(str(reconciliation_msg))}"
     prot_status = (
-        "PROTECTION UNVERIFIED"
+        "Unverified"
         if (unprot_n > 0 or "unprotected" in str(reconciliation_msg or "").lower())
-        else "ACTIVE (SUPERVISING)"
+        else "Active (Supervising)"
     )
     return _styled_startup((
         f"🟡 <b>{name} Online — New Entries Blocked</b>\n"
         f"Mode: {mode}\n"
-        f"Listener: LISTENER RUNNING — {allowed_chats_count} authorized channels\n"
+        f"Listener: Active {allowed_chats_count} channel{'s' if allowed_chats_count != 1 else ''}\n"
         f"Reconciliation: {rec_status}\n"
         f"Protection Watcher: {prot_status}\n"
-        f"New Entries Gate: NEW ENTRIES BLOCKED"
+        f"New Entries Gate: Blocked"
     ))
 
 
