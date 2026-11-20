@@ -94,17 +94,17 @@ EVENTS = {
     },
     "settings_update": {
         "title": "Settings Update Confirmation",
-        "fields": ["instance", "changed_keys"],
+        "fields": ["changed_keys"],
         "allowed": ["instance", "changed_keys", "mode"],
     },
     "dhan_health": {
         "title": "Dhan TOTP — 5 PM Health Check",
-        "fields": ["instance", "event_time", "mode"],
+        "fields": [],
         "allowed": ["instance", "event_time", "mode"],
     },
     "startup": {
         "title": "AuditBot Startup",
-        "fields": ["instance", "mode", "channels"],
+        "fields": ["mode", "channels"],
         "allowed": ["instance", "mode", "channels"],
     },
 }
@@ -259,13 +259,32 @@ def render(event: str, values: Mapping[str, Any], required_lines: list[str],
     heading = (icon + " " if icon else "") + "<b>" + title + "</b>"
     rendered = [heading]
     entries = []
+    locked_lines = list(required_lines)
     for field in cfg["fields"]:
-        raw_value = values.get(field["key"])
+        key = field["key"]
+        raw_value = values.get(key)
         if raw_value is None or raw_value == "":
             continue
         icon_text = escape(field["emoji"], quote=False)
         label = escape(field["label"], quote=False)
         value = escape(str(raw_value), quote=False)
+        if event == "startup" and key in ("mode", "channels"):
+            # These are real rows in the immutable startup card, not extra
+            # metadata rows. Change their presentation in place, preserving
+            # the original, code-generated mode and listener evidence.
+            prefix = "Mode: " if key == "mode" else "Listener: "
+            for row_index, line in enumerate(locked_lines):
+                if line.startswith(prefix):
+                    locked_lines[row_index] = (
+                        ((icon_text + " ") if icon_text and icon_text != "•" else "")
+                        + label + ": " + line[len(prefix):]
+                    )
+                    break
+            continue
+        if event == "startup" and key == "instance" and value.casefold() in title.casefold():
+            continue  # The bot name is already in the operator's heading.
+        if event == "dhan_health" and key in ("instance", "event_time", "mode"):
+            continue  # Report already carries these authoritative facts.
         entries.append(((icon_text + " ") if icon_text else "") + label + ": " + value)
     if cfg["style"] == "compact":
         rendered += [" | ".join(entries[i:i + 2]) for i in range(0, len(entries), 2)]
@@ -281,7 +300,7 @@ def render(event: str, values: Mapping[str, Any], required_lines: list[str],
         rendered.append(escape(cfg["footer"], quote=False))
     # Locked status always last. Replace only the code-owned leading status emoji.
     icon_status = escape(cfg["status_emoji"], quote=False)
-    for i, line in enumerate(required_lines):
+    for i, line in enumerate(locked_lines):
         if event not in SYSTEM_EVENTS and i == 0 and any(line.startswith(icon + " ") for icon in ("✅", "❌", "⏳", "⚠️")):
             _, rest = line.split(" ", 1)
             rendered.append((icon_status + " " if icon_status else "") + rest)
