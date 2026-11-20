@@ -214,7 +214,7 @@ class DirectBrokerRestartTests(unittest.TestCase):
         from src.engine.tracker_v2_safety import inspect_transaction_recovery
         from hashlib import sha256
         directory = Path(self.temp.name) / "data" / "config_restart_v2"
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, mode=0o700)  # Tracker state must be private even under umask 002.
         before_hash = sha256(self.before.encode()).hexdigest()
         write_json_atomic(str(directory / "current_transaction.json"), {
             "phase": "VERIFIED",
