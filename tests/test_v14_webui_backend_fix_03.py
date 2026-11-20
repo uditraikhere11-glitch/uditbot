@@ -28,6 +28,7 @@ from src.engine.config_manager import (
     ServiceOperatingState,
     TransitionGateStatus,
     compute_config_version,
+    write_json_atomic,
 )
 from src.engine.protection_watcher import ProtectionWatcher
 from src.journal.db import JournalDB
@@ -423,7 +424,7 @@ class TestV14WebUIBackendFix03(unittest.TestCase):
         """
         with open(self.tracker.deferred_env_file, "w", encoding="utf-8") as f:
             f.write("TRADING_MODE=TEST\n")
-        self.tracker.save_deferred_metadata({
+        write_json_atomic(self.tracker.deferred_meta_file, {
             "change_id": "CFG-RO-TEST-01",
             "requested_mode": "TEST",
             "previous_mode": "LIVE",
