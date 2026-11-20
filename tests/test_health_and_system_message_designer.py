@@ -182,6 +182,50 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         self.assertIn("⚙️ Settings: EQUITY_SL_PCT", card)
         self.assertIn(required, card)
 
+    def test_verified_save_apply_queues_designed_telegram_confirmation(self):
+        import pathlib
+        import sqlite3
+        from src.engine import simple_save_apply as direct
+        from src.engine.config_patch import revision
+
+        env = pathlib.Path(self.data_dir) / ".env"
+        env.write_text(
+            chr(10).join([
+                "TRADING_MODE=TEST", "DHAN_CLIENT_ID=FAKE_ID",
+                f"DATA_DIR={self.data_dir}", "EQUITY_AMO_ENABLED=false",
+            ]) + chr(10), encoding="utf-8",
+        )
+        self._enable(
+            "settings_update", title="Verified Settings", fields=[],
+        )
+        proof = dict(
+            data=pathlib.Path(self.data_dir), account="FAKE_ID",
+            pid=101, starttime=123,
+        )
+        with (
+            patch.object(direct, "is_isolated_test_environment", return_value=False),
+            patch.object(direct, "_positive_running_restart_proof", return_value=proof),
+            patch.object(direct, "acquire_apply_barrier", return_value=True),
+            patch.object(direct, "_verify_new_runtime"),
+        ):
+            outcome = direct.apply_settings(
+                {"equity_amo_enabled": True},
+                env_path=env, expected_revision=revision(env.read_text()),
+                state_reader=lambda: "active", restart=lambda: None,
+            )
+        self.assertEqual(outcome.status, "RESTARTED")
+        with sqlite3.connect(pathlib.Path(self.data_dir) / "trade_journal.db") as conn:
+            rows = conn.execute(
+                "SELECT payload FROM outbox WHERE event_type='SETTINGS_RESTART_VERIFIED'"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        queued = json.loads(rows[0][0])["text"]
+        self.assertIn("<b>Verified Settings</b>", queued)
+        self.assertIn(
+            "Settings updated. Trading bot restarted and the new configuration was verified.",
+            queued,
+        )
+
     def test_existing_saved_templates_migrate_without_reset(self):
         old = designer.defaults()
         old["templates"]["fno_amo"]["enabled"] = True
