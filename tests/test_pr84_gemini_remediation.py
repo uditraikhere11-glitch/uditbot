@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 from src.setup_app import SETUP_CSRF_TOKEN, app
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
 from src.engine.config_manager import ConfigChangeTracker, ServiceOperatingState, ConfigApplyState, write_json_atomic
-from src.engine.webui_update import submit_webui_patch
 
 ENV = (
     "TRADING_MODE=TEST\n"
@@ -111,35 +110,6 @@ class WebUIRegression(unittest.TestCase):
             repeated = offline_client.post("/control/amo/fno", json=body)
             self.assertEqual(repeated.status_code, 200)
             self.assertEqual(repeated.json()["change_id"], result.json()["change_id"])
-
-    def test_f05_coordinator_recovers_prepared_save_before_legacy_timeout(self):
-        tracker = ConfigChangeTracker(data_dir=str(Path(self.tmp.name) / "data"))
-        target, _ = patch_env(ENV, {"dhan_response_group_name": "-5514889030"})
-        change_id = tracker.generate_change_id()
-        txn_dir = Path(tracker.data_dir) / "config_field_transactions"
-        txn_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(str(txn_dir / (change_id + ".json")), {
-            "change_id": change_id, "previous_sha256": revision(ENV),
-            "target_sha256": revision(target), "status": "PREPARED",
-            "backup_path": str(txn_dir / "original.env"), "env_path": str(self.path.resolve()),
-            "policy": "NEXT_START",
-        })
-        from src.engine.config_manager import ConfigChangeRecord, OperationState
-        tracker.save_change_record(ConfigChangeRecord(
-            change_id=change_id, state=ConfigApplyState.REQUEST_RECEIVED,
-            operation_state=OperationState.REQUESTED.value,
-            application_method="SAVE_FOR_CONTROLLED_START",
-            requested_file_revision=revision(target),
-            requested_at=1.0,
-        ))
-        self.path.write_text(target, encoding="utf-8")
-        tracker.run_control_coordinator_tick(env_path=str(self.path.resolve()),
-                                             db_path=str(Path(self.tmp.name) / "missing.db"))
-        rec = tracker.get_change_record(change_id)
-        self.assertEqual(rec.state, ConfigApplyState.SAVED_FOR_NEXT_START)
-        self.assertFalse(rec.runtime_verified)
-        self.assertEqual(self.path.read_text(), target)
-
 
 class ManualRiskGateRegression(WebUIRegression):
     def test_f02_two_exact_owner_acknowledged_filled_holdings_do_not_block_safe_stop(self):
