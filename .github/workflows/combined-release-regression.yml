@@ -7,6 +7,10 @@ permissions:
   contents: read
 jobs:
   combined-release:
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONPATH: ${{ github.workspace }}/tests/ci_offline:${{ github.workspace }}
     runs-on: ubuntu-latest
     env:
       AUDITBOT_TEST_ISOLATION: '1'
