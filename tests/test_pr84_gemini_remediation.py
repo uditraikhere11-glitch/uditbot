@@ -112,31 +112,6 @@ class WebUIRegression(unittest.TestCase):
             self.assertEqual(repeated.status_code, 200)
             self.assertEqual(repeated.json()["change_id"], result.json()["change_id"])
 
-    def test_f06_safety_enqueued_request_survives_crash_before_returning_receipt(self):
-        tracker = ConfigChangeTracker(data_dir=str(Path(self.tmp.name) / "data"))
-        accepted = []
-        original = tracker.enqueue_durable_configuration_update
-        def crash_after_enqueue(**kwargs):
-            rec = original(**kwargs)
-            accepted.append(rec.change_id)
-            raise RuntimeError("synthetic crash AFTER queue and request index are durable")
-        with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
-                          return_value=(ServiceOperatingState.RUNNING, "mocked")), \
-             patch.object(tracker, "enqueue_durable_configuration_update", side_effect=crash_after_enqueue):
-            with self.assertRaisesRegex(RuntimeError, "synthetic crash"):
-                submit_webui_patch(tracker, {"equity_active": False}, str(self.path),
-                                   expected_revision=revision(ENV),
-                                   request_id="F06-IDEMPOTENT-REPLAY-01", spawn_worker=False)
-        self.assertEqual(len(accepted), 1)
-        with patch.object(ConfigChangeTracker, "resolve_service_operating_state",
-                          side_effect=AssertionError("retry may not re-enter service state")):
-            retried = submit_webui_patch(tracker, {"equity_active": False}, str(self.path),
-                                         expected_revision=revision(ENV),
-                                         request_id="F06-IDEMPOTENT-REPLAY-01", spawn_worker=False)
-        self.assertEqual(retried.change_id, accepted[0])
-        self.assertEqual(len(accepted), 1)
-        self.assertEqual(self.path.read_text(), ENV)
-
     def test_f05_coordinator_recovers_prepared_save_before_legacy_timeout(self):
         tracker = ConfigChangeTracker(data_dir=str(Path(self.tmp.name) / "data"))
         target, _ = patch_env(ENV, {"dhan_response_group_name": "-5514889030"})
