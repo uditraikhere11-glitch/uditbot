@@ -203,8 +203,10 @@ class DirectBrokerRestartTests(unittest.TestCase):
         queued = [json.loads(raw)["text"] for raw, in rows]
         self.assertEqual(len(queued), 1)
         self.assertIn("<b>Settings Updated</b>", queued[0])
-        self.assertIn("Trading bot: RESTARTED", queued[0])
-        self.assertIn("Configuration: VERIFIED", queued[0])
+        self.assertIn("Trading bot: Restarted", queued[0])
+        self.assertIn("Configuration: Verified", queued[0])
+        self.assertIn("Changed Settings (1):", queued[0])
+        self.assertIn("Disabled → Enabled", queued[0])
         # The user-facing WebUI message is retained for API compatibility.
         self.assertIn("Settings updated. Trading bot restarted", out.message)
 
