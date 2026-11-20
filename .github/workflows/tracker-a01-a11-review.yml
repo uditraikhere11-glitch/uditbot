@@ -24,6 +24,8 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -41,6 +43,15 @@ jobs:
         run: |
           python -m unittest -q tests.test_simple_save_apply tests.test_pr98_stale_recovery tests.test_settings_host_migration
           python -m unittest -q tests.test_control_center_step2 tests.test_tracker_v2_authenticated_acceptance
+      - name: Package exact changed-files review artifact
+        run: |
+          python tools/package_retirement_review.py --base 34f72ca89564fc2c9f2ba7db1a7b4f0e534801a0 --output /tmp/uditbot-tracker-retirement-review.zip
+      - name: Upload source-only review package
+        uses: actions/upload-artifact@v4
+        with:
+          name: UditBot-AmanBot-tracker-retirement-changed-files
+          path: /tmp/uditbot-tracker-retirement-review.zip
+          if-no-files-found: error
   full-offline-regression:
     runs-on: ubuntu-latest
     timeout-minutes: 24
