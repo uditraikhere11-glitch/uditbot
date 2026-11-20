@@ -81,7 +81,7 @@ fieldset{border:none;margin:0;padding:0}.stack{display:flex;gap:8px;flex-wrap:wr
         <div><label for="custom-status-emoji">Custom status emoji</label><input id="custom-status-emoji" maxlength="16" type="text" placeholder="✅"></div>
       </div>
       <div id="emoji-palette" aria-label="Suggested emojis"></div>
-      <p class="hint">Tap an emoji to set the heading emoji, or type/paste any Unicode emoji. Telegram-only premium emoji IDs are not required or supported here.</p>
+      <p class="hint">Tap an emoji to set the heading emoji, or type/paste any Unicode emoji. System health and startup status icons are locked for safety. Telegram-only premium emoji IDs are not required or supported here.</p>
       <h3>Included fields <span class="hint" id="field-count"></span></h3>
       <p class="hint">Drag rows to reorder or use ↑ / ↓. Rename each label and choose an emoji independently.</p>
       <div id="selected" aria-label="Included fields"></div>
@@ -183,6 +183,9 @@ function bindFields(){
   });
 }
 function drawType(){
+  var locked=["settings_update","dhan_health","startup"].includes(current);
+  $("status-emoji").disabled=locked;
+  $("custom-status-emoji").disabled=locked;
   var x=cfg();$("enabled").checked=x.enabled;$("style").value=x.style;$("separator").value=x.separator;
   $("title").value=x.title;$("footer").value=x.footer;
   [["title-emoji","custom-title-emoji","title_emoji"],["status-emoji","custom-status-emoji","status_emoji"]].forEach(function(item){
@@ -198,7 +201,26 @@ var mandatory = {
   executed:["✅ Status: Order Executed","Filled: 75/75","🛡️ Protection: Pending Broker Verification"],
   partial:["⏳ Status: Partially Executed","Filled: 25/75","🛡️ Protection: Pending Broker Verification"],
   final:["❌ Status: Order CANCELLED","Filled: 0/75"],
-  unverified:["⚠️ Status: Fill Verification Pending","No confirmed execution yet."]
+  unverified:["⚠️ Status: Fill Verification Pending","No confirmed execution yet."],
+  settings_update:["Settings updated. Trading bot restarted and the new configuration was verified."],
+  dhan_health:[
+    "🔑 Dhan authentication: ✅ VERIFIED",
+    "🔄 Token renewal: ✅ SUCCESS",
+    "💳 Dhan account identity: ✅ VERIFIED",
+    "⏳ Token expiration: ⚠️ Scheduled renewal pending",
+    "💰 Broker funds: ✅ VERIFIED",
+    "📚 Scrip master: ✅ OK",
+    "🛡️ Emergency STOP: ✅ INACTIVE",
+    "🚦 Next trading session readiness: ⏳ RENEWAL PENDING",
+    "📊 Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED"
+  ],
+  startup:[
+    "Listener: LISTENER RUNNING (3 channels)",
+    "Reconciliation: HEALTHY",
+    "Protection Watcher: ACTIVE (VERIFIED)",
+    "New Entries Gate: OPEN (ACCEPTING SIGNALS)",
+    "Status: Actively listening for trade signals"
+  ]
 };
 function preview(){
   if(!state||!defs)return;
@@ -212,8 +234,8 @@ function preview(){
   if(x.style==="detailed")lines.push("");
   if(x.footer)lines.push(x.footer);
   var locked=mandatory[current].slice();
-  if(locked.length&&x.status_emoji){
-    // Replace only the primary status icon, never the mandatory status text.
+  if(locked.length&&x.status_emoji&&!["settings_update","dhan_health","startup"].includes(current)){
+    // Replace only the primary status icon for order cards; system safety icons are locked.
     locked[0]=x.status_emoji+" "+locked[0].replace(/^(✅|❌|⏳|⚠️)\s*/u,"");
   }
   $("preview").textContent=lines.concat(locked).join("\n");
@@ -236,7 +258,7 @@ async function load(){
     var data=await getJSON("/setup/telegram-designer/config");
     state=data.settings;original=data.defaults;defs=data.events;labels=data.fields;emojiList=data.emojis;samples=data.samples;
     Object.keys(defs).forEach(function(key){
-      var opt=document.createElement("option");opt.value=key;opt.textContent=key.replace(/_/g," ").toUpperCase();$("event").appendChild(opt);
+      var opt=document.createElement("option");opt.value=key;opt.textContent=["settings_update","dhan_health","startup"].includes(key)?defs[key].title:key.replace(/_/g," ").toUpperCase();$("event").appendChild(opt);
     });$("event").value=current;
     emojiList.filter(Boolean).forEach(function(e){
       var b=document.createElement("button");b.type="button";b.title="Use as heading emoji";b.textContent=e;b.onclick=function(){cfg().title_emoji=e;drawType()};$("emoji-palette").appendChild(b);
@@ -266,7 +288,14 @@ $("export").onclick=async function(){
 $("import").onclick=function(){$("import-json").hidden=false;$("apply-import").hidden=false;$("import-json").focus()};
 $("apply-import").onclick=function(){
   try{var candidate=JSON.parse($("import-json").value);
-      if(!candidate||candidate.version!==1||!candidate.templates||Object.keys(candidate.templates).length!==Object.keys(defs).length)throw Error("Wrong template schema");
+      if(!candidate||candidate.version!==1||!candidate.templates||
+         Object.keys(candidate.templates).some(function(k){return !Object.prototype.hasOwnProperty.call(defs,k)}))throw Error("Wrong template schema");
+      Object.keys(defs).forEach(function(k){
+        if(!Object.prototype.hasOwnProperty.call(candidate.templates,k)&&
+           ["settings_update","dhan_health","startup"].includes(k)){
+          candidate.templates[k]=clone(original.templates[k]);
+        }
+      });
       state=candidate;drawType();feedback("Imported into preview; select Save to validate and apply.");}
   catch(e){feedback("Invalid import: "+e.message,true)}
 };

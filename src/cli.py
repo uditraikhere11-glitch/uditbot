@@ -421,6 +421,8 @@ def format_morning_health_report(
     next_close_ts = next_close_dt.timestamp()
     next_open_str = next_open_dt.strftime("%a %d %b %H:%M IST")
     next_close_str = next_close_dt.strftime("%a %d %b %H:%M IST")
+    next_day = cur_date + datetime.timedelta(days=1)
+    next_day_market_closed = next_day.weekday() >= 5 or (cal_ok and next_day in holidays_set)
 
     next_session_expiry_ok = False
     if effective_expired:
@@ -455,6 +457,18 @@ def format_morning_health_report(
         and int(unresolved_intents_count or 0) == 0
         and int(unprotected_positions_count or 0) == 0
     )
+    # Reporting-only exception: tomorrow has no exchange session and today's
+    # renewal, identity, funds, calendar and local safety checks all passed.
+    # The later session is still unverified, NOT ready for trading today.
+    holiday_no_action = bool(
+        not ready and next_day_market_closed and cal_ok
+        and auth_ok and token_renewed is True
+        and parsed_exp_ts is not None and parsed_exp_ts < next_open_ts
+        and funds_verified and not fallback_funds and master_loaded
+        and not is_stopped and reconciliation_ok
+        and int(unresolved_intents_count or 0) == 0
+        and int(unprotected_positions_count or 0) == 0
+    )
     token_line = "✅ VERIFIED" if auth_ok else "❌ FAILED"
     if raw_id_status == "VERIFIED" and not effective_expired:
         # Identity is a distinct broker-profile fact, not a synonym for
@@ -476,8 +490,16 @@ def format_morning_health_report(
 
     master_line = "✅ OK" if master_loaded else "⚠️ WARNING (UNAVAILABLE / STALE)"
     stop_line = "🔴 ACTIVE — NEW ENTRIES BLOCKED" if is_stopped else "✅ INACTIVE"
-    readiness_line = "✅ VERIFIED CHECKS" if ready else "⚠️ REVIEW REQUIRED"
-    overall_line = "✅ SUCCESS" if ready else "❌ ACTION REQUIRED"
+    readiness_line = (
+        "✅ VERIFIED CHECKS" if ready else
+        "⏳ RENEWAL PENDING (NEXT DAY MARKET CLOSED)" if holiday_no_action else
+        "⚠️ REVIEW REQUIRED"
+    )
+    overall_line = (
+        "✅ SUCCESS" if ready else
+        "✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED" if holiday_no_action else
+        "❌ ACTION REQUIRED"
+    )
     lines = (
         "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
         f"🤖 Instance: <b>{name}</b> | 🕒 {ist:%d %b %Y, %H:%M:%S} IST",
@@ -508,7 +530,19 @@ def format_morning_health_report(
         lines = lines[:-2] + (
             "🧾 Reconciliation: ⚠️ NEW ENTRIES BLOCKED — " + html.escape(detail),
         ) + lines[-2:]
-    return "\n".join(lines)
+    # The full authoritative status block is kept immutable in custom cards.
+    # In particular, the designer cannot hide an expired token, STOP or failed renewal.
+    from src.notifier.message_designer import render as render_designed_message
+    custom = render_designed_message(
+        "dhan_health",
+        {
+            "instance": str(getattr(cfg, "instance_name", "AuditBot") or "AuditBot"),
+            "event_time": ist.strftime("%d %b %Y, %H:%M IST"),
+            "mode": str(getattr(configured_mode, "value", configured_mode)),
+        },
+        list(lines)[1:], getattr(cfg, "data_dir", None),
+    )
+    return custom if custom is not None else "\n".join(lines)
 
 
 format_after_market_health_report = format_morning_health_report
@@ -540,8 +574,21 @@ def format_startup_online_card(
     unprot_n = int(unprotected_positions_count or 0)
     entries_open = bool(reconciliation_ok and not is_stopped and unres_n == 0 and unprot_n == 0)
 
+    def _styled_startup(card: str) -> str:
+        from src.notifier.message_designer import render as render_designed_message
+        custom = render_designed_message(
+            "startup",
+            {
+                "instance": str(getattr(cfg, "instance_name", "AuditBot") or "AuditBot"),
+                "mode": str(getattr(configured_mode, "value", configured_mode)),
+                "channels": allowed_chats_count,
+            },
+            card.splitlines()[1:], getattr(cfg, "data_dir", None),
+        )
+        return custom if custom is not None else card
+
     if entries_open:
-        return (
+        return _styled_startup((
             f"🟢 <b>{name} Online</b>\n"
             f"Mode: <code>{mode}</code>\n"
             f"Listener: <code>LISTENER RUNNING</code> ({allowed_chats_count} channels{channel_note})\n"
@@ -549,7 +596,7 @@ def format_startup_online_card(
             f"Protection Watcher: <code>ACTIVE (VERIFIED)</code>\n"
             f"New Entries Gate: <code>OPEN (ACCEPTING SIGNALS)</code>\n"
             f"Status: Actively listening for trade signals"
-        )
+        ))
 
     rec_status = f"RECONCILIATION PENDING ({unres_n})" if (not reconciliation_ok or unres_n > 0) else "HEALTHY"
     if reconciliation_msg:
@@ -559,7 +606,7 @@ def format_startup_online_card(
         if (unprot_n > 0 or "unprotected" in str(reconciliation_msg or "").lower())
         else "ACTIVE (SUPERVISING)"
     )
-    return (
+    return _styled_startup((
         f"🟡 <b>{name} Online — New Entries Blocked</b>\n"
         f"Mode: <code>{mode}</code>\n"
         f"Listener: <code>LISTENER RUNNING</code> ({allowed_chats_count} channels{channel_note})\n"
@@ -567,7 +614,7 @@ def format_startup_online_card(
         f"Protection Watcher: <code>{prot_status}</code>\n"
         f"New Entries Gate: <code>NEW ENTRIES BLOCKED</code>\n"
         f"Status: Listener running; new trading entries are BLOCKED until reconciliation/protection is verified"
-    )
+    ))
 
 
 
@@ -595,6 +642,7 @@ def dispatch_morning_health_report_once(
     text_up = str(report or "").upper()
     is_ready_report = (
         "OVERALL RESULT: ✅ SUCCESS" in text_up
+        or "OVERALL RESULT: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED" in text_up
         or "✅ CHECKS PASSED" in text_up
         or ("<B>RECOVERED</B>" in text_up and "FAILED" not in text_up)
     ) and not any(marker in text_up for marker in (
@@ -856,7 +904,10 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     )
     auth_check_label = "PASS" if auth_check_ok else "FAIL"
     readiness_label = "VERIFIED_CHECKS" if next_session_ready else "REVIEW_REQUIRED"
-    overall_ok = bool(auth_check_ok and next_session_ready)
+    holiday_no_action = (
+        "Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED" in report
+    )
+    overall_ok = bool(auth_check_ok and (next_session_ready or holiday_no_action))
     summary = (
         f"AUTH_CHECK={auth_check_label}, "
         f"NEXT_SESSION_READINESS={readiness_label}, "
