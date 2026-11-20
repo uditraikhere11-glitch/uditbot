@@ -5,6 +5,7 @@ Never contacts Dhan/Telegram or accesses production configuration/databases.
 """
 import datetime as dt
 import json
+from html import unescape
 import os
 import tempfile
 import unittest
@@ -309,7 +310,7 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         self.assertIn("Changed Settings (7):", message)
         self.assertIn("• Equity SL: 3% → 4%", message)
         self.assertIn("• F&amp;O Target: 3% → 5%", message)
-        self.assertIn("• F&O Target: 3% → 5%", __import__("html").unescape(message))
+        self.assertIn("• F&O Target: 3% → 5%", unescape(message))
         for secret in (
             "OLD_TOTP_SECRET", "NEW_TOTP_SECRET", "9000000001",
             "9000000002", "123456", "456789", "OLD_BOT_TOKEN",
