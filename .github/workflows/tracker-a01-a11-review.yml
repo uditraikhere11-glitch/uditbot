@@ -69,5 +69,13 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/tests/ci_offline:${{ github.workspace }}
         run: |
-          python -c "import socket; exec('try:\\n socket.getaddrinfo(\\\"api.dhan.co\\\", 443)\\n raise SystemExit(\\\"External DNS guard missing\\\")\\nexcept socket.gaierror as exc:\\n assert \\\"OFFLINE_TEST\\\" in str(exc)')"
+          python - <<'PY'
+          import socket
+          try:
+              socket.getaddrinfo("api.dhan.co", 443)
+          except socket.gaierror as exc:
+              assert "OFFLINE_TEST" in str(exc), str(exc)
+          else:
+              raise SystemExit("External DNS guard is not installed")
+          PY
           python -m unittest discover -s tests -t . -p 'test_*.py' -q
