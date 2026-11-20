@@ -202,7 +202,13 @@ var mandatory = {
   partial:["⏳ Status: Partially Executed","Filled: 25/75","🛡️ Protection: Pending Broker Verification"],
   final:["❌ Status: Order CANCELLED","Filled: 0/75"],
   unverified:["⚠️ Status: Fill Verification Pending","No confirmed execution yet."],
-  settings_update:["Trading bot: RESTARTED","Configuration: VERIFIED"],
+  settings_update:[
+    "Trading bot: Restarted",
+    "Configuration: Verified",
+    "Changed Settings (2):",
+    "• Equity SL: 3% → 4%",
+    "• F&O Target: 3% → 5%"
+  ],
   dhan_health:[
     "🔑 Dhan authentication: ✅ VERIFIED",
     "🔄 Token renewal: ✅ SUCCESS",
@@ -216,10 +222,10 @@ var mandatory = {
   ],
   startup:[
     "Mode: LIVE",
-    "Listener: LISTENER RUNNING — 3 authorized channels",
-    "Reconciliation: HEALTHY",
-    "Protection Watcher: ACTIVE (VERIFIED)",
-    "New Entries Gate: OPEN (ACCEPTING SIGNALS)"
+    "Listener: Active 2 channels",
+    "Reconciliation: Healthy",
+    "Protection Watcher: Active and Verified",
+    "New Entries Gate: Open"
   ]
 };
 function preview(){
@@ -229,6 +235,16 @@ function preview(){
   x.fields.forEach(function(f){
     var val=samples[f.key];
     if(val===undefined||val===null||val==="")return;
+    if(current==="settings_update"&&f.key==="changed_keys"){
+      for(var i=0;i<locked.length;i++){
+        if(locked[i].startsWith("Changed Settings (")){
+          locked[i]=((f.emoji&&f.emoji!=="•")?f.emoji+" ":"")+
+            (f.label||"Changed Settings")+" "+locked[i].slice("Changed Settings ".length);
+          break;
+        }
+      }
+      return;
+    }
     if(current==="startup"&&(f.key==="mode"||f.key==="channels")){
       var prefix=f.key==="mode"?"Mode: ":"Listener: ";
       for(var i=0;i<locked.length;i++){
