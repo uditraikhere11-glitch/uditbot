@@ -159,7 +159,7 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         )
         self.assertTrue(card.startswith("🚀 <b>Custom startup</b>"))
         self.assertIn("New Entries Gate: Blocked", card)
-        self.assertIn("Reconciliation: Reconciliation Pending (1)", card)
+        self.assertIn("Reconciliation: Pending (1)", card)
         self.assertIn("Protection Watcher: Unverified", card)
 
     def test_startup_default_remains_unchanged_when_disabled(self):
