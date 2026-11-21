@@ -25,6 +25,10 @@ def main():
     parser.add_argument("--shadow-db",required=True,
                         help="Separate private path ending .shadow.sqlite3")
     parser.add_argument("--max-messages",type=int,default=1000)
+    parser.add_argument("--max-sessions",type=int,default=1,
+                        help="Bounded read-only observation sessions (default one)")
+    parser.add_argument("--idle-timeout-sec",type=float,default=75.0)
+    parser.add_argument("--max-backoff-sec",type=float,default=30.0)
     parser.add_argument("--explicit-readonly-network-opt-in",action="store_true")
     args=parser.parse_args()
     if not args.explicit_readonly_network_opt_in:
@@ -39,8 +43,12 @@ def main():
         owner=JournalOwnership(args.journal)
         with ShadowEventLedger(args.shadow_db,account_id=account) as ledger:
             observer=ShadowOrderObserver(account,owner,shadow_ledger=ledger)
-            report=asyncio.run(DhanShadowWebSocket(observer).run_once(
-                access_token=token,network_opt_in=True,max_messages=args.max_messages,
+            report=asyncio.run(DhanShadowWebSocket(observer).run_supervised(
+                access_token=token,network_opt_in=True,
+                max_sessions=args.max_sessions,
+                max_messages_per_session=args.max_messages,
+                idle_timeout_sec=args.idle_timeout_sec,
+                max_backoff_sec=args.max_backoff_sec,
             ))
             print(json.dumps(report,indent=2))
     except Exception as exc:
