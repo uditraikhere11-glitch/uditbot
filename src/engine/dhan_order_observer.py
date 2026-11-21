@@ -12,10 +12,12 @@ missed order update. No stream observation may clear a reconciliation gate.
 """
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import math
 import sqlite3
 from typing import Any, Dict, Optional, Tuple
 
@@ -219,13 +221,19 @@ class DhanShadowWebSocket:
         self.observer = observer
 
     async def run_once(self, *, access_token: str, network_opt_in: bool = False,
-                       max_messages: int = 100000) -> dict:
+                       max_messages: int = 100000,
+                       idle_timeout_sec: float = 75.0) -> dict:
         if network_opt_in is not True:
             raise PermissionError("read-only network operation requires explicit opt-in")
         if not isinstance(access_token, str) or not access_token:
             raise ValueError("a current Dhan access token is required")
         if type(max_messages) is not int or not 1 <= max_messages <= 1000000:
             raise ValueError("invalid max_messages")
+        if (isinstance(idle_timeout_sec, bool)
+                or not isinstance(idle_timeout_sec, (int, float))
+                or not math.isfinite(idle_timeout_sec)
+                or not 1 <= idle_timeout_sec <= 600):
+            raise ValueError("idle timeout must be finite 1..600 seconds")
         # Import inside the explicit opt-in boundary. Never use broker mutation APIs.
         import websockets
         auth = {
@@ -243,7 +251,12 @@ class DhanShadowWebSocket:
             ) as ws:
                 await ws.send(json.dumps(auth, separators=(",", ":")))
                 for _ in range(max_messages):
-                    message = await ws.recv()
+                    # A live TCP/WebSocket with functioning ping/pong can
+                    # still have a stale application feed. Explicit silence
+                    # is a stream gap: never infer that no orders changed.
+                    message = await asyncio.wait_for(
+                        ws.recv(), timeout=idle_timeout_sec
+                    )
                     try:
                         raw = json.loads(message)
                     except (ValueError, TypeError):
@@ -258,3 +271,58 @@ class DhanShadowWebSocket:
             # session, unless REST reconciliation independently proves state.
             self.observer.connection_lost("SESSION_END")
         return self.observer.summary()
+
+    async def run_supervised(self, *, access_token: str,
+                             network_opt_in: bool = False,
+                             max_sessions: int = 3,
+                             max_messages_per_session: int = 1000,
+                             idle_timeout_sec: float = 75.0,
+                             initial_backoff_sec: float = 1.0,
+                             max_backoff_sec: float = 30.0) -> dict:
+        """Operator opt-in reconnects with bounded exponential backoff.
+
+        The observer never becomes authoritative, even after receiving many
+        status updates. Reconnect cannot establish missed fill information;
+        a separate broker REST/tradebook reconciliation remains mandatory.
+        There is no infinite reconnect loop or automatic token refresh.
+        """
+        if network_opt_in is not True:
+            raise PermissionError("supervised read-only network requires explicit opt-in")
+        if type(max_sessions) is not int or not 1 <= max_sessions <= 100:
+            raise ValueError("max_sessions must be in 1..100")
+        for value in (initial_backoff_sec, max_backoff_sec):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0.1 <= value <= 300):
+                raise ValueError("reconnect backoff must be finite 0.1..300")
+        if initial_backoff_sec > max_backoff_sec:
+            raise ValueError("initial backoff cannot exceed maximum backoff")
+        # Validate connection arguments even before the first network call.
+        if type(max_messages_per_session) is not int or not 1 <= max_messages_per_session <= 1000000:
+            raise ValueError("invalid max_messages_per_session")
+        if (isinstance(idle_timeout_sec, bool)
+                or not isinstance(idle_timeout_sec, (int, float))
+                or not math.isfinite(idle_timeout_sec)
+                or not 1 <= idle_timeout_sec <= 600):
+            raise ValueError("invalid idle timeout")
+        if not isinstance(access_token, str) or not access_token:
+            raise ValueError("a current Dhan access token is required")
+        sessions = 0
+        for session_no in range(max_sessions):
+            if session_no:
+                delay = min(max_backoff_sec, initial_backoff_sec * (2 ** (session_no - 1)))
+                await asyncio.sleep(delay)
+            # run_once reports *every* session end as a reconciliation gap;
+            # no sessions in this loop can ever reset that fact.
+            await self.run_once(
+                access_token=access_token, network_opt_in=True,
+                max_messages=max_messages_per_session,
+                idle_timeout_sec=idle_timeout_sec,
+            )
+            sessions += 1
+        result = self.observer.summary()
+        result["completed_observation_sessions"] = sessions
+        result["reconnect_attempts"] = max(0, sessions - 1)
+        result["may_authorize_orders"] = False
+        result["may_modify_reconciliation_gate"] = False
+        result["may_assert_verified_fills"] = False
+        return result
