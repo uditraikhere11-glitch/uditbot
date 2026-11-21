@@ -118,6 +118,50 @@ class TestOrderedIngress(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded,[1])
         self.assertEqual(disp.metrics()["completed"],1)
 
+    async def test_cancellation_while_waiting_for_capacity_cannot_lose_signal(self):
+        # Telethon callback cancellation used to remove a blocked Queue.put()
+        # producer without durable admission, silently dropping a valid signal.
+        seen=[]
+        def worker(*,number):
+            time.sleep(0.005)
+            seen.append(number)
+            return number
+        disp=OrderedSignalDispatcher(worker,max_pending=1)
+        await disp.start()
+        tasks=[]
+        for i in range(10):
+            tasks.append(asyncio.create_task(disp.submit(number=i)))
+            await asyncio.sleep(0)
+        self.assertGreater(disp._pending_admissions,1)
+        tasks[-1].cancel()  # most recent admission is still waiting
+        with self.assertRaises(asyncio.CancelledError):
+            await tasks[-1]
+        await asyncio.wait_for(disp.close(),timeout=5)
+        self.assertEqual(await asyncio.gather(*tasks[:-1]),list(range(9)))
+        self.assertEqual(seen,list(range(10)))
+        report=disp.metrics()
+        self.assertEqual(report["accepted"],10)
+        self.assertEqual(report["completed"],10)
+        self.assertEqual(report["detached_callbacks"],1)
+        self.assertEqual(report["capacity_drop_count"],0)
+
+    async def test_fifo_during_repeated_saturation_and_shutdown(self):
+        seen=[]
+        def worker(*,number):
+            time.sleep(0.002)
+            seen.append(number)
+            return number
+        disp=OrderedSignalDispatcher(worker,max_pending=1)
+        await disp.start()
+        tasks=[]
+        for i in range(30):
+            tasks.append(asyncio.create_task(disp.submit(number=i)))
+            await asyncio.sleep(0)
+        await asyncio.wait_for(disp.close(),timeout=5)
+        self.assertEqual(await asyncio.gather(*tasks),list(range(30)))
+        self.assertEqual(seen,list(range(30)))
+        self.assertEqual(disp.metrics()["max_observed_backlog"],1)
+
     async def test_misconfiguration_is_rejected(self):
         for v in (0,-1,1.5,True,20000):
             with self.subTest(v=v), self.assertRaises(ValueError):
