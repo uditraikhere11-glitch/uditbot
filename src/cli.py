@@ -424,13 +424,6 @@ def format_morning_health_report(
     next_day = cur_date + datetime.timedelta(days=1)
     next_day_market_closed = next_day.weekday() >= 5 or (cal_ok and next_day in holidays_set)
 
-    # Display calendar facts even when an unrelated authentication check fails.
-    from src.notifier.market_calendar_status import format_market_calendar_lines
-    calendar_lines = format_market_calendar_lines(
-        today=cur_date, next_session_date=next_session_date,
-        calendar_verified=cal_ok, holidays_set=holidays_set,
-    )
-
     next_session_expiry_ok = False
     if effective_expired:
         expiry_line = f"❌ EXPIRED (<code>{html.escape(clean_exp or 'expired')}</code>)"
@@ -515,7 +508,6 @@ def format_morning_health_report(
         f"⏳ Token expiration: {expiry_line}",
         f"💰 Broker funds: {funds_line}",
         f"📚 Scrip master: {master_line}",
-        *calendar_lines,
         f"⚙️ Trading mode: <b>{mode}</b>",
         f"🛡️ Emergency STOP: {stop_line}",
         f"🚦 Next trading session readiness: {readiness_line}",
