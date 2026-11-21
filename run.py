@@ -65,6 +65,7 @@ if len(sys.argv) > 1 and sys.argv[1] in (
 from src.main import TradingBotPipeline
 from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock
+from src.engine.telegram_event_metadata import source_name_for_event
 from src.notifier.outbox_worker import OutboxWorker
 from src.notifier.dhan_response import configure_dhan_response_group, send_telethon_notification
 from src.engine.config_manager import compute_config_version
@@ -202,8 +203,9 @@ async def main():
             text = event.message.message or ""
             if not text.strip():
                 return
-            chat = await event.get_chat()
-            source_name = getattr(chat, "title", str(event.chat_id))
+            # Use Telethon's already-cached chat whenever present; preserve
+            # the original async lookup path when it is not yet cached.
+            source_name = await source_name_for_event(event)
             msg_ts = event.message.date.timestamp() if hasattr(event.message, "date") and event.message.date else time.time()
 
             print(f"📩 [{source_name}] New Signal: {text[:80]}")
