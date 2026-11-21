@@ -34,6 +34,7 @@ from src.parsers.equity_parser import parse_equity_regex, filter_equity_message
 from src.parsers.fno_parser import parse_fno_regex, looks_like_option
 from src.parsers.gemini_fallback import parse_fno_gemini_sync, parse_equity_gemini_sync
 from src.parsers.brain import parse_signal_brain
+from src.engine.deterministic_preparse import DeterministicPreparse
 from src.parsers.duplicate_filter import DuplicateFilter
 from src.instruments.resolver import InstrumentResolver
 from src.engine.sizer import (
@@ -236,6 +237,7 @@ class TradingBotPipeline:
         source_name: str = "Test group",
         signal_received_at: Optional[float] = None,
         callback_monotonic_ns: Optional[int] = None,
+        preparsed_brain: Optional[DeterministicPreparse] = None,
     ) -> ValidationResult:
         # Observe worker scheduling + pipeline-lock wait without changing the
         # serialized risk/commitment boundary or broker order behavior.
@@ -332,15 +334,28 @@ class TradingBotPipeline:
                 self.dispatch_notification("TRADE_LOG", log_card)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
 
-            decision = parse_signal_brain(
-                text=text,
-                channel_id=channel_id,
-                message_id=message_id,
-                msg_timestamp=msg_ts,
-                max_age_sec=self.cfg.max_message_age_sec,
-                current_time=injected_clock if injected_clock is not None else now,
-                journal_db=self.db,
-            )
+            # Optional deterministic REGEX hint was computed without a DB,
+            # network, AI or broker call. Every source/age/message claim above
+            # remains authoritative and serialized. Non-REGEX hints ALWAYS
+            # go through the original full BRAIN parser with adaptive/AI.
+            if (isinstance(preparsed_brain, DeterministicPreparse)
+                    and preparsed_brain.usable_for(
+                        text=text, channel_id=channel_id, message_id=message_id,
+                        msg_timestamp=msg_timestamp,
+                        max_age_sec=self.cfg.max_message_age_sec,
+                        injected_clock=injected_clock,
+                    )):
+                decision = preparsed_brain.decision
+            else:
+                decision = parse_signal_brain(
+                    text=text,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    msg_timestamp=msg_ts,
+                    max_age_sec=self.cfg.max_message_age_sec,
+                    current_time=injected_clock if injected_clock is not None else now,
+                    journal_db=self.db,
+                )
             prov_kwargs = {
                 "parser_version": decision.parser_version,
                 "parse_source": decision.source,
