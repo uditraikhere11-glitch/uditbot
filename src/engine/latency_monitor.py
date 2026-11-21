@@ -362,6 +362,10 @@ class LatencyMonitor:
         self.telegram_to_ack_latencies_ms: List[float] = []
         self.ack_to_fill_latencies_ms: List[float] = []
         self.fill_to_protection_latencies_ms: List[float] = []
+        # Non-authoritative in-process ingress telemetry. Never used to decide
+        # whether a broker order, STOP, or reconciliation is permitted.
+        self.ingress_to_processing_ms: List[float] = []
+        self.pipeline_lock_wait_ms: List[float] = []
         self.quote_ages_sec: List[float] = []
         self.quote_age_unknown_count: int = 0
         self.yahoo_success_count: int = 0
@@ -644,6 +648,19 @@ class LatencyMonitor:
         frac = idx - lo
         return round(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac, 2)
 
+    def record_preprocessing_wait(self, *, total_ms: float, lock_ms: float) -> None:
+        """Record elapsed ingress and lock delays without DB or network I/O."""
+        if not (math.isfinite(total_ms) and math.isfinite(lock_ms)
+                and 0.0 <= lock_ms <= total_ms):
+            return
+        with self._lock:
+            self.ingress_to_processing_ms.append(total_ms)
+            self.pipeline_lock_wait_ms.append(lock_ms)
+            if len(self.ingress_to_processing_ms) > self.max_samples:
+                self.ingress_to_processing_ms.pop(0)
+            if len(self.pipeline_lock_wait_ms) > self.max_samples:
+                self.pipeline_lock_wait_ms.pop(0)
+
     def get_summary(self) -> Dict[str, Any]:
         with self._lock:
             yf = sorted(self.yahoo_http_latencies_ms)
@@ -656,6 +673,11 @@ class LatencyMonitor:
             q_over_15 = sum(1 for a in self.quote_ages_sec if a > 15.0)
 
             return {
+                "queue_samples": len(self.ingress_to_processing_ms),
+                "p50_ingress_to_processing_ms": self._percentile(sorted(self.ingress_to_processing_ms), 50.0),
+                "p95_ingress_to_processing_ms": self._percentile(sorted(self.ingress_to_processing_ms), 95.0),
+                "p99_ingress_to_processing_ms": self._percentile(sorted(self.ingress_to_processing_ms), 99.0),
+                "p95_pipeline_lock_wait_ms": self._percentile(sorted(self.pipeline_lock_wait_ms), 95.0),
                 "yahoo_requests_total": total_yf,
                 "yahoo_success_count": self.yahoo_success_count,
                 "yahoo_failure_count": self.yahoo_failure_count,
@@ -689,6 +711,7 @@ class LatencyMonitor:
             f"[*] Yahoo HTTP Latency  : Avg={s['avg_yahoo_http_ms']:.1f}ms | Median={s['median_yahoo_http_ms']:.1f}ms | P95={s['p95_yahoo_http_ms']:.1f}ms | Max={s['max_yahoo_http_ms']:.1f}ms",
             f"[*] Quote Age Buckets   : <=2s: {q_dist['lte_2s']} | 2-5s: {q_dist['2s_to_5s']} | 5-15s: {q_dist['5s_to_15s']} | >15s: {q_dist['gt_15s']} | Unknown: {q_dist['unknown']}",
             f"[*] Stage Intervals     : TG->CMP Avg={s['avg_telegram_to_cmp_ms']:.1f}ms | TG->Broker Ack Avg={s['avg_telegram_to_ack_ms']:.1f}ms | Ack->Fill Avg={s['avg_ack_to_fill_ms']:.1f}ms | Fill->Prot Avg={s['avg_fill_to_protection_ms']:.1f}ms",
+            f"[*] Ingress Queue       : N={s['queue_samples']} | Preprocess P50/P95/P99={s['p50_ingress_to_processing_ms']:.1f}/{s['p95_ingress_to_processing_ms']:.1f}/{s['p99_ingress_to_processing_ms']:.1f}ms | Lock P95={s['p95_pipeline_lock_wait_ms']:.1f}ms (in-memory only)",
         ]
         if s["rejection_reasons"]:
             top_rej = ", ".join(f"{k}({v})" for k, v in list(s["rejection_reasons"].items())[:4])
