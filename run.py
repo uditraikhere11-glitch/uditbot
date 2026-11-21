@@ -67,6 +67,7 @@ from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock
 from src.engine.telegram_event_metadata import source_name_for_event
 from src.engine.deterministic_preparse import prepare_deterministic_buy
+from src.engine.ordered_ingress import OrderedSignalDispatcher
 from src.notifier.outbox_worker import OutboxWorker
 from src.notifier.dhan_response import configure_dhan_response_group, send_telethon_notification
 from src.engine.config_manager import compute_config_version
@@ -114,6 +115,7 @@ session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else ses
 
 async def main():
     outbox_worker = None
+    ordered_dispatcher = None
     client = None
     try:
         # Construct Telethon inside asyncio.run's *running* event loop.
@@ -191,6 +193,17 @@ async def main():
             )
             await asyncio.to_thread(pipeline.dispatch_notification, "SYSTEM_STARTUP", startup_card)
 
+        # OFF by default. A bounded single worker preserves UditBot's sole
+        # serialized order authority and prevents unbounded executor queuing.
+        if os.environ.get("AUDITBOT_ORDERED_INGRESS", "0") == "1":
+            pending_bound = int(os.environ.get(
+                "AUDITBOT_ORDERED_INGRESS_MAX_PENDING", "64"
+            ))
+            ordered_dispatcher = OrderedSignalDispatcher(
+                pipeline.process_raw_message, max_pending=pending_bound
+            )
+            await ordered_dispatcher.start()
+            print("📥 Ordered ingress enabled (single broker-execution authority)")
         print(f"\n⚡ Listening for live signals on {len(allowed_chats)} authorized channels...\n")
 
         @client.on(events.NewMessage(chats=allowed_chats))
@@ -230,9 +243,9 @@ async def main():
                         "Optional deterministic preparse failed; using canonical parser",
                         exc_info=False,
                     )
-            # Original serialized risk/commit and broker execution remain.
-            result = await asyncio.to_thread(
-                pipeline.process_raw_message,
+            # Both paths preserve canonical claim/risk/broker serialization.
+            # A bounded FIFO worker is optional and never silently drops.
+            execution_kwargs = dict(
                 text=text,
                 channel_id=event.chat_id,
                 message_id=event.id,
@@ -242,6 +255,12 @@ async def main():
                 callback_monotonic_ns=callback_monotonic_ns,
                 preparsed_brain=preparse,
             )
+            if ordered_dispatcher is not None:
+                result = await ordered_dispatcher.submit(**execution_kwargs)
+            else:
+                result = await asyncio.to_thread(
+                    pipeline.process_raw_message, **execution_kwargs
+                )
             print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
 
             if cfg.log_group_id and not getattr(result, "log_card", None):
@@ -294,14 +313,18 @@ async def main():
         await client.run_until_disconnected()
     finally:
         try:
-            if outbox_worker:
-                outbox_worker.stop()
+            if ordered_dispatcher is not None:
+                await ordered_dispatcher.close()
         finally:
             try:
-                if client is not None:
-                    await client.disconnect()
+                if outbox_worker:
+                    outbox_worker.stop()
             finally:
-                lock.release()
+                try:
+                    if client is not None:
+                        await client.disconnect()
+                finally:
+                    lock.release()
 
 
 if __name__ == "__main__":
