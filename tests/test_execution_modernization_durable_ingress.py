@@ -52,8 +52,10 @@ class TestDurableIngressAudit(unittest.TestCase):
         self.assertFalse(report["automatic_signal_replay_allowed"])
         self.assertFalse(report["broker_fills_verified"])
         self.assertNotIn("SYNTHETIC",str(report))
-        self.assertNotIn(str(ARGS["message_id"]),str(report))
         self.assertNotIn(str(ARGS["channel_id"]),str(report))
+        self.assertFalse(
+            {"channel_id","message_id","raw_hash","account_id"}.intersection(report)
+        )
 
     def test_mark_return_only_once_and_reopen(self):
         with DurableIngressAudit(str(self.path),account_id="SYNTHETIC") as d:
