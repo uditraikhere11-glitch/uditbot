@@ -49,6 +49,7 @@ class OrderedSignalDispatcher:
         self.accepted=0
         self.completed=0
         self.processing_failures=0
+        self.detached_callbacks=0
         self.max_observed_backlog=0
         self.queue_wait_ms: list[float]=[]
 
@@ -60,31 +61,56 @@ class OrderedSignalDispatcher:
             self._run(),name="uditbot-ordered-ingress"
         )
 
-    async def submit(self, **kwargs):
-        if not self._started or self._closed:
-            raise IngressClosed("dispatcher is not accepting new messages")
-        loop=asyncio.get_running_loop()
-        request=_Request(dict(kwargs),loop.create_future(),time.perf_counter_ns())
-        # Await capacity, but count unfinished admissions separately so a
-        # shutdown cannot cancel the worker before a waiting put is handled.
-        self._pending_admissions+=1
-        self._admissions_drained.clear()
+    @staticmethod
+    def _consume_detached_result(future: asyncio.Future) -> None:
+        """Avoid unhandled result warnings when Telethon canceled its callback."""
+        if not future.cancelled():
+            try:
+                future.exception()
+            except Exception:
+                pass
+
+    async def _admit(self, request: _Request) -> None:
         try:
+            # FIFO is enforced from the moment a callback enters admission;
+            # blocked producers cannot be leapfrogged by later signals.
             async with self._admission_lock:
                 await self.queue.put(request)
                 self.accepted+=1
                 self.max_observed_backlog=max(
                     self.max_observed_backlog,self.queue.qsize()
                 )
+        except Exception as error:
+            if not request.future.done():
+                request.future.set_exception(
+                    RuntimeError("Ordered ingress admission failed: "
+                                 + type(error).__name__)
+                )
         finally:
             self._pending_admissions-=1
             if self._pending_admissions==0:
                 self._admissions_drained.set()
+
+    async def submit(self, **kwargs):
+        if not self._started or self._closed:
+            raise IngressClosed("dispatcher is not accepting new messages")
+        loop=asyncio.get_running_loop()
+        request=_Request(dict(kwargs),loop.create_future(),time.perf_counter_ns())
+        self._pending_admissions+=1
+        self._admissions_drained.clear()
+        # Cancellation of a Telegram callback must never abort an admission
+        # it has already started. Run it in a separate, shielded task; the
+        # dispatcher drains all accepted requests on orderly shutdown.
+        admission=asyncio.create_task(
+            self._admit(request),name="uditbot-order-admission"
+        )
         try:
+            await asyncio.shield(admission)
             return await asyncio.shield(request.future)
         except asyncio.CancelledError:
-            # Once queued, processing still proceeds. Dropping an acknowledged
-            # submission because the callback task was canceled is unsafe.
+            self.detached_callbacks+=1
+            request.future.add_done_callback(self._consume_detached_result)
+            # The signal is STILL enqueued and processed once; do not retry.
             raise
 
     async def _run(self):
@@ -148,6 +174,7 @@ class OrderedSignalDispatcher:
             "completed":self.completed,
             "pending":self.queue.qsize(),
             "processing_failures":self.processing_failures,
+            "detached_callbacks":self.detached_callbacks,
             "max_observed_backlog":self.max_observed_backlog,
             "queue_wait_p50_ms":pct(50),
             "queue_wait_p95_ms":pct(95),
