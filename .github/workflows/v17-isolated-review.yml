@@ -1,0 +1,49 @@
+name: V17 isolated source and integration review
+on:
+  push:
+    branches:
+      - dev/uditbot-v17-v9-fidelity-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUDITBOT_TEST_ISOLATION: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONHASHSEED: "0"
+    steps:
+      - name: Checkout exact development commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Make source-only offline audit archive
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          import json, subprocess
+          out=Path("v17-audit-source.zip")
+          exclude={".git",".env","data","logs","__pycache__",".venv","venv","secrets"}
+          with ZipFile(out,"w",ZIP_DEFLATED) as z:
+              for p in Path(".").rglob("*"):
+                  if p.is_file() and not set(p.parts)&exclude and p!=out and p.stat().st_size<3000000:
+                      z.write(p,p.as_posix())
+          Path("v17-audit-source-manifest.json").write_text(json.dumps({
+              "git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
+              "archive":out.name,"scope":"Source-only; no runtime secrets or local VM data"
+          },indent=2))
+          PY
+      - name: Upload source archive for isolated integration
+        uses: actions/upload-artifact@v4
+        with:
+          name: UditBot-V17-Full-Source-Checkout
+          path: |
+            v17-audit-source.zip
+            v17-audit-source-manifest.json
+          if-no-files-found: error
+          retention-days: 7
