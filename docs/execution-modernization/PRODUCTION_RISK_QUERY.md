@@ -11,8 +11,8 @@ The candidate now:
 1. Retrieves today's LIVE broker order IDs (same semantics as before).
 2. Groups fills by those IDs only, using parameterized batches of 400.
 3. Adds idempotent indexes on `fills(broker_order_id)`,
-   `orders(trading_mode,created_at)`, and
-   `order_intents(state,created_at)` during existing journal initialization.
+   `orders(trading_mode,created_at)` during existing journal initialization.
+   No additional index is added to the order-intent write path.
 4. Converts a previously swallowed fills-table SQLite read error into an
    exception so the existing LIVE RiskManager fails closed.
 5. Uses `EXISTS` with a broker-order-ID equality to count accepted partially
