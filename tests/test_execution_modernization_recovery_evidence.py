@@ -101,6 +101,13 @@ class TestRecoveryEvidence(unittest.TestCase):
         self.assertEqual(r.reason_code,"CONTRADICTORY_EXCHANGE_TRADE_ID")
         self.assert_non_authoritative(r)
 
+    def test_exchange_trade_id_cannot_belong_to_two_broker_orders(self):
+        other={**TRADE,"orderId":"OTHER-OID"}
+        order={**ORDER,"orderStatus":"PART_TRADED","filledQty":2}
+        r=run(order=order,trades=[TRADE,other])
+        self.assertEqual(r.reason_code,"EXCHANGE_TRADE_ID_REUSED_ACROSS_ORDERS")
+        self.assert_non_authoritative(r)
+
     def test_lost_ack_book_traded_but_missing_trades_is_unknown(self):
         r=run(order={**ORDER,"orderStatus":"TRADED","filledQty":5},trades=[])
         self.assertEqual(r.reason_code,"BROKER_TRADEBOOK_FILL_DISAGREEMENT")
