@@ -3047,6 +3047,17 @@ class DhanClient:
                     uncertain_outcome = False
                     return True, rec_oid, rec_msg
                 return False, None, f"Dhan auth error ({resp.status_code}) on {corr_id}; {rec_msg}"
+            elif resp.status_code == 429:
+                # A remote broker 429 is NOT the same as a local pre-send
+                # governor deferral. Once an HTTP POST crossed the network,
+                # an error response cannot prove no order was accepted.
+                # Preserve the durable mutation fence and require broker
+                # reconciliation. Never automatically POST the same entry.
+                uncertain_outcome = True
+                return False, None, (
+                    f"Dhan remote HTTP 429 on {corr_id}: order outcome UNKNOWN; "
+                    "do not automatically resubmit until broker-confirmed"
+                )
             elif resp.status_code >= 500 or resp.status_code == 408:
                 uncertain_outcome = True
                 if is_fno_amo:
@@ -3193,6 +3204,12 @@ class DhanClient:
                     uncertain_outcome = False
                     return True, rec_oid, rec_msg
                 return False, None, f"Dhan super order auth/ambiguous error ({resp.status_code}) for {corr_id}: {rec_msg}"
+            elif resp.status_code == 429:
+                uncertain_outcome = True
+                return False, None, (
+                    f"Dhan remote HTTP 429 on super order {corr_id}: outcome UNKNOWN; "
+                    "no automatic resubmission until broker-confirmed"
+                )
             elif resp.status_code >= 500 or resp.status_code == 408:
                 uncertain_outcome = True
                 rec_ok, rec_oid, rec_msg = self._reconcile_uncertain_submission(corr_id, str(order_req.security_id))
@@ -3253,7 +3270,7 @@ class DhanClient:
                 return False, msg, {"state": "DEFERRED", "status_code": resp.status_code,
                                     "error": msg, "price": float(price)}
             if resp.status_code not in (200, 202):
-                st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code == 408) else "REJECTED"
+                st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code in (408, 429)) else "REJECTED"
                 msg = f"Failed to modify {leg_clean} ({resp.status_code}): {resp.text}"
                 return False, msg, {"state": st, "status_code": resp.status_code, "error": msg, "price": float(price)}
             data = resp.json() if resp.text else {}
@@ -3331,6 +3348,11 @@ class DhanClient:
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Super order {leg_name} cancellation accepted (HTTP {resp.status_code}) for {order_id_clean}"
+            if resp.status_code == 429:
+                return False, (
+                    "Dhan remote HTTP 429: Super Order cancellation outcome "
+                    "UNKNOWN; broker readback required before any repeat"
+                )
             return False, f"Failed to cancel super order {leg_name} ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
@@ -3360,7 +3382,10 @@ class DhanClient:
             elif resp.status_code == 401:
                 return False, f"Dhan auth error (401): {resp.text}"
             elif resp.status_code == 429:
-                return False, f"Dhan rate limit exceeded (429): {resp.text}"
+                return False, (
+                    "Dhan remote HTTP 429: cancellation outcome UNKNOWN; "
+                    "verify broker order state before any further mutation"
+                )
             return False, f"Failed to cancel order ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
@@ -3470,8 +3495,15 @@ class DhanClient:
                 if not forever_id:
                     return False, None, f"Ambiguous Forever OCO response missing orderId for {correlation_id}: outcome UNKNOWN"
                 return True, forever_id, "Forever OCO placed successfully on Dhan"
+            elif resp.status_code == 429:
+                # Protect an existing long exposure from duplicate OCO SELLs:
+                # remote rate-limit response is NOT a verified no-send result.
+                return False, None, (
+                    f"Dhan remote HTTP 429 on Forever OCO {correlation_id}: "
+                    "outcome UNKNOWN; do not resubmit without broker readback"
+                )
             elif resp.status_code >= 500 or resp.status_code == 408:
-                return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}"
+                return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}
             return False, None, f"Forever OCO rejected ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
@@ -3494,6 +3526,11 @@ class DhanClient:
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Forever order cancellation accepted (HTTP {resp.status_code}) for {oid_clean}"
+            if resp.status_code == 429:
+                return False, (
+                    "Dhan remote HTTP 429: Forever OCO cancellation outcome "
+                    "UNKNOWN; broker readback required before any repeat"
+                )
             return False, f"Failed to cancel Forever order ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
