@@ -103,9 +103,17 @@ Unit=auditbot-morning-health.service
 WantedBy=timers.target
 EOF
 
-sudo install -o root -g root -m 0644 "$TMP/am.service" "$AM_SERVICE"
-sudo install -o root -g root -m 0644 "$TMP/am.timer" "$AM_TIMER"
-sudo systemctl daemon-reload
+if ! sudo install -o root -g root -m 0644 "$TMP/am.service" "$AM_SERVICE"; then
+  die 'Could not install 08:00 service; no timer changed'
+fi
+if ! sudo install -o root -g root -m 0644 "$TMP/am.timer" "$AM_TIMER"; then
+  sudo rm -f -- "$AM_SERVICE"
+  die 'Could not install 08:00 timer; cleaned up service'
+fi
+if ! sudo systemctl daemon-reload; then
+  sudo rm -f -- "$AM_SERVICE" "$AM_TIMER"
+  die 'Daemon reload failed; morning files removed and 17:00 upgrade was not attempted'
+fi
 # The existing upstream utility takes an automatic backup and rolls back on failure.
 if ! bash "$ROOT/deploy/install_vm_services.sh" --upgrade-timer; then
   sudo systemctl disable --now auditbot-morning-health.timer 2>/dev/null || true
