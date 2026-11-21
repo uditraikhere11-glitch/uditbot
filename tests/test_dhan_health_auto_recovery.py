@@ -142,8 +142,9 @@ class HealthRecoveryTests(unittest.TestCase):
                                        datetime(2026, 1, 26).date()}, "OK")):
             self.assertTrue(queue_verified_dhan_recovery(self.gate, now_ts=self.now))
         msg = self.db.conn.execute("SELECT text FROM notice").fetchone()[0]
-        self.assertIn("Tomorrow (Tue 24 Nov 2026): 🚫 CLOSED (Exchange holiday)", msg)
-        self.assertIn("Next trading session: ✅ Wed 25 Nov 2026", msg)
+        self.assertIn("Market tomorrow (Tue 24 Nov 2026): 🚫 CLOSED (Exchange holiday)", msg)
+        self.assertIn("Market today (Mon 23 Nov 2026): ✅ SCHEDULED TRADING DAY", msg)
+        self.assertIn("Next scheduled session: Wed 25 Nov 2026", msg)
         self.assertIn("Next-session readiness: Not independently verified", msg)
 
     def test_recovery_notice_fails_closed_when_calendar_unverified(self):
@@ -152,9 +153,9 @@ class HealthRecoveryTests(unittest.TestCase):
                    return_value=(False, set(), "Missing calendar")):
             self.assertTrue(queue_verified_dhan_recovery(self.gate, now_ts=self.now))
         msg = self.db.conn.execute("SELECT text FROM notice").fetchone()[0]
-        self.assertIn("Tomorrow (Sun 22 Nov 2026): 🚫 CLOSED (Weekend)", msg)
-        self.assertIn("Next trading session: ⚠️ UNVERIFIED", msg)
-        self.assertNotIn("Next trading session: ✅", msg)
+        self.assertIn("Market tomorrow (Sun 22 Nov 2026): 🚫 CLOSED (Weekend)", msg)
+        self.assertIn("Next scheduled session: ⚠️ UNVERIFIED", msg)
+        self.assertNotIn("Next scheduled session: ✅", msg)
 
     def test_no_notification_if_stop_or_gate_blocked(self):
         self.record_health("AUTH_CHECK=FAIL")
