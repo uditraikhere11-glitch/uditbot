@@ -36,6 +36,10 @@ class OrderedSignalDispatcher:
             raise ValueError("max_pending must be in 1..10000")
         self.processor=processor
         self.queue=asyncio.Queue(maxsize=max_pending)
+        # A later producer can otherwise overtake a producer waking from
+        # Queue.put() when capacity appears, breaking signal source order.
+        # asyncio.Lock serializes the *entire* admission wait in FIFO order.
+        self._admission_lock=asyncio.Lock()
         self._worker: asyncio.Task | None=None
         self._closed=False
         self._started=False
@@ -66,11 +70,12 @@ class OrderedSignalDispatcher:
         self._pending_admissions+=1
         self._admissions_drained.clear()
         try:
-            await self.queue.put(request)
-            self.accepted+=1
-            self.max_observed_backlog=max(
-                self.max_observed_backlog,self.queue.qsize()
-            )
+            async with self._admission_lock:
+                await self.queue.put(request)
+                self.accepted+=1
+                self.max_observed_backlog=max(
+                    self.max_observed_backlog,self.queue.qsize()
+                )
         finally:
             self._pending_admissions-=1
             if self._pending_admissions==0:
