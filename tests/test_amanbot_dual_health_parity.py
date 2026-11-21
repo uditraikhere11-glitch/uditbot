@@ -109,6 +109,32 @@ class AmanBotDualScheduleTests(unittest.TestCase):
         self.assertTrue(any(row[0].endswith(":AM_0800") for row in identities))
         self.assertTrue(any(not row[0].endswith(":AM_0800") for row in identities))
 
+    def test_08_failure_does_not_suppress_separate_17_report(self):
+        notifier = Mock(enabled=True)
+        notifier.send_log_message.return_value = True
+        with patch("src.notifier.telegram_notifier.TelegramNotifier", return_value=notifier), \
+             patch("src.broker.dhan_token.locked_token_file",
+                   side_effect=lambda _path: nullcontext()):
+            with patch.dict(os.environ, {"AUDITBOT_HEALTH_SLOT": "AM_0800"}):
+                morning_result = dispatch_morning_health_report_once(
+                    self.cfg, self.db, "Overall result: ❌ ACTION REQUIRED",
+                    now_ts=self.when,
+                )
+            with patch.dict(os.environ, {"AUDITBOT_HEALTH_SLOT": ""}):
+                evening_result = dispatch_morning_health_report_once(
+                    self.cfg, self.db, "Overall result: ✅ SUCCESS",
+                    now_ts=self.when + 9 * 3600,
+                )
+        self.assertEqual(morning_result, "DELIVERED VIA TELEGRAM BOT API")
+        self.assertEqual(evening_result, "DELIVERED VIA TELEGRAM BOT API")
+        self.assertEqual(notifier.send_log_message.call_count, 2)
+        failures = self.db.conn.execute(
+            "SELECT order_id FROM order_notification_events "
+            "WHERE event_key='DAILY_HEALTH_1700_FAILED'"
+        ).fetchall()
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0][0].endswith(":AM_0800"))
+
     def test_morning_and_evening_heading_and_no_calendar_rows(self):
         next_day = datetime(2026, 11, 24, 8, 0, tzinfo=IST)
         kwargs = dict(
