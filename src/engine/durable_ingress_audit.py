@@ -34,6 +34,7 @@ class DurableIngressAudit:
             raise ValueError("separate ingress-audit database suffix required")
         if not path.parent.is_dir() or path.is_symlink():
             raise ValueError("existing safe directory and non-symlink file required")
+        created_new = False
         try:
             fd=os.open(path, os.O_CREAT|os.O_EXCL|os.O_RDWR, 0o600)
         except FileExistsError:
@@ -46,40 +47,42 @@ class DurableIngressAudit:
                 raise IngressAuditConflict("existing empty ledger cannot reset history")
         else:
             os.close(fd)
+            created_new = True
         self.path=path
         self.account_id=account_id.strip()
         self.conn=sqlite3.connect(str(path),timeout=3.0,isolation_level=None)
         try:
             self.conn.execute("PRAGMA synchronous=FULL")
-            self.conn.execute("PRAGMA journal_mode=DELETE")
-            self.conn.execute("CREATE TABLE IF NOT EXISTS ingress_meta "
-                              "(name TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS ingress_messages (
-                    channel_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
-                    raw_hash TEXT NOT NULL,
-                    message_timestamp REAL NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN ('RECEIVED','PIPELINE_RETURNED')),
-                    first_seen REAL NOT NULL,
-                    last_update REAL NOT NULL,
-                    PRIMARY KEY (channel_id, message_id)
-                )
-            """)
             self.conn.execute("BEGIN IMMEDIATE")
-            try:
-                row=self.conn.execute(
+            if created_new:
+                self.conn.execute("CREATE TABLE ingress_meta "
+                                  "(name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                self.conn.execute("""
+                    CREATE TABLE ingress_messages (
+                        channel_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        raw_hash TEXT NOT NULL,
+                        message_timestamp REAL NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('RECEIVED','PIPELINE_RETURNED')),
+                        first_seen REAL NOT NULL,
+                        last_update REAL NOT NULL,
+                        PRIMARY KEY (channel_id, message_id)
+                    )
+                """)
+                self.conn.execute("INSERT INTO ingress_meta VALUES (?, ?)",
+                                  ("account_id", self.account_id))
+            else:
+                tables = {r[0] for r in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )}
+                if not {"ingress_meta", "ingress_messages"} <= tables:
+                    raise IngressAuditConflict("existing ledger schema incomplete; manual review required")
+                binding = self.conn.execute(
                     "SELECT value FROM ingress_meta WHERE name='account_id'"
                 ).fetchone()
-                if row is None:
-                    self.conn.execute("INSERT INTO ingress_meta VALUES (?,?)",
-                                      ("account_id",self.account_id))
-                elif row[0] != self.account_id:
-                    raise IngressAuditConflict("account changed for ingress ledger")
-                self.conn.execute("COMMIT")
-            except BaseException:
-                self.conn.execute("ROLLBACK")
-                raise
+                if binding is None or binding[0] != self.account_id:
+                    raise IngressAuditConflict("existing ledger account binding missing or mismatched")
+            self.conn.execute("COMMIT")
         except BaseException:
             self.conn.close()
             raise

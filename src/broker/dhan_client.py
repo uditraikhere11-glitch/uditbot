@@ -3083,7 +3083,10 @@ class DhanClient:
             return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             uncertain_outcome = True
-            return False, None, f"HTTP exception placing order: {e}"
+            return False, None, f"HTTP exception placing order: {e} (outcome UNKNOWN)"
+        except BaseException:
+            uncertain_outcome = True
+            raise
         finally:
             if hasattr(self.stop_manager, "finalize_mutation"):
                 self.stop_manager.finalize_mutation(corr_id, keep_persisted_if_uncertain=uncertain_outcome)
@@ -3238,7 +3241,10 @@ class DhanClient:
             return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             uncertain_outcome = True
-            return False, None, f"HTTP exception placing super order: {e}"
+            return False, None, f"HTTP exception placing super order: {e} (outcome UNKNOWN)"
+        except BaseException:
+            uncertain_outcome = True
+            raise
         finally:
             if hasattr(self.stop_manager, "finalize_mutation"):
                 self.stop_manager.finalize_mutation(corr_id, keep_persisted_if_uncertain=uncertain_outcome)

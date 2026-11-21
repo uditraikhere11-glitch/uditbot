@@ -38,6 +38,7 @@ class ShadowEventLedger:
             raise ValueError("symlink shadow ledgers are prohibited")
         # A new shadow ledger is created explicitly with 0600 permissions.
         # No production journal path is opened for write by this module.
+        created_new = False
         try:
             fd=os.open(candidate, os.O_CREAT|os.O_EXCL|os.O_RDWR, 0o600)
         except FileExistsError:
@@ -45,38 +46,46 @@ class ShadowEventLedger:
                 raise ValueError("invalid existing shadow journal")
             if candidate.stat().st_mode & 0o077:
                 raise PermissionError("existing shadow journal permissions must be 0600")
+            if candidate.stat().st_size == 0:
+                raise ShadowLedgerConflict("existing empty shadow ledger cannot reset history")
         else:
             os.close(fd)
+            created_new = True
         self.path=candidate
         self.account_id=account_id
         self._conn=sqlite3.connect(str(candidate), isolation_level=None, timeout=3.0)
         self._conn.row_factory=sqlite3.Row
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA journal_mode=DELETE")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS shadow_metadata "
-                           "(name TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS shadow_events (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id TEXT NOT NULL,
-                order_id TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                serialized TEXT NOT NULL,
-                UNIQUE(account_id, order_id, event_id)
-            )
-        """)
         try:
-            with self._conn:
-                row=self._conn.execute(
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("BEGIN IMMEDIATE")
+            if created_new:
+                self._conn.execute("CREATE TABLE shadow_metadata "
+                                   "(name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                self._conn.execute("""
+                    CREATE TABLE shadow_events (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id TEXT NOT NULL,
+                        order_id TEXT NOT NULL,
+                        event_id TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        serialized TEXT NOT NULL,
+                        UNIQUE(account_id, order_id, event_id)
+                    )
+                """)
+                self._conn.execute("INSERT INTO shadow_metadata VALUES (?, ?)",
+                                  ("account_id", self.account_id))
+            else:
+                tables = {r[0] for r in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )}
+                if not {"shadow_metadata", "shadow_events"} <= tables:
+                    raise ShadowLedgerConflict("existing ledger schema incomplete; manual review required")
+                binding = self._conn.execute(
                     "SELECT value FROM shadow_metadata WHERE name='account_id'"
                 ).fetchone()
-                if row is None:
-                    self._conn.execute("INSERT INTO shadow_metadata VALUES (?,?)",
-                                       ("account_id",account_id))
-                elif row["value"]!=account_id:
-                    raise ShadowLedgerConflict("shadow ledger account ID mismatch")
+                if binding is None or binding[0] != self.account_id:
+                    raise ShadowLedgerConflict("existing ledger account binding missing or mismatched")
+            self._conn.execute("COMMIT")
         except BaseException:
             self._conn.close()
             raise

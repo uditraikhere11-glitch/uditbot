@@ -219,12 +219,9 @@ class TradingBotPipeline:
                 self.db.enqueue_outbox(event_type, payload)
             except Exception as e:
                 logger.error(f"[Outbox] Could not enqueue notification: {e}")
-            if getattr(self.cfg, "trading_mode", None) == TradingMode.TEST:
-                if hasattr(self, "notifier") and self.notifier and self.notifier.enabled:
-                    self.notifier.send_log_message(card)
+                return False
             return True
-        elif hasattr(self, "notifier") and self.notifier:
-            return self.notifier.send_log_message(card)
+        logger.error("[Outbox] Notification journal unavailable")
         return False
 
     def process_raw_message(
