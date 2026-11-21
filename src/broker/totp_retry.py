@@ -22,7 +22,9 @@ def retry_scheduled_invalid_totp_once(
     A transport exception on the second request propagates to its existing
     error handler. No token is published here.
     """
-    if on_demand:
+    # Only Dhan's documented HTTP 200 JSON application error is retryable.
+    # Never turn HTTP authentication errors into extra login attempts.
+    if on_demand or getattr(response, "status_code", None) != 200:
         return response
     try:
         body = response.json()
