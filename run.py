@@ -227,7 +227,10 @@ async def main():
             # concurrently. No AI, DB, broker, STOP, risk or journal side
             # effects occur outside the original serialized trading pipeline.
             preparse = None
-            if os.environ.get("AUDITBOT_DETERMINISTIC_PREPARSE", "0") == "1":
+            # Independent experiments: disable speculative preparse when
+            # ordered ingress is enabled, to avoid completion-order reordering.
+            if (ordered_dispatcher is None and
+                    os.environ.get("AUDITBOT_DETERMINISTIC_PREPARSE", "0") == "1"):
                 try:
                     preparse = await asyncio.to_thread(
                         prepare_deterministic_buy,
@@ -315,6 +318,9 @@ async def main():
         try:
             if ordered_dispatcher is not None:
                 await ordered_dispatcher.close()
+                logging.getLogger("trading_bot").info(
+                    "ORDERED_INGRESS_SUMMARY %s", ordered_dispatcher.metrics()
+                )
         finally:
             try:
                 if outbox_worker:
