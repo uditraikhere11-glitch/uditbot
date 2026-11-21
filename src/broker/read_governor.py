@@ -63,10 +63,6 @@ class ReadGovernor:
         # history are not silently abandoned during the migration.
         self.path = self.directory / f'dhan-reads-{key}.sqlite3'
         self.clock = clock
-        # Initialized only after cross-process flock, schema checks and a
-        # committed SQLite migration. Never cache rate-limit quotas/cooldowns.
-        self._verified_file_key = None
-        self._verified_schema_version = None
 
     @classmethod
     def classify(cls, method, url):
@@ -148,79 +144,12 @@ class ReadGovernor:
             os.close(fd)
 
     def _connect(self):
-        """Fast connection for an already verified, unchanged SQLite ledger.
-
-        The old implementation acquired the cross-process schema flock and
-        repeated CREATE TABLE/INDEX statements on EVERY broker API GET.
-        Only first use needs schema migration. All admissions still acquire
-        SQLite BEGIN IMMEDIATE and persist under synchronous=FULL.
-
-        The verified file's (device,inode) must not change. A replaced,
-        deleted or truncated governor cannot silently reset its quotas.
-        Missing/corrupt runtime tables still raise from the admission SQL.
-        """
-        verified = self._verified_file_key
-        if verified is not None:
-            try:
-                st = self.path.stat()
-            except OSError as exc:
-                raise sqlite3.DatabaseError(
-                    "Persisted broker governor ledger vanished"
-                ) from exc
-            if (st.st_dev, st.st_ino) != verified or st.st_size <= 0:
-                raise sqlite3.DatabaseError(
-                    "Persisted broker governor ledger changed unexpectedly"
-                )
-            # mode=rw refuses to create a fresh quota DB if the path is
-            # removed between stat() and sqlite3.connect().
-            conn = sqlite3.connect(
-                self.path.absolute().as_uri() + "?mode=rw",
-                uri=True, timeout=0.07,
-            )
-            try:
-                conn.execute("PRAGMA synchronous=FULL")
-                mode = conn.execute("PRAGMA journal_mode").fetchone()
-                schema_version = conn.execute("PRAGMA schema_version").fetchone()
-                after = self.path.stat()
-                if (not mode or str(mode[0]).lower() != "wal"
-                        or not schema_version
-                        or int(schema_version[0]) != self._verified_schema_version
-                        or (after.st_dev, after.st_ino) != verified
-                        or after.st_size <= 0):
-                    raise sqlite3.DatabaseError(
-                        "Persisted broker governor WAL/identity unverified"
-                    )
-                return conn
-            except BaseException:
-                conn.close()
-                raise
-
-        # First use still executes the exact original cross-process schema
-        # and legacy-migration barrier before any API admission.
         with self._schema_initialization_lock():
-            conn = self._connect_unlocked()
-            try:
-                st = self.path.stat()
-                if st.st_size <= 0:
-                    raise sqlite3.DatabaseError("Governor schema initialization incomplete")
-                schema = conn.execute("PRAGMA schema_version").fetchone()
-                if not schema:
-                    raise sqlite3.DatabaseError("Governor schema version unavailable")
-                self._verified_schema_version = int(schema[0])
-                self._verified_file_key = (st.st_dev, st.st_ino)
-            except BaseException:
-                conn.close()
-                raise
-            return conn
+            return self._connect_unlocked()
 
     def _connect_unlocked(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # An already existing zero-byte ledger could be a truncated quota
-        # history. Do not recreate it as a fresh healthy zero-used allowance.
-        exists = self.path.exists()
-        if exists and (not self.path.is_file() or self.path.stat().st_size == 0):
-            raise sqlite3.DatabaseError("Persisted governor audit ledger missing or empty")
-        persisted = exists
+        persisted = self.path.is_file() and self.path.stat().st_size > 0
         conn = sqlite3.connect(self.path, timeout=0.07)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
