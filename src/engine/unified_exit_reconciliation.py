@@ -455,7 +455,15 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
     evidence = {}
     parents = set()
     for row in trades:
-        if str(row.get("securityId")) != key[0]:
+        if not isinstance(row, dict):
+            raise ReconciliationEvidenceError("Malformed tradebook row during delivery recovery")
+        if str(row.get("securityId") or "").strip().upper() != key[0]:
+            continue
+        # Dhan may legitimately return CNC and MTF fills for the same equity
+        # security on one day. Only the exact segment/product contract enters
+        # the signed-net delivery proof. Malformed matching identities and
+        # wrong-account records still fail closed in _broker_trade().
+        if _identity(row) != key:
             continue
         side = row.get("transactionType")
         if side not in ("BUY", "SELL"):
