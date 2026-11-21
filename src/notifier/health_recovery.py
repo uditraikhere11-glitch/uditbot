@@ -58,9 +58,6 @@ def queue_verified_dhan_recovery(gate, *, now_ts=None) -> bool:
         f"DAILY_HEALTH:{today:%Y-%m-%d}:{account}:"
         f"{getattr(cfg, 'instance_name', 'AuditBot')}"
     )
-    # Report the verified market calendar without authorizing a future trade.
-    from src.notifier.market_calendar_status import verified_market_calendar_lines
-    today_line, tomorrow_line, next_session_line = verified_market_calendar_lines(now)
     card = (
         "🟢 <b>Auditbot — Automatic Recovery Confirmed</b>\n"
         f"🕒 {today:%d %b %Y, %H:%M:%S} IST\n"
@@ -69,9 +66,6 @@ def queue_verified_dhan_recovery(gate, *, now_ts=None) -> bool:
         "🛡️ Reconciliation: ✅ HEALTHY\n"
         "🚦 New Entries Gate: ✅ OPEN\n"
         "📋 Earlier 5 PM authentication failure: RECOVERED\n"
-        f"{today_line}\n"
-        f"{tomorrow_line}\n"
-        f"{next_session_line}\n"
         "⏳ Next-session readiness: Not independently verified by this notice"
     )
     # Atomic durable claim + enqueue prevents duplicate recovery cards across
