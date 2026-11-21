@@ -1861,4 +1861,13 @@ class StartupReconciliationGate:
                 self.db.record_system_event(ev_type, f"Reconciliation gate transitioned {prev_state.value} -> {new_state.value}: {msg}")
             except Exception:
                 pass
+        # Notification-only: today's failed 17:00 Dhan health report may be
+        # superseded by independently broker-verified reconciliation recovery.
+        # This never changes trading gates, STOP, orders, or token state.
+        if ok and prev_state != new_state and self.is_accepting_entries:
+            try:
+                from src.notifier.health_recovery import queue_verified_dhan_recovery
+                queue_verified_dhan_recovery(self)
+            except Exception:
+                logger.exception("Unable to queue verified Dhan recovery notification")
         return ok, msg
