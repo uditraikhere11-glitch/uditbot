@@ -2940,6 +2940,12 @@ class DhanClient:
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
+                if st.get("blocked_reason") == "IN_FLIGHT_CORRELATION_UNRESOLVED":
+                    return False, None, (
+                        "MUTATION BLOCKED: unresolved in-flight correlation ID "
+                        "was already submitted or its broker outcome is UNKNOWN; "
+                        "no second order POST without verified reconciliation"
+                    )
                 reason_msg = (
                     f"MUTATION BLOCKED: Durable EMERGENCY STOP active "
                     f"(triggered by {st.get('stopped_by')}: {st.get('reason')})"
@@ -3103,6 +3109,12 @@ class DhanClient:
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
+                if st.get("blocked_reason") == "IN_FLIGHT_CORRELATION_UNRESOLVED":
+                    return False, None, (
+                        "MUTATION BLOCKED: unresolved in-flight correlation ID "
+                        "was already submitted or its broker outcome is UNKNOWN; "
+                        "no second order POST without verified reconciliation"
+                    )
                 reason_msg = (
                     f"MUTATION BLOCKED: Durable EMERGENCY STOP active "
                     f"(triggered by {st.get('stopped_by')}: {st.get('reason')})"
