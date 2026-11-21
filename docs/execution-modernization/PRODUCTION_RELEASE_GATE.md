@@ -12,10 +12,10 @@ or deployments were performed during this development.**
    parameterized query batches. Exact previous trade-count, position/exposure
    rules and safety cutoffs are preserved. Any failed fills read now raises so
    LIVE risk synchronization must fail closed, not silently report zero fills.
-2. Add `idx_risk_orders_mode_day`, `idx_risk_fills_order_id`,
-   `idx_intents_state_created` idempotently on journal initialization.
-   They are additive and do not remove history, reallocate trades or change
-   existing entry/protection authorization.
+2. Add `idx_risk_orders_mode_day` and `idx_risk_fills_order_id`
+   idempotently on journal initialization. These two indexes are additive:
+   no old history, exit allocation, or canonical journal row is removed.
+   There is no new order-intent write-path index.
 3. The proposed `src/broker/read_governor.py` fast path was tested and
    **rejected**. The synthetic median admission changed from 1.169 ms to
    1.152 ms (1.01x), insufficient to justify touching a safety-critical
@@ -24,6 +24,41 @@ or deployments were performed during this development.**
 The observer, shadow event ledger, opt-in FIFO dispatcher and deterministic
 preparse remain separate enhancements. The latter two are OFF by default and
 must not be counted in production performance claims.
+
+## Optional, NOT YET production-approved ingress crash audit
+
+The experimental flags `AUDITBOT_ORDERED_INGRESS=1` and
+`AUDITBOT_DURABLE_INGRESS_AUDIT=1` must both be explicitly enabled
+to use the separate `signals.ingress-audit.sqlite3` ledger.
+**Both remain OFF in the existing production configuration.**
+Before any async Telegram chat lookup, it records the source channel/message
+identity, timestamp and raw-text SHA-256 (not the raw signal). The FIFO
+worker durably marks `PIPELINE_RETURNED` only after the canonical
+single-owner pipeline has returned; this is **not** evidence of a Dhan ACK,
+a fill, or broker-verified protection.
+
+If the process dies after durable admission but before completion, an
+unreturned record survives restart. Startup then refuses to attach the
+listener until account-specific broker and journal reconciliation is
+performed. **No automatic replay, duplicate order, resubmission, or
+unverified gate release occurs.**
+
+Operators can inspect anonymized counts without database mutation:
+`python3 -m tools.inspect_ingress_audit /path/to/signals.ingress-audit.sqlite3`.
+There is deliberately no automatic 'clear pending' endpoint: a separate
+operator reconciliation and release procedure still requires review.
+This experimental mode is not part of approved production rollout.
+
+### Single PR and rollback
+
+M1 tracker: GitHub issue #115. Single integration: draft PR #113.
+Production optimization #114 was closed **without merge** after six
+substantive files were confirmed identical within PR #113.
+If subsequently approved, merge PR #113 using **Squash and merge**,
+record its exact single commit SHA, and revert that commit via a reviewed
+reversal PR when needed. A code revert is not a rollback of broker fills,
+journal data, or any SQLite index migration; verify those separately.
+Do not merge or deploy until all gates below are independently satisfied.
 
 ## Verified offline evidence and its limitations
 
