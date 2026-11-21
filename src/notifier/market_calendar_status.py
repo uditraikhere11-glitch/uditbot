@@ -18,6 +18,14 @@ def format_market_calendar_lines(
 ) -> Tuple[str, str]:
     """Separate calendar facts from the authentication/overall health verdict."""
     holidays = set(holidays_set or ())
+    if today.weekday() >= 5:
+        today_status = "🚫 CLOSED (Weekend)"
+    elif not calendar_verified:
+        today_status = "⚠️ UNVERIFIED (exchange holiday calendar unavailable)"
+    elif today in holidays:
+        today_status = "🚫 CLOSED (Exchange holiday)"
+    else:
+        today_status = "✅ SCHEDULED TRADING DAY"
     tomorrow = today + timedelta(days=1)
     day_label = tomorrow.strftime("%a %d %b %Y")
     if tomorrow.weekday() >= 5:
@@ -30,15 +38,14 @@ def format_market_calendar_lines(
         tomorrow_status = "✅ SCHEDULED TRADING DAY"
 
     if calendar_verified:
-        next_status = (
-            f"✅ {next_session_date:%a %d %b %Y}, 09:15 IST"
-        )
+        next_status = f"{next_session_date:%a %d %b %Y}, 09:15 IST"
     else:
         next_status = "⚠️ UNVERIFIED (exchange calendar unavailable)"
 
     return (
-        f"📅 Tomorrow ({day_label}): {tomorrow_status}",
-        f"📆 Next trading session: {next_status}",
+        f"📅 Market today ({today:%a %d %b %Y}): {today_status}",
+        f"📅 Market tomorrow ({day_label}): {tomorrow_status}",
+        f"📆 Next scheduled session: {next_status}",
     )
 
 
