@@ -600,6 +600,17 @@ class JournalDB:
                 "ON fills(broker_order_id) "
                 "WHERE evidence_source='BROKER_HISTORICAL_NO_EXECUTION_ID'"
             )
+            # Risk-handoff hot path: previously every BUY re-scanned all
+            # historical exchange fills, even with no matching open order.
+            # These are additive indexes; no canonical rows are altered.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_risk_orders_mode_day "
+                "ON orders(trading_mode, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_risk_fills_order_id "
+                "ON fills(broker_order_id)"
+            )
 
     # --- Durable Protection-Attempt Lifecycle (Safety Correction A & CV13-01) ---
 
@@ -1831,8 +1842,10 @@ class JournalDB:
                       AND (
                           status NOT IN ('REJECTED', 'CANCELLED', 'EXPIRED', 'NOT_SUBMITTED')
                           OR COALESCE(filled_quantity, 0) > 0
-                          OR (broker_order_id IS NOT NULL AND broker_order_id != '' AND broker_order_id IN (
-                              SELECT broker_order_id FROM fills WHERE traded_quantity > 0
+                          OR (broker_order_id IS NOT NULL AND broker_order_id != '' AND EXISTS (
+                              SELECT 1 FROM fills
+                              WHERE fills.broker_order_id = orders.broker_order_id
+                                AND fills.traded_quantity > 0
                           ))
                       )
                     """,
@@ -1855,14 +1868,6 @@ class JournalDB:
             has_filled_col = "filled_quantity" in o_cols
             daily_trades = self.get_today_orders_count(start_of_day=start_of_day)
 
-            fill_sums: Dict[str, int] = {}
-            try:
-                for fr in conn.execute("SELECT broker_order_id, SUM(traded_quantity) AS sq FROM fills GROUP BY broker_order_id").fetchall():
-                    if fr["broker_order_id"]:
-                        fill_sums[str(fr["broker_order_id"])] = int(fr["sq"] or 0)
-            except sqlite3.OperationalError:
-                pass
-
             if has_filled_col:
                 rows = conn.execute(
                     "SELECT broker_order_id, security_id, price, quantity, COALESCE(filled_quantity, 0) AS filled_qty, status FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE'",
@@ -1873,6 +1878,27 @@ class JournalDB:
                     "SELECT broker_order_id, security_id, price, quantity, 0 AS filled_qty, status FROM orders WHERE created_at >= ? AND trading_mode = 'LIVE'",
                     (start_of_day,),
                 ).fetchall()
+
+            # F03-01 preserved: aggregate all fills for each *today LIVE*
+            # broker order, not all years of irrelevant fills. The same fill
+            # sums are used for PENDING/PARTIAL/TRADED/CANCELLED decisions.
+            # Chunk bounded IN clauses for SQLite builds with 999 variables.
+            # Failed journal reads now raise: LIVE risk sync must fail closed
+            # rather than silently treating an unreadable fills table as 0.
+            relevant_ids = sorted({
+                str(row["broker_order_id"])
+                for row in rows if row["broker_order_id"]
+            })
+            fill_sums: Dict[str, int] = {}
+            for offset in range(0, len(relevant_ids), 400):
+                batch = relevant_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                for fr in conn.execute(
+                    f"SELECT broker_order_id, SUM(traded_quantity) AS sq FROM fills "
+                    f"WHERE broker_order_id IN ({placeholders}) GROUP BY broker_order_id",
+                    batch,
+                ):
+                    fill_sums[str(fr["broker_order_id"])] = int(fr["sq"] or 0)
 
             open_sec_ids = set()
             exposure = 0.0

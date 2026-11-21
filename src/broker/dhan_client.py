@@ -2341,6 +2341,40 @@ class DhanClient:
             logger.error(f"HTTP exception fetching order by correlation {correlation_id}: {e}")
             return None
 
+    def diagnose_external_order_lookup(self, correlation_id: str, *, expected_security_id: str = ""):
+        """Read-only typed diagnosis of a prior submission's external order ID.
+
+        This is opt-in and separate from the current get_order_by_correlation_id()
+        compatibility contract. It NEVER retries a mutation, infers a fill, or
+        equates 404/timeout/401 with an order that was not submitted.
+        """
+        from src.engine.typed_broker_evidence import (
+            ExternalOrderEvidence, classify_external_order_lookup,
+        )
+        cid = str(correlation_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", cid):
+            return ExternalOrderEvidence("INVALID_LOOKUP", "invalid correlation ID")
+        if self.cfg.trading_mode == TradingMode.TEST:
+            return ExternalOrderEvidence("NOT_QUERIED_TEST_MODE", "TEST mode cannot establish live broker evidence")
+        try:
+            response = self._get_with_auth_recovery(f"{BASE_URL}/orders/external/{cid}")
+        except Exception as exc:
+            return classify_external_order_lookup(correlation_id=cid, transport_error=exc)
+        status = getattr(response, "status_code", None)
+        payload = None
+        if status == 200:
+            try:
+                payload = response.json()
+            except (ValueError, AttributeError, TypeError):
+                return ExternalOrderEvidence("MALFORMED", "broker returned unreadable order JSON")
+        return classify_external_order_lookup(
+            correlation_id=cid,
+            http_status=status,
+            payload=payload,
+            expected_account_id=str(getattr(self.cfg, "dhan_client_id", "") or ""),
+            expected_security_id=str(expected_security_id or ""),
+        )
+
     # =========================================================================
     # SAFETY CORRECTION C.A: Structured Broker Collection Reads
     # =========================================================================
@@ -2906,6 +2940,12 @@ class DhanClient:
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
+                if st.get("blocked_reason") == "IN_FLIGHT_CORRELATION_UNRESOLVED":
+                    return False, None, (
+                        "MUTATION BLOCKED: unresolved in-flight correlation ID "
+                        "was already submitted or its broker outcome is UNKNOWN; "
+                        "no second order POST without verified reconciliation"
+                    )
                 reason_msg = (
                     f"MUTATION BLOCKED: Durable EMERGENCY STOP active "
                     f"(triggered by {st.get('stopped_by')}: {st.get('reason')})"
@@ -3013,6 +3053,17 @@ class DhanClient:
                     uncertain_outcome = False
                     return True, rec_oid, rec_msg
                 return False, None, f"Dhan auth error ({resp.status_code}) on {corr_id}; {rec_msg}"
+            elif resp.status_code == 429:
+                # A remote broker 429 is NOT the same as a local pre-send
+                # governor deferral. Once an HTTP POST crossed the network,
+                # an error response cannot prove no order was accepted.
+                # Preserve the durable mutation fence and require broker
+                # reconciliation. Never automatically POST the same entry.
+                uncertain_outcome = True
+                return False, None, (
+                    f"Dhan remote HTTP 429 on {corr_id}: order outcome UNKNOWN; "
+                    "do not automatically resubmit until broker-confirmed"
+                )
             elif resp.status_code >= 500 or resp.status_code == 408:
                 uncertain_outcome = True
                 if is_fno_amo:
@@ -3032,7 +3083,10 @@ class DhanClient:
             return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             uncertain_outcome = True
-            return False, None, f"HTTP exception placing order: {e}"
+            return False, None, f"HTTP exception placing order: {e} (outcome UNKNOWN)"
+        except BaseException:
+            uncertain_outcome = True
+            raise
         finally:
             if hasattr(self.stop_manager, "finalize_mutation"):
                 self.stop_manager.finalize_mutation(corr_id, keep_persisted_if_uncertain=uncertain_outcome)
@@ -3058,6 +3112,12 @@ class DhanClient:
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
+                if st.get("blocked_reason") == "IN_FLIGHT_CORRELATION_UNRESOLVED":
+                    return False, None, (
+                        "MUTATION BLOCKED: unresolved in-flight correlation ID "
+                        "was already submitted or its broker outcome is UNKNOWN; "
+                        "no second order POST without verified reconciliation"
+                    )
                 reason_msg = (
                     f"MUTATION BLOCKED: Durable EMERGENCY STOP active "
                     f"(triggered by {st.get('stopped_by')}: {st.get('reason')})"
@@ -3159,6 +3219,12 @@ class DhanClient:
                     uncertain_outcome = False
                     return True, rec_oid, rec_msg
                 return False, None, f"Dhan super order auth/ambiguous error ({resp.status_code}) for {corr_id}: {rec_msg}"
+            elif resp.status_code == 429:
+                uncertain_outcome = True
+                return False, None, (
+                    f"Dhan remote HTTP 429 on super order {corr_id}: outcome UNKNOWN; "
+                    "no automatic resubmission until broker-confirmed"
+                )
             elif resp.status_code >= 500 or resp.status_code == 408:
                 uncertain_outcome = True
                 rec_ok, rec_oid, rec_msg = self._reconcile_uncertain_submission(corr_id, str(order_req.security_id))
@@ -3175,7 +3241,10 @@ class DhanClient:
             return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
         except Exception as e:
             uncertain_outcome = True
-            return False, None, f"HTTP exception placing super order: {e}"
+            return False, None, f"HTTP exception placing super order: {e} (outcome UNKNOWN)"
+        except BaseException:
+            uncertain_outcome = True
+            raise
         finally:
             if hasattr(self.stop_manager, "finalize_mutation"):
                 self.stop_manager.finalize_mutation(corr_id, keep_persisted_if_uncertain=uncertain_outcome)
@@ -3219,7 +3288,7 @@ class DhanClient:
                 return False, msg, {"state": "DEFERRED", "status_code": resp.status_code,
                                     "error": msg, "price": float(price)}
             if resp.status_code not in (200, 202):
-                st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code == 408) else "REJECTED"
+                st = "UNKNOWN" if (resp.status_code >= 500 or resp.status_code in (408, 429)) else "REJECTED"
                 msg = f"Failed to modify {leg_clean} ({resp.status_code}): {resp.text}"
                 return False, msg, {"state": st, "status_code": resp.status_code, "error": msg, "price": float(price)}
             data = resp.json() if resp.text else {}
@@ -3297,6 +3366,11 @@ class DhanClient:
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Super order {leg_name} cancellation accepted (HTTP {resp.status_code}) for {order_id_clean}"
+            if resp.status_code == 429:
+                return False, (
+                    "Dhan remote HTTP 429: Super Order cancellation outcome "
+                    "UNKNOWN; broker readback required before any repeat"
+                )
             return False, f"Failed to cancel super order {leg_name} ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
@@ -3326,7 +3400,10 @@ class DhanClient:
             elif resp.status_code == 401:
                 return False, f"Dhan auth error (401): {resp.text}"
             elif resp.status_code == 429:
-                return False, f"Dhan rate limit exceeded (429): {resp.text}"
+                return False, (
+                    "Dhan remote HTTP 429: cancellation outcome UNKNOWN; "
+                    "verify broker order state before any further mutation"
+                )
             return False, f"Failed to cancel order ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"
@@ -3436,6 +3513,13 @@ class DhanClient:
                 if not forever_id:
                     return False, None, f"Ambiguous Forever OCO response missing orderId for {correlation_id}: outcome UNKNOWN"
                 return True, forever_id, "Forever OCO placed successfully on Dhan"
+            elif resp.status_code == 429:
+                # Protect an existing long exposure from duplicate OCO SELLs:
+                # remote rate-limit response is NOT a verified no-send result.
+                return False, None, (
+                    f"Dhan remote HTTP 429 on Forever OCO {correlation_id}: "
+                    "outcome UNKNOWN; do not resubmit without broker readback"
+                )
             elif resp.status_code >= 500 or resp.status_code == 408:
                 return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}"
             return False, None, f"Forever OCO rejected ({resp.status_code}): {resp.text}"
@@ -3460,6 +3544,11 @@ class DhanClient:
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
                 return True, f"Forever order cancellation accepted (HTTP {resp.status_code}) for {oid_clean}"
+            if resp.status_code == 429:
+                return False, (
+                    "Dhan remote HTTP 429: Forever OCO cancellation outcome "
+                    "UNKNOWN; broker readback required before any repeat"
+                )
             return False, f"Failed to cancel Forever order ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, f"MUTATION NOT_SUBMITTED (config fence): {e}"

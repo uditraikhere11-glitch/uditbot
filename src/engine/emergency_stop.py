@@ -427,10 +427,24 @@ class EmergencyStopManager:
                 state = self._load_raw()
                 if state.get("is_stopped", True):
                     return False, state
-                self._in_flight.add(correlation_id)
                 persisted = list(state.get("in_flight_orders") or [])
-                if correlation_id not in persisted:
-                    persisted.append(correlation_id)
+                if correlation_id in persisted or correlation_id in self._in_flight:
+                    # A lost ACK/HTTP 429 must never admit a second
+                    # transmission with the SAME durable correlation ID.
+                    # Only broker-authoritative recovery may release this
+                    # persistent mutation fence.
+                    blocked = dict(state)
+                    blocked["blocked_reason"] = "IN_FLIGHT_CORRELATION_UNRESOLVED"
+                    blocked["reason"] = (
+                        "Correlation ID already has unresolved broker mutation; "
+                        "read-only broker reconciliation required"
+                    )
+                    logger.warning(
+                        "[MUTATION_FENCE] Repeated unresolved correlation blocked"
+                    )
+                    return False, blocked
+                self._in_flight.add(correlation_id)
+                persisted.append(correlation_id)
                 state["in_flight_orders"] = persisted
                 if not self._save_raw(state):
                     self._in_flight.discard(correlation_id)

@@ -1,0 +1,4 @@
+# OPTIONAL, separately approved READ-ONLY order observation tool ONLY.
+# Never installed by production requirements.txt or normal offline CI.
+# Python 3.11+; verified PyPI 2026-11.
+websockets==17.4

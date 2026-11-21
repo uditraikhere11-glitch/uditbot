@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from typing import Optional
 from src.config import AppConfig
 from src.models import (
@@ -33,6 +34,7 @@ from src.parsers.equity_parser import parse_equity_regex, filter_equity_message
 from src.parsers.fno_parser import parse_fno_regex, looks_like_option
 from src.parsers.gemini_fallback import parse_fno_gemini_sync, parse_equity_gemini_sync
 from src.parsers.brain import parse_signal_brain
+from src.engine.deterministic_preparse import DeterministicPreparse
 from src.parsers.duplicate_filter import DuplicateFilter
 from src.instruments.resolver import InstrumentResolver
 from src.engine.sizer import (
@@ -217,12 +219,9 @@ class TradingBotPipeline:
                 self.db.enqueue_outbox(event_type, payload)
             except Exception as e:
                 logger.error(f"[Outbox] Could not enqueue notification: {e}")
-            if getattr(self.cfg, "trading_mode", None) == TradingMode.TEST:
-                if hasattr(self, "notifier") and self.notifier and self.notifier.enabled:
-                    self.notifier.send_log_message(card)
+                return False
             return True
-        elif hasattr(self, "notifier") and self.notifier:
-            return self.notifier.send_log_message(card)
+        logger.error("[Outbox] Notification journal unavailable")
         return False
 
     def process_raw_message(
@@ -234,14 +233,25 @@ class TradingBotPipeline:
         current_time: Optional[float] = None,
         source_name: str = "Test group",
         signal_received_at: Optional[float] = None,
+        callback_monotonic_ns: Optional[int] = None,
+        preparsed_brain: Optional[DeterministicPreparse] = None,
     ) -> ValidationResult:
+        # Observe worker scheduling + pipeline-lock wait without changing the
+        # serialized risk/commitment boundary or broker order behavior.
+        worker_start_ns = time.perf_counter_ns()
         with self._pipeline_lock:
             l1_start_ns = time.perf_counter_ns()
+            if (type(callback_monotonic_ns) is int and
+                    0 < callback_monotonic_ns <= worker_start_ns):
+                GLOBAL_LATENCY_MONITOR.record_preprocessing_wait(
+                    total_ms=(l1_start_ns - callback_monotonic_ns) / 1_000_000.0,
+                    lock_ms=(l1_start_ns - worker_start_ns) / 1_000_000.0,
+                )
             injected_clock = current_time
             now = injected_clock if injected_clock is not None else time.time()
             msg_ts = msg_timestamp or now
             trace = SignalLatencyTrace(
-                trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
+                trace_id=f"TRC-{uuid.uuid4().hex}",
                 channel_id=channel_id,
                 message_id=message_id,
                 ist_received_time=signal_received_at if signal_received_at is not None else now,
@@ -321,15 +331,28 @@ class TradingBotPipeline:
                 self.dispatch_notification("TRADE_LOG", log_card)
                 return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason)
 
-            decision = parse_signal_brain(
-                text=text,
-                channel_id=channel_id,
-                message_id=message_id,
-                msg_timestamp=msg_ts,
-                max_age_sec=self.cfg.max_message_age_sec,
-                current_time=injected_clock if injected_clock is not None else now,
-                journal_db=self.db,
-            )
+            # Optional deterministic REGEX hint was computed without a DB,
+            # network, AI or broker call. Every source/age/message claim above
+            # remains authoritative and serialized. Non-REGEX hints ALWAYS
+            # go through the original full BRAIN parser with adaptive/AI.
+            if (isinstance(preparsed_brain, DeterministicPreparse)
+                    and preparsed_brain.usable_for(
+                        text=text, channel_id=channel_id, message_id=message_id,
+                        msg_timestamp=msg_timestamp,
+                        max_age_sec=self.cfg.max_message_age_sec,
+                        injected_clock=injected_clock,
+                    )):
+                decision = preparsed_brain.decision
+            else:
+                decision = parse_signal_brain(
+                    text=text,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    msg_timestamp=msg_ts,
+                    max_age_sec=self.cfg.max_message_age_sec,
+                    current_time=injected_clock if injected_clock is not None else now,
+                    journal_db=self.db,
+                )
             prov_kwargs = {
                 "parser_version": decision.parser_version,
                 "parse_source": decision.source,
@@ -1034,7 +1057,7 @@ class TradingBotPipeline:
         heads_up_note = None
         if trace is None:
             trace = SignalLatencyTrace(
-                trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
+                trace_id=f"TRC-{uuid.uuid4().hex}",
                 symbol=sig.symbol,
                 channel_id=sig.channel_id,
                 message_id=sig.message_id,

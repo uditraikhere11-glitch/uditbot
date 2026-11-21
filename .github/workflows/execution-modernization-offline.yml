@@ -1,0 +1,145 @@
+name: Execution modernization - isolated CI
+on:
+  push:
+    branches:
+      - dev/execution-modernization-20261121
+      - dev/uditbot-combined-modernization-phase2
+  pull_request:
+    paths:
+      - 'run.py'
+      - 'src/main.py'
+      - 'src/engine/latency_monitor.py'
+      - 'src/journal/db.py'
+      - 'tools/benchmark_risk_journal.py'
+      - 'src/engine/shadow_execution_events.py'
+      - 'src/engine/typed_broker_evidence.py'
+      - 'src/engine/delivery_sell_triage.py'
+      - 'src/engine/broker_tradebook_preflight.py'
+      - 'tools/benchmark_phase2_tradebook.py'
+      - 'src/engine/deterministic_preparse.py'
+      - 'src/engine/ordered_ingress.py'
+      - 'src/engine/dhan_order_observer.py'
+      - 'src/engine/dhan_order_update_shadow.py'
+      - 'src/engine/shadow_event_ledger.py'
+      - 'src/engine/telegram_event_metadata.py'
+      - 'tools/execution_*.py'
+      - 'tools/dhan_order_shadow_cli.py'
+      - 'requirements-order-shadow.txt'
+      - 'docs/execution-modernization/**'
+      - 'tests/test_execution_modernization_*.py'
+      - '.github/workflows/execution-modernization-offline.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: execution-modernization-${{ github.ref }}
+  # Newer development-branch tests supersede a stuck/outdated run.
+  cancel-in-progress: true
+jobs:
+  offline-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UDITBOT_OFFLINE_TESTS: '1'
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Enable offline network perimeter
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+      - name: Compile sources and standalone observer CLI
+        run: python -B -m compileall -q run.py src tools tests
+      - name: Focused modernization tests
+        # A hung concurrency test is a failed safety gate, not a slow PASS.
+        run: timeout --signal=TERM 40s python -u -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_execution_modernization_*.py' -v 2>&1 | tee focused.log
+        shell: bash
+      - name: Full offline regression suite
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' -v 2>&1 | tee full.log
+        shell: bash
+      - name: Offline matched parser/commit contention benchmark
+        run: |
+          python -B tools/execution_modernization_benchmark.py --count 120 --workers 8 --commit-delay-ms 2.0 > benchmark.json
+          cat benchmark.json
+          python - <<'PY'
+          import json
+          with open('benchmark.json',encoding='utf-8') as f:
+              result=json.load(f)
+          assert result['production_latency_improvement_proven'] is False
+          assert result['count']==120
+          PY
+      - name: Benchmark indexed LIVE-risk journal queries against legacy SQL
+        run: |
+          python -B -m tools.benchmark_risk_journal --historical-fills 30000 --rounds 10 > journal_risk_benchmark.json
+          cat journal_risk_benchmark.json
+          python - <<'PY'
+          import json
+          with open('journal_risk_benchmark.json',encoding='utf-8') as f:
+              result=json.load(f)
+          assert result['risk_state_equivalent'] is True
+          assert result['orders_submitted'] == 0
+          assert result['production_latency_improvement_proven'] is False
+          PY
+      - name: Benchmark whole-book preflight cost
+        run: |
+          python -B -m tools.benchmark_phase2_tradebook --count 1000 --rounds 10 > phase2_preflight_benchmark.json
+          cat phase2_preflight_benchmark.json
+          python - <<'PY'
+          import json
+          with open('phase2_preflight_benchmark.json',encoding='utf-8') as f:
+              report=json.load(f)
+          assert report['synthetic_executions']==1000
+          assert report['canonical_fill_writes_during_preflight']==0
+          assert report['broker_requests']==0
+          PY
+      - name: Preserve anonymized benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-modernization-synthetic-benchmark
+          path: |
+            benchmark.json
+            journal_risk_benchmark.json
+            phase2_preflight_benchmark.json
+          retention-days: 14
+      - name: Separate offline ingress and lock measurements
+        run: python -m tools.execution_stage_benchmark > stage-latency.json && cat stage-latency.json
+      - name: Package combined review against pinned main
+        if: github.ref == 'refs/heads/dev/uditbot-combined-modernization-phase2'
+        shell: bash
+        run: |
+          base=d59feee9b47f83967c483ab9ad930a68b8a49b74
+          git merge-base --is-ancestor "$base" HEAD
+          git diff --binary "$base" HEAD > combined.patch
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          import subprocess
+          from zipfile import ZipFile, ZIP_DEFLATED
+          base = "d59feee9b47f83967c483ab9ad930a68b8a49b74"
+          paths = subprocess.check_output(["git", "diff", "--diff-filter=ACMRT", "--name-only", "-z", base, "HEAD"]).split(b"\0")
+          names = [p.decode() for p in paths if p]
+          with ZipFile("changed-files.zip", "w", compression=ZIP_DEFLATED) as z:
+              for name in names:
+                  z.write(name)
+          names += ["changed-files.zip", "combined.patch", "focused.log", "full.log", "benchmark.json", "journal_risk_benchmark.json", "phase2_preflight_benchmark.json", "stage-latency.json"]
+          Path("SHA256SUMS.txt").write_text("".join(f"{sha256(Path(n).read_bytes()).hexdigest()}  {n}\n" for n in names))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always() && github.ref == 'refs/heads/dev/uditbot-combined-modernization-phase2'
+        with:
+          name: combined-review-${{ github.sha }}
+          if-no-files-found: warn
+          path: |
+            changed-files.zip
+            combined.patch
+            SHA256SUMS.txt
+            focused.log
+            full.log
+            *benchmark.json
+            stage-latency.json

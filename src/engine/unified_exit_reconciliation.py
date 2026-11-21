@@ -408,6 +408,11 @@ def _signed_cnc_delivery_sell_reconciles(
             continue
         if _identity(row) != key:
             continue
+        # A complete, authenticated Dhan positions response may omit the
+        # account on individual position rows. The startup gate separately
+        # validates the Dhan profile and journal account, and every actual
+        # SELL trade must attest the account via _broker_trade(). Reject a
+        # positive contradictory row identity, never infer a different one.
         if account and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account:
             return False
         raw_net = row.get("netQty")
@@ -452,7 +457,15 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
     evidence = {}
     parents = set()
     for row in trades:
-        if str(row.get("securityId")) != key[0]:
+        if not isinstance(row, dict):
+            raise ReconciliationEvidenceError("Malformed tradebook row during delivery recovery")
+        if str(row.get("securityId") or "").strip().upper() != key[0]:
+            continue
+        # Dhan may legitimately return CNC and MTF fills for the same equity
+        # security on one day. Only the exact segment/product contract enters
+        # the signed-net delivery proof. Malformed matching identities and
+        # wrong-account records still fail closed in _broker_trade().
+        if _identity(row) != key:
             continue
         side = row.get("transactionType")
         if side not in ("BUY", "SELL"):
