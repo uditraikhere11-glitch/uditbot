@@ -94,6 +94,7 @@ class TestDurableIngressAudit(unittest.TestCase):
 
     def test_existing_truncated_ledger_cannot_reset_record(self):
         self.path.touch()
+        os.chmod(self.path,0o600)  # exercise truncation, not file permissions
         with self.assertRaises(IngressAuditConflict):
             DurableIngressAudit(str(self.path),account_id="SYNTHETIC")
 
