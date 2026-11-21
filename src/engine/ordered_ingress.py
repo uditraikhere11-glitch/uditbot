@@ -94,11 +94,17 @@ class OrderedSignalDispatcher:
                     result=await asyncio.to_thread(self.processor,**request.kwargs)
                 except Exception as error:
                     # Do not swallow asyncio.CancelledError (BaseException).
-                    # Shutdown must terminate the worker instead of leaving
-                    # a canceled execution task alive indefinitely.
+                    # A distinct exception is delivered to the callback rather
+                    # than sharing the executor exception/traceback object with
+                    # the long-running worker coroutine. This prevents a
+                    # re-entrant exception traceback from destabilizing the
+                    # worker on older Python runtimes.
                     self.processing_failures+=1
+                    reason=type(error).__name__
                     if not request.future.done():
-                        request.future.set_exception(error)
+                        request.future.set_exception(
+                            RuntimeError("Ordered ingress processing failed: "+reason)
+                        )
                 else:
                     if not request.future.done():
                         request.future.set_result(result)
