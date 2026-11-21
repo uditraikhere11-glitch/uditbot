@@ -153,6 +153,22 @@ def assess_order_recovery(
     if state=="REJECTED" and filled:
         return _fail("REJECTED_WITH_EXECUTION",quantity,found=True,broker_filled=filled)
 
+    # An exchange execution ID is unique broker evidence, not an order-local
+    # label. Seeing it attributed to two order IDs makes the snapshot unsafe
+    # even if the matching subset would otherwise sum correctly.
+    id_owners={}
+    for trade in trade_book:
+        tid=_str(trade,"exchangeTradeId")
+        if tid.lower() in _BAD_ID:
+            continue
+        seen_order=_str(trade,"orderId")
+        if tid in id_owners and id_owners[tid]!=seen_order:
+            return _fail(
+                "EXCHANGE_TRADE_ID_REUSED_ACROSS_ORDERS",
+                quantity,found=True,broker_filled=filled,
+            )
+        id_owners[tid]=seen_order
+
     unique={}
     for trade in trade_book:
         # A matching trade ID for a different order is an ambiguous identity;
