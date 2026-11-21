@@ -92,7 +92,10 @@ class OrderedSignalDispatcher:
                     self.queue_wait_ms.pop(0)
                 try:
                     result=await asyncio.to_thread(self.processor,**request.kwargs)
-                except BaseException as error:
+                except Exception as error:
+                    # Do not swallow asyncio.CancelledError (BaseException).
+                    # Shutdown must terminate the worker instead of leaving
+                    # a canceled execution task alive indefinitely.
                     self.processing_failures+=1
                     if not request.future.done():
                         request.future.set_exception(error)
