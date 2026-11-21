@@ -8,6 +8,8 @@ on:
       - 'run.py'
       - 'src/main.py'
       - 'src/engine/latency_monitor.py'
+      - 'src/journal/db.py'
+      - 'tools/benchmark_risk_journal.py'
       - 'src/engine/shadow_execution_events.py'
       - 'src/engine/typed_broker_evidence.py'
       - 'src/engine/delivery_sell_triage.py'
@@ -64,9 +66,23 @@ jobs:
           assert result['production_latency_improvement_proven'] is False
           assert result['count']==120
           PY
+      - name: Benchmark indexed LIVE-risk journal queries against legacy SQL
+        run: |
+          python -B -m tools.benchmark_risk_journal --historical-fills 30000 --rounds 10 > journal_risk_benchmark.json
+          cat journal_risk_benchmark.json
+          python - <<'PY'
+          import json
+          with open('journal_risk_benchmark.json',encoding='utf-8') as f:
+              result=json.load(f)
+          assert result['risk_state_equivalent'] is True
+          assert result['orders_submitted'] == 0
+          assert result['production_latency_improvement_proven'] is False
+          PY
       - name: Preserve anonymized benchmark report
         uses: actions/upload-artifact@v4
         with:
           name: execution-modernization-synthetic-benchmark
-          path: benchmark.json
+          path: |
+            benchmark.json
+            journal_risk_benchmark.json
           retention-days: 14
