@@ -285,7 +285,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
     @patch("requests.Session.delete")
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_c03_05_http_429_rate_limit_error(self, mock_delete):
-        """C03-05: Dhan returns HTTP 429 -> Rate-limit error; original order remains unresolved in previous state."""
+        """C03-05: Remote HTTP 429 cannot prove cancellation was NOT accepted; keep cancellation uncertain."""
         mock_resp = MagicMock()
         mock_resp.status_code = 429
         mock_resp.text = '{"error": "Too Many Requests"}'
@@ -309,7 +309,12 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         ok, msg = watcher.request_cancel(oid)
         self.assertFalse(ok)
         self.assertIn("429", msg)
-        self.assertEqual(watcher.pending[oid]["state"], OrderLifecycleState.PART_FILLED.value)
+        self.assertIn("UNKNOWN", msg)
+        # Once DELETE crossed the network, remote rate limiting is NOT
+        # verified rejection; do not treat the live cancel as never sent.
+        self.assertEqual(watcher.pending[oid]["state"], OrderLifecycleState.CANCEL_REQUESTED.value)
+        self.assertTrue(watcher.pending[oid]["cancel_uncertain"])
+        self.assertFalse(watcher.pending[oid]["cancel_acknowledged"])
 
     @patch("requests.Session.delete")
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
