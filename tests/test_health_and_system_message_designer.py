@@ -84,8 +84,6 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
                 self.assertIn("⏳ RENEWAL PENDING (NEXT DAY MARKET CLOSED)", msg)
                 self.assertIn("Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED", msg)
                 self.assertNotIn("Next trading session readiness: ✅ VERIFIED CHECKS", msg)
-                self.assertIn("Market tomorrow (", msg)
-                self.assertIn("🚫 CLOSED (Weekend)", msg)
 
     def test_verified_midweek_holiday_is_not_action_required(self):
         msg = self._health(
@@ -93,17 +91,6 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             dt.datetime(2026, 11, 24, 9, 0, tzinfo=IST),
         )
         self.assertIn("Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED", msg)
-        self.assertIn("Market tomorrow (Tue 24 Nov 2026): 🚫 CLOSED (Exchange holiday)", msg)
-        self.assertIn("Next scheduled session: Wed 25 Nov 2026", msg)
-
-    def test_exchange_holiday_today_explicitly_identified(self):
-        msg = self._health(
-            dt.date(2026, 11, 24),
-            dt.datetime(2026, 11, 25, 17, 0, 5, tzinfo=IST),
-        )
-        self.assertIn("Market today (Tue 24 Nov 2026): 🚫 CLOSED (Exchange holiday)", msg)
-        self.assertIn("Market tomorrow (Wed 25 Nov 2026): ✅ SCHEDULED TRADING DAY", msg)
-        self.assertIn("Next scheduled session: Wed 25 Nov 2026", msg)
 
     def test_normal_next_day_still_requires_action(self):
         msg = self._health(
@@ -112,13 +99,14 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
         )
         self.assertIn("Overall result: ❌ ACTION REQUIRED", msg)
 
-    def test_failed_auth_still_shows_holiday_information(self):
-        now = dt.date(2026, 11, 21)  # Saturday; tomorrow Sunday closed.
+    def test_failed_auth_on_weekend_keeps_action_required_without_calendar_rows(self):
+        now = dt.date(2026, 11, 21)  # Saturday; next day Sunday closed.
         expiry = dt.datetime(2026, 11, 21, 17, 0, 6, tzinfo=IST)
         msg = self._health(now, expiry, token_verified=False, token_renewed=False)
-        self.assertIn("Market tomorrow (Sun 22 Nov 2026): 🚫 CLOSED (Weekend)", msg)
-        self.assertIn("Next scheduled session: Mon 23 Nov 2026", msg)
         self.assertIn("Overall result: ❌ ACTION REQUIRED", msg)
+        self.assertNotIn("📅 Market today", msg)
+        self.assertNotIn("📅 Market tomorrow", msg)
+        self.assertNotIn("📆 Next scheduled session", msg)
 
     def test_closed_next_day_does_not_suppress_actual_failures(self):
         day = dt.date(2026, 11, 20)
