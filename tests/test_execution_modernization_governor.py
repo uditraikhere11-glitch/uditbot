@@ -68,6 +68,20 @@ class TestGovFastConnection(unittest.TestCase):
         with self.assertRaises(sqlite3.Error):
             self.g.admit()
 
+    def test_dropped_modification_history_blocks_even_reads(self):
+        self.g.admit()
+        with sqlite3.connect(self.g.path) as c:
+            c.execute("DROP TABLE order_modifications")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.g.admit(category="NON_TRADING")
+
+    def test_unauthorized_schema_change_blocks_fast_path(self):
+        self.g.admit()
+        with sqlite3.connect(self.g.path) as c:
+            c.execute("CREATE TABLE unrelated_change (id INTEGER)")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.g.admit()
+
     def test_truncated_ledger_fails_closed(self):
         self.g.admit()
         with open(self.g.path,"wb") as f:
