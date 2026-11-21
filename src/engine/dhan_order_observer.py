@@ -1,8 +1,10 @@
 """Read-only, bounded Dhan order-update observer for independent shadow testing.
 
 This module is intentionally NOT imported by the production run.py, DhanClient,
-reconciliation gate, ProtectionWatcher, or order placer. It never writes to
-SQLite, sends REST calls, places orders, cancels orders, or declares fills.
+reconciliation gate, ProtectionWatcher, or order placer. It NEVER writes to
+UditBot's trading journal, sends REST calls, places orders, cancels orders,
+or declares fills. An explicitly supplied separate .shadow.sqlite3 evidence
+ledger may persist *only* observations and is not a trading-state store.
 It accepts only broker updates that match one unique durable journal identity.
 
 A new connection starts DEGRADED because a WebSocket does not replay every
@@ -77,7 +79,8 @@ class ShadowOrderObserver:
     """Event-only ledger. All unknowns increase caution, never order permissions."""
 
     def __init__(self, account_id: str, ownership: Any, *,
-                 max_orders: int = 512, max_events_per_order: int = 128):
+                 max_orders: int = 512, max_events_per_order: int = 128,
+                 shadow_ledger: Any = None):
         if not account_id or not isinstance(account_id, str):
             raise ValueError("account_id required")
         if type(max_orders) is not int or not 1 <= max_orders <= 50000:
@@ -86,6 +89,9 @@ class ShadowOrderObserver:
             raise ValueError("invalid max_events_per_order")
         self.account_id = account_id
         self.ownership = ownership
+        self.shadow_ledger = shadow_ledger
+        if shadow_ledger is not None and shadow_ledger.account_id != account_id:
+            raise ValueError("shadow ledger/account identity mismatch")
         self.max_orders = max_orders
         self.max_events_per_order = max_events_per_order
         self.projections: Dict[str, OrderProjection] = OrderedDict()
@@ -144,14 +150,34 @@ class ShadowOrderObserver:
             if len(self.projections) >= self.max_orders:
                 self._degrade("SHADOW_CAPACITY_EXHAUSTED")
                 return "REJECTED"
-            projection = OrderProjection(
-                owned.account_id, owned.order_id, owned.security_id,
-                owned.exchange_segment, owned.product_type, owned.requested_qty,
-            )
+            try:
+                if self.shadow_ledger is None:
+                    projection = OrderProjection(
+                        owned.account_id, owned.order_id, owned.security_id,
+                        owned.exchange_segment, owned.product_type, owned.requested_qty,
+                    )
+                else:
+                    projection, _ = self.shadow_ledger.replay_order(
+                        broker_order_id=owned.order_id,
+                        security_id=owned.security_id,
+                        exchange_segment=owned.exchange_segment,
+                        product_type=owned.product_type,
+                        requested_qty=owned.requested_qty,
+                        max_events=self.max_events_per_order,
+                    )
+            except (EvidenceConflict, ValueError, sqlite3.Error):
+                self._degrade("SHADOW_REPLAY_UNVERIFIED")
+                return "REJECTED"
             self.projections[event.broker_order_id] = projection
         if len(projection._events) >= self.max_events_per_order and event.event_id not in projection._events:
             self._degrade("SHADOW_EVENT_CAPACITY_EXHAUSTED")
             return "REJECTED"
+        if self.shadow_ledger is not None:
+            try:
+                self.shadow_ledger.append(event)
+            except (ValueError, sqlite3.Error, OSError):
+                self._degrade("SHADOW_PERSISTENCE_UNVERIFIED")
+                return "REJECTED"
         try:
             result = projection.apply(event)
         except (EvidenceConflict, ValueError, TypeError):
