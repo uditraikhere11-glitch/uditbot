@@ -215,7 +215,12 @@ class ReadGovernor:
 
     def _connect_unlocked(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        persisted = self.path.is_file() and self.path.stat().st_size > 0
+        # An already existing zero-byte ledger could be a truncated quota
+        # history. Do not recreate it as a fresh healthy zero-used allowance.
+        exists = self.path.exists()
+        if exists and (not self.path.is_file() or self.path.stat().st_size == 0):
+            raise sqlite3.DatabaseError("Persisted governor audit ledger missing or empty")
+        persisted = exists
         conn = sqlite3.connect(self.path, timeout=0.07)
         try:
             conn.execute('PRAGMA journal_mode=WAL')
