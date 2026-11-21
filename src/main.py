@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from typing import Optional
 from src.config import AppConfig
 from src.models import (
@@ -251,7 +252,7 @@ class TradingBotPipeline:
             now = injected_clock if injected_clock is not None else time.time()
             msg_ts = msg_timestamp or now
             trace = SignalLatencyTrace(
-                trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
+                trace_id=f"TRC-{uuid.uuid4().hex}",
                 channel_id=channel_id,
                 message_id=message_id,
                 ist_received_time=signal_received_at if signal_received_at is not None else now,
@@ -1044,7 +1045,7 @@ class TradingBotPipeline:
         heads_up_note = None
         if trace is None:
             trace = SignalLatencyTrace(
-                trace_id=f"TRC-{int(now * 1000)}-{os.getpid()}",
+                trace_id=f"TRC-{uuid.uuid4().hex}",
                 symbol=sig.symbol,
                 channel_id=sig.channel_id,
                 message_id=sig.message_id,
