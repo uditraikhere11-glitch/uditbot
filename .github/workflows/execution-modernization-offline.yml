@@ -28,7 +28,8 @@ permissions:
   contents: read
 concurrency:
   group: execution-modernization-${{ github.ref }}
-  cancel-in-progress: false
+  # Newer development-branch tests supersede a stuck/outdated run.
+  cancel-in-progress: true
 jobs:
   offline-test:
     runs-on: ubuntu-latest
