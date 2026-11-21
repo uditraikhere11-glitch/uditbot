@@ -1,4 +1,4 @@
-"""Bounded retry for a scheduled Dhan login rejected as Invalid TOTP.
+"""Bounded retry for a forced (scheduled or manual CLI) Dhan Invalid TOTP.
 
 This function does not generate a second token on HTTP 401, account mismatch,
 or other broker errors. The caller already owns the shared Dhan token lock;
