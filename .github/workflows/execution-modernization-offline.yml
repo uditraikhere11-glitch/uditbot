@@ -1,0 +1,43 @@
+name: Execution modernization - isolated CI
+on:
+  push:
+    branches:
+      - dev/execution-modernization-20261121
+  pull_request:
+    paths:
+      - 'run.py'
+      - 'src/main.py'
+      - 'src/engine/latency_monitor.py'
+      - 'src/engine/shadow_execution_events.py'
+      - 'src/engine/typed_broker_evidence.py'
+      - 'src/engine/delivery_sell_triage.py'
+      - 'tests/test_execution_modernization_*.py'
+      - '.github/workflows/execution-modernization-offline.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: execution-modernization-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  offline-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Enable offline network perimeter
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+      - name: Compile sources
+        run: python -B -m compileall -q run.py src tests
+      - name: Focused modernization tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_execution_modernization_*.py' -v
+      - name: Full offline regression suite
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py'
