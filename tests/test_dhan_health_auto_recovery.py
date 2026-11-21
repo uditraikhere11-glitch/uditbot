@@ -14,8 +14,9 @@ from src.notifier.health_recovery import queue_verified_dhan_recovery
 
 
 class FakeResponse:
-    def __init__(self, body):
+    def __init__(self, body, status_code=200):
         self.body = body
+        self.status_code = status_code
 
     def json(self):
         return self.body
@@ -47,6 +48,20 @@ class TotpRetryTests(unittest.TestCase):
         session.post.return_value = second
         self.assertIs(self.retry(first, session=session), second)
         session.post.assert_called_once()
+
+    def test_http_401_403_and_429_never_trigger_an_extra_login(self):
+        for status in (400, 401, 403, 429, 500):
+            with self.subTest(status=status):
+                response = FakeResponse(
+                    {"status": "error", "message": "Invalid TOTP"},
+                    status_code=status,
+                )
+                session, sleep = Mock(), Mock()
+                self.assertIs(
+                    self.retry(response, session=session, sleep=sleep), response
+                )
+                session.post.assert_not_called()
+                sleep.assert_not_called()
 
     def test_runtime_and_other_errors_never_retry(self):
         for on_demand, body in (
