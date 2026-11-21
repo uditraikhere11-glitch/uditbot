@@ -32,7 +32,7 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
             dhan_client_id=ACCOUNT,
             trading_mode="LIVE",
         )
-        self.holidays = {dt.date(2026, 1, 26), dt.date(2026, 11, 25)}
+        self.holidays = {dt.date(2026, 1, 26), dt.date(2026, 11, 24)}
 
     def _enable(self, event, **kwargs):
         settings = designer.load(self.data_dir)
@@ -84,19 +84,31 @@ class HealthAndSystemDesignerTests(unittest.TestCase):
                 self.assertIn("⏳ RENEWAL PENDING (NEXT DAY MARKET CLOSED)", msg)
                 self.assertIn("Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED", msg)
                 self.assertNotIn("Next trading session readiness: ✅ VERIFIED CHECKS", msg)
+                self.assertIn("Tomorrow (", msg)
+                self.assertIn("🚫 CLOSED (Weekend)", msg)
 
     def test_verified_midweek_holiday_is_not_action_required(self):
         msg = self._health(
-            dt.date(2026, 11, 24),
-            dt.datetime(2026, 11, 25, 9, 0, tzinfo=IST),
+            dt.date(2026, 11, 23),
+            dt.datetime(2026, 11, 24, 9, 0, tzinfo=IST),
         )
         self.assertIn("Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED", msg)
+        self.assertIn("Tomorrow (Tue 24 Nov 2026): 🚫 CLOSED (Exchange holiday)", msg)
+        self.assertIn("Next trading session: ✅ Wed 25 Nov 2026", msg)
 
     def test_normal_next_day_still_requires_action(self):
         msg = self._health(
-            dt.date(2026, 11, 23),
-            dt.datetime(2026, 11, 24, 8, 0, tzinfo=IST),
+            dt.date(2026, 11, 25),
+            dt.datetime(2026, 11, 26, 8, 0, tzinfo=IST),
         )
+        self.assertIn("Overall result: ❌ ACTION REQUIRED", msg)
+
+    def test_failed_auth_still_shows_holiday_information(self):
+        now = dt.date(2026, 11, 21)  # Saturday; tomorrow Sunday closed.
+        expiry = dt.datetime(2026, 11, 21, 17, 0, 6, tzinfo=IST)
+        msg = self._health(now, expiry, token_verified=False, token_renewed=False)
+        self.assertIn("Tomorrow (Sun 22 Nov 2026): 🚫 CLOSED (Weekend)", msg)
+        self.assertIn("Next trading session: ✅ Mon 23 Nov 2026", msg)
         self.assertIn("Overall result: ❌ ACTION REQUIRED", msg)
 
     def test_closed_next_day_does_not_suppress_actual_failures(self):
