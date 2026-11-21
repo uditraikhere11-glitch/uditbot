@@ -81,6 +81,26 @@ class TestOrderedIngress(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(IngressClosed):
             await disp.submit(number=9)
 
+    async def test_close_waits_for_pending_admissions_before_worker_cancel(self):
+        observed=[]
+        def worker(*,number):
+            time.sleep(0.004)
+            observed.append(number)
+            return number
+        disp=OrderedSignalDispatcher(worker,max_pending=1)
+        await disp.start()
+        tasks=[]
+        for i in range(9):
+            tasks.append(asyncio.create_task(disp.submit(number=i)))
+            await asyncio.sleep(0)
+        self.assertGreaterEqual(disp._pending_admissions,1)
+        # Close begins while some callbacks are blocked waiting for capacity.
+        await disp.close()
+        self.assertEqual(await asyncio.gather(*tasks),list(range(9)))
+        self.assertEqual(observed,list(range(9)))
+        self.assertEqual(disp.metrics()["accepted"],9)
+        self.assertEqual(disp.metrics()["completed"],9)
+
     async def test_cancelled_callback_does_not_cancel_queued_trade(self):
         recorded=[]
         def worker(*,number):
