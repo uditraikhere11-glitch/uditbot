@@ -130,7 +130,8 @@ class TestJournalAccountBoundOwnership(unittest.TestCase):
                 event_id="INVALID-TRADE-1", account_id="SYNTHETIC",
                 broker_order_id="BUY-1", security_id="SEC",
                 exchange_segment="NSE_EQ", product_type="CNC",
-                kind="TRADE", exchange_trade_id="EX-FAIL", traded_qty=99,
+                kind="TRADE", cumulative_filled_qty=2,
+                exchange_trade_id="EX-FAIL", traded_qty=99,
             )
             with patch(
                 "src.engine.dhan_order_observer.normalize_dhan_order_update",
