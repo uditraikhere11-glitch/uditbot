@@ -39,6 +39,9 @@ class OrderedSignalDispatcher:
         self._worker: asyncio.Task | None=None
         self._closed=False
         self._started=False
+        self._pending_admissions=0
+        self._admissions_drained=asyncio.Event()
+        self._admissions_drained.set()
         self.accepted=0
         self.completed=0
         self.processing_failures=0
@@ -58,10 +61,20 @@ class OrderedSignalDispatcher:
             raise IngressClosed("dispatcher is not accepting new messages")
         loop=asyncio.get_running_loop()
         request=_Request(dict(kwargs),loop.create_future(),time.perf_counter_ns())
-        # Never silently drop. Capacity pressure awaits an available slot.
-        await self.queue.put(request)
-        self.accepted+=1
-        self.max_observed_backlog=max(self.max_observed_backlog,self.queue.qsize())
+        # Await capacity, but count unfinished admissions separately so a
+        # shutdown cannot cancel the worker before a waiting put is handled.
+        self._pending_admissions+=1
+        self._admissions_drained.clear()
+        try:
+            await self.queue.put(request)
+            self.accepted+=1
+            self.max_observed_backlog=max(
+                self.max_observed_backlog,self.queue.qsize()
+            )
+        finally:
+            self._pending_admissions-=1
+            if self._pending_admissions==0:
+                self._admissions_drained.set()
         try:
             return await asyncio.shield(request.future)
         except asyncio.CancelledError:
@@ -94,8 +107,11 @@ class OrderedSignalDispatcher:
         self._closed=True
         if self._worker is None:
             return
-        # Drains all accepted submissions before ending the worker. It does
-        # not itself cancel or retry any Dhan broker mutation.
+        # First resolve ALL callbacks that entered admission before close().
+        # They may be blocked waiting for queue capacity.
+        await self._admissions_drained.wait()
+        # Now drain all accepted submissions before ending the worker. It
+        # does not itself cancel or retry any Dhan broker mutation.
         await self.queue.join()
         self._worker.cancel()
         try:
