@@ -63,6 +63,9 @@ class ReadGovernor:
         # history are not silently abandoned during the migration.
         self.path = self.directory / f'dhan-reads-{key}.sqlite3'
         self.clock = clock
+        # Initialized only after cross-process flock, schema checks and a
+        # committed SQLite migration. Never cache rate-limit quotas/cooldowns.
+        self._verified_file_key = None
 
     @classmethod
     def classify(cls, method, url):
@@ -144,8 +147,63 @@ class ReadGovernor:
             os.close(fd)
 
     def _connect(self):
+        """Fast connection for an already verified, unchanged SQLite ledger.
+
+        The old implementation acquired the cross-process schema flock and
+        repeated CREATE TABLE/INDEX statements on EVERY broker API GET.
+        Only first use needs schema migration. All admissions still acquire
+        SQLite BEGIN IMMEDIATE and persist under synchronous=FULL.
+
+        The verified file's (device,inode) must not change. A replaced,
+        deleted or truncated governor cannot silently reset its quotas.
+        Missing/corrupt runtime tables still raise from the admission SQL.
+        """
+        verified = self._verified_file_key
+        if verified is not None:
+            try:
+                st = self.path.stat()
+            except OSError as exc:
+                raise sqlite3.DatabaseError(
+                    "Persisted broker governor ledger vanished"
+                ) from exc
+            if (st.st_dev, st.st_ino) != verified or st.st_size <= 0:
+                raise sqlite3.DatabaseError(
+                    "Persisted broker governor ledger changed unexpectedly"
+                )
+            # mode=rw refuses to create a fresh quota DB if the path is
+            # removed between stat() and sqlite3.connect().
+            conn = sqlite3.connect(
+                self.path.absolute().as_uri() + "?mode=rw",
+                uri=True, timeout=0.07,
+            )
+            try:
+                conn.execute("PRAGMA synchronous=FULL")
+                mode = conn.execute("PRAGMA journal_mode").fetchone()
+                after = self.path.stat()
+                if (not mode or str(mode[0]).lower() != "wal"
+                        or (after.st_dev, after.st_ino) != verified
+                        or after.st_size <= 0):
+                    raise sqlite3.DatabaseError(
+                        "Persisted broker governor WAL/identity unverified"
+                    )
+                return conn
+            except BaseException:
+                conn.close()
+                raise
+
+        # First use still executes the exact original cross-process schema
+        # and legacy-migration barrier before any API admission.
         with self._schema_initialization_lock():
-            return self._connect_unlocked()
+            conn = self._connect_unlocked()
+            try:
+                st = self.path.stat()
+                if st.st_size <= 0:
+                    raise sqlite3.DatabaseError("Governor schema initialization incomplete")
+                self._verified_file_key = (st.st_dev, st.st_ino)
+            except BaseException:
+                conn.close()
+                raise
+            return conn
 
     def _connect_unlocked(self):
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
