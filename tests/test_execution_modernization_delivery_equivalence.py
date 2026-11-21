@@ -4,11 +4,14 @@ These fixtures exercise the REAL _signed_cnc_delivery_sell_reconciles()
 helper—not the new diagnostic. No Dhan calls, order writes, or OCO mutations.
 """
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 import unittest
 
 from src.engine.market import IST
 from src.engine.unified_exit_reconciliation import (
     _signed_cnc_delivery_sell_reconciles as reconcile_signed,
+    verified_flat_delivery_day,
 )
 
 
@@ -100,6 +103,34 @@ class TestSignedDeliveryCnc(unittest.TestCase):
         trades={"sell":{"qty":3,"side":"SELL","from_today":True,"when":TODAY},
                 "buy":{"qty":1,"side":"BUY","from_today":True,"when":TODAY}}
         self.assertTrue(run(trades=trades))
+
+    def test_same_equity_unrelated_mtf_trade_is_not_false_cnc_evidence(self):
+        # The live Dhan tradebook can contain CNC and MTF for one security.
+        # A different product must not be fed to the CNC proof parser; the
+        # missing exact CNC SELL still prevents any false-flat outcome.
+        other={
+            "dhanClientId":ACCOUNT,"securityId":"SEC",
+            "exchangeSegment":"NSE_EQ","productType":"MTF",
+            "orderId":"OTHER-SELL","exchangeTradeId":"OTHER-EXEC",
+            "transactionType":"SELL","tradedQuantity":2,
+            "tradedPrice":100.0,
+            "exchangeTime":datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        db=SimpleNamespace(
+            account_id=ACCOUNT,
+            get_open_positions_lifecycle=lambda:[],
+        )
+        with patch(
+            "src.engine.unified_exit_reconciliation._broker_trade",
+            side_effect=AssertionError("unrelated product cannot be used"),
+        ):
+            result=verified_flat_delivery_day(
+                DAY,[DAY],[HOLD],[other],db,ACCOUNT,
+                lambda *args: (_ for _ in ()).throw(
+                    AssertionError("incomplete exact-contract evidence must not read protection")
+                ),
+            )
+        self.assertFalse(result)
 
     def test_wrong_day_evidence_blocks(self):
         trades={"E1":{"qty":2,"side":"SELL","from_today":True,
