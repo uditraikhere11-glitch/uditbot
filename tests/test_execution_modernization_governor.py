@@ -82,6 +82,12 @@ class TestGovFastConnection(unittest.TestCase):
         with self.assertRaises(sqlite3.DatabaseError):
             self.g.admit()
 
+    def test_existing_zero_byte_ledger_is_not_a_new_quota(self):
+        self.g.path.touch()
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.g.admit()
+        self.assertEqual(self.g.path.stat().st_size,0)
+
     def test_truncated_ledger_fails_closed(self):
         self.g.admit()
         with open(self.g.path,"wb") as f:
