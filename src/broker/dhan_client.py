@@ -898,6 +898,19 @@ class DhanClient:
                     )
                     time.sleep(2)
                     params["totp"] = compute_totp(self.cfg.dhan_totp_secret)
+            # Forced-login retry (scheduled health or manual CLI); never on-demand.
+            # The coordinator's token lock remains held; candidate account
+            # verification and fail-closed publication below remain unchanged.
+            from src.broker.totp_retry import retry_scheduled_invalid_totp_once
+            resp = retry_scheduled_invalid_totp_once(
+                resp,
+                on_demand=on_demand,
+                session=self.session,
+                auth_url=AUTH_URL,
+                params=params,
+                timeout=req_timeout,
+                generate_code=lambda: compute_totp(self.cfg.dhan_totp_secret),
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 if not isinstance(data, dict):

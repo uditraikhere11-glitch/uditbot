@@ -1844,6 +1844,15 @@ class StartupReconciliationGate:
             self.last_reconciled_at = time.time()
             self.last_error = ""
         logger.info("✅ [RECONCILIATION] Invariant checks passed! Gate opened: ACCEPTING_NEW_ENTRIES=True.")
+        # Notification-only: a subsequent broker-verified HEALTHY gate can close
+        # an earlier 17:00 auth incident even when recovery used the startup
+        # path instead of the background recheck path. Durable dedup guarantees
+        # one card per account/day; failures here cannot change gate outcomes.
+        try:
+            from src.notifier.health_recovery import queue_verified_dhan_recovery
+            queue_verified_dhan_recovery(self)
+        except Exception:
+            logger.exception("Unable to queue verified Dhan recovery notification")
         return True, "Reconciliation successful, system healthy and accepting new trades."
 
     def recheck_and_recover_if_verified(self) -> Tuple[bool, str]:
