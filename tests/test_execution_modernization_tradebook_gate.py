@@ -5,6 +5,7 @@ This is a narrow, hermetic test of the REAL recovery method. Broker and
 journal boundaries are mocked; no live Dhan/Telegram/API/SQLite mutations.
 """
 import unittest
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -38,6 +39,9 @@ class TestRecoveryBatchPreflight(unittest.TestCase):
             side_effect=lambda name, label: (True,book,"OK")
         )
         gate.last_error=""
+        gate._entry_state_lock=threading.RLock()
+        gate._halt_generation=0
+        gate._accepting_entries=False
         return gate
 
     def test_late_conflicting_execution_blocks_before_any_fill_write(self):
