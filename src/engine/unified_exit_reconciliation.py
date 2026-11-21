@@ -408,7 +408,10 @@ def _signed_cnc_delivery_sell_reconciles(
             continue
         if _identity(row) != key:
             continue
-        if account and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account:
+        # Negative CNC/MTF netQty is a delivery-sale exception to the
+        # ordinary position validator. Unlike a normal positive position,
+        # missing broker account identity must NEVER certify this exception.
+        if not account or str(row.get("dhanClientId") or "").strip() != account:
             return False
         raw_net = row.get("netQty")
         if isinstance(raw_net, bool) or raw_net is None:
