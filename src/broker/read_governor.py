@@ -66,6 +66,7 @@ class ReadGovernor:
         # Initialized only after cross-process flock, schema checks and a
         # committed SQLite migration. Never cache rate-limit quotas/cooldowns.
         self._verified_file_key = None
+        self._verified_schema_version = None
 
     @classmethod
     def classify(cls, method, url):
@@ -179,8 +180,11 @@ class ReadGovernor:
             try:
                 conn.execute("PRAGMA synchronous=FULL")
                 mode = conn.execute("PRAGMA journal_mode").fetchone()
+                schema_version = conn.execute("PRAGMA schema_version").fetchone()
                 after = self.path.stat()
                 if (not mode or str(mode[0]).lower() != "wal"
+                        or not schema_version
+                        or int(schema_version[0]) != self._verified_schema_version
                         or (after.st_dev, after.st_ino) != verified
                         or after.st_size <= 0):
                     raise sqlite3.DatabaseError(
@@ -199,6 +203,10 @@ class ReadGovernor:
                 st = self.path.stat()
                 if st.st_size <= 0:
                     raise sqlite3.DatabaseError("Governor schema initialization incomplete")
+                schema = conn.execute("PRAGMA schema_version").fetchone()
+                if not schema:
+                    raise sqlite3.DatabaseError("Governor schema version unavailable")
+                self._verified_schema_version = int(schema[0])
                 self._verified_file_key = (st.st_dev, st.st_ino)
             except BaseException:
                 conn.close()
