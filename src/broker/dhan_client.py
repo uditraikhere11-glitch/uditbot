@@ -2341,6 +2341,40 @@ class DhanClient:
             logger.error(f"HTTP exception fetching order by correlation {correlation_id}: {e}")
             return None
 
+    def diagnose_external_order_lookup(self, correlation_id: str, *, expected_security_id: str = ""):
+        """Read-only typed diagnosis of a prior submission's external order ID.
+
+        This is opt-in and separate from the current get_order_by_correlation_id()
+        compatibility contract. It NEVER retries a mutation, infers a fill, or
+        equates 404/timeout/401 with an order that was not submitted.
+        """
+        from src.engine.typed_broker_evidence import (
+            ExternalOrderEvidence, classify_external_order_lookup,
+        )
+        cid = str(correlation_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", cid):
+            return ExternalOrderEvidence("INVALID_LOOKUP", "invalid correlation ID")
+        if self.cfg.trading_mode == TradingMode.TEST:
+            return ExternalOrderEvidence("NOT_QUERIED_TEST_MODE", "TEST mode cannot establish live broker evidence")
+        try:
+            response = self._get_with_auth_recovery(f"{BASE_URL}/orders/external/{cid}")
+        except Exception as exc:
+            return classify_external_order_lookup(correlation_id=cid, transport_error=exc)
+        status = getattr(response, "status_code", None)
+        payload = None
+        if status == 200:
+            try:
+                payload = response.json()
+            except (ValueError, AttributeError, TypeError):
+                return ExternalOrderEvidence("MALFORMED", "broker returned unreadable order JSON")
+        return classify_external_order_lookup(
+            correlation_id=cid,
+            http_status=status,
+            payload=payload,
+            expected_account_id=str(getattr(self.cfg, "dhan_client_id", "") or ""),
+            expected_security_id=str(expected_security_id or ""),
+        )
+
     # =========================================================================
     # SAFETY CORRECTION C.A: Structured Broker Collection Reads
     # =========================================================================
