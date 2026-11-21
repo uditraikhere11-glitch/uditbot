@@ -33,6 +33,9 @@ from datetime import datetime
 import threading
 import zoneinfo
 from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots
+from src.engine.broker_tradebook_preflight import (
+    TradebookPreflightError, preflight_tradebook,
+)
 from src.engine.unified_exit_reconciliation import (
     ReconciliationEvidenceError, reconcile_verified_exits, _exchange_time, verified_flat_delivery_day,
 )
@@ -1571,6 +1574,19 @@ class StartupReconciliationGate:
                 or getattr(self.db, "account_id", "")
                 or ""
             ).strip()
+            # Phase 2: validate the ENTIRE broker trade snapshot before
+            # persisting even its first fill. A contradictory late execution
+            # must never leave a half-reconciled SQLite journal.
+            if hasattr(self.db, "record_fill"):
+                try:
+                    preflight_tradebook(
+                        trade_book, expected_account_id=expected_tb_acct
+                    )
+                except TradebookPreflightError as exc:
+                    return self._fail_reconciliation_locked(
+                        "Broker tradebook preflight blocked: " + str(exc),
+                        starting_halt_generation,
+                    )
             for trade in trade_book:
                 if not isinstance(trade, dict):
                     return self._fail_reconciliation_locked("Malformed non-dict record in trade_book", starting_halt_generation)
