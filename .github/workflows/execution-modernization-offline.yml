@@ -49,7 +49,8 @@ jobs:
       - name: Compile sources and standalone observer CLI
         run: python -B -m compileall -q run.py src tools tests
       - name: Focused modernization tests
-        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_execution_modernization_*.py' -v
+        # A hung concurrency test is a failed safety gate, not a slow PASS.
+        run: timeout --signal=TERM 40s python -u -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_execution_modernization_*.py' -v
       - name: Full offline regression suite
         run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py'
       - name: Offline matched parser/commit contention benchmark
