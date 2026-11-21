@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -37,6 +38,7 @@ class OwnedOrder:
     exchange_segment: str
     product_type: str
     requested_qty: int
+    transaction_side: str = ""
 
 
 class JournalOwnership:
@@ -52,27 +54,30 @@ class JournalOwnership:
         conn = sqlite3.connect(self.uri, uri=True, timeout=3.0)
         try:
             conn.execute("PRAGMA query_only=ON")
+            # Every order update needs one and only one durable claimant.
+            # Entry intents are BUY; protection attempts are SELL. The
+            # broker's TxnType is checked BEFORE persisting shadow evidence.
+            fields = ("account_id, broker_order_id, security_id, "
+                      "exchange_segment, product_type, quantity")
             claims = []
-            for sql in (
-                "SELECT account_id, broker_order_id, security_id, "
-                "exchange_segment, product_type, quantity "
-                "FROM order_intents WHERE broker_order_id=?",
-                "SELECT account_id, broker_order_id, security_id, "
-                "exchange_segment, product_type, quantity "
-                "FROM protection_attempts WHERE broker_order_id=?",
-            ):
-                claims.extend(conn.execute(sql, (order_id,)).fetchall())
+            for table, side in (("order_intents", "BUY"),
+                                ("protection_attempts", "SELL")):
+                rows = conn.execute(
+                    f"SELECT {fields} FROM {table} WHERE broker_order_id=?",
+                    (order_id,),
+                ).fetchall()
+                claims.extend((row, side) for row in rows)
             if not claims:
                 return None
             if len(claims) != 1:
                 raise ValueError("ambiguous duplicate broker-order ownership claims")
-            a, oid, sec, seg, prod, qty = claims[0]
+            (a, oid, sec, seg, prod, qty), side = claims[0]
             if any(not isinstance(v, str) or not v.strip()
                    for v in (a, oid, sec, seg, prod)):
                 raise ValueError("incomplete journal order identity")
             if type(qty) is not int or qty <= 0:
                 raise ValueError("invalid journal requested quantity")
-            return OwnedOrder(a, oid, sec, seg.upper(), prod.upper(), qty)
+            return OwnedOrder(a, oid, sec, seg.upper(), prod.upper(), qty, side)
         finally:
             conn.close()
 
@@ -144,9 +149,24 @@ class ShadowOrderObserver:
                 event.exchange_segment, event.product_type):
             self._degrade("OWNED_ORDER_IDENTITY_CONFLICT")
             return "REJECTED"
-        if event.cumulative_filled_qty is None or event.cumulative_filled_qty > owned.requested_qty:
+        # A matching broker OrderNo alone does not prove this stream record
+        # belongs to the persisted BUY or protective SELL. Validate Dhan's
+        # original Quantity and TxnType against the unique local claim.
+        # Quantity is known integral because normalization already validated
+        # it; do not infer order size from cumulative TradedQty.
+        data = raw["Data"]
+        if (event.cumulative_filled_qty is None
+                or event.cumulative_filled_qty > owned.requested_qty
+                or int(data["Quantity"]) != owned.requested_qty):
             self._degrade("OWNED_ORDER_QUANTITY_CONFLICT")
             return "REJECTED"
+        if owned.transaction_side:
+            claimed_side = str(owned.transaction_side).upper()
+            observed_side = str(data.get("TxnType") or "").upper()
+            if (claimed_side not in ("BUY", "SELL")
+                    or observed_side != {"BUY":"B", "SELL":"S"}[claimed_side]):
+                self._degrade("OWNED_ORDER_SIDE_CONFLICT")
+                return "REJECTED"
         projection = self.projections.get(event.broker_order_id)
         if projection is None:
             if len(self.projections) >= self.max_orders:
@@ -174,18 +194,24 @@ class ShadowOrderObserver:
         if len(projection._events) >= self.max_events_per_order and event.event_id not in projection._events:
             self._degrade("SHADOW_EVENT_CAPACITY_EXHAUSTED")
             return "REJECTED"
+        # Validate on an isolated copy BEFORE durable append. Previously an
+        # invalid event was committed and only then rejected by projection,
+        # poisoning every subsequent process-restart replay. A post-commit
+        # crash is still safe: replay rebuilds the validated candidate.
+        candidate = deepcopy(projection)
+        try:
+            result = candidate.apply(event)
+        except (EvidenceConflict, ValueError, TypeError):
+            self._degrade("PROJECTOR_EVIDENCE_CONFLICT")
+            return "REJECTED"
         if self.shadow_ledger is not None:
             try:
                 self.shadow_ledger.append(event)
             except (ValueError, sqlite3.Error, OSError):
                 self._degrade("SHADOW_PERSISTENCE_UNVERIFIED")
                 return "REJECTED"
-        try:
-            result = projection.apply(event)
-        except (EvidenceConflict, ValueError, TypeError):
-            self._degrade("PROJECTOR_EVIDENCE_CONFLICT")
-            return "REJECTED"
-        if projection.reconciliation_required:
+        self.projections[event.broker_order_id] = candidate
+        if candidate.reconciliation_required:
             self._degrade("PROJECTOR_RECONCILIATION_REQUIRED")
         if result == "DUPLICATE":
             self.duplicate_events += 1
