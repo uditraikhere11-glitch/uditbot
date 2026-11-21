@@ -63,9 +63,11 @@ for line in Path(sys.argv[1]).read_text().splitlines():
         continue
     k,v=line.split("=",1)
     vals[k.strip()]=v.strip().strip("\"'")
-if not vals.get("LOG_GROUP_ID"):
-    raise SystemExit("LOG_GROUP_ID missing in AmanBot .env; no changes made")
-print("AmanBot Telegram log destination: CONFIGURED (value hidden)")
+missing = [k for k in ("LOG_GROUP_ID", "TG_BOT_TOKEN") if not vals.get(k)]
+if missing:
+    raise SystemExit("Direct Telegram health delivery requires " + ", ".join(missing) +
+                     " in AmanBot .env; no changes made")
+print("AmanBot Bot API sender and log destination: CONFIGURED (values hidden)")
 PY
 
 TMP="$(mktemp -d)"
