@@ -611,10 +611,6 @@ class JournalDB:
                 "CREATE INDEX IF NOT EXISTS idx_risk_fills_order_id "
                 "ON fills(broker_order_id)"
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_intents_state_created "
-                "ON order_intents(state, created_at)"
-            )
 
     # --- Durable Protection-Attempt Lifecycle (Safety Correction A & CV13-01) ---
 
