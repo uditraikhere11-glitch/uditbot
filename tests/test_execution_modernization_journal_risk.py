@@ -119,6 +119,46 @@ class TestRiskJournalIndexedEquivalence(unittest.TestCase):
         with self.journal._get_conn() as c:
             self.assertEqual(after,_legacy_risk(c))
 
+    def test_more_than_one_sqlite_batch_preserves_every_execution(self):
+        # 425 currently active broker orders require TWO bounded IN batches.
+        with self.journal._get_conn() as c:
+            c.executemany(
+                "INSERT INTO orders(correlation_id,broker_order_id,trading_mode,"
+                "security_id,price,quantity,filled_quantity,status,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                [(f"NEW-{i}",f"NEW-{i}","LIVE",f"S-{i}",10.0,3,0,
+                  "TRADED",START+100+i) for i in range(425)],
+            )
+            c.executemany(
+                "INSERT INTO fills(broker_order_id,exchange_trade_id,"
+                "traded_quantity) VALUES(?,?,?)",
+                [(f"NEW-{i}",f"X-NEW-{i}",2) for i in range(425)],
+            )
+            expected=_legacy_risk(c)
+        actual=self.journal.get_live_portfolio_risk_state(START)
+        self.assertEqual(actual,expected)
+        self.assertEqual(actual["daily_trades"],
+                         self.journal.get_today_orders_count(START))
+
+    def test_null_broker_ids_and_duplicate_order_ids_preserve_legacy_semantics(self):
+        with self.journal._get_conn() as c:
+            c.execute(
+                "INSERT INTO orders(correlation_id,broker_order_id,trading_mode,"
+                "security_id,price,quantity,filled_quantity,status,created_at) "
+                "VALUES('NO-OID',NULL,'LIVE','MISSING-ID',1.0,1,0,'PENDING',?)",
+                (START+55,),
+            )
+            c.execute(
+                "INSERT INTO orders(correlation_id,broker_order_id,trading_mode,"
+                "security_id,price,quantity,filled_quantity,status,created_at) "
+                "VALUES('DUPLICATE-BOID','E3','LIVE','DUP',10.0,2,0,"
+                "'CANCELLED',?)",
+                (START+56,),
+            )
+            expected=_legacy_risk(c)
+        self.assertEqual(self.journal.get_live_portfolio_risk_state(START),
+                         expected)
+
     def test_new_fill_visible_immediately_no_cache(self):
         before=self.journal.get_live_portfolio_risk_state(START)
         with self.journal._get_conn() as c:
