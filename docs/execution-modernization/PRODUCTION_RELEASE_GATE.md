@@ -16,15 +16,10 @@ or deployments were performed during this development.**
    `idx_intents_state_created` idempotently on journal initialization.
    They are additive and do not remove history, reallocate trades or change
    existing entry/protection authorization.
-3. `src/broker/read_governor.py`: after the first cross-process locked schema
-   verification, Dhan broker GET/ORDER/DATA/QUOTE admission uses a verified
-   existing WAL database connection instead of repeating CREATE TABLE/INDEX
-   and schema locking for every request. Per-category 1-second/other existing
-   quotas, BEGIN IMMEDIATE atomic reservation, durable write with
-   synchronous FULL, cooldown and modification caps remain enforced.
-   The file's device/inode, size, WAL journal mode and schema version are
-   checked on each fast admission. Replaced/deleted/truncated databases or
-   unexpected schema changes fail closed, never reset quotas.
+3. The proposed `src/broker/read_governor.py` fast path was tested and
+   **rejected**. The synthetic median admission changed from 1.169 ms to
+   1.152 ms (1.01x), insufficient to justify touching a safety-critical
+   cross-process rate limiter. The original governor is unchanged from main.
 
 The observer, shadow event ledger, opt-in FIFO dispatcher and deterministic
 preparse remain separate enhancements. The latter two are OFF by default and
@@ -41,8 +36,9 @@ synthetic historical fills and 1 current LIVE order, 10 repeated rounds:
 See GitHub Actions run 44881444093. This measures the database component
 only. It does NOT establish 17.48x shorter Telegram-to-Dhan ACK, and the gain
 depends on real journal size, current-day activity and VM disk conditions.
-The Dhan governor benchmark and full-current-head CI must be checked on the
-latest development commit before proposing a release.
+The governor experiment was independently benchmarked and reverted.
+The full-current-head CI must be checked on the latest development commit
+before proposing a release.
 
 ## Commands for supervised *read-only* VM evidence collection
 
@@ -95,8 +91,8 @@ journals to public GitHub or attach to a public PR.
    token auth, single owner, STOP, config and idempotent mutations.
 3. Existing SQLite journal backed up consistently; confirm indexes and
    unmodified trading state before/after migration.
-4. Dhan governor cross-process tests verify documented per-category quotas,
-   cooldowns, modification caps, busy retries and fail-closed corruption.
+4. Dhan category-governor existing behavior remains unchanged; its
+   cross-process quotas, cooldowns, mutation limits and busy-retry tests pass.
 5. Current VM telemetry: matched p50/p95/p99 ingress, quote, broker HTTP,
    ACK, fill-to-protection, watcher API admission and journal lock waits.
 6. No false HEALTHY, no duplicate order, no unverified OCO/Super protection,
