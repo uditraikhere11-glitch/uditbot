@@ -15,7 +15,7 @@ SESSION_CLOSE = time(15, 35)
 def format_market_calendar_lines(
     *, today: date, next_session_date: date,
     calendar_verified: bool, holidays_set: Iterable[date],
-) -> Tuple[str, str]:
+) -> Tuple[str, str, str]:
     """Separate calendar facts from the authentication/overall health verdict."""
     holidays = set(holidays_set or ())
     if today.weekday() >= 5:
@@ -49,7 +49,7 @@ def format_market_calendar_lines(
     )
 
 
-def verified_market_calendar_lines(now_ts: float) -> Tuple[str, str]:
+def verified_market_calendar_lines(now_ts: float) -> Tuple[str, str, str]:
     """Read-only calendar summary for runtime recovery notices.
 
     This deliberately does not infer trading readiness, holidays from weekdays,
