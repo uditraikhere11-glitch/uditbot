@@ -408,10 +408,12 @@ def _signed_cnc_delivery_sell_reconciles(
             continue
         if _identity(row) != key:
             continue
-        # Negative CNC/MTF netQty is a delivery-sale exception to the
-        # ordinary position validator. Unlike a normal positive position,
-        # missing broker account identity must NEVER certify this exception.
-        if not account or str(row.get("dhanClientId") or "").strip() != account:
+        # A complete, authenticated Dhan positions response may omit the
+        # account on individual position rows. The startup gate separately
+        # validates the Dhan profile and journal account, and every actual
+        # SELL trade must attest the account via _broker_trade(). Reject a
+        # positive contradictory row identity, never infer a different one.
+        if account and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account:
             return False
         raw_net = row.get("netQty")
         if isinstance(raw_net, bool) or raw_net is None:
