@@ -29,12 +29,16 @@ class _Request:
 
 class OrderedSignalDispatcher:
     def __init__(self, processor: Callable[..., Any], *,
-                 max_pending: int = 64):
+                 max_pending: int = 64,
+                 on_pipeline_returned: Callable[[dict], Any] | None = None):
         if not callable(processor):
             raise TypeError("callable processor required")
         if type(max_pending) is not int or not 1 <= max_pending <= 10000:
             raise ValueError("max_pending must be in 1..10000")
+        if on_pipeline_returned is not None and not callable(on_pipeline_returned):
+            raise TypeError("on_pipeline_returned must be callable")
         self.processor=processor
+        self.on_pipeline_returned=on_pipeline_returned
         self.queue=asyncio.Queue(maxsize=max_pending)
         # A later producer can otherwise overtake a producer waking from
         # Queue.put() when capacity appears, breaking signal source order.
@@ -123,6 +127,11 @@ class OrderedSignalDispatcher:
                     self.queue_wait_ms.pop(0)
                 try:
                     result=await asyncio.to_thread(self.processor,**request.kwargs)
+                    if self.on_pipeline_returned is not None:
+                        # The callback records ONLY that the local pipeline
+                        # returned. Failure leaves the ingress claim PENDING
+                        # and requires manual broker/journal reconciliation.
+                        self.on_pipeline_returned(dict(request.kwargs))
                 except Exception as error:
                     # Do not swallow asyncio.CancelledError (BaseException).
                     # A distinct exception is delivered to the callback rather
