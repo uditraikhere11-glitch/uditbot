@@ -56,11 +56,11 @@ class TestOrderedIngress(unittest.IsolatedAsyncioTestCase):
             return number
         disp=OrderedSignalDispatcher(worker)
         await disp.start()
-        self.assertEqual(await disp.submit(number=0),0)
+        self.assertEqual(await asyncio.wait_for(disp.submit(number=0),timeout=3),0)
         with self.assertRaises(RuntimeError):
-            await disp.submit(number=1)
-        self.assertEqual(await disp.submit(number=2),2)
-        await disp.close()
+            await asyncio.wait_for(disp.submit(number=1),timeout=3)
+        self.assertEqual(await asyncio.wait_for(disp.submit(number=2),timeout=3),2)
+        await asyncio.wait_for(disp.close(),timeout=3)
         self.assertEqual(disp.processing_failures,1)
 
     async def test_shutdown_drains_accepted_work(self):
