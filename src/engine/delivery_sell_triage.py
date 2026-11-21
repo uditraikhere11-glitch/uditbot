@@ -90,8 +90,10 @@ def triage_negative_delivery_position(
         except ValueError:
             return _unknown("malformed holdings quantity", net)
         matched_holdings.append(holding)
-    if len(matched_holdings) > 1:
-        return _unknown("ambiguous duplicate holdings", net)
+    if len(matched_holdings) != 1:
+        return _unknown(
+            "exactly one account-bound settled holdings row required", net
+        )
 
     seen: dict[str, tuple[str, int, str]] = {}
     buys = sells = 0
