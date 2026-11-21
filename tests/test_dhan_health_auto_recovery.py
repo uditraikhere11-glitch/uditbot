@@ -6,7 +6,7 @@ import sqlite3
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 from src.broker.totp_retry import retry_scheduled_invalid_totp_once
@@ -123,6 +123,9 @@ class HealthRecoveryTests(unittest.TestCase):
         self.assertEqual(event_key, "DAILY_HEALTH_1700_RECOVERY")
         self.assertIn("Reconciliation: ✅ HEALTHY", msg)
         self.assertIn("Next-session readiness: Not independently verified", msg)
+        self.assertNotIn("📅 Market today", msg)
+        self.assertNotIn("📅 Market tomorrow", msg)
+        self.assertNotIn("📆 Next scheduled session", msg)
         self.assertNotIn("9000001536", msg)
 
     def test_no_notification_without_same_day_auth_failure(self):
@@ -131,31 +134,6 @@ class HealthRecoveryTests(unittest.TestCase):
         self.assertFalse(queue_verified_dhan_recovery(self.gate, now_ts=self.now))
         self.record_health("AUTH_CHECK=FAIL", self.now - 86400)
         self.assertFalse(queue_verified_dhan_recovery(self.gate, now_ts=self.now))
-
-    def test_recovery_notice_contains_verified_exchange_holiday(self):
-        # Official 2026 calendar: Tuesday 24 November is a trading holiday.
-        self.now = datetime(2026, 11, 23, 17, 10,
-                            tzinfo=ZoneInfo("Asia/Kolkata")).timestamp()
-        self.record_health("AUTH_CHECK=FAIL")
-        with patch("src.engine.market.load_holidays_verified",
-                   return_value=(True, {datetime(2026, 11, 24).date(),
-                                       datetime(2026, 1, 26).date()}, "OK")):
-            self.assertTrue(queue_verified_dhan_recovery(self.gate, now_ts=self.now))
-        msg = self.db.conn.execute("SELECT text FROM notice").fetchone()[0]
-        self.assertIn("Market tomorrow (Tue 24 Nov 2026): 🚫 CLOSED (Exchange holiday)", msg)
-        self.assertIn("Market today (Mon 23 Nov 2026): ✅ SCHEDULED TRADING DAY", msg)
-        self.assertIn("Next scheduled session: Wed 25 Nov 2026", msg)
-        self.assertIn("Next-session readiness: Not independently verified", msg)
-
-    def test_recovery_notice_fails_closed_when_calendar_unverified(self):
-        self.record_health("AUTH_CHECK=FAIL")
-        with patch("src.engine.market.load_holidays_verified",
-                   return_value=(False, set(), "Missing calendar")):
-            self.assertTrue(queue_verified_dhan_recovery(self.gate, now_ts=self.now))
-        msg = self.db.conn.execute("SELECT text FROM notice").fetchone()[0]
-        self.assertIn("Market tomorrow (Sun 22 Nov 2026): 🚫 CLOSED (Weekend)", msg)
-        self.assertIn("Next scheduled session: ⚠️ UNVERIFIED", msg)
-        self.assertNotIn("Next scheduled session: ✅", msg)
 
     def test_no_notification_if_stop_or_gate_blocked(self):
         self.record_health("AUTH_CHECK=FAIL")
