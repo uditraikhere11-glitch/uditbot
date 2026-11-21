@@ -11,6 +11,16 @@ on:
       - 'src/engine/shadow_execution_events.py'
       - 'src/engine/typed_broker_evidence.py'
       - 'src/engine/delivery_sell_triage.py'
+      - 'src/engine/deterministic_preparse.py'
+      - 'src/engine/ordered_ingress.py'
+      - 'src/engine/dhan_order_observer.py'
+      - 'src/engine/dhan_order_update_shadow.py'
+      - 'src/engine/shadow_event_ledger.py'
+      - 'src/engine/telegram_event_metadata.py'
+      - 'tools/execution_*.py'
+      - 'tools/dhan_order_shadow_cli.py'
+      - 'requirements-order-shadow.txt'
+      - 'docs/execution-modernization/**'
       - 'tests/test_execution_modernization_*.py'
       - '.github/workflows/execution-modernization-offline.yml'
   workflow_dispatch:
@@ -35,9 +45,26 @@ jobs:
         run: python -m pip install -r requirements-test.txt
       - name: Enable offline network perimeter
         run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
-      - name: Compile sources
-        run: python -B -m compileall -q run.py src tests
+      - name: Compile sources and standalone observer CLI
+        run: python -B -m compileall -q run.py src tools tests
       - name: Focused modernization tests
         run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_execution_modernization_*.py' -v
       - name: Full offline regression suite
         run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py'
+      - name: Offline matched parser/commit contention benchmark
+        run: |
+          python -B tools/execution_modernization_benchmark.py --count 120 --workers 8 --commit-delay-ms 2.0 > benchmark.json
+          cat benchmark.json
+          python - <<'PY'
+          import json
+          with open('benchmark.json',encoding='utf-8') as f:
+              result=json.load(f)
+          assert result['production_latency_improvement_proven'] is False
+          assert result['count']==120
+          PY
+      - name: Preserve anonymized benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-modernization-synthetic-benchmark
+          path: benchmark.json
+          retention-days: 14
