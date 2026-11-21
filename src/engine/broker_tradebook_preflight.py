@@ -20,14 +20,14 @@ class TradebookPreflightError(ValueError):
 
 def _execution_id(value: Any) -> str:
     if isinstance(value, bool):
-        raise TradebookPreflightError("invalid exchange execution ID")
+        raise TradebookPreflightError("invalid exchangeTradeId execution identity")
     eid = str(value).strip() if value is not None else ""
     if (
         not eid or eid.lower() in ("none", "null", "na", "nan", "inf", "infinity")
         or re.fullmatch(r"[+-]?0+(?:\.0+)?", eid)
         or any(marker in eid for marker in ("-TRD-", "-FILL-", "-RECON-"))
     ):
-        raise TradebookPreflightError("synthetic, missing or zero exchange execution ID")
+        raise TradebookPreflightError("synthetic, missing or zero exchangeTradeId execution identity")
     return eid
 
 
