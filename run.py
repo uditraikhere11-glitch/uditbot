@@ -193,6 +193,7 @@ async def main():
 
         @client.on(events.NewMessage(chats=allowed_chats))
         async def handler(event):
+            callback_monotonic_ns = time.perf_counter_ns()
             received_at = time.time()  # event callback arrival, before chat lookup / to_thread
             if event.chat_id not in allowed_chats:
                 return
@@ -215,6 +216,7 @@ async def main():
                 msg_timestamp=msg_ts,
                 source_name=source_name,
                 signal_received_at=received_at,
+                callback_monotonic_ns=callback_monotonic_ns,
             )
             print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
 
