@@ -3503,7 +3503,7 @@ class DhanClient:
                     "outcome UNKNOWN; do not resubmit without broker readback"
                 )
             elif resp.status_code >= 500 or resp.status_code == 408:
-                return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}
+                return False, None, f"Dhan HTTP {resp.status_code} server error on Forever OCO {correlation_id} (outcome UNKNOWN): {resp.text}"
             return False, None, f"Forever OCO rejected ({resp.status_code}): {resp.text}"
         except BrokerMutationNotSubmitted as e:
             return False, None, f"MUTATION NOT_SUBMITTED (config fence): {e}"
