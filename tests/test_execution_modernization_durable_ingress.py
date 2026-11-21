@@ -13,6 +13,7 @@ import unittest
 from src.engine.durable_ingress_audit import (
     DurableIngressAudit, IngressAuditConflict,
 )
+from tools.inspect_ingress_audit import inspect
 
 
 ARGS=dict(
@@ -39,6 +40,20 @@ class TestDurableIngressAudit(unittest.TestCase):
         with DurableIngressAudit(str(self.path),account_id="SYNTHETIC") as d:
             self.assertEqual(d.admit(**ARGS),"DUPLICATE_PENDING")
             self.assertTrue(d.summary()["requires_manual_reconciliation"])
+
+    def test_read_only_report_omits_account_and_message_identifiers(self):
+        with DurableIngressAudit(str(self.path),account_id="SYNTHETIC") as d:
+            d.admit(**ARGS)
+        before=self.path.read_bytes()
+        report=inspect(self.path)
+        self.assertEqual(before,self.path.read_bytes())
+        self.assertEqual(report["unreturned_signals"],1)
+        self.assertTrue(report["manual_reconciliation_required"])
+        self.assertFalse(report["automatic_signal_replay_allowed"])
+        self.assertFalse(report["broker_fills_verified"])
+        self.assertNotIn("SYNTHETIC",str(report))
+        self.assertNotIn(str(ARGS["message_id"]),str(report))
+        self.assertNotIn(str(ARGS["channel_id"]),str(report))
 
     def test_mark_return_only_once_and_reopen(self):
         with DurableIngressAudit(str(self.path),account_id="SYNTHETIC") as d:
