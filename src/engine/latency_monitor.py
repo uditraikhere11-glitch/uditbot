@@ -25,11 +25,15 @@ Implements Section 5, Section 6 & Section 7 requirements + P1 Durable Telemetry 
 """
 
 from dataclasses import dataclass, field
+import logging
 import math
 import statistics
 import threading
 import time
 from typing import Any, Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 def _ns_to_ms(delta_ns: Optional[int]) -> Optional[float]:
@@ -366,6 +370,7 @@ class LatencyMonitor:
         # whether a broker order, STOP, or reconciliation is permitted.
         self.ingress_to_processing_ms: List[float] = []
         self.pipeline_lock_wait_ms: List[float] = []
+        self._ingress_samples_seen: int = 0
         self.quote_ages_sec: List[float] = []
         self.quote_age_unknown_count: int = 0
         self.yahoo_success_count: int = 0
@@ -653,13 +658,37 @@ class LatencyMonitor:
         if not (math.isfinite(total_ms) and math.isfinite(lock_ms)
                 and 0.0 <= lock_ms <= total_ms):
             return
+        sample_summary = None
         with self._lock:
             self.ingress_to_processing_ms.append(total_ms)
             self.pipeline_lock_wait_ms.append(lock_ms)
+            self._ingress_samples_seen += 1
             if len(self.ingress_to_processing_ms) > self.max_samples:
                 self.ingress_to_processing_ms.pop(0)
             if len(self.pipeline_lock_wait_ms) > self.max_samples:
                 self.pipeline_lock_wait_ms.pop(0)
+            if self._ingress_samples_seen % 50 == 0:
+                values = sorted(self.ingress_to_processing_ms)
+                locks = sorted(self.pipeline_lock_wait_ms)
+                sample_summary = (
+                    self._ingress_samples_seen,
+                    self._percentile(values, 50.0),
+                    self._percentile(values, 95.0),
+                    self._percentile(values, 99.0),
+                    self._percentile(locks, 95.0),
+                )
+        # No SQLite write or broker operation. Only anonymized counters in logs.
+        # Logging failure must never affect the trade processing boundary.
+        if sample_summary is not None:
+            try:
+                n, p50, p95, p99, l95 = sample_summary
+                logger.info(
+                    "INGRESS_LATENCY samples=%d queue_p50_ms=%.2f queue_p95_ms=%.2f "
+                    "queue_p99_ms=%.2f lock_p95_ms=%.2f",
+                    n, p50, p95, p99, l95,
+                )
+            except Exception:
+                pass
 
     def get_summary(self) -> Dict[str, Any]:
         with self._lock:
