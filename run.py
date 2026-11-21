@@ -116,8 +116,32 @@ session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else ses
 async def main():
     outbox_worker = None
     ordered_dispatcher = None
+    ingress_audit = None
     client = None
     try:
+        # Ingress crash audit is opt-in AND requires the one-worker FIFO.
+        # No automatic replay after a crashed order submission is allowed.
+        if ("os" in globals()
+                and os.environ.get("AUDITBOT_DURABLE_INGRESS_AUDIT", "0") == "1"):
+            if os.environ.get("AUDITBOT_ORDERED_INGRESS", "0") != "1":
+                raise RuntimeError("Durable ingress audit requires ordered ingress")
+            from src.engine.durable_ingress_audit import DurableIngressAudit
+            account_id = str(getattr(pipeline.db, "account_id", "") or "")
+            if not account_id or account_id != str(getattr(cfg, "dhan_client_id", "") or ""):
+                raise RuntimeError("Durable ingress account identity not verified")
+            ingress_audit = DurableIngressAudit(
+                os.path.join(cfg.data_dir, "signals.ingress-audit.sqlite3"),
+                account_id=account_id,
+            )
+            existing = ingress_audit.summary()
+            if existing["requires_manual_reconciliation"]:
+                pipeline.reconciliation_gate.halt_new_entries(
+                    "INGRESS_AUDIT_UNRETURNED_SIGNAL_REQUIRES_MANUAL_BROKER_REVIEW"
+                )
+                raise RuntimeError(
+                    "Unreturned inbound signals exist: broker and journal review required; "
+                    "automatic replay prohibited"
+                )
         # Construct Telethon inside asyncio.run's *running* event loop.
         # Python 3.14 no longer implicitly creates a loop for get_event_loop().
         client = TelegramClient(session, tg_api_id, tg_api_hash)
@@ -202,8 +226,24 @@ async def main():
             pending_bound = int(os.environ.get(
                 "AUDITBOT_ORDERED_INGRESS_MAX_PENDING", "64"
             ))
+            on_returned = None
+            if ingress_audit is not None:
+                def on_returned(kw):
+                    try:
+                        ingress_audit.mark_pipeline_returned(
+                            channel_id=kw["channel_id"],
+                            message_id=kw["message_id"],
+                            text=kw["text"],
+                            message_timestamp=kw["msg_timestamp"],
+                        )
+                    except Exception:
+                        pipeline.reconciliation_gate.halt_new_entries(
+                            "INGRESS_AUDIT_PIPELINE_RETURN_PERSISTENCE_UNVERIFIED"
+                        )
+                        raise
             ordered_dispatcher = OrderedSignalDispatcher(
-                pipeline.process_raw_message, max_pending=pending_bound
+                pipeline.process_raw_message, max_pending=pending_bound,
+                on_pipeline_returned=on_returned,
             )
             await ordered_dispatcher.start()
             print("📥 Ordered ingress enabled (single broker-execution authority)")
@@ -220,10 +260,31 @@ async def main():
             text = event.message.message or ""
             if not text.strip():
                 return
+            # Capture durable ingress identity BEFORE the first await in this
+            # callback. The record contains a SHA-256 digest only, not raw
+            # signal text. A duplicate or edited identity must NEVER resubmit.
+            msg_ts = event.message.date.timestamp() if hasattr(event.message, "date") and event.message.date else time.time()
+            if ingress_audit is not None:
+                try:
+                    admission = ingress_audit.admit(
+                        channel_id=event.chat_id, message_id=event.id,
+                        text=text, message_timestamp=msg_ts,
+                    )
+                except Exception:
+                    pipeline.reconciliation_gate.halt_new_entries(
+                        "INGRESS_AUDIT_ADMISSION_UNVERIFIED"
+                    )
+                    raise RuntimeError(
+                        "Inbound signal audit failed; live entry gate halted"
+                    ) from None
+                if admission != "ADMITTED":
+                    logging.getLogger("trading_bot").warning(
+                        "Duplicate inbound signal withheld; manual review if unresolved"
+                    )
+                    return
             # Use Telethon's already-cached chat whenever present; preserve
             # the original async lookup path when it is not yet cached.
             source_name = await source_name_for_event(event)
-            msg_ts = event.message.date.timestamp() if hasattr(event.message, "date") and event.message.date else time.time()
 
             print(f"📩 [{source_name}] New Signal: {text[:80]}")
             # Default OFF. Only deterministic REGEX BUY signals are prepared
@@ -333,7 +394,11 @@ async def main():
                     if client is not None:
                         await client.disconnect()
                 finally:
-                    lock.release()
+                    try:
+                        if ingress_audit is not None:
+                            ingress_audit.close()
+                    finally:
+                        lock.release()
 
 
 if __name__ == "__main__":
