@@ -66,6 +66,7 @@ from src.main import TradingBotPipeline
 from src.engine.market import is_lifecycle_open
 from src.engine.lock import SingletonListenerLock
 from src.engine.telegram_event_metadata import source_name_for_event
+from src.engine.deterministic_preparse import prepare_deterministic_buy
 from src.notifier.outbox_worker import OutboxWorker
 from src.notifier.dhan_response import configure_dhan_response_group, send_telethon_notification
 from src.engine.config_manager import compute_config_version
@@ -209,7 +210,27 @@ async def main():
             msg_ts = event.message.date.timestamp() if hasattr(event.message, "date") and event.message.date else time.time()
 
             print(f"📩 [{source_name}] New Signal: {text[:80]}")
-            # V12-14: Offload synchronous pipeline execution to worker thread
+            # Default OFF. Only deterministic REGEX BUY signals are prepared
+            # concurrently. No AI, DB, broker, STOP, risk or journal side
+            # effects occur outside the original serialized trading pipeline.
+            preparse = None
+            if os.environ.get("AUDITBOT_DETERMINISTIC_PREPARSE", "0") == "1":
+                try:
+                    preparse = await asyncio.to_thread(
+                        prepare_deterministic_buy,
+                        text=text,
+                        channel_id=event.chat_id,
+                        message_id=event.id,
+                        msg_timestamp=msg_ts,
+                        max_age_sec=cfg.max_message_age_sec,
+                    )
+                except Exception:
+                    # Optional prework failure must never drop a signal.
+                    logging.getLogger("trading_bot").warning(
+                        "Optional deterministic preparse failed; using canonical parser",
+                        exc_info=False,
+                    )
+            # Original serialized risk/commit and broker execution remain.
             result = await asyncio.to_thread(
                 pipeline.process_raw_message,
                 text=text,
@@ -219,6 +240,7 @@ async def main():
                 source_name=source_name,
                 signal_received_at=received_at,
                 callback_monotonic_ns=callback_monotonic_ns,
+                preparsed_brain=preparse,
             )
             print(f"🤖 Outcome: valid={result.is_valid} | action={result.action.value} | reason={result.reason}")
 
