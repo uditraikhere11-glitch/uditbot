@@ -51,23 +51,25 @@ class TestSignedDeliveryCnc(unittest.TestCase):
         self.assertFalse(run(holdings=[{**HOLD,"securityId":"OTHER"}],
                              projected=0))
 
-    def test_negative_delivery_must_attest_broker_account_id(self):
-        # Missing account used to pass signed-net checks when other evidence
-        # matched. That was insufficient to certify a special-case exception.
-        for account_value in ("", None, "OTHER"):
+    def test_negative_delivery_rejects_explicit_account_mismatch(self):
+        # Per-row Dhan position account is optional in the actual schema;
+        # upstream startup independently validates authenticated account and
+        # each broker SELL trade MUST match it. Contradictions are rejected.
+        self.assertFalse(run(
+            position={**DAY,"dhanClientId":"OTHER"}
+        ))
+        for account_value in ("",None):
             with self.subTest(account_value=account_value):
-                self.assertFalse(run(
+                self.assertTrue(run(
                     position={**DAY,"dhanClientId":account_value}
                 ))
 
-    def test_mtf_negative_delivery_requires_the_same_account_identity(self):
+    def test_mtf_negative_delivery_rejects_wrong_account(self):
         mtf_key=("SEC","NSE_EQ","MTF")
         valid={**DAY,"productType":"MTF"}
-        self.assertTrue(run(
-            position=valid,key=mtf_key,holdings=[HOLD]
-        ))
+        self.assertTrue(run(position=valid,key=mtf_key,holdings=[HOLD]))
         self.assertFalse(run(
-            position={**valid,"dhanClientId":None},
+            position={**valid,"dhanClientId":"OTHER"},
             key=mtf_key,holdings=[HOLD],
         ))
 
