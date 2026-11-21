@@ -67,16 +67,19 @@ class ShadowEventLedger:
                 UNIQUE(account_id, order_id, event_id)
             )
         """)
-        with self._conn:
-            row=self._conn.execute(
-                "SELECT value FROM shadow_metadata WHERE name='account_id'"
-            ).fetchone()
-            if row is None:
-                self._conn.execute("INSERT INTO shadow_metadata VALUES (?,?)",
-                                   ("account_id",account_id))
-            elif row["value"]!=account_id:
-                self._conn.close()
-                raise ShadowLedgerConflict("shadow ledger account ID mismatch")
+        try:
+            with self._conn:
+                row=self._conn.execute(
+                    "SELECT value FROM shadow_metadata WHERE name='account_id'"
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("INSERT INTO shadow_metadata VALUES (?,?)",
+                                       ("account_id",account_id))
+                elif row["value"]!=account_id:
+                    raise ShadowLedgerConflict("shadow ledger account ID mismatch")
+        except BaseException:
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         self._conn.close()
