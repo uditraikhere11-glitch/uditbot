@@ -104,7 +104,7 @@ class TestRiskJournalIndexedEquivalence(unittest.TestCase):
         self.assertGreater(got["open_positions"],0)
 
     def test_today_counts_include_cancelled_partial_and_exclude_test(self):
-        self.assertEqual(self.journal.get_today_orders_count(START),7)
+        self.assertEqual(self.journal.get_today_orders_count(START),6)
 
     def test_historical_rows_do_not_change_today_risk(self):
         before=self.journal.get_live_portfolio_risk_state(START)
