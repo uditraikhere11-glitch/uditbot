@@ -24,6 +24,11 @@ from src.journal.db import JournalDB
 from src.engine.emergency_stop import EmergencyStopManager
 
 
+def _is_morning_health_slot() -> bool:
+    """Opt-in only for AmanBot's separate 08:00 weekday notification unit."""
+    return os.environ.get("AUDITBOT_HEALTH_SLOT", "").strip().upper() == "AM_0800"
+
+
 def _mask_account_id(acct: str) -> str:
     if not acct:
         return "Not Configured"
@@ -501,7 +506,9 @@ def format_morning_health_report(
         "❌ ACTION REQUIRED"
     )
     lines = (
-        "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
+        ("🕗 <b>AUDITBOT — 08:00 AM DHAN HEALTH CHECK</b>"
+         if _is_morning_health_slot()
+         else "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>"),
         f"🤖 Instance: <b>{name}</b> | 🕒 {ist:%d %b %Y, %H:%M:%S} IST",
         f"🔑 Dhan authentication: {token_line}",
         f"💳 Dhan account identity: {identity_line}",
@@ -635,6 +642,10 @@ def dispatch_morning_health_report_once(
         now_ts, tz=zoneinfo.ZoneInfo("Asia/Kolkata")
     ).strftime("%Y-%m-%d")
     identity = f"DAILY_HEALTH:{ist_date}:{cfg.dhan_client_id}:{getattr(cfg, 'instance_name', 'AuditBot')}"
+    # 08:00 reporting and the existing 17:00 event MUST have independent
+    # dedup keys. Default/legacy identity remains byte-for-byte unchanged.
+    if _is_morning_health_slot():
+        identity += ":AM_0800"
 
     text_up = str(report or "").upper()
     is_ready_report = (
@@ -755,7 +766,11 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     from src.instruments.resolver import InstrumentResolver
 
     print("=======================================================")
-    print("     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          ")
+    print(
+        "     AUDIT BOT 08:00 AM IST DHAN HEALTH CHECK          "
+        if _is_morning_health_slot()
+        else "     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          "
+    )
     print("=======================================================")
 
     renewal_evidence = {}
@@ -916,7 +931,12 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         f"emergency_stop={'ACTIVE' if is_stopped else 'INACTIVE'}, "
         f"telegram_report={notify_status}"
     )
-    db.record_system_event("DAILY_HEALTH_CHECK", summary)
+    # 08:00 failure must not be mistaken for the 17:00 authentication
+    # incident that triggers the distinct verified recovery Telegram card.
+    db.record_system_event(
+        "MORNING_HEALTH_CHECK" if _is_morning_health_slot() else "DAILY_HEALTH_CHECK",
+        summary,
+    )
     if overall_ok:
         print(f"✅ Daily health check passed: {summary}")
         return 0
