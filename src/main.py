@@ -234,9 +234,19 @@ class TradingBotPipeline:
         current_time: Optional[float] = None,
         source_name: str = "Test group",
         signal_received_at: Optional[float] = None,
+        callback_monotonic_ns: Optional[int] = None,
     ) -> ValidationResult:
+        # Observe worker scheduling + pipeline-lock wait without changing the
+        # serialized risk/commitment boundary or broker order behavior.
+        worker_start_ns = time.perf_counter_ns()
         with self._pipeline_lock:
             l1_start_ns = time.perf_counter_ns()
+            if (type(callback_monotonic_ns) is int and
+                    0 < callback_monotonic_ns <= worker_start_ns):
+                GLOBAL_LATENCY_MONITOR.record_preprocessing_wait(
+                    total_ms=(l1_start_ns - callback_monotonic_ns) / 1_000_000.0,
+                    lock_ms=(l1_start_ns - worker_start_ns) / 1_000_000.0,
+                )
             injected_clock = current_time
             now = injected_clock if injected_clock is not None else time.time()
             msg_ts = msg_timestamp or now
