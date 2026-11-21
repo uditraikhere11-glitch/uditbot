@@ -1,5 +1,6 @@
 """Operator snapshot benchmark never mutates or reports order identities."""
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ class TestOperatorSnapshotBenchmark(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             source=Path(folder)/"approved-snapshot.sqlite3"
             JournalDB(str(source),account_id="SYNTHETIC")
-            with sqlite3.connect(source) as c:
+            with closing(sqlite3.connect(source)) as c, c:
                 c.execute(
                     "INSERT INTO orders(correlation_id,broker_order_id,trading_mode,"
                     "security_id,price,quantity,status,created_at) "
@@ -29,11 +30,11 @@ class TestOperatorSnapshotBenchmark(unittest.TestCase):
                     "traded_quantity) VALUES(?,?,?)",
                     [(f"OLD-{i}",f"TRADE-{i}",1) for i in range(1200)],
                 )
-            before=sqlite3.connect(source).execute(
-                "SELECT COUNT(*) FROM fills").fetchone()[0]
+            with closing(sqlite3.connect(source)) as c:
+                before=c.execute("SELECT COUNT(*) FROM fills").fetchone()[0]
             report=measure_snapshot(source,start_of_day=1800000000,rounds=3)
-            after=sqlite3.connect(source).execute(
-                "SELECT COUNT(*) FROM fills").fetchone()[0]
+            with closing(sqlite3.connect(source)) as c:
+                after=c.execute("SELECT COUNT(*) FROM fills").fetchone()[0]
             self.assertEqual(before,after)
             self.assertTrue(report["indexed_candidate_available"])
             self.assertTrue(report["risk_fill_sums_equivalent"])
