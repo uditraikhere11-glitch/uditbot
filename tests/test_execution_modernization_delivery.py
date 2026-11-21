@@ -23,6 +23,10 @@ class TestNegativeDeliveryTriage(unittest.TestCase):
         self.assertFalse(x.allow_position_close)
         self.assertFalse(x.allow_protection_cancel)
 
+    def test_absent_or_duplicate_holdings_fail_closed(self):
+        self.assertEqual(go(holdings=[]).classification,"UNVERIFIED")
+        self.assertEqual(go(holdings=[H,H]).classification,"UNVERIFIED")
+
     def test_incomplete_books_fail_closed(self):
         self.assertEqual(go(books_complete=False).classification,"UNVERIFIED")
 
