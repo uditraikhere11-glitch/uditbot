@@ -195,7 +195,10 @@ async def main():
 
         # OFF by default. A bounded single worker preserves UditBot's sole
         # serialized order authority and prevents unbounded executor queuing.
-        if os.environ.get("AUDITBOT_ORDERED_INGRESS", "0") == "1":
+        # Compatibility with isolated runner tests that compile main() with
+        # deliberately restricted globals and no os module. In that context
+        # the optional feature remains OFF, as it does by default in service.
+        if "os" in globals() and os.environ.get("AUDITBOT_ORDERED_INGRESS", "0") == "1":
             pending_bound = int(os.environ.get(
                 "AUDITBOT_ORDERED_INGRESS_MAX_PENDING", "64"
             ))
