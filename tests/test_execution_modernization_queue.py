@@ -35,6 +35,7 @@ class QueueMetricsTests(unittest.TestCase):
         m = LatencyMonitor()
         p = object.__new__(TradingBotPipeline)
         p._pipeline_lock = threading.Lock()
+        p.db = SimpleNamespace(record_signal=lambda *args, **kwargs: None)
         p.cfg = SimpleNamespace(
             monitored_channel_ids=[123],
             trading_mode=TradingMode.TEST,
@@ -50,6 +51,7 @@ class QueueMetricsTests(unittest.TestCase):
         m = LatencyMonitor()
         p = object.__new__(TradingBotPipeline)
         p._pipeline_lock = threading.Lock()
+        p.db = SimpleNamespace(record_signal=lambda *args, **kwargs: None)
         p.cfg = SimpleNamespace(
             monitored_channel_ids=[123], trading_mode=TradingMode.TEST,
             test_group_id=None, enforce_source_allowlist=True, log_group_id=None,
@@ -67,6 +69,7 @@ class QueueMetricsTests(unittest.TestCase):
         m = LatencyMonitor()
         p = object.__new__(TradingBotPipeline)
         p._pipeline_lock = threading.Lock()
+        p.db = SimpleNamespace(record_signal=lambda *args, **kwargs: None)
         p.cfg = SimpleNamespace(
             monitored_channel_ids=[123], trading_mode=TradingMode.TEST,
             test_group_id=None, enforce_source_allowlist=True, log_group_id=None,
