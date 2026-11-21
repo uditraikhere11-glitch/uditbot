@@ -192,6 +192,34 @@ class TestRiskJournalIndexedEquivalence(unittest.TestCase):
             self.assertEqual(self.journal.get_live_portfolio_risk_state(START),
                              _legacy_risk(c))
 
+    def test_real_schema_index_migration_on_large_existing_journal(self):
+        # Model an older production journal: existing evidence, no new index.
+        with self.journal._get_conn() as c:
+            c.execute("DROP INDEX idx_risk_fills_order_id")
+            c.execute("DROP INDEX idx_risk_orders_mode_day")
+            c.executemany(
+                "INSERT INTO fills(broker_order_id,exchange_trade_id,"
+                "traded_quantity) VALUES(?,?,?)",
+                [(f"H-{i//3}",f"EX-{i}",(i%4)+1) for i in range(8000)],
+            )
+            baseline=(
+                c.execute("SELECT COUNT(*) FROM fills").fetchone()[0],
+                c.execute("SELECT SUM(traded_quantity) FROM fills").fetchone()[0],
+            )
+            legacy=_legacy_risk(c)
+        # Reinitialization is exactly the existing deployment migration path.
+        JournalDB(str(self.path),account_id="SYNTHETIC")
+        with self.journal._get_conn() as c:
+            after=(
+                c.execute("SELECT COUNT(*) FROM fills").fetchone()[0],
+                c.execute("SELECT SUM(traded_quantity) FROM fills").fetchone()[0],
+            )
+            indexes={r[1] for r in c.execute("PRAGMA index_list(fills)")}
+            self.assertIn("idx_risk_fills_order_id",indexes)
+            self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0],"ok")
+            self.assertEqual(_legacy_risk(c),legacy)
+        self.assertEqual(after,baseline)
+
     def test_missing_fills_schema_fails_closed(self):
         with self.journal._get_conn() as c:
             c.execute("DROP TABLE fills")
