@@ -9,6 +9,8 @@ on:
       - 'src/main.py'
       - 'src/engine/latency_monitor.py'
       - 'src/journal/db.py'
+      - 'src/broker/read_governor.py'
+      - 'tools/benchmark_governor_fastpath.py'
       - 'tools/benchmark_risk_journal.py'
       - 'src/engine/shadow_execution_events.py'
       - 'src/engine/typed_broker_evidence.py'
@@ -78,6 +80,18 @@ jobs:
           assert result['orders_submitted'] == 0
           assert result['production_latency_improvement_proven'] is False
           PY
+      - name: Benchmark safe Dhan admission without repeated schema migrations
+        run: |
+          python -B -m tools.benchmark_governor_fastpath --count 150 > governor_benchmark.json
+          cat governor_benchmark.json
+          python - <<'PY'
+          import json
+          with open('governor_benchmark.json',encoding='utf-8') as f:
+              result=json.load(f)
+          assert result['persisted_admissions_verified'] == 301
+          assert result['broker_requests_made'] == 0
+          assert result['production_latency_improvement_proven'] is False
+          PY
       - name: Preserve anonymized benchmark report
         uses: actions/upload-artifact@v4
         with:
@@ -85,4 +99,5 @@ jobs:
           path: |
             benchmark.json
             journal_risk_benchmark.json
+            governor_benchmark.json
           retention-days: 14
