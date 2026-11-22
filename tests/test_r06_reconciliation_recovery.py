@@ -205,7 +205,7 @@ class YesbankTwoParentRecovery(unittest.TestCase):
             self.assertTrue(item["manual_exit_detected"])
             self.assertTrue(item.get("external_unlinked_sell_observed"))
 
-    def test_failed_parent_specific_trade_read_prevents_auto_recovery(self):
+    def test_prior_day_buy_get_failure_does_not_override_full_historical_proof(self):
         for item in (self.a, self.b):
             item.update(
                 position_state="RECONCILIATION_REQUIRED",
@@ -220,8 +220,23 @@ class YesbankTwoParentRecovery(unittest.TestCase):
         ))
         self.full_pass()
         for item in (self.a, self.b):
-            self.assertEqual("RECONCILIATION_REQUIRED", item["position_state"])
-            self.assertTrue(item["reconciliation_required"])
+            self.assertEqual("UNPROTECTED_MANUAL_RISK", item["position_state"])
+            self.assertFalse(item["reconciliation_required"])
+        self.broker.get_trades_for_order.assert_not_called()
+
+    def test_failed_trade_read_for_active_exit_leg_still_blocks(self):
+        self.a.update(position_state="RECONCILIATION_REQUIRED",
+                      reconciliation_required=True, manual_exit_detected=True,
+                      unreadable_broker_response=True, sl_order_id="SYNTH-ACTIVE-EXIT")
+        self.healthy()
+        self.broker.get_trades_for_order = Mock(return_value=BrokerReadFailure(
+            status=BrokerReadStatus.UNAVAILABLE.value,
+            error="synthetic active leg GET denied", status_code=429,
+        ))
+        self.full_pass()
+        self.assertEqual("RECONCILIATION_REQUIRED", self.a["position_state"])
+        self.assertTrue(self.a["reconciliation_required"])
+        self.broker.get_trades_for_order.assert_called()
 
     def test_extra_manual_shares_cannot_conceal_unlinked_sale(self):
         # Two bot BUY parents total two shares. A separate manual BUY can
