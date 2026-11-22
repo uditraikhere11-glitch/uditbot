@@ -16,7 +16,7 @@ Dashboard **never asserts** Dhan connected, 20:00 token expiry, HEALTHY reconcil
 - Browser: 24 captures (six views × desktop/iPhone × dark/light), no horizontal overflow, JS errors or mutation requests; 54 unique Setup names.
 - Restart/owner WARN, account drawer, bad-status fail closed, responsive layouts and safe long names: 18/18 browser interaction checks.
 - Control Center response fail-closed behaviors: 10/10 simulated-browser scenarios.
-- Existing and new focused tests: 48 PASS + 106 subtests in the latest re-run; earlier expanded review 118 PASS + 221 subtests.
+- Expanded current focused tests: 93 PASS + 162 subtests, 0 failures. The old static navigation expectation was updated to assert all six visible tabs still map to exactly three authenticated page routes. Earlier visual review: 118 PASS + 221 subtests.
 - Independent baseline source check: PASS, including the exact main blob SHA of all five previously committed source/test files.
 
 ## Release gate

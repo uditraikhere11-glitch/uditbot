@@ -57,15 +57,35 @@ class ApprovedVisualOnlyContract(unittest.TestCase):
         self.assertNotIn('min=', tag)
         self.assertIn("fetch('/setup/save-apply'", page)
 
-    def test_navigation_is_three_real_pages_only(self):
+    def test_six_visual_tabs_use_only_three_authenticated_page_routes(self):
+        # V17's approved preview has six visible tabs, not six new FastAPI
+        # pages. Dashboard/Control/AMO/Health are hash-only native views.
+        from urllib.parse import urlsplit
         helper = source('src/premium_ui.py')
-        self.assertIn("('control', '/',", helper)
-        self.assertIn("('setup', '/setup',", helper)
-        self.assertIn("('designer', '/setup/telegram-designer',", helper)
-        self.assertNotIn('replica-extra-nav', helper)
-        self.assertNotIn('Trading &amp; Orders', helper)
-        self.assertNotIn('Logs &amp; Monitoring', helper)
-        self.assertNotIn('approved_replica_', helper)
+        tree = ast.parse(helper)
+        pages_decl = next(node for node in tree.body
+                          if isinstance(node, ast.Assign) and
+                          any(isinstance(target, ast.Name) and target.id == '_PAGES'
+                              for target in node.targets))
+        self.assertEqual(set(ast.literal_eval(pages_decl.value.args[0])),
+                         {'control', 'setup', 'designer'})
+        nav_fn = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == 'premium_nav')
+        entries = next(ast.literal_eval(node.value) for node in nav_fn.body
+                       if isinstance(node, ast.Assign) and
+                       any(isinstance(target, ast.Name) and target.id == 'destinations'
+                           for target in node.targets))
+        hrefs = {key: href for key, href, _icon, _label in entries}
+        self.assertEqual(hrefs, {
+            'dashboard': '/#dashboard', 'control': '/#control',
+            'setup': '/setup', 'telegram': '/setup/telegram-designer',
+            'amo': '/#amo', 'health': '/#health',
+        })
+        self.assertEqual({urlsplit(href).path for href in hrefs.values()},
+                         {'/', '/setup', '/setup/telegram-designer'})
+        for forbidden in ('replica-extra-nav', 'Trading &amp; Orders',
+                          'Logs &amp; Monitoring', 'approved_replica_'):
+            self.assertNotIn(forbidden, helper)
 
     def test_presentation_cannot_rewrite_or_mirror_inputs(self):
         css = source('src/premium_ui.css')
