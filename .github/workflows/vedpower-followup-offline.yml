@@ -1,0 +1,65 @@
+name: VEDPOWER unreadable prior-day BUY recovery acceptance
+on:
+  push:
+    branches: [audit/vedpower-unreadable-parent-recovery-20261122]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verified-unreadable-parent-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install declared test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Offline broker and Telegram network firewall
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+      - name: Compile all modules
+        run: python -B -m compileall -q src run.py tests
+      - name: Three-position persisted unreadable and existing safety regression
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest -v \
+            tests.test_vedpower_three_position_e2e \
+            tests.test_vedpower_governor_429_chain \
+            tests.test_yesbank_nov22_e2e \
+            tests.test_settled_owner_read_policy \
+            tests.test_r06_reconciliation_recovery \
+            tests.test_historical_fill_reconciliation_h01_h17 \
+            tests.test_v13_targeted_safety_corrections \
+            tests.test_v14_webui_backend_fix_04 2>&1 | tee targeted-offline.log
+      - name: Complete offline regression
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' \
+            2>&1 | tee full-offline.log
+      - name: Check code patch scope and baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD 8dc8688e4c788f07fcf9ce47bbf2f35d3a1e3562)" = "8dc8688e4c788f07fcf9ce47bbf2f35d3a1e3562"
+          git diff --check 8dc8688e4c788f07fcf9ce47bbf2f35d3a1e3562 HEAD
+          git diff --binary 8dc8688e4c788f07fcf9ce47bbf2f35d3a1e3562 HEAD > followup.patch
+          sha256sum followup.patch > SHA256SUMS.txt
+          git rev-parse HEAD > HEAD_SHA.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vedpower-unreadable-recovery-evidence
+          path: |
+            targeted-offline.log
+            full-offline.log
+            followup.patch
+            SHA256SUMS.txt
+            HEAD_SHA.txt
