@@ -30,3 +30,17 @@
   window.addEventListener('resize', sync);
   sync();
 }());
+/* Visual preference only. Never stores credentials, account identifiers or commands. */
+(function () {
+  const key='auditbot-v17-appearance';
+  let light=false;
+  try {light=window.localStorage.getItem(key)==='light';} catch (_) { /* opaque preview origin */ }
+  const apply=()=>{
+    document.documentElement.classList.toggle('v17-light',light);
+    const control=document.getElementById('premiumThemeToggle');
+    if(control){control.textContent=light?'☾ Use dark appearance':'☼ Use light appearance';control.setAttribute('aria-pressed',String(light));}
+  };
+  const btn=document.getElementById('premiumThemeToggle');
+  if(btn)btn.addEventListener('click',()=>{light=!light;try{window.localStorage.setItem(key,light?'light':'dark');}catch(_){/* nonpersistent visual fallback */}apply();});
+  apply();
+}());
