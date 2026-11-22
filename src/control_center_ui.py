@@ -57,6 +57,17 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
 .tile{border:1px solid var(--edge);background:#172033;border-radius:12px;padding:16px;min-height:113px}
 .label{font-size:12px;color:var(--muted);margin-bottom:9px}.value{font-size:20px;font-weight:700;overflow-wrap:anywhere}
 .detail{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}
+.status-line{display:flex;align-items:center;gap:11px;min-height:26px}
+.status-beacon{display:none;position:relative;flex:0 0 11px;width:11px;height:11px;border-radius:50%;
+  background:radial-gradient(circle at 32% 28%,#dcffef 0%,#71ecb4 33%,#1ebf7d 76%);
+  box-shadow:0 0 0 3px rgba(52,211,153,.12),0 0 12px rgba(52,211,153,.32)}
+.status-beacon.is-active{display:inline-block;animation:verified-beacon-glow 2.8s ease-in-out infinite}
+.status-beacon.is-active::after{content:"";position:absolute;top:1px;left:2px;width:4px;height:3px;border-radius:50%;background:#ffffffd9}
+@keyframes verified-beacon-glow{
+  0%,100%{box-shadow:0 0 0 3px rgba(52,211,153,.12),0 0 12px rgba(52,211,153,.32)}
+  50%{box-shadow:0 0 0 4px rgba(52,211,153,.16),0 0 18px rgba(52,211,153,.62)}
+}
+@media(prefers-reduced-motion:reduce){.status-beacon.is-active{animation:none}}
 .buttons{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:15px}
 .btn-start{background:#064e3b;color:#d1fae5;border-color:#047857}.btn-stop{background:#571e29;color:#ffe4e6;border-color:#9f1239}
 .row{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:15px 0;border-top:1px solid var(--edge)}
@@ -81,9 +92,11 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
 </header>
 <section aria-label="Bot operating state">
   <div class="grid">
-    <div class="tile"><div class="label">Bot service</div><div id="service" class="value">Checking…</div>
+    <div class="tile"><div class="label">Bot service</div>
+      <div class="status-line"><span id="service-beacon" class="status-beacon" aria-hidden="true"></span><div id="service" class="value">Checking…</div></div>
       <div id="service-detail" class="detail">Verifying VM service state</div></div>
-    <div class="tile"><div class="label">Trading mode</div><div id="mode" class="value">UNKNOWN</div>
+    <div class="tile"><div class="label">Trading mode</div>
+      <div class="status-line"><span id="mode-beacon" class="status-beacon" aria-hidden="true"></span><div id="mode" class="value">UNKNOWN</div></div>
       <div id="mode-detail" class="detail">Running configuration pending verification</div></div>
   </div>
   <div class="buttons">
@@ -139,9 +152,13 @@ async function refreshStatus(){
     const s=await requestJSON('/control/status');current=s;
     const state=safeStatus(s.service_state);
     setText('service',state.replace(/_/g,' '));
+    // The glow is a verified-status indicator, not a substitute for Health Check.
+    const verifiedRunning=state==='RUNNING'&&s.runtime_verified===true;
+    $('service-beacon').classList.toggle('is-active',verifiedRunning);
     setText('service-detail',s.service_detail||'Verified state from trading_bot.service');
     const mode=(s.runtime_verified===true)?safeStatus(s.running_mode):'UNVERIFIED';
     setText('mode',mode);
+    $('mode-beacon').classList.toggle('is-active',verifiedRunning&&mode==='LIVE');
     setText('mode-detail',s.runtime_verified===true?'Active running configuration verified':'Saved mode: '+safeStatus(s.saved_mode));
     $('start').disabled=!['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
     $('stop').disabled=state!=='RUNNING';
@@ -156,6 +173,7 @@ async function refreshStatus(){
       ' · F&O route: broker native AMO /orders (entry only)');
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
   }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;
+    $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active');
     $('equity-amo').disabled=true;$('fno-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
     setText('info','Cannot verify bot state: '+err.message+' (controls disabled)')}
 }
