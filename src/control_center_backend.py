@@ -11,6 +11,10 @@ import os
 import re
 import sqlite3
 import stat
+import time
+import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -20,6 +24,7 @@ from fastapi.responses import JSONResponse
 from src.config import AppConfig, parse_env_dict
 from src.engine.config_patch import ConfigurationConflict, ConfigurationRejected, patch_env, revision, validate_effective_config
 from src.engine.runtime_evidence import read_private_json
+from src.engine.operational_snapshot import read_verified_snapshot
 from src.engine.simple_save_apply import apply_settings
 from src.engine.config_manager import (
     ConfigApplyState,
@@ -117,6 +122,148 @@ def _revision_for_control(env_path: str) -> str:
         return "UNAVAILABLE"
 
 
+# Broker profile GET is explicit, bounded and cached. Never perform a TOTP login.
+_BROKER_LOCK = threading.Lock()
+_BROKER_CACHE: Dict[str, Any] = {"key": None, "at": 0.0, "value": None}
+_BROKER_CACHE_TTL = 90.0
+
+
+def _cached_broker_status(cfg: AppConfig, *, refresh: bool = False) -> Dict[str, Any]:
+    """Read-only Dhan /v2/profile evidence. No POST, token minting or auto refresh."""
+    token_path = os.path.expanduser(str(cfg.dhan_token_file or "~/.dhan_token"))
+    try:
+        token_stat = os.stat(token_path)
+        token_key = (str(cfg.dhan_client_id), token_path, token_stat.st_ino,
+                     token_stat.st_size, token_stat.st_mtime_ns)
+        if os.path.islink(token_path) or not stat.S_ISREG(token_stat.st_mode) or token_stat.st_size < 1 or (token_stat.st_mode & 0o077):
+            raise OSError("Token file not private")
+    except OSError:
+        return {"status": "UNVERIFIED", "detail": "Private token unavailable", "verified_at": None,
+                "token_expiration_ist": None}
+    with _BROKER_LOCK:
+        now = time.time()
+        cached = (_BROKER_CACHE.get("key") == token_key and
+                  now - _BROKER_CACHE.get("at", 0) < _BROKER_CACHE_TTL)
+        if cached and _BROKER_CACHE.get("value") is not None:
+            value = dict(_BROKER_CACHE["value"])
+            expiry = value.get("token_expiration_ts")
+            if type(expiry) in (int, float) and now >= expiry:
+                value["status"] = "EXPIRED"
+                value["detail"] = "Token expired"
+            return value
+        if not refresh:
+            return {"status": "UNVERIFIED", "detail": "No recent broker profile verification",
+                    "verified_at": None, "token_expiration_ist": None}
+        result = {"status": "UNVERIFIED", "detail": "Broker profile could not be verified",
+                  "verified_at": None, "token_expiration_ist": None}
+        client = None
+        try:
+            from src.broker.dhan_client import DhanClient
+            client = DhanClient(cfg, auto_generate_token=False)
+            evidence = client.verify_profile_and_token_expiry(allow_refresh=False)
+            status = str(evidence.get("identity_status") or "UNVERIFIED").upper()
+            if status not in {"VERIFIED", "EXPIRED", "MISMATCH", "UNVERIFIED"}:
+                status = "UNVERIFIED"
+            result["status"] = status
+            if status == "VERIFIED" and evidence.get("identity_verified") is True:
+                result["verified_at"] = now
+                result["detail"] = "Dhan profile account identity verified"
+            elif status in {"MISMATCH", "EXPIRED"}:
+                result["detail"] = "Broker identity mismatch" if status == "MISMATCH" else "Token expired"
+            expiry = evidence.get("token_expiration_ts")
+            if status in ("VERIFIED", "EXPIRED") and type(expiry) in (int, float) and 0 < expiry < 4102444800:
+                result["token_expiration_ist"] = datetime.fromtimestamp(
+                    expiry, ZoneInfo("Asia/Kolkata")).strftime("%d %b %H:%M IST")
+                result["token_expiration_ts"] = expiry
+        except Exception:
+            # Do not expose broker exceptions, token, account ID or raw payload.
+            pass
+        finally:
+            if client is not None:
+                try:
+                    client.session.close()
+                except Exception:
+                    pass
+        _BROKER_CACHE.update({"key": token_key, "at": now, "value": result})
+        return dict(result)
+
+
+def _operational_evidence(tracker: ConfigChangeTracker, raw: Dict[str, Any],
+                          cfg: AppConfig, data_dir: str) -> Dict[str, Any]:
+    """Correlate the 10-second producer heartbeat with systemd/PID/starttime."""
+    unknown = {"reconciliation": "UNVERIFIED", "protection_watcher": "UNVERIFIED",
+               "new_entries_gate": "UNVERIFIED", "telegram_listener": "UNVERIFIED", "runtime_evidence_at": None}
+    if raw.get("runtime_verified") is not True or raw.get("service_state") != "RUNNING":
+        return unknown
+    ack = tracker.get_active_running_version(require_live_pid=True) or {}
+    pid, start = ack.get("pid"), ack.get("process_starttime")
+    data = read_verified_snapshot(data_dir, expected_pid=pid, expected_starttime=start,
+                                  expected_account_id=str(cfg.dhan_client_id or ""))
+    if data is None:
+        return unknown
+    recon = data["reconciliation"]
+    watcher = "ACTIVE" if data["watcher_running"] is True else "INACTIVE"
+    # An open gate is credible only after a healthy recon AND clear STOP intent.
+    gate = "OPEN" if data["entries_open"] and recon == "HEALTHY" else "BLOCKED"
+    telegram = ("CONNECTED" if data.get("telegram_connected") is True else
+                "DISCONNECTED" if data.get("telegram_connected") is False else "UNVERIFIED")
+    return {"reconciliation": recon, "protection_watcher": watcher,
+            "new_entries_gate": gate, "telegram_listener": telegram,
+            "runtime_evidence_at": data["created_at"]}
+
+
+def build_control_reports(env_path: str = ".env") -> Dict[str, Any]:
+    """Allowlisted read-only journal metrics; no log text, secrets or mutations."""
+    cfg, _env_path, _dir = _config_and_paths(env_path)
+    path = os.path.abspath(cfg.journal_db_path)
+    if not os.path.isfile(path) or os.path.islink(path):
+        return {"available": False, "summary": {}, "events": [], "recent_orders": []}
+    uri = "file:" + quote(path, safe="/") + "?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=1) as con:
+            con.execute("PRAGMA query_only=ON")
+            # The labels intentionally do not expose original event descriptions.
+            event_types = {
+                "DAILY_HEALTH_CHECK", "RECONCILIATION_GATE_HALTED",
+                "RECONCILIATION_GATE_RECOVERED", "RECONCILIATION_GATE_BLOCKED"
+            }
+            rows = con.execute(
+                "SELECT event_type, created_at FROM system_events "
+                "WHERE event_type IN (?,?,?,?) ORDER BY id DESC LIMIT 20",
+                tuple(sorted(event_types)),
+            ).fetchall()
+            events = [{"event": typ, "at": ts} for typ, ts in rows
+                      if typ in event_types and isinstance(ts, (int, float))]
+            today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            totals = {
+                "orders_today": con.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (today_ist,)).fetchone()[0],
+                "signals_today": con.execute("SELECT COUNT(*) FROM signals WHERE received_at >= ?", (today_ist,)).fetchone()[0],
+                "trades_today": con.execute("SELECT COUNT(*) FROM fills WHERE traded_at >= ?", (today_ist,)).fetchone()[0],
+                "orders": con.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+                "signals": con.execute("SELECT COUNT(*) FROM signals").fetchone()[0],
+                "unresolved_intents": con.execute("SELECT COUNT(*) FROM order_intents WHERE state='UNKNOWN'").fetchone()[0],
+                "unprotected_records": con.execute("SELECT COUNT(*) FROM protection_orders "
+                                                 "WHERE status IN ('UNPROTECTED','UNVERIFIED')").fetchone()[0],
+            }
+            orders = con.execute(
+                "SELECT symbol, status, trading_mode, created_at FROM orders ORDER BY id DESC LIMIT 12"
+            ).fetchall()
+            latest = []
+            for sym, state, mode, ts in orders:
+                clean_symbol = str(sym or "")[:32]
+                if not re.fullmatch(r"[A-Za-z0-9._ -]{1,32}", clean_symbol):
+                    clean_symbol = "Instrument"
+                clean_state = str(state or "UNKNOWN").upper()
+                if not re.fullmatch(r"[A-Z_]{1,32}", clean_state):
+                    clean_state = "UNKNOWN"
+                latest.append({"symbol": clean_symbol, "status": clean_state,
+                               "mode": mode if mode in ("LIVE", "TEST") else "UNKNOWN",
+                               "at": ts if isinstance(ts, (int, float)) else None})
+            return {"available": True, "summary": totals, "events": events, "recent_orders": latest}
+    except (sqlite3.Error, OSError, ValueError):
+        return {"available": False, "summary": {}, "events": [], "recent_orders": []}
+
+
 def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     """A read-only, field-allowlisted status; never expose raw systemd/config."""
     cfg, absolute_env, data_dir = _config_and_paths(env_path)
@@ -171,7 +318,15 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         if pending else "Owner Stop pending; AMO change disabled"
         if stopping else "Runtime active setting verified" if verified else "Saved setting only — active bot setting unverified"
     )
+    from src.engine.tracker_v2_health import owner_intent_health
+    owner = owner_intent_health(state, raw.get("owner_intent"))
+    observed = _operational_evidence(tracker, raw, cfg, data_dir)
+    if owner.status != "PASS" and observed["new_entries_gate"] == "OPEN":
+        observed["new_entries_gate"] = "REVIEW_REQUIRED"
     return {
+        **observed,
+        "owner_intent_status": owner.status,
+        "mode_can_edit": bool(can_edit and owner.status == "PASS"),
         "service_state": state,
         "config_file_revision": _revision_for_control(absolute_env),
         "service_detail": "Runtime inspected through the existing systemd service coordinator",
@@ -250,13 +405,43 @@ def build_control_health(env_path: str = ".env") -> Dict[str, Any]:
             check("Dhan token file", "PASS", "Token file present and private; validity unverified")
     except OSError:
         check("Dhan token file", "UNKNOWN", "Token file cannot be inspected")
-    check("Dhan broker authentication", "UNKNOWN", "Read-only authenticated profile call not performed")
-    check("Telegram ingestion", "UNKNOWN", "Configured channels: " + str(len(cfg.monitored_channel_ids)) + "; listener heartbeat not independently verified")
+    broker = _cached_broker_status(cfg)
+    broker_state = broker.get("status")
+    check("Dhan broker authentication", "PASS" if broker_state == "VERIFIED" else
+          "FAIL" if broker_state in ("MISMATCH", "EXPIRED") else "UNKNOWN",
+          broker.get("detail", "Authenticated broker identity unavailable"))
+    expiry = broker.get("token_expiration_ts")
+    check("Dhan token expiration", "PASS" if broker_state == "VERIFIED" and
+          type(expiry) in (int, float) and expiry > time.time() else
+          "FAIL" if type(expiry) in (int, float) and expiry <= time.time() else "UNKNOWN",
+          broker.get("token_expiration_ist") or "No broker/JWT-verified expiry evidence")
+    runtime_listener = _operational_evidence(tracker, status, cfg, data_dir)
+    tg_state = runtime_listener["telegram_listener"]
+    check("Telegram connection", "PASS" if tg_state == "CONNECTED" else
+          "WARN" if tg_state == "DISCONNECTED" else "UNKNOWN",
+          "Telegram client connected; receiving monitored channel messages and outbound delivery are not tested" if tg_state == "CONNECTED" else
+          "Telegram client disconnected" if tg_state == "DISCONNECTED" else
+          "Configured channels: " + str(len(cfg.monitored_channel_ids)) + "; live client connection not verified")
     check("Yahoo quote freshness", "UNKNOWN", "No live market quote requested by read-only health check")
     gate = tracker.inspect_transition_gate_status(read_only=True)
     check("Transition safety gate", "WARN" if gate.get("active", True) else "PASS", "Active or unverified" if gate.get("active", True) else "Not active")
     check("Configuration coordinator", "WARN" if _pending(tracker) else "PASS", "Change pending" if _pending(tracker) else "No pending update detected")
-    check("Order protection watcher", "UNKNOWN", "Watcher heartbeat and broker protection not independently verified")
+    runtime = _operational_evidence(tracker, status, cfg, data_dir)
+    recon = runtime["reconciliation"]
+    check("Reconciliation", "PASS" if recon == "HEALTHY" else
+          "WARN" if recon == "BLOCKED" else "UNKNOWN",
+          "Process-matched runtime evidence" if recon != "UNVERIFIED" else "Fresh process snapshot unavailable")
+    watcher = runtime["protection_watcher"]
+    check("Order protection watcher", "PASS" if watcher == "ACTIVE" else
+          "WARN" if watcher == "INACTIVE" else "UNKNOWN",
+          "Watcher loop active (does not prove every open leg)" if watcher == "ACTIVE"
+          else "Watcher loop inactive" if watcher == "INACTIVE" else "Watcher heartbeat not independently verified")
+    gate_state = runtime["new_entries_gate"]
+    check("New entries gate", "PASS" if gate_state == "OPEN" and intent.status == "PASS" else
+          "WARN" if gate_state == "BLOCKED" or intent.status == "WARN" else "UNKNOWN",
+          "Open based on fresh healthy process evidence" if gate_state == "OPEN" and intent.status == "PASS"
+          else "Blocked or owner intent requires review" if gate_state == "BLOCKED" or intent.status == "WARN"
+          else "Live gate status unverified")
     summary = "Read-only health checks completed: " + ", ".join(f"{x}: {sum(c['status']==x for c in checks)}" for x in ("PASS", "WARN", "FAIL", "UNKNOWN"))
     return {"summary": summary, "checks": checks}
 
@@ -360,6 +545,60 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
             return _json(build_control_health())
         except Exception:
             return _json({"summary": "Health checks are not available", "checks": []}, 503)
+
+    @app.get("/control/broker-status")
+    def get_control_broker_status():
+        try:
+            cfg, _env, _data = _config_and_paths()
+            return _json(_cached_broker_status(cfg, refresh=True))
+        except Exception:
+            return _json({"status": "UNVERIFIED", "detail": "Read-only broker check unavailable"}, 503)
+
+    @app.get("/control/reports")
+    def get_control_reports():
+        try:
+            return _json(build_control_reports())
+        except Exception:
+            return _json({"available": False, "summary": {}, "events": []}, 503)
+
+    @app.post("/control/mode")
+    async def post_control_mode(request: Request):
+        """Single-setting Save & Apply transaction shared with Setup; never edit .env directly."""
+        if "application/json" not in request.headers.get("content-type", "").lower():
+            return _json({"error": "JSON content type required"}, 415)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"error": "Malformed JSON"}, 400)
+        if (not isinstance(body, dict) or set(body) !=
+                {"mode", "csrf_token", "expected_revision", "confirm_live"}):
+            return _json({"error": "Invalid mode request"}, 400)
+        if body["csrf_token"] != csrf_token or not isinstance(body["csrf_token"], str):
+            return _json({"error": "Invalid CSRF token"}, 403)
+        if body["mode"] not in ("LIVE", "TEST"):
+            return _json({"error": "Only LIVE and TEST supported"}, 422)
+        if type(body["confirm_live"]) is not bool:
+            return _json({"error": "Boolean confirmation required"}, 422)
+        if not isinstance(body["expected_revision"], str) or not re.fullmatch(r"[0-9a-f]{64}", body["expected_revision"]):
+            return _json({"error": "Current configuration revision required"}, 409)
+        try:
+            status = build_control_status()
+            if status.get("mode_can_edit") is not True:
+                return _json({"error": "Safety/Owner STOP gate prevents mode change"}, 409)
+            result = apply_settings(
+                {"is_live_mode": body["mode"] == "LIVE"}, env_path=os.path.abspath(".env"),
+                expected_revision=body["expected_revision"],
+                confirm_live=body["confirm_live"],
+            )
+            return _json(result.as_dict())
+        except ConfigurationConflict as exc:
+            return _json({"error": str(exc)}, 409)
+        except ConfigurationRejected as exc:
+            return _json({"error": str(exc)}, 422)
+        except (ValueError, OSError, TimeoutError):
+            return _json({"error": "Mode configuration could not be verified"}, 409)
+        except Exception:
+            return _json({"error": "Mode change unavailable"}, 503)
 
     @app.get("/control/amo/orders")
     def get_control_amo_orders():

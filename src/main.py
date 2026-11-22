@@ -1735,6 +1735,7 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
         raise RuntimeError(f"Cannot start listener: {lock_msg}")
 
     outbox_worker = None
+    runtime_evidence_task = None
     try:
         # V14: Automatically rebind an outdated Emergency STOP account only
         # when Dhan's authenticated profile matches the configured account.
@@ -1819,6 +1820,18 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
             logger.warning("Dhan Response requested and previous destinations unverified; final mirroring disabled")
 
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
+        # Observability-only heartbeat: no broker GETs, trading decisions or
+        # service changes. A stale/wrong-PID record fails closed in the WebUI.
+        async def _publish_ui_runtime_evidence():
+            from src.engine.operational_snapshot import publish_operational_snapshot
+            while True:
+                try:
+                    publish_operational_snapshot(pipeline, telegram_connected=bool(client.is_connected()))
+                except Exception as exc:
+                    logger.warning("Cannot publish read-only runtime evidence: %s", type(exc).__name__)
+                await asyncio.sleep(10)
+
+        runtime_evidence_task = asyncio.create_task(_publish_ui_runtime_evidence())
         outbox_worker = OutboxWorker(
             journal_db=pipeline.db,
             dispatch_fn=lambda text: pipeline.notifier.send_log_message(text, outbox=True),
@@ -1873,6 +1886,8 @@ async def start_telegram_listener(pipeline: TradingBotPipeline):
 
         await client.run_until_disconnected()
     finally:
+        if runtime_evidence_task is not None:
+            runtime_evidence_task.cancel()
         if outbox_worker:
             outbox_worker.stop()
         lock.release()

@@ -60,7 +60,7 @@ class PresentationIntegrationContracts(unittest.TestCase):
 
     def test_control_center_unchanged_service_contract(self):
         content = read('src/control_center_ui.py')
-        for fragment in ('id="start"', 'id="stop"', 'id="health"',
+        for fragment in ('id="start"', 'id="stop"', 'id="v17-health-run"',
                          'id="equity-amo"', 'id="fno-amo"', '/setup/service-control',
                          'requestJSON(\'/control/status\')', '/control/amo/fno',
                          'premium_nav("control")'):
