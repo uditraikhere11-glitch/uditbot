@@ -689,3 +689,31 @@ html.v17p-preview-shell .v17p-brand{display:inline-block;max-width:min(285px,36v
 html.v17p-preview-shell.premium-setup .container>.header{display:block!important;grid-template-columns:none!important;gap:0!important}
 html.v17p-preview-shell.premium-setup .container>.header h1,
 html.v17p-preview-shell.premium-setup .container>.header .subtitle{grid-column:auto!important;grid-row:auto!important;margin-left:0!important;padding-left:0!important}
+
+/* V17 Setup navigation correctness: presentation-only six-category views. */
+html.v17p-preview-shell .v17p-setup-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:14px;margin:16px 0 24px}
+html.v17p-preview-shell .v17p-setup-actions .v17p-view-all{margin:0}
+html.v17p-preview-shell .v17p-setup-amo-link{color:var(--v17p-primary);font-size:13px;font-weight:700;text-decoration:underline;text-underline-offset:3px}
+html.v17p-preview-shell .v17p-setup-amo-link:focus-visible,html.v17p-preview-shell .v17p-setup-card:focus-visible{outline:3px solid #4297df;outline-offset:3px}
+html.v17p-preview-shell.premium-setup .v17p-setup-toolbar[hidden],
+html.v17p-preview-shell.premium-setup .section-card[hidden]{display:none!important}
+html.v17p-preview-shell .v17p-setup-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin:0 0 15px;scroll-margin-top:100px}
+html.v17p-preview-shell .v17p-back-setup{border:1px solid var(--v17p-edge);background:var(--v17p-soft);color:var(--v17p-text);border-radius:10px;padding:10px 14px;font-weight:750;cursor:pointer}
+html.v17p-preview-shell .v17p-setup-toolbar strong{font-size:19px;color:var(--v17p-text)}
+html.v17p-preview-shell.premium-setup .setup-section-jumps{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px;padding:8px;background:var(--v17p-soft);border:1px solid var(--v17p-edge);border-radius:12px}
+html.v17p-preview-shell.premium-setup .setup-section-jumps a{color:var(--v17p-muted)!important;display:inline-block;padding:9px 11px;border-radius:9px;text-decoration:none;font-weight:700;font-size:12px;white-space:nowrap}
+html.v17p-preview-shell.premium-setup .setup-section-jumps a[aria-current="location"]{background:var(--v17p-card);color:var(--v17p-text)!important;box-shadow:0 1px 5px #00000012}
+html.v17p-preview-shell .v17p-dhan-badge{display:inline-flex;align-items:center;gap:5px;padding:7px 9px;border:1px solid var(--v17p-edge);background:var(--v17p-soft);border-radius:9px;color:var(--v17p-muted);font-size:11px;font-weight:600;white-space:nowrap;max-width:100%}
+html.v17p-preview-shell .v17p-dhan-badge strong{color:var(--v17p-text);font-size:11px;font-weight:800}
+/* The retired status grid is not duplicated on Setup. Its runtime signals are in Dashboard/Health. */
+html.v17p-preview-shell.premium-setup .system-status-panel{display:none!important}
+@media(max-width:780px){
+  html.v17p-preview-shell .v17p-topbar{flex-wrap:wrap;row-gap:4px}
+  html.v17p-preview-shell .v17p-top-actions{flex-wrap:wrap;justify-content:flex-end;max-width:63%}
+  html.v17p-preview-shell .v17p-dhan-badge{order:10;margin-left:auto}
+  html.v17p-preview-shell.premium-setup .setup-section-jumps{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:thin}
+  html.v17p-preview-shell .v17p-setup-actions{justify-content:stretch;flex-direction:column;align-items:stretch}
+  html.v17p-preview-shell .v17p-setup-actions .v17p-view-all,html.v17p-preview-shell .v17p-setup-amo-link{width:100%;text-align:center}
+}
+
+html.v17p-preview-shell.premium-setup form[action="/setup"]>label[hidden]{display:none!important}

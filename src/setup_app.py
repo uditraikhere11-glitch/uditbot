@@ -979,98 +979,11 @@ def get_setup_page(saved: bool = False, saved_info: Optional[dict] = None):
     raw_cfg_values = parse_env_dict(".env")
     cfg = AppConfig.from_env(env=raw_cfg_values, env_file="")
 
-    # Build real-time system status bar
-    from src.engine.config_manager import check_service_is_active, ConfigChangeTracker, ServiceOperatingState
-    tracker = ConfigChangeTracker(data_dir=getattr(cfg, "data_dir", "data"))
-    svc_op_state, _ = tracker.resolve_service_operating_state()
-    is_svc_active = (svc_op_state == ServiceOperatingState.RUNNING)
-    act_info = tracker.get_active_running_version() or {}
-    act_v = act_info.get("short_version", "v-UNKNOWN")
-    stop_path = os.path.join(getattr(cfg, "data_dir", "data"), "emergency_stop.json")
-    is_stopped = False
-    if os.path.exists(stop_path):
-        try:
-            with open(stop_path, "r", encoding="utf-8") as f:
-                is_stopped = bool(json.load(f).get("is_stopped", False))
-        except Exception:
-            is_stopped = True
-
-    if svc_op_state == ServiceOperatingState.RUNNING:
-        svc_badge = '<span class="status-pill pill-online">🟢 Online (Running)</span>'
-    elif svc_op_state == ServiceOperatingState.STOPPED_BY_OWNER:
-        svc_badge = '<span class="status-pill pill-offline">⚪ Stopped by Owner</span>'
-    elif svc_op_state == ServiceOperatingState.FAILED:
-        svc_badge = '<span class="status-pill pill-danger">❌ Stopped Unexpectedly</span>'
-    elif svc_op_state == ServiceOperatingState.UNKNOWN:
-        svc_badge = '<span class="status-pill pill-offline">⚠️ Status Unavailable (UNKNOWN)</span>'
-    else:
-        svc_badge = '<span class="status-pill pill-offline">⚪ Offline (Stopped)</span>'
-    mode_badge = f'<span class="status-pill {"pill-live" if cfg.trading_mode.value == "LIVE" else "pill-test"}">{"🔴 Real Trading (Live Money)" if cfg.trading_mode.value == "LIVE" else "🧪 Paper Trading (Safe / Zero Risk)"}</span>'
-    stop_badge = '<span class="status-pill pill-danger">🛑 Halted (Emergency Stop)</span>' if is_stopped else '<span class="status-pill pill-online">🟢 Normal (Trading Allowed)</span>'
-    cmp_pol = getattr(cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP")
-    cmp_label = "📈 Darvas Live Market Price" if cmp_pol == "DARVAS_HTTP_SUCCESS" else "⏱️ Strict 2s Market Price"
-    cmp_badge = f'<span class="status-pill pill-darvas">{cmp_label}</span>'
-    
-    clean_v_id = escape_html(str(act_v).replace("v-", ""), quote=True)
-    # A running process is not proof that it consumed recently saved settings.
-    # Verify the actual systemd PID and acknowledged configuration hash.
-    runtime_matches_saved = False
-    if is_svc_active:
-        try:
-            runtime_matches_saved, _, _ = tracker.is_active_version_confirmed(
-                expected_hashes={compute_config_version(cfg)},
-                expected_mode=cfg.trading_mode.value,
-                require_systemd_active=True,
-            )
-        except Exception:
-            runtime_matches_saved = False
-    if runtime_matches_saved:
-        ver_badge = f'<span class="status-pill pill-online">🟢 Active Configuration Verified</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
-    elif is_svc_active:
-        ver_badge = f'<span class="status-pill pill-offline">⚠️ Saved — Running Version Not Verified</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
-    else:
-        ver_badge = f'<span class="status-pill pill-offline">⚪ Saved (Start Bot to Apply)</span><span style="font-size: 10px; opacity: 0.6; display: block; font-weight: normal; margin-top: 3px;">Sync Ref: {clean_v_id}</span>'
-
-    dhan_masked = escape_html(_mask_account_id(cfg.dhan_client_id), quote=True)
-    dhan_badge = f'<span class="status-pill pill-neutral">Connected ({dhan_masked})</span>' if cfg.dhan_client_id else '<span class="status-pill pill-offline">Not Configured</span>'
-
-    status_bar = f"""
-    <div class="system-status-panel">
-      <div class="status-header">
-        <div class="status-header-title">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-          AuditBot Real-Time System Status
-        </div>
-        <div class="status-header-tag">Safety Guardrails Active</div>
-      </div>
-      <div class="status-grid">
-        <div class="status-card">
-          <div class="status-card-label">Bot Service</div>
-          <div class="status-card-val">{svc_badge}</div>
-        </div>
-        <div class="status-card">
-          <div class="status-card-label">Trading Mode</div>
-          <div class="status-card-val">{mode_badge}</div>
-        </div>
-        <div class="status-card">
-          <div class="status-card-label">Settings Status</div>
-          <div class="status-card-val">{ver_badge}</div>
-        </div>
-        <div class="status-card">
-          <div class="status-card-label">Price Source</div>
-          <div class="status-card-val">{cmp_badge}</div>
-        </div>
-        <div class="status-card">
-          <div class="status-card-label">Safety Circuit Breaker</div>
-          <div class="status-card-val">{stop_badge}</div>
-        </div>
-        <div class="status-card">
-          <div class="status-card-label">Dhan Broker Account</div>
-          <div class="status-card-val">{dhan_badge}</div>
-        </div>
-      </div>
-    </div>
-    """
+    # Runtime service/mode/protection information belongs to Dashboard, Control
+    # and Health, where it can be independently verified. Setup only edits the
+    # configured account/strategy. Its masked account ID lives in the shared
+    # authenticated header (premium_nav), never as a "Connected" claim.
+    status_bar = ""
 
     banner = ""
     if saved:
