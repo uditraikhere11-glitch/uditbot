@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 import threading
 import zoneinfo
-from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots
+from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots, prepare_protected_prior_day_buy_history
 from src.engine.unified_exit_reconciliation import (
     ReconciliationEvidenceError, reconcile_verified_exits, _exchange_time, verified_flat_delivery_day,
 )
@@ -1820,6 +1820,9 @@ class StartupReconciliationGate:
             try:
                 prepare_owner_lots(self.broker, self.db, books, positions, trade_book, time.time(),
                                    pre_watcher_holdings, pre_watcher_forever)
+                prepare_protected_prior_day_buy_history(
+                    self.broker, self.db, books, positions, trade_book, time.time()
+                )
             except Exception as exc:
                 return self._fail_reconciliation_locked(
                     str(exc) if isinstance(exc, ValueError) else f"Owner-lot evidence unavailable ({type(exc).__name__})", starting_halt_generation)
