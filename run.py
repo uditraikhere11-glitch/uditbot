@@ -198,11 +198,24 @@ async def main():
             from src.cli import format_startup_online_card
             pending_cnt = len(pipeline.db.get_non_terminal_intents()) if hasattr(pipeline.db, "get_non_terminal_intents") else 0
             unprot_cnt = len(pipeline.db.get_unprotected_orders()) if hasattr(pipeline.db, "get_unprotected_orders") else 0
+            # Read current gate/watcher truth immediately before queuing.
+            gate_now = pipeline.reconciliation_gate
+            watcher_now = pipeline.watcher
+            gate_live = (
+                gate_now.is_accepting_entries is True
+                and str(getattr(getattr(gate_now, "state", None), "value", "")) == "HEALTHY"
+            )
+            watcher_live = (
+                getattr(watcher_now, "_is_running", None) is True
+                and getattr(watcher_now, "_supervision_read_complete", None) is True
+            )
             startup_card = format_startup_online_card(
                 cfg,
                 allowed_chats_count=len(allowed_chats),
-                reconciliation_ok=rec_ok,
-                reconciliation_msg=rec_msg,
+                reconciliation_ok=gate_live,
+                reconciliation_msg=(rec_msg if gate_live else
+                    str(getattr(gate_now, "last_error", "") or "Current gate is not verified healthy")),
+                watcher_verified=watcher_live,
                 unresolved_intents_count=pending_cnt,
                 unprotected_positions_count=unprot_cnt,
                 is_stopped=pipeline.stop_manager.is_stopped(),

@@ -1,0 +1,41 @@
+name: YESBANK reconciliation integration review (offline)
+on:
+  push:
+    branches:
+      - audit/yesbank-recovery-integration-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  yesbank-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install declared test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Enforce offline broker/network isolation
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+      - name: Compile candidate and complete source tree
+        run: python -B -m compileall -q src run.py tests
+      - name: YESBANK recovery and backward-compatibility integration tests
+        run: |
+          python -m unittest -v \
+            tests.test_settled_owner_read_policy \
+            tests.test_reconciliation_halt_aggregation \
+            tests.test_r06_reconciliation_recovery \
+            tests.test_owner_lot_restart \
+            tests.test_r02_read_governor \
+            tests.test_historical_fill_reconciliation_h01_h17 \
+            tests.test_startup_card_verified_runtime \
+            tests.test_health_and_system_message_designer
+      - name: Full repository offline test discovery
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py"
