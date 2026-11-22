@@ -24,11 +24,13 @@ class V17InstanceAndNativePreservation(TestCase):
     def test_distinct_bot_instance_names_are_not_cached(self):
         def udit():
             self.assertEqual(premium_instance_name(),'Udit')
-            self.assertIn('TRADING SYSTEM · Udit',premium_nav('control'))
+            self.assertIn('<strong>UditBot</strong>',premium_nav('control'))
+            self.assertIn('Powered by AuditBot · Trading System',premium_nav('control'))
             self.assertIn('<h1>Udit</h1>',render_control_center('fake_csrf'))
         def aman():
             self.assertEqual(premium_instance_name(),'Aman')
-            self.assertIn('TRADING SYSTEM · Aman',premium_nav('control'))
+            self.assertIn('<strong>AmanBot</strong>',premium_nav('control'))
+            self.assertIn('Powered by AuditBot · Trading System',premium_nav('control'))
             self.assertIn('<h1>Aman</h1>',render_control_center('fake_csrf'))
         self._with_env('OPERATOR_NAME=Udit\nBOT_INSTANCE_NAME=UditBot\n',udit)
         self._with_env('OPERATOR_NAME=Aman\nBOT_INSTANCE_NAME=AmanBot\n',aman)
@@ -42,7 +44,8 @@ class V17InstanceAndNativePreservation(TestCase):
             html=render_control_center('fake_csrf')
             self.assertIn('&lt;script&gt;',html)
             self.assertNotIn('<h1><script>',html)
-            self.assertIn('TRADING SYSTEM · &lt;script&gt;',html)
+            self.assertIn('&lt;script&gt;',premium_nav('control'))
+            self.assertNotIn('<script>alert(1)</script>',premium_nav('control'))
         self._with_env('OPERATOR_NAME=<script>alert(1)</script>\n',check)
 
     def test_long_label_is_bounded(self):
@@ -55,7 +58,7 @@ class V17InstanceAndNativePreservation(TestCase):
 
     def test_existing_routes_and_native_actions_still_present(self):
         html=render_control_center('fake_csrf')
-        for marker in ('id="start"','id="stop"','id="health"','id="equity-amo"','id="fno-amo"',
+        for marker in ('id="start"','id="stop"','id="v17-health-run"','id="equity-amo"','id="fno-amo"',
                        '/control/status','/control/health','/control/amo/equity',
                        '/control/amo/fno','/control/amo/fno/cancel','/setup/service-control'):
             with self.subTest(marker=marker):self.assertIn(marker,html)

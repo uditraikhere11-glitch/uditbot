@@ -100,7 +100,7 @@ class ApprovedVisualOnlyContract(unittest.TestCase):
 
     def test_actual_control_center_and_designer_contracts(self):
         cc = source('src/control_center_ui.py')
-        for token in ('id="start"', 'id="stop"', 'id="health"',
+        for token in ('id="start"', 'id="stop"', 'id="v17-health-run"',
                       'id="equity-amo"', 'id="fno-amo"', 'id="amo-orders"',
                       'id="system-health"', '/setup/service-control', '/control/status'):
             self.assertIn(token, cc)

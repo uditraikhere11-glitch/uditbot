@@ -30,10 +30,11 @@ class V17WorkspaceContracts(unittest.TestCase):
         self.assertNotIn('Realized P&L',self.html)
 
     def test_service_controls_only_one_copy(self):
-        for field in ('start','stop','health','equity-amo','fno-amo'):
+        for field in ('start','stop','restart','v17-health-run','equity-amo','fno-amo'):
             with self.subTest(field=field):
                 self.assertEqual(len(re.findall(fr'id="{field}"',self.html)),1)
-        self.assertIn("$('v17-health-run').addEventListener('click',()=>{ $('health').click(); });",self.html)
+        self.assertNotIn('id="health"', self.html)
+        self.assertIn("$('v17-health-run').addEventListener('click',async()=>{", self.html)
         self.assertIn('/setup/service-control',self.html)
         self.assertIn('/control/amo/fno',self.html)
         self.assertIn('/control/health',self.html)

@@ -109,9 +109,9 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
   <div class="v17p-kpis">
     <div id="v17p-service-card" class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Trading Service</span><strong id="v17-db-service">VERIFYING</strong><small>Trading bot</small></div>
     <div id="v17p-mode-card" class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Trading Mode</span><strong id="v17-db-mode">UNVERIFIED</strong><small>Execution mode</small></div>
-    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Reconciliation</span><strong id="v17p-reconciliation">UNVERIFIED</strong><small>Broker positions not verified by this route</small></div>
-    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Protection Watcher</span><strong id="v17p-protection">UNVERIFIED</strong><small>Heartbeat and broker protection unverified</small></div>
-    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>New Entries Gate</span><strong id="v17p-gate">UNVERIFIED</strong><small>Live entry permission not proved by this route</small></div>
+    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Reconciliation</span><strong id="v17p-reconciliation">UNVERIFIED</strong><small>Awaiting process-matched reconciliation evidence</small></div>
+    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Protection Watcher</span><strong id="v17p-protection">UNVERIFIED</strong><small>Process heartbeat and watcher supervision</small></div>
+    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>New Entries Gate</span><strong id="v17p-gate">UNVERIFIED</strong><small>Verified reconciliation and Owner STOP gate</small></div>
   </div>
   <div class="v17p-offscreen-data" aria-hidden="true"><span id="v17-db-equity">UNVERIFIED</span><span id="v17-db-fno">UNVERIFIED</span><span id="v17-db-verified">UNVERIFIED</span></div>
   <h2 class="v17p-quick-title">Quick Access</h2>
@@ -121,7 +121,7 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
     <a href="/setup/telegram-designer"><span class="v17p-quick-icon" aria-hidden="true">➤</span><span><b>Telegram Designer</b><small>Alerts, reports and messages</small></span></a>
     <a href="#health"><span class="v17p-quick-icon" aria-hidden="true">♡</span><span><b>System Health</b><small>Run read-only checks</small></span></a>
     <a href="#amo"><span class="v17p-quick-icon" aria-hidden="true">▣</span><span><b>AMO Orders</b><small>Equity and F&amp;O AMO management</small></span></a>
-    <a href="#health"><span class="v17p-quick-icon" aria-hidden="true">▥</span><span><b>Reports &amp; Logs</b><small>Health summary and available checks</small></span></a>
+    <a href="#reports"><span class="v17p-quick-icon" aria-hidden="true">▥</span><span><b>Reports &amp; Logs</b><small>Read-only journal metrics and safety events</small></span></a>
   </div>
 </section>
 <section id="v17-control" class="v17-view-panel" aria-label="Bot operating state">
@@ -132,14 +132,13 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
       <div id="service-detail" class="detail">Verifying VM service state</div></div>
     <div class="tile"><div class="label">Trading Mode</div>
       <div class="status-line"><span id="mode-beacon" class="status-beacon" aria-hidden="true"></span><div id="mode" class="value">UNKNOWN</div></div>
-      <div class="v17p-mode-pills" role="group" aria-label="Verified trading mode (read only)"><span id="v17p-mode-live">LIVE</span><span id="v17p-mode-test">TEST</span></div>
-      <div id="mode-detail" class="detail">Running configuration pending verification</div><a class="v17p-mode-link" href="/setup#setup-execution">Change mode in Setup</a></div>
+      <div class="v17p-mode-pills" role="group" aria-label="Set trading mode through verified Save and Apply"><button type="button" id="v17p-mode-live" disabled>LIVE</button><button type="button" id="v17p-mode-test" disabled>TEST</button></div>
+      <div id="mode-detail" class="detail">Running configuration pending verification</div><div id="v17p-mode-feedback" class="detail" role="status" aria-live="polite">Mode changes use the same safeguarded Save &amp; Apply as Setup.</div></div>
   </div>
   <div class="buttons">
     <button id="start" class="btn-start" type="button" disabled>▶ Start</button>
     <button id="stop" class="btn-stop" type="button" disabled>■ Stop</button>
     <button id="restart" type="button" disabled>⟳ Restart</button>
-    <button id="health" type="button">♡ Health Check</button>
   </div>
   <div id="info" class="status-note" role="status" aria-live="polite">Read-only status is loading. No action has been taken.</div>
 
@@ -168,6 +167,16 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
   <div id="health-state" role="status" aria-live="polite">Select Health Check to check service, broker, token, Telegram and safety gates.</div>
   <div id="checks"></div>
 </section>
+<section id="v17-reports" class="v17-view-panel" aria-label="Reports and Logs" hidden>
+  <div class="v17p-pagehead"><div><h1>Reports &amp; Logs</h1><p>Read-only journal totals and recent safety-event categories. No account secrets or raw Telegram messages.</p></div></div>
+  <div class="section-header"><h2>Trading Journal</h2><button id="v17-refresh-reports" type="button">↻ Refresh reports</button></div>
+  <div id="v17-report-summary" class="v17p-report-summary" role="status">Select Refresh reports to load journal facts.</div>
+  <div id="v17-report-counts" class="v17p-report-counts"></div>
+  <h2>Recent orders (local journal)</h2>
+  <div id="v17-report-orders" class="v17p-report-events" aria-live="polite"></div>
+  <h2>Safety and daily-health events</h2>
+  <div id="v17-report-events" class="v17p-report-events" aria-live="polite"></div>
+</section>
 </main>
 <script>
 'use strict';
@@ -175,16 +184,17 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
 const $=id=>document.getElementById(id);
 const csrf=document.querySelector('meta[name="control-csrf"]').content;
 /* View-only navigation: preserve the original controls and authenticated routes. */
-const v17ViewNames = new Set(['dashboard','control','amo','health']);
+const v17ViewNames = new Set(['dashboard','control','amo','health','reports']);
 function v17ShowView() {
   const requested=window.location.hash.slice(1).toLowerCase();
   const active=v17ViewNames.has(requested)?requested:'dashboard';
   if((active==='dashboard'||active==='control')&&window.v17pDashboardHealthReady===true)loadDashboardHealth();
-  for (const id of ['dashboard','control','amo-settings','amo-orders','system-health']) {
-    const el=$(id==='dashboard'?'v17-dashboard':id==='control'?'v17-control':id==='amo-settings'?'v17-amo-settings':id);
+  if(active==='reports')refreshReports();
+  for (const id of ['dashboard','control','amo-settings','amo-orders','system-health','reports']) {
+    const el=$(id==='dashboard'?'v17-dashboard':id==='control'?'v17-control':id==='amo-settings'?'v17-amo-settings':id==='reports'?'v17-reports':id);
     if (!el) continue;
     el.hidden = active==='amo' ? !(id==='amo-settings'||id==='amo-orders')
-      : active==='health' ? id!=='system-health' : id!==active;
+      : active==='health' ? id!=='system-health' : active==='reports' ? id!=='reports' : id!==active;
   }
   for(const a of document.querySelectorAll('[data-v17-view]')) {
     if(a.dataset.v17View===active)a.setAttribute('aria-current','page');
@@ -224,7 +234,10 @@ async function refreshStatus(){
     // The glow is a verified-status indicator, not a substitute for Health Check.
     const verifiedRunning=state==='RUNNING'&&s.runtime_verified===true;
     $('service-beacon').classList.toggle('is-active',verifiedRunning);
-    setText('service-detail',s.service_detail||'Verified state from trading_bot.service');
+    $('service').classList.toggle('v17p-verified-running',verifiedRunning);
+    setText('service-detail',s.runtime_verified===true?
+      'Verified systemd trading_bot.service · Running mode: '+safeStatus(s.running_mode):
+      (s.service_detail||'Runtime evidence pending'));
     const mode=(s.runtime_verified===true)?safeStatus(s.running_mode):'UNVERIFIED';
     setText('mode',mode);
     const headerChip=$('v17p-runtime-chip');
@@ -240,7 +253,11 @@ async function refreshStatus(){
     $('mode-beacon').classList.toggle('is-active',verifiedRunning&&mode==='LIVE');
     $('v17p-mode-live').classList.toggle('selected',verifiedRunning&&mode==='LIVE');
     $('v17p-mode-test').classList.toggle('selected',verifiedRunning&&mode==='TEST');
-    setText('mode-detail',s.runtime_verified===true?'Active running configuration verified':'Saved mode: '+safeStatus(s.saved_mode));
+    setText('mode-detail',s.runtime_verified===true?'Running: '+mode+' · Saved: '+safeStatus(s.saved_mode)+' · Runtime verified':'Saved: '+safeStatus(s.saved_mode)+' · Running: unverified');
+    for(const [target,id] of [['LIVE','v17p-mode-live'],['TEST','v17p-mode-test']]){
+      $(id).disabled=s.mode_can_edit!==true||safeStatus(s.saved_mode)===target;
+      $(id).setAttribute('aria-pressed',String(verifiedRunning&&mode===target));
+    }
     $('start').disabled=!['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
     $('stop').disabled=state!=='RUNNING';
     $('restart').disabled=state!=='RUNNING'||s.runtime_verified!==true||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true||!ownerIntentSafe;
@@ -257,15 +274,22 @@ async function refreshStatus(){
     $('v17p-service-card').classList.toggle('verified',verifiedRunning);
     $('v17p-mode-card').classList.toggle('verified',verifiedRunning&&(mode==='LIVE'||mode==='TEST'));
     setText('v17-db-mode',mode);
+    renderOperationalStatus(s);
     setText('v17-db-equity',s.equity_amo_saved===true?'SAVED ON':s.equity_amo_saved===false?'SAVED OFF':'UNKNOWN');
     setText('v17-db-fno',s.fno_amo_saved===true?'SAVED ON':s.fno_amo_saved===false?'SAVED OFF':'UNKNOWN');
     setText('v17-db-verified',s.runtime_verified===true&&state==='RUNNING'?'VERIFIED':'UNVERIFIED');
+    ownerIntentSafe=s.owner_intent_status==='PASS';
+    $('restart').disabled=!ownerIntentSafe||!verifiedRunning||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
+    if(s.owner_intent_status==='WARN'){
+      $('v17p-owner-warning').hidden=false;
+      setText('v17p-owner-warning','Owner service intent: WARNING — Saved STOP conflicts with the running service; review before restart or mode change.');
+    }
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
   }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;
     $('v17p-service-card').classList.remove('verified');$('v17p-mode-card').classList.remove('verified');
-    $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active');
+    $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active');$('service').classList.remove('v17p-verified-running');
     $('v17p-mode-live').classList.remove('selected');$('v17p-mode-test').classList.remove('selected');
-    $('equity-amo').disabled=true;$('fno-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
+    $('equity-amo').disabled=true;$('fno-amo').disabled=true;$('v17p-mode-live').disabled=true;$('v17p-mode-test').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
     $('v17p-runtime-chip').textContent='UNVERIFIED';$('v17p-runtime-chip').className='v17p-runtime-chip';
     for(const id of ['v17-db-service','v17-db-mode','v17-db-equity','v17-db-fno','v17-db-verified'])setText(id,'UNVERIFIED');
     setText('info','Cannot verify bot state: '+err.message+' (controls disabled)')}
@@ -285,6 +309,8 @@ async function serviceAction(action){
     const r=await requestJSON('/setup/service-control',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({action,confirm_live:(action==='start'||action==='restart')&&live,csrf_token:csrf,reason:'Owner requested '+action+' from Control Center'})});
     resultMessage=r.message||r.error||('Request '+action+' received.');
+    if(r.ok===true&&r.runtime_verified===true&&action==='restart')
+      resultMessage='Restart completed and runtime verified: '+safeStatus(r.running_mode);
     if(r.requires_live_confirmation){
       resultMessage='LIVE action requires explicit confirmation; no action performed.';
     }else if(r.deferred===true){
@@ -301,6 +327,99 @@ async function serviceAction(action){
 $('start').addEventListener('click',()=>serviceAction('start'));
 $('stop').addEventListener('click',()=>serviceAction('stop'));
 $('restart').addEventListener('click',()=>serviceAction('restart'));
+async function changeMode(mode){
+  if(!current||current.mode_can_edit!==true||current.tracker_v2_apply_blocked===true)return;
+  if(safeStatus(current.saved_mode)===mode)return;
+  const warning=mode==='LIVE'
+    ?'Switch to LIVE mode? This can restart the trading service and enable REAL Dhan orders after safety verification.'
+    :'Switch to TEST mode? Changing the running mode may restart the trading service and interrupt order supervision.';
+  if(!confirm(warning))return;
+  const oldRevision=current.config_file_revision;
+  for(const id of ['v17p-mode-live','v17p-mode-test'])$(id).disabled=true;
+  setText('v17p-mode-feedback','Saving '+mode+' through the existing configuration coordinator…');
+  try{
+    const r=await requestJSON('/control/mode',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode,csrf_token:csrf,expected_revision:oldRevision,confirm_live:mode==='LIVE'})});
+    setText('v17p-mode-feedback',String(r.message||r.status||'Change submitted')+
+      (r.restart_performed===true?' · Runtime restart verified':' · Running mode not yet verified'));
+  }catch(err){setText('v17p-mode-feedback','Mode change rejected/unverified: '+err.message)}
+  await refreshStatus();
+}
+$('v17p-mode-live').addEventListener('click',()=>changeMode('LIVE'));
+$('v17p-mode-test').addEventListener('click',()=>changeMode('TEST'));
+function renderOperationalStatus(s){
+  const details=[['v17p-reconciliation','reconciliation'],['v17p-protection','protection_watcher'],['v17p-gate','new_entries_gate']];
+  for(const [id,key] of details){
+    const value=String(s[key]||'UNVERIFIED');
+    setText(id,value);
+    const card=$(id).closest('.v17p-kpi');
+    const isVerified=(key==='reconciliation'&&value==='HEALTHY')||
+      (key==='protection_watcher'&&value==='ACTIVE')||
+      (key==='new_entries_gate'&&value==='OPEN'&&s.owner_intent_status==='PASS');
+    if(card){
+      card.classList.toggle('verified',isVerified);
+      const description=card.querySelector('small');
+      if(description){
+        const descriptions={
+          reconciliation:isVerified?'Fresh process-matched reconciliation evidence':
+            'Reconciliation '+value.toLowerCase()+'; check Health for details',
+          protection_watcher:isVerified?'Fresh watcher-loop heartbeat; individual order legs not proven':
+            'Watcher '+value.toLowerCase()+'; individual order legs not proven',
+          new_entries_gate:isVerified?'Fresh healthy gate; Owner STOP intent clear':
+            'Entry gate '+value.toLowerCase()+'; verify owner intent and reconciliation'
+        };
+        description.textContent=descriptions[key];
+      }
+    }
+  }
+}
+async function refreshBrokerEvidence(){
+  try{
+    const b=await requestJSON('/control/broker-status');
+    if(b.status==='VERIFIED')setText('v17p-dhan','Dhan: Verified');
+    else if(b.status==='MISMATCH')setText('v17p-dhan','Dhan: ACCOUNT MISMATCH');
+    else setText('v17p-dhan','Dhan: '+String(b.status||'UNVERIFIED'));
+    if(typeof b.token_expiration_ist==='string'&&b.token_expiration_ist)
+      setText('v17p-token','Token expiry: '+b.token_expiration_ist);
+    else setText('v17p-token','Token validity: Not verified');
+  }catch(_){setText('v17p-dhan','Dhan: Not independently verified');setText('v17p-token','Token validity: Not verified')}
+}
+async function refreshReports(){
+  const btn=$('v17-refresh-reports');if(btn.disabled)return;
+  btn.disabled=true;
+  try{
+    const r=await requestJSON('/control/reports');
+    if(r.available!==true)throw Error('Read-only journal unavailable');
+    const m=r.summary||{};
+    setText('v17-report-summary','Local journal · Orders: '+String(m.orders||0)+' · Signals: '+String(m.signals||0)+
+      ' · Unknown intents: '+String(m.unresolved_intents||0)+' · Unprotected records: '+String(m.unprotected_records||0));
+    const summaryCards=$('v17-report-counts');summaryCards.replaceChildren();
+    for(const [name,key] of [['Orders today','orders_today'],['Signals today','signals_today'],['Trades today','trades_today'],['Unknown intents','unresolved_intents'],['Unprotected records','unprotected_records']]){
+      const tile=document.createElement('div');tile.className='v17p-report-stat';
+      const title=document.createElement('span');title.textContent=name;
+      const value=document.createElement('strong');value.textContent=String(Number.isInteger(m[key])?m[key]:'UNKNOWN');
+      tile.append(title,value);summaryCards.append(tile);
+    }
+    const orders=$('v17-report-orders');orders.replaceChildren();
+    for(const item of (Array.isArray(r.recent_orders)?r.recent_orders:[])){
+      const line=document.createElement('div');line.className='v17p-report-row';
+      const a=document.createElement('strong');a.textContent=String(item.symbol||'Instrument');
+      const b=document.createElement('span');b.textContent=String(item.mode||'UNKNOWN')+' · '+String(item.status||'UNKNOWN');
+      line.append(a,b);orders.append(line);
+    }
+    const parent=$('v17-report-events');parent.replaceChildren();
+    for(const e of (Array.isArray(r.events)?r.events:[])){
+      const row=document.createElement('div');row.className='v17p-report-row';
+      const label=document.createElement('strong');label.textContent=String(e.event||'Event');
+      const time=document.createElement('span');time.textContent=typeof e.at==='number'&&Number.isFinite(e.at)?new Date(e.at*1000).toLocaleString():'Unknown time';
+      row.append(label,time);parent.append(row);
+    }
+    if(!parent.childElementCount){const empty=document.createElement('p');empty.textContent='No recent safety events in the local journal.';parent.append(empty);}
+  }catch(err){setText('v17-report-summary','Reports unavailable: '+err.message);$('v17-report-events').replaceChildren();$('v17-report-orders').replaceChildren();$('v17-report-counts').replaceChildren()}
+  btn.disabled=false;
+}
+$('v17-refresh-reports').addEventListener('click',refreshReports);
+
 function reflectDashboardHealth(result){
   const checks=Array.isArray(result.checks)?result.checks:[];
   const owner=checks.find(x=>x.name==='Owner service intent');
@@ -311,6 +430,9 @@ function reflectDashboardHealth(result){
   const account=checks.find(x=>x.name==='Dhan broker authentication');
   const token=checks.find(x=>x.name==='Dhan token file');
   const watcher=checks.find(x=>x.name==='Order protection watcher');
+  const recon=checks.find(x=>x.name==='Reconciliation');
+  const gate=checks.find(x=>x.name==='New entries gate');
+  const profile=checks.find(x=>x.name==='Dhan broker authentication');
   const banner=$('v17p-owner-warning');
   const critical=checks.filter(x=>x.status==='FAIL'||x.status==='WARN');
   $('health-state').classList.toggle('v17p-health-warning',critical.length>0);
@@ -319,12 +441,12 @@ function reflectDashboardHealth(result){
     banner.hidden=false;
   }else banner.hidden=true;
   if(owner && owner.status==='WARN') banner.hidden=false;
-  setText('v17p-dhan',account&&account.status==='PASS'?'Dhan: Verified':'Dhan: Not independently verified');
-  setText('v17p-token',token&&token.status==='PASS'?'Token file: Present (validity unverified)':'Token validity: Not verified');
-  // The current health endpoint does not assert reconciliation or entry permission.
-  setText('v17p-reconciliation','UNVERIFIED');
-  setText('v17p-gate','UNVERIFIED');
-  setText('v17p-protection',watcher&&watcher.status==='FAIL'?'CHECK REQUIRED':'UNVERIFIED');
+  setText('v17p-dhan',profile&&profile.status==='PASS'?'Dhan: Verified':profile&&profile.status==='FAIL'?'Dhan: Check required':'Dhan: Not independently verified');
+  if(!$('v17p-token').textContent.startsWith('Token expiry:'))
+    setText('v17p-token',token&&token.status==='PASS'?'Token file: Present (expiry unverified)':'Token validity: Not verified');
+  if(!current)return;
+  // Operational values come exclusively from the process-matched status endpoint.
+  renderOperationalStatus(current);
 }
 let v17pDashboardHealthRequested=false;
 window.v17pDashboardHealthReady=true;
@@ -332,12 +454,12 @@ if(!window.location.hash||window.location.hash==='#dashboard'||window.location.h
 async function loadDashboardHealth(){
   if(v17pDashboardHealthRequested)return;
   v17pDashboardHealthRequested=true;
-  try{reflectDashboardHealth(await requestJSON('/control/health'))}
+  try{await refreshBrokerEvidence();reflectDashboardHealth(await requestJSON('/control/health'))}
   catch(_){setText('v17p-dhan','Dhan: Not independently verified');}
 }
-$('v17-health-run').addEventListener('click',()=>{ $('health').click(); });
-$('health').addEventListener('click',async()=>{
-  $('health').disabled=true;$('v17-health-run').disabled=true;setText('health-state','Running read-only checks…');$('checks').replaceChildren();
+$('v17-health-run').addEventListener('click',async()=>{
+  $('v17-health-run').disabled=true;setText('health-state','Running read-only checks…');$('checks').replaceChildren();
+  await refreshBrokerEvidence();
   try{
     const r=await requestJSON('/control/health');
     setText('health-state',r.summary||'Health checks returned');
@@ -352,7 +474,7 @@ $('health').addEventListener('click',async()=>{
       el.append(name,detail);$('checks').append(el);
     }
   }catch(err){setText('health-state','Health check unavailable: '+err.message)}
-  $('health').disabled=false;$('v17-health-run').disabled=false;
+  $('v17-health-run').disabled=false;
 });
 $('equity-amo').addEventListener('change',async()=>{
   const requested=$('equity-amo').checked;
