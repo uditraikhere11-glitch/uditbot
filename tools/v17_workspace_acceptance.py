@@ -73,7 +73,7 @@ def run() -> dict:
                                             page.wait_for_function("document.getElementById('v17-db-service').textContent==='STOPPED BY OWNER'")
                                             assert page.locator('#v17-db-verified').inner_text()=='UNVERIFIED'
                                             for label in ['Trading Controls','Configuration','System Health','AMO Orders','Telegram Designer']:
-                                                assert page.locator('.v17-quick-grid').get_by_text(label).count()>=1,label
+                                                assert page.locator('.v17p-quick').get_by_text(label).count()>=1,label
                                         if view=='health':
                                             page.locator('#v17-health-run').click()
                                             page.wait_for_function("document.getElementById('health-state').textContent.includes('Read-only health completed')")
