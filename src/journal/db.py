@@ -23,6 +23,7 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -373,6 +374,21 @@ class JournalDB:
                 payload TEXT,
                 created_at REAL
             );
+
+            -- Halt occurrence aggregation is intentionally NOT system_events.
+            -- system_events remains immutable; this separate table stores
+            -- mutable counts across restarts without modifying audit evidence.
+            CREATE TABLE IF NOT EXISTS reconciliation_halt_aggregates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1
+                    CHECK (occurrence_count >= 1),
+                first_seen_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS reconciliation_halt_aggregates_recent
+                ON reconciliation_halt_aggregates(account_id, id DESC);
 
             CREATE TRIGGER IF NOT EXISTS preserve_owner_evidence_updates BEFORE UPDATE ON system_events
             WHEN OLD.event_type GLOB 'OWNER_LOT_*' OR OLD.event_type='RECONCILIATION_GATE_HALTED'
@@ -1814,6 +1830,52 @@ class JournalDB:
                 (event_type, description, payload, time.time())
             )
             return cur.lastrowid
+
+    def record_reconciliation_halt_occurrence(
+        self, reason: str, *, state_transition: bool = False,
+        observed_at: Optional[float] = None, window_sec: float = 300.0,
+    ) -> bool:
+        """Atomically append a material halt event and count identical repeats.
+
+        Never UPDATE or DELETE protected rows in system_events. Multiple
+        processes serialize through the WAL transaction. Returns True only
+        when this occurrence produced a new immutable halt event.
+        Telemetry failures are handled by the calling gate AFTER it closes.
+        """
+        now = time.time() if observed_at is None else float(observed_at)
+        if not (math.isfinite(now) and math.isfinite(window_sec) and window_sec > 0):
+            raise ValueError("Invalid halt aggregation clock/window")
+        desc = str(reason)
+        account = self.account_id
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute("""
+                SELECT id, reason, last_seen_at
+                FROM reconciliation_halt_aggregates
+                WHERE account_id=? ORDER BY id DESC LIMIT 1
+            """, (account,)).fetchone()
+            repeated = (
+                not state_transition and prior is not None
+                and prior["reason"] == desc
+                and 0.0 <= now - float(prior["last_seen_at"]) < window_sec
+            )
+            if repeated:
+                conn.execute("""
+                    UPDATE reconciliation_halt_aggregates
+                       SET occurrence_count=occurrence_count+1, last_seen_at=?
+                     WHERE id=?
+                """, (now, prior["id"]))
+                return False
+            conn.execute("""
+                INSERT INTO reconciliation_halt_aggregates
+                    (account_id, reason, occurrence_count, first_seen_at, last_seen_at)
+                VALUES (?, ?, 1, ?, ?)
+            """, (account, desc, now, now))
+            conn.execute("""
+                INSERT INTO system_events(event_type, description, created_at)
+                VALUES ('RECONCILIATION_GATE_HALTED', ?, ?)
+            """, (desc, now))
+        return True
 
     def get_today_orders_count(self, start_of_day: Optional[float] = None) -> int:
         if start_of_day is None:

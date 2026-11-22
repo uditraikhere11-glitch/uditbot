@@ -188,6 +188,7 @@ class StartupReconciliationGate:
         self._in_startup_reconciliation_pass: bool = False
         self._active_pass_holdings: Optional[List[Dict[str, Any]]] = None
         self._active_pass_forever_orders: Optional[List[Dict[str, Any]]] = None
+        # Keep protected reconciliation audit rows immutable.
 
     @property
     def is_accepting_entries(self) -> bool:
@@ -195,21 +196,46 @@ class StartupReconciliationGate:
         return self._accepting_entries and not self.stop_manager.is_stopped()
 
     def halt_new_entries(self, reason: str) -> None:
-        """
-        11-F / 15-E: Immediately closes the entry gate when unprotected fill exposure,
-        an UNKNOWN order outcome, or a runtime broker reconciliation failure is detected.
+        """Fail closed first, then durably aggregate identical audit events.
+
+        Aggregation never controls the gate, cannot override STOP, and is
+        independent of watcher or trade reconciliation decisions.
         """
         with self._entry_state_lock:
+            transitioned = (
+                self._accepting_entries or self.state != ReconciliationState.BLOCKED
+            )
             self._halt_generation += 1
             self._accepting_entries = False
             self.state = ReconciliationState.BLOCKED
             self.last_error = reason
-        logger.critical(f"🛑 [RECONCILIATION GATE HALTED] Blocking all new entries: {reason}")
-        if hasattr(self.db, "record_system_event"):
+        # Every call above closes the gate even when SQLite is unavailable.
+        aggregated = getattr(self.db, "record_reconciliation_halt_occurrence", None)
+        if callable(aggregated):
             try:
-                self.db.record_system_event("RECONCILIATION_GATE_HALTED", reason)
-            except Exception:
-                pass
+                new_event = aggregated(reason, state_transition=transitioned)
+            except Exception as exc:
+                logger.error(
+                    "[RECONCILIATION] Halt telemetry failed (%s); gate remains BLOCKED",
+                    type(exc).__name__,
+                )
+                new_event = True  # preserve first/changed evidence if possible
+                if hasattr(self.db, "record_system_event"):
+                    try:
+                        self.db.record_system_event("RECONCILIATION_GATE_HALTED", reason)
+                    except Exception:
+                        pass
+        else:
+            new_event = True
+            if hasattr(self.db, "record_system_event"):
+                try:
+                    self.db.record_system_event("RECONCILIATION_GATE_HALTED", reason)
+                except Exception:
+                    pass
+        if new_event:
+            logger.critical(
+                "🛑 [RECONCILIATION GATE HALTED] Blocking all new entries: %s", reason
+            )
 
     def is_healthy_for_resume(self) -> bool:
         """04-E: Checks whether reconciliation state has zero unresolved intents or protection before clearing STOP."""
@@ -961,8 +987,44 @@ class StartupReconciliationGate:
         if now < self._historical_background_retry_after:
             self._historical_background_lock.release()
             return
-        # Rate-limit failed checks, including checks while an owner STOP is active.
-        self._historical_background_retry_after = now + 600.0
+        # Preflight respects the account-scoped shared Dhan read governor.
+        try:
+            governor_getter = getattr(self.broker, "_get_active_read_governor", None)
+            governor = governor_getter() if callable(governor_getter) else getattr(self.broker, "_read_governor", None)
+            from src.broker.read_governor import ReadGovernor
+            if isinstance(governor, ReadGovernor):
+                wait = float(governor.seconds_until_capacity(required=8, priority="normal"))
+                if not math.isfinite(wait) or wait < 0:
+                    raise ValueError("Invalid read-governor preflight")
+                if wait > 0:
+                    self._historical_background_retry_after = now + max(2.0, min(wait, 60.0))
+                    self._historical_background_lock.release()
+                    return
+        except Exception:
+            self._historical_background_retry_after = now + 60.0
+            self._historical_background_lock.release()
+            return
+        owner_retry = False
+        try:
+            account = str(getattr(self.db, "account_id", "") or "")
+            for row in self.db.get_open_positions_lifecycle():
+                if (row.get("position_state") == "RECONCILIATION_REQUIRED"
+                        and row.get("product_type") in ("CNC", "MTF")
+                        and int(row.get("confirmed_open_qty") or 0) > 0
+                        and self.db.is_manual_risk_acknowledged(
+                            str(row.get("parent_order_id") or ""),
+                            str(row.get("parent_order_id") or ""),
+                            expected_account_id=account,
+                            expected_security_id=str(row.get("security_id") or ""),
+                            required_qty=int(row.get("confirmed_open_qty") or 0),
+                        ) and not self.db.owner_lot_review_reason(
+                            account, str(row.get("parent_order_id") or "")
+                        )):
+                    owner_retry = True
+                    break
+        except Exception:
+            owner_retry = False
+        self._historical_background_retry_after = now + (120.0 if owner_retry else 600.0)
         try:
             if self.stop_manager.is_stopped():
                 self._historical_background_lock.release()
@@ -1496,6 +1558,12 @@ class StartupReconciliationGate:
                     books.update(verified={}, errors={}, share=False)
                     self._active_pass_holdings = self._active_pass_forever_orders = None
                     result = self._run_startup_reconciliation_inner(starting_halt_generation)
+                if (result[0] and self.watcher is not None
+                        and getattr(self.watcher, "_supervision_read_complete", False) is True):
+                    try:
+                        self.watcher.mark_completed_startup_supervision()
+                    except (AttributeError, TypeError, ValueError):
+                        pass  # Scheduling optimization only; never changes gate
                 return result
             finally:
                 GATE_BOOKS.reset(books_token)

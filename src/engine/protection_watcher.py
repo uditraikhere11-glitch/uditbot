@@ -50,6 +50,7 @@ from src.models import (
 )
 from src.engine.sizer import calculate_protection_levels, round_to_tick
 from src.engine.owner_lot_evidence import GATE_BOOKS, corroborated_external_sells
+from src.engine.settled_owner_read_policy import may_omit_prior_day_buy_trade_read
 from src.engine.holding_quantity import observed_open_quantity
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
@@ -3854,10 +3855,21 @@ class ProtectionWatcher:
                     ):
                         rec["external_unlinked_sell_observed"] = True
 
+            # Old settled BUYs are verified by the serialized historical owner
+            # evidence pass. All live exits and protection IDs retain broker reads.
+            omit_old_buy_read = may_omit_prior_day_buy_trade_read(
+                record=rec, all_open_records=open_recs, leg_order_ids=leg_order_ids,
+                journal_db=self.journal_db, gate_books=gate_books,
+                current_trades=trade_book, current_positions=positions_book,
+                current_holdings=holdings_book, account_id=expected_client_id,
+                now=now_ts,
+            )
             if hasattr(self.broker, "get_trades_for_order"):
                 parent_reads_complete = True
                 for l_oid in sorted(leg_order_ids):
                     if l_oid.startswith("SUPER-"):
+                        continue
+                    if l_oid == oid and omit_old_buy_read:
                         continue
                     try:
                         if is_real_dhan_unmocked_session and not hasattr(self.broker.get_trades_for_order, "mock_calls") and "unittest.mock" not in str(type(self.broker.get_trades_for_order)):
@@ -4653,6 +4665,17 @@ class ProtectionWatcher:
         with self._lock:
             self._supervision_request = getattr(self, "_supervision_request", 0) + 1
 
+    def mark_completed_startup_supervision(self) -> None:
+        """Only fully verified, leg-free acknowledged lots may seed polling."""
+        if self._supervision_read_complete is not True:
+            return
+        pending, opened, signature = self._poll_snapshot()
+        if not manual_risk_only(pending, opened):
+            return
+        self._startup_supervision_hint = (
+            time.monotonic(), is_lifecycle_open(), signature
+        )
+
     def _poll_snapshot(self):
         with self._lock:
             pending = copy.deepcopy(self.pending)
@@ -4719,6 +4742,26 @@ class ProtectionWatcher:
 
         next_due = 0.0
         last_signature = None
+        # Do not repeat a just-completed, verified startup read immediately.
+        # Changed orders, protection obligations or market state invalidate it.
+        hint = getattr(self, "_startup_supervision_hint", None)
+        self._startup_supervision_hint = None
+        if hint is not None:
+            try:
+                passed_at, seeded_market_open, seeded_signature = hint
+                pending, opened, actual_signature = self._poll_snapshot()
+                current_market_open = is_lifecycle_open()
+                if (seeded_signature == actual_signature
+                        and seeded_market_open == current_market_open
+                        and manual_risk_only(pending, opened)
+                        and time.monotonic() >= passed_at):
+                    last_signature = (current_market_open, actual_signature)
+                    next_due = passed_at + watcher_cadence_seconds(
+                        pending=pending, open_records=opened,
+                        now=self.clock(), market_open=current_market_open,
+                    )
+            except (ValueError, TypeError, AttributeError):
+                pass
         last_notice = 0.0
         failure_holdoff = 0.0
         try:
