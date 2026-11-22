@@ -14,8 +14,15 @@ jobs:
           fetch-depth: 0
       - name: Export tracked source only
         run: git archive --format=zip --output=uditbot_tracked_source.zip HEAD
+      - name: Export exact 27865aa baseline tracked source
+        run: git archive --format=zip --output=uditbot_baseline_27865aa.zip 27865aa4449d1a0ae31635f44b04d4d0fb858db0
       - uses: actions/upload-artifact@v4
         with:
           name: audit-source-snapshot
           path: uditbot_tracked_source.zip
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audit-baseline-27865aa
+          path: uditbot_baseline_27865aa.zip
           retention-days: 1
