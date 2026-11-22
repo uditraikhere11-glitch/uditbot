@@ -1,0 +1,41 @@
+name: V17 missing-dependency offline regression
+on:
+  push:
+    branches:
+      - dev/uditbot-v17-v9-fidelity-20261122
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  telethon-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official declared test requirements
+        run: python -m pip install -r requirements-test.txt
+      - name: Enforce offline network isolation
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+      - name: Run previously blocked Telethon regression tests with the real dependency
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_dhan_response_activation.py \
+            tests/test_python314_runner_loop.py \
+            tests/test_run_entrypoint_dhan_response.py \
+            --junitxml=v17-telethon-report.xml
+      - name: Upload full test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: V17-Pinned-Telethon-Regression
+          path: v17-telethon-report.xml
+          if-no-files-found: warn
+          retention-days: 14
