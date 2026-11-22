@@ -62,8 +62,8 @@
 
   // Purely visual preference; user can switch dark/light at any time.
   const key='auditbot-v17-appearance';
-  let light=true;
-  try {light=window.localStorage.getItem(key)!=='dark';}catch(_){/* private origin */}
+  let light=false; // Approved dark appearance is the first-visit default.
+  try {light=window.localStorage.getItem(key)==='light';}catch(_){/* private origin */}
   function applyTheme(){
     root.classList.toggle('v17-light',light);
     root.classList.toggle('v17p-dark',!light);
