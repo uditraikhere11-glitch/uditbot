@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from tests.offline_stopped_service_fixture import stopped_service_test
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -66,6 +67,7 @@ def form_fields(rendered: str) -> dict:
 
 
 class SetupFormRoundTripRegression(unittest.TestCase):
+    @stopped_service_test
     def test_ac01_full_rendered_form_only_changes_response_group(self):
         old_cwd = os.getcwd()
         original_env = dict(os.environ)

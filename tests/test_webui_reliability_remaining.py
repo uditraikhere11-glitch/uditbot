@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from tests.offline_stopped_service_fixture import stopped_service_test
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +40,7 @@ SYNTHETIC = (
 
 
 class ControlCenterFnoAmoTransactionAudit(unittest.TestCase):
+    @stopped_service_test
     def test_fno_disable_failed_or_accepted_enqueues_cannot_mutate_old_local_queue(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient

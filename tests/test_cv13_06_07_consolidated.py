@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from tests.offline_stopped_service_fixture import stopped_service_test
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
@@ -668,6 +669,7 @@ class TestCV1306And07Consolidated(unittest.TestCase):
         self.assertEqual(read_token(self.tok_path), "VALID_SHARED_JWT_TOKEN_304_CHARS")
         self.assertNotIn("STALE_WEBUI_POSTED_TOKEN_SHOULD_BE_IGNORED", env_content)
 
+    @stopped_service_test
     def test_15_defect3_csrf_enforced_on_all_settings_post_routes(self):
         """
         Defect 3 Regression Test:

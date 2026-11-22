@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from tests.offline_stopped_service_fixture import stopped_service_test
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -46,6 +47,7 @@ class WebUIRegression(unittest.TestCase):
         with self.assertRaises(ConfigurationRejected):
             patch_env(ENV, {"max_daily_trades": ""})
 
+    @stopped_service_test
     def test_f08_can_repair_invalid_existing_env_without_process_environ_pollution(self):
         invalid = ENV.replace("EQUITY_SL_PCT=3\n", "EQUITY_SL_PCT=0\n")
         self.path.write_text(invalid, encoding="utf-8")
@@ -74,6 +76,7 @@ class WebUIRegression(unittest.TestCase):
         self.assertEqual(result.status_code, 422)
         self.assertEqual(self.path.read_text(), ENV)
 
+    @stopped_service_test
     def test_f10_control_center_is_mounted_and_stopped_amo_save_does_not_use_broker(self):
         # The real deployed app is the password facade, NOT bare Setup.
         # Never expose the Control Center directly in unauthenticated Setup.

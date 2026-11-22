@@ -60,7 +60,9 @@ class SettingsHostMigrationTests(unittest.TestCase):
         @contextmanager
         def after_other_writer(folder):
             journal.unlink()
-            (folder / "apply_barrier.json").write_text('{"active":true}')
+            barrier = folder / "apply_barrier.json"
+            barrier.write_text('{"active":true}')
+            barrier.chmod(0o600)
             yield
         with patch("src.engine.simple_save_apply.prior_settings_lock", after_other_writer):
             with self.assertRaisesRegex(ConfigurationConflict, "fence is unresolved"):

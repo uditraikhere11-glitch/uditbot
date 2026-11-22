@@ -28,6 +28,7 @@ from datetime import date
 import os
 import tempfile
 import unittest
+from tests.offline_stopped_service_fixture import stopped_service_test
 from tests.offline_order_transport_fixtures import mocked_order_transport
 from unittest.mock import MagicMock, patch
 
@@ -590,6 +591,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     # ------------------------------------------------------------------
     # Scenario 18: Original web setup workflows remain operational
     # ------------------------------------------------------------------
+    @stopped_service_test
     def test_18_original_web_setup_workflows_remain_operational(self):
         import hashlib
         import inspect
