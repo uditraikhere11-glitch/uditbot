@@ -17,6 +17,8 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -31,6 +33,8 @@ jobs:
           python -m unittest -v \
             tests.test_settled_owner_read_policy \
             tests.test_reconciliation_halt_aggregation \
+            tests.test_yesbank_restart_handoff \
+            tests.test_yesbank_governor_recovery \
             tests.test_r06_reconciliation_recovery \
             tests.test_owner_lot_restart \
             tests.test_r02_read_governor \
@@ -39,3 +43,17 @@ jobs:
             tests.test_health_and_system_message_designer
       - name: Full repository offline test discovery
         run: python -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py"
+      - name: Package checked changed files
+        if: success()
+        run: |
+          git diff --name-only -z 27865aa4449d1a0ae31635f44b04d4d0fb858db0 HEAD | xargs -0 zip -q yesbank_integration_changed_files.zip
+          sha256sum yesbank_integration_changed_files.zip | tee YESBANK_SHA256.txt
+      - name: Publish checked candidate ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yesbank-integration-changed-files
+          path: |
+            yesbank_integration_changed_files.zip
+            YESBANK_SHA256.txt
+          retention-days: 30
