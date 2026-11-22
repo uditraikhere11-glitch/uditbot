@@ -70,7 +70,7 @@ The four-state Control Center layout and all in-page actions are staging functio
 | Native Emergency STOP UI | **NOT IMPLEMENTED — original engine/CLI path unchanged** |
 | Independent authorization for production | **REJECT / NO-GO** |
 
-**No GitHub branch update, PR, merge, VM login, service restart or live broker action was carried out.** Never deploy this patch based only on the offline results. Verify exact visual references and live operational acceptance in a staging VM before further authorization.
+**Publication update (22 November 2026):** The independently reviewed 13-file candidate was subsequently published as **draft PR #119** (`review/uditbot-v17-reference-restoration-20261122`). Publication does not change the decision: **NO MERGE, NO PRODUCTION VM DEPLOYMENT, NO LIVE BROKER ACTION**. Never deploy this patch based only on the offline results. Verify exact visual references and live operational acceptance in a staging VM before further authorization.
 
 ### Reproduce the offline checks
 
