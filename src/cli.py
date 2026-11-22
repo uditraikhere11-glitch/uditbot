@@ -557,6 +557,7 @@ def format_startup_online_card(
     unresolved_intents_count: int = 0,
     unprotected_positions_count: int = 0,
     is_stopped: bool = False,
+    watcher_verified: bool = True,
 ) -> str:
     """
     H14: Formats the startup Telegram card with explicit separation between
@@ -586,7 +587,7 @@ def format_startup_online_card(
         )
         return custom if custom is not None else card
 
-    if entries_open:
+    if entries_open and watcher_verified:
         return _styled_startup((
             f"🟢 <b>{name} Online</b>\n"
             f"Mode: {mode}\n"
@@ -601,16 +602,17 @@ def format_startup_online_card(
         rec_status = f"{rec_status} — {html.escape(str(reconciliation_msg))}"
     prot_status = (
         "Unverified"
-        if (unprot_n > 0 or "unprotected" in str(reconciliation_msg or "").lower())
+        if (not watcher_verified or unprot_n > 0
+            or "unprotected" in str(reconciliation_msg or "").lower())
         else "Active (Supervising)"
     )
     return _styled_startup((
-        f"🟡 <b>{name} Online — New Entries Blocked</b>\n"
+        f"🟡 <b>{name} Online — Verification Required</b>\n"
         f"Mode: {mode}\n"
         f"Listener: Active {allowed_chats_count} channel{'s' if allowed_chats_count != 1 else ''}\n"
         f"Reconciliation: {rec_status}\n"
         f"Protection Watcher: {prot_status}\n"
-        f"New Entries Gate: Blocked"
+        f"New Entries Gate: {'Open (watcher unverified)' if entries_open else 'Blocked'}"
     ))
 
 
