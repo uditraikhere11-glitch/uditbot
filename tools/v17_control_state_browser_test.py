@@ -60,6 +60,8 @@ def main():
                 page.on('dialog',lambda dialog:dialog.accept())
                 page.evaluate("(()=>{" + MOCK_JS + "; return true;})()")
                 page.set_content(page_file.read_text(encoding='utf-8'), wait_until='load')
+                # V17 now opens on Dashboard; explicitly select native Control view.
+                page.evaluate("location.hash='#control'")
                 page.wait_for_function("document.getElementById('stop').disabled === false")
                 assert page.locator('#service-beacon').get_attribute('class').find('is-active')>=0, 'Verified RUNNING beacon not active'
                 assert page.locator('#mode-beacon').get_attribute('class').find('is-active')>=0, 'Verified LIVE beacon not active'
