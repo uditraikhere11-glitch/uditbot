@@ -241,6 +241,34 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
         batch["get_forever_orders"] = forever
 
 
+def _protected_history_rejection_code(exc):
+    """Small, non-sensitive reason vocabulary; never log broker payloads/tokens."""
+    message = str(exc)
+    if "Historical pagination incomplete" in message:
+        return "HISTORICAL_PAGE_UNAVAILABLE"
+    if "Complete history does not contain every original BUY" in message:
+        return "ORIGINAL_BUY_MISSING_FROM_HISTORY"
+    if "Original BUY quantity differs" in message:
+        return "ORIGINAL_BUY_QUANTITY_MISMATCH"
+    if "Original account-bound order date unavailable" in message:
+        return "ORIGINAL_ORDER_DATE_UNAVAILABLE"
+    if "Verified original BUY fills unavailable" in message:
+        return "VERIFIED_BUY_FILLS_UNAVAILABLE"
+    if "settled quantity mismatch" in message:
+        return "SETTLED_HOLDINGS_QUANTITY_MISMATCH"
+    if "holding missing" in message or "Holdings ISIN unavailable" in message:
+        return "HOLDING_IDENTITY_INCOMPLETE"
+    if "Duplicate historical execution" in message:
+        return "DUPLICATE_HISTORICAL_EXECUTION"
+    if "Unexplained execution" in message:
+        return "UNATTRIBUTED_EXECUTION"
+    if "Trade account or ISIN differs" in message:
+        return "ACCOUNT_OR_ISIN_MISMATCH"
+    if "Trade identity incomplete" in message or "Execution identity" in message:
+        return "HISTORICAL_TRADE_IDENTITY_INCOMPLETE"
+    return "HISTORICAL_ATTESTATION_REJECTED"
+
+
 def prepare_protected_prior_day_buy_history(broker, db, batch, positions, day_trades, now):
     """Admit NO old-order exemption unless full prior-day protected BUY history is fresh.
 
@@ -275,7 +303,10 @@ def prepare_protected_prior_day_buy_history(broker, db, batch, positions, day_tr
                 continue
             targets.append(row)
         except (ValueError, TypeError, KeyError):
-            # No durable old BUY identity: keep the ordinary parent read.
+            # The parent is not proven old; watcher keeps strict normal semantics.
+            batch.setdefault("protected_skip_reason", {})[str(row.get("parent_order_id") or "")] = (
+                "ORIGINAL_BUY_IDENTITY_OR_DATE_UNAVAILABLE"
+            )
             continue
     if not targets:
         return
@@ -333,17 +364,21 @@ def prepare_protected_prior_day_buy_history(broker, db, batch, positions, day_tr
             verify_owner_history(broker, db, account, sec, seg, prod, siblings,
                                  holding, day_trades, now, evidence)
             batch.setdefault("protected_verified", {})[oid] = (account, sec, qty)
+            batch.setdefault("protected_skip_reason", {}).pop(oid, None)
         except ExecutionConflict as exc:
             # A confirmed historical SELL is positive conflicting evidence;
             # the gate must block even if the old BUY endpoint is readable.
             batch.setdefault("errors", {})[oid] = (
                 "Protected original BUY history contains a SELL: " + str(exc)
             )
-        except (ValueError, TypeError, KeyError, IndexError):
-            # This is an optional *read omission*, not an added prerequisite
-            # for an otherwise successful legacy protected-position pass.
-            # If history cannot certify the old BUY, retain its original
-            # order-specific GET and all existing fail-closed semantics.
+            batch.setdefault("protected_skip_reason", {})[oid] = "CONFIRMED_SELL_CONFLICT"
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            # A rejected attestation is never broker evidence. The watcher
+            # receives a stable reason code, not the raw response or token.
+            # It must remain fail-closed and continue live protective-leg reads.
+            batch.setdefault("protected_skip_reason", {})[oid] = (
+                _protected_history_rejection_code(exc)
+            )
             continue
     batch["get_holdings"] = holdings
     batch["get_forever_orders"] = forever

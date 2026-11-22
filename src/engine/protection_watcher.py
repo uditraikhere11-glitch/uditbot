@@ -50,7 +50,11 @@ from src.models import (
 )
 from src.engine.sizer import calculate_protection_levels, round_to_tick
 from src.engine.owner_lot_evidence import GATE_BOOKS, corroborated_external_sells
-from src.engine.settled_owner_read_policy import may_omit_prior_day_buy_trade_read, may_omit_protected_prior_day_buy_trade_read
+from src.engine.settled_owner_read_policy import (
+    may_omit_prior_day_buy_trade_read,
+    may_omit_protected_prior_day_buy_trade_read,
+    durably_identified_prior_day_protected_buy,
+)
 from src.engine.holding_quantity import observed_open_quantity
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
@@ -3867,6 +3871,7 @@ class ProtectionWatcher:
             # Only the ORIGINAL prior-day BUY is exempt. Live/triggered OCO
             # legs remain subject to their normal order-specific trade reads.
             prior_protected_proof = getattr(self, "_protected_buy_history_session", {})
+            protected_skip_decision = {}
             omit_protected_old_buy_read = may_omit_protected_prior_day_buy_trade_read(
                 record=rec, all_open_records=open_recs, leg_order_ids=leg_order_ids,
                 journal_db=self.journal_db, gate_books=gate_books,
@@ -3874,7 +3879,54 @@ class ProtectionWatcher:
                 current_holdings=holdings_book, current_forever=forever_book,
                 account_id=expected_client_id, now=now_ts,
                 session_proof=prior_protected_proof.get(oid),
+                rejection=protected_skip_decision,
             )
+            # An old original BUY endpoint is not a valid fallback if this
+            # exact account-bound, fully filled parent can be proven prior-day
+            # from durable journal evidence. When fresh broker attestation is
+            # missing, fail closed, do NOT grant an exemption, and continue to
+            # independently read any active protective SELL/order legs.
+            historical_parent_known = durably_identified_prior_day_protected_buy(
+                record=rec, journal_db=self.journal_db,
+                account_id=expected_client_id, now=now_ts,
+            )
+            # Only suppress the fallback if this parent already has a
+            # persisted unreadable broker response. Other prior-day protected
+            # positions retain the established fallback path, avoiding a
+            # general availability regression in legacy journal scenarios.
+            historical_parent_unverified = (
+                historical_parent_known
+                and not omit_protected_old_buy_read
+                and rec.get("unreadable_broker_response") is True
+            )
+            if historical_parent_unverified:
+                history_reason = str(
+                    (gate_books or {}).get("protected_skip_reason", {}).get(oid)
+                    or protected_skip_decision.get("reason")
+                    or "HISTORICAL_BUY_ATTESTATION_MISSING"
+                )
+                # Only stable codes, never raw Dhan responses or credentials.
+                notice_map = getattr(self, "_protected_parent_rejections", {})
+                previous_notice = notice_map.get(oid)
+                if (not isinstance(previous_notice, tuple)
+                        or previous_notice[0] != history_reason
+                        or now_ts - previous_notice[1] >= 300):
+                    logger.warning(
+                        "[Protection] Prior-day protected original BUY %s: "
+                        "skip not certified (%s); original BUY GET suppressed, "
+                        "all active exit checks remain required; entry gate blocked",
+                        oid, history_reason,
+                    )
+                    notice_map = dict(notice_map)
+                    notice_map[oid] = (history_reason, now_ts)
+                    self._protected_parent_rejections = notice_map
+                parent_reason = (
+                    f"Prior-day protected original BUY {oid} cannot be "
+                    f"broker-certified ({history_reason}); active exits still supervised"
+                )
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(parent_reason)
+                all_parent_reads_ok = False
             if (omit_protected_old_buy_read and isinstance(gate_books, dict)
                     and (gate_books.get("protected_verified") or {}).get(oid)):
                 new_proof = dict(prior_protected_proof)
@@ -3886,7 +3938,10 @@ class ProtectionWatcher:
                 for l_oid in sorted(leg_order_ids):
                     if l_oid.startswith("SUPER-"):
                         continue
-                    if l_oid == oid and (omit_old_buy_read or omit_protected_old_buy_read):
+                    if l_oid == oid and (omit_old_buy_read or omit_protected_old_buy_read
+                                         or historical_parent_unverified):
+                        if historical_parent_unverified:
+                            parent_reads_complete = False
                         continue
                     try:
                         if is_real_dhan_unmocked_session and not hasattr(self.broker.get_trades_for_order, "mock_calls") and "unittest.mock" not in str(type(self.broker.get_trades_for_order)):

@@ -4,6 +4,7 @@ No live Dhan or Telegram connections. All broker returns are synthetic,
 but source reconciliation, history paging calls, SQLite, and watcher are real.
 """
 import sqlite3
+from contextlib import closing
 import unittest
 from unittest.mock import patch
 
@@ -103,6 +104,104 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         self.assertIn(OCO,attempted)
         self.assertGreaterEqual(self.broker.get_historical_trades.call_count,2)
         self.assertEqual(self.watcher._supervision_read_complete,True)
+
+    def _persist_actual_victim_watcher_flag(self):
+        """Matches the 2026-11-22 production screenshot, not a clean fixture."""
+        import json
+        with self.db._get_conn() as conn:
+            row=conn.execute(
+                "SELECT record_json FROM watcher_orders WHERE order_id=?", (VED,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            rec=json.loads(row[0])
+            self.assertEqual(rec["position_state"], "PROTECTED")
+            self.assertEqual(rec["state"], "TRADED")
+            self.assertEqual(rec["protected_qty"], 1)
+            self.assertEqual(rec["filled_qty"], 1)
+            self.assertEqual(rec["reconciliation_required"], False)
+            # The production watcher has one persisted active OCO leg ID.
+            # The synthetic attested-fill helper seeds confirmed protection,
+            # but has not yet populated this watcher-specific list.
+            rec["verified_leg_order_ids"] = [OCO]
+            rec["unreadable_broker_response"] = True
+            conn.execute(
+                "UPDATE watcher_orders SET record_json=? WHERE order_id=?",
+                (json.dumps(rec), VED),
+            )
+        self.restart()
+        self.assertTrue(self.watcher.terminal_orders[VED]["unreadable_broker_response"])
+
+    def test_real_persisted_vedpower_unreadable_flag_is_not_a_permanent_recovery_blocker(self):
+        self._persist_actual_victim_watcher_flag()
+        ok,reason=self.gate_once()
+        self.assertTrue(ok,reason)
+        self.assertTrue(self.gate.is_accepting_entries)
+        attempted=[c.args[0] for c in self.broker.get_trades_for_order.call_args_list]
+        self.assertNotIn(VED,attempted)
+        self.assertIn(OCO,attempted)
+        self.assert_ack_and_no_sell()
+
+    def test_missing_historical_original_buy_blocks_without_retrying_old_buy_or_OCO(self):
+        self._persist_actual_victim_watcher_flag()
+        self.broker.get_historical_trades.return_value = r01.as_read_list([
+            self.fx._normalized(self.fx.first), self.fx._normalized(self.fx.second)
+        ])
+        # A Dhan 429 on the obsolete original lookup would place *all* GET
+        # requests into a 60-second category cooldown. The corrected watcher
+        # must not send this lookup and still MUST query the active OCO SELL.
+        attempts=[]
+        def old_lookup_fails(oid):
+            attempts.append(oid)
+            if oid == VED:
+                self.gov.throttled(60)
+                return BrokerReadFailure(BrokerReadStatus.UNAVAILABLE.value,
+                                         "synthetic old daily BUY endpoint 429",429)
+            return r01.as_read_list([])
+        self.broker.get_trades_for_order.side_effect=old_lookup_fails
+        with self.assertLogs("src.engine.protection_watcher",level="WARNING") as captured:
+            ok,_=self.gate_once()
+        self.assertFalse(ok)
+        self.assertFalse(self.gate.is_accepting_entries)
+        self.assertNotIn(VED,attempts)
+        self.assertIn(OCO,attempts)
+        self.assertTrue(any("ORIGINAL_BUY_MISSING_FROM_HISTORY" in line
+                            for line in captured.output),captured.output)
+        with closing(self.gov._connect()) as db:
+            remaining=db.execute(
+                "SELECT until FROM category_cooldown WHERE category='NON_TRADING'"
+            ).fetchone()
+            self.assertIsNone(remaining)
+        self.assert_ack_and_no_sell()
+        # Restoring *fresh* complete history, rather than clearing flags or
+        # modifying production SQLite, allows an independent green pass.
+        self.broker.get_historical_trades.return_value=r01.as_read_list([
+            self.fx._normalized(self.fx.first),self.fx._normalized(self.fx.second),
+            self.fx._normalized(self.ved_trade),
+        ])
+        self.broker.get_trades_for_order.reset_mock()
+        ok,reason=self.gate_once()
+        self.assertTrue(ok,reason)
+        self.assertTrue(self.gate.is_accepting_entries)
+        self.assertNotIn(VED,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
+        self.assert_ack_and_no_sell()
+
+    def test_missing_live_oco_still_blocks_and_does_not_hit_old_buy(self):
+        self._persist_actual_victim_watcher_flag()
+        self.broker.get_forever_orders.return_value=r01.as_read_list([])
+        ok,_=self.gate_once()
+        self.assertFalse(ok)
+        self.assertFalse(self.gate.is_accepting_entries)
+        self.assertNotIn(VED,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
+        self.assert_ack_and_no_sell()
+
+    def test_current_day_or_unverified_buy_still_requires_original_trade_endpoint(self):
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE order_intents SET created_at=? WHERE broker_order_id=?",
+                         (self.now-120,VED))
+        ok,_=self.gate_once()
+        self.assertFalse(ok)
+        self.assertFalse(self.gate.is_accepting_entries)
+        self.assertIn(VED,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
 
     def test_oco_disappears_fails_closed(self):
         self.broker.get_forever_orders.return_value=r01.as_read_list([])
@@ -215,4 +314,9 @@ class VEDPOWERRecoveryAcrossDH904(VEDPOWERProtectedThreeHoldings):
         self.assertFalse(hasattr(self.watcher,"_protected_buy_history_session"))
         self.broker.get_trades_for_order.reset_mock()
         self.watcher.check_once()
-        self.assertIn(VED,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
+        # A clean legacy protected record without prior unreadable evidence
+        # retains its original fallback; an already-unreadable parent instead
+        # uses the fail-closed, no-repeat path tested above.
+        attempted=[c.args[0] for c in self.broker.get_trades_for_order.call_args_list]
+        self.assertIn(VED,attempted)
+        self.assertIn(OCO,attempted)
