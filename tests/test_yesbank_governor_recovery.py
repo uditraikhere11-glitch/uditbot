@@ -32,7 +32,7 @@ class GovernorRecovery(unittest.TestCase):
         self.assertFalse(self.gate._accepting_entries)
         self.gate.recheck_and_recover_if_verified.assert_not_called()
         self.assertFalse(self.gate._historical_background_lock.locked())
-        self.now+=20
+        self.now+=61  # Dhan read governor enforces at least 60 seconds
         with patch("src.engine.reconciliation.time.monotonic",return_value=400.0):
             with patch("src.engine.reconciliation.threading.Thread") as thread:
                 thread.return_value.start.side_effect=lambda:thread.call_args.kwargs["target"]()
