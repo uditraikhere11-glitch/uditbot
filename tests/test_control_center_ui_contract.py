@@ -33,6 +33,16 @@ class ControlCenterPresentationTests(unittest.TestCase):
         self.assertIn('id="service" class="value">Checking…', self.html)
         self.assertIn('id="mode" class="value">UNKNOWN', self.html)
 
+    def test_verified_green_beacons_only_reflect_running_live_evidence(self):
+        self.assertIn('id="service-beacon" class="status-beacon" aria-hidden="true"', self.html)
+        self.assertIn('id="mode-beacon" class="status-beacon" aria-hidden="true"', self.html)
+        self.assertNotIn('class="status-beacon is-active"', self.html)
+        self.assertIn("const verifiedRunning=state==='RUNNING'&&s.runtime_verified===true", self.html)
+        self.assertIn("classList.toggle('is-active',verifiedRunning)", self.html)
+        self.assertIn("classList.toggle('is-active',verifiedRunning&&mode==='LIVE')", self.html)
+        self.assertIn("classList.remove('is-active')", self.html)
+        self.assertIn('@media(prefers-reduced-motion:reduce)', self.html)
+
     def test_escapes_csrf_attribute(self):
         self.assertIn('TOKEN-&amp;&quot;&lt;&gt;', self.html)
         self.assertNotIn('content="TOKEN-&"<>"', self.html)
