@@ -1,0 +1,78 @@
+name: VEDPOWER prior-day BUY surgical offline acceptance
+on:
+  push:
+    branches: [audit/vedpower-prior-day-protected-buy-20261122]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  protected-buy-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install declared offline regression dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Enable network-isolated test perimeter
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+      - name: Compile all source and test modules
+        run: python -B -m compileall -q src run.py tests
+      - name: Three-position, governor and prior regression acceptance
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest -v \
+            tests.test_vedpower_three_position_e2e \
+            tests.test_vedpower_governor_429_chain \
+            tests.test_yesbank_nov22_e2e \
+            tests.test_settled_owner_read_policy \
+            tests.test_r06_reconciliation_recovery \
+            tests.test_historical_fill_reconciliation_h01_h17 \
+            tests.test_v13_targeted_safety_corrections \
+            tests.test_v14_webui_backend_fix_04 \
+            2>&1 | tee vedpower-targeted-tests.log
+      - name: Full repository offline regression
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' \
+            2>&1 | tee vedpower-full-tests.log
+      - name: Generate exact e7306a5 patch and changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=e7306a5a24b00f32e85cfa234eb52acb002aa6e0
+          files=(
+            src/engine/owner_lot_evidence.py
+            src/engine/protection_watcher.py
+            src/engine/reconciliation.py
+            src/engine/settled_owner_read_policy.py
+            tests/test_vedpower_three_position_e2e.py
+            tests/test_vedpower_governor_429_chain.py
+          )
+          git diff --binary "$BASE" HEAD -- "${files[@]}" > UDITBOT_VEDPOWER_PROTECTED_BUY.patch
+          zip -q -9 UDITBOT_VEDPOWER_CHANGED_FILES.zip "${files[@]}"
+          sha256sum UDITBOT_VEDPOWER_PROTECTED_BUY.patch UDITBOT_VEDPOWER_CHANGED_FILES.zip > SHA256SUMS.txt
+          git rev-parse HEAD > TESTED_AUDIT_COMMIT.txt
+          echo "$BASE" > BASELINE_SHA.txt
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: vedpower-surgical-offline-test-artifacts
+          path: |
+            vedpower-targeted-tests.log
+            vedpower-full-tests.log
+            UDITBOT_VEDPOWER_PROTECTED_BUY.patch
+            UDITBOT_VEDPOWER_CHANGED_FILES.zip
+            SHA256SUMS.txt
+            TESTED_AUDIT_COMMIT.txt
+            BASELINE_SHA.txt
+          retention-days: 30

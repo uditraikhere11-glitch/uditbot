@@ -50,7 +50,7 @@ from src.models import (
 )
 from src.engine.sizer import calculate_protection_levels, round_to_tick
 from src.engine.owner_lot_evidence import GATE_BOOKS, corroborated_external_sells
-from src.engine.settled_owner_read_policy import may_omit_prior_day_buy_trade_read
+from src.engine.settled_owner_read_policy import may_omit_prior_day_buy_trade_read, may_omit_protected_prior_day_buy_trade_read
 from src.engine.holding_quantity import observed_open_quantity
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
@@ -3864,12 +3864,29 @@ class ProtectionWatcher:
                 current_holdings=holdings_book, account_id=expected_client_id,
                 now=now_ts,
             )
+            # Only the ORIGINAL prior-day BUY is exempt. Live/triggered OCO
+            # legs remain subject to their normal order-specific trade reads.
+            prior_protected_proof = getattr(self, "_protected_buy_history_session", {})
+            omit_protected_old_buy_read = may_omit_protected_prior_day_buy_trade_read(
+                record=rec, all_open_records=open_recs, leg_order_ids=leg_order_ids,
+                journal_db=self.journal_db, gate_books=gate_books,
+                current_trades=trade_book, current_positions=positions_book,
+                current_holdings=holdings_book, current_forever=forever_book,
+                account_id=expected_client_id, now=now_ts,
+                session_proof=prior_protected_proof.get(oid),
+            )
+            if (omit_protected_old_buy_read and isinstance(gate_books, dict)
+                    and (gate_books.get("protected_verified") or {}).get(oid)):
+                new_proof = dict(prior_protected_proof)
+                new_proof[oid] = (datetime.fromtimestamp(now_ts, IST).date().isoformat(),
+                                  expected_client_id, sec_id, buy_filled)
+                self._protected_buy_history_session = new_proof
             if hasattr(self.broker, "get_trades_for_order"):
                 parent_reads_complete = True
                 for l_oid in sorted(leg_order_ids):
                     if l_oid.startswith("SUPER-"):
                         continue
-                    if l_oid == oid and omit_old_buy_read:
+                    if l_oid == oid and (omit_old_buy_read or omit_protected_old_buy_read):
                         continue
                     try:
                         if is_real_dhan_unmocked_session and not hasattr(self.broker.get_trades_for_order, "mock_calls") and "unittest.mock" not in str(type(self.broker.get_trades_for_order)):

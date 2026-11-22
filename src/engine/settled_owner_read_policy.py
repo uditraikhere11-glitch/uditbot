@@ -116,3 +116,112 @@ def may_omit_prior_day_buy_trade_read(
         return evidence == "VERIFIED_SETTLED_HOLDINGS" and owned == aggregate and aggregate >= qty
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError, OSError, sqlite3.Error):
         return False
+
+
+_PROTECTED_UNSAFE = (
+    "pending_oco", "orphaned_legs_detected",
+    "orphaned_legs_manual_intervention_required", "orphaned_leg_cancel_states",
+    "external_unlinked_sell_observed", "uncommitted_broker_sell_trades",
+    "broker_exit_already_executed", "unverified_trade_detected",
+    "persistence_uncertain", "cancel_uncertain", "cancel_requested",
+    "retry_reserved", "entry_timeout_elapsed", "manual_exit_detected",
+    "ambiguous_super_closed", "triggered_leg", "reconciliation_required",
+)
+
+
+def may_omit_protected_prior_day_buy_trade_read(
+    *, record, all_open_records, leg_order_ids, journal_db, gate_books,
+    current_trades, current_positions, current_holdings, current_forever,
+    account_id, now, session_proof=None,
+):
+    """Skip ONLY a historic, fully filled original BUY -- never OCO/exit legs.
+
+    A serialized gate recheck requires a fresh historical execution attestation.
+    A routine watch can reuse only this process's successful attestation for
+    the current IST date, while all current broker exposure and OCO evidence
+    must independently remain complete. This function cannot open the gate.
+    """
+    try:
+        from src.broker.dhan_client import verify_forever_oco_group
+        oid = str(record.get("order_id") or "").strip()
+        sec = str(record.get("security_id") or "").strip()
+        seg = str(record.get("segment") or "").strip().upper()
+        prod = str(record.get("product_type") or "").strip().upper()
+        account = str(account_id or "").strip()
+        qty = int(record.get("qty") or 0)
+        filled = int(record.get("filled_qty") or 0)
+        if (not oid or not sec or not account or prod not in ("CNC", "MTF")
+                or str(record.get("state") or "").upper() != "TRADED"
+                or str(record.get("position_state") or "").upper() != "PROTECTED"
+                or str(record.get("protection_route") or "").upper() != "FOREVER_OCO"
+                or qty <= 0 or filled != qty
+                or int(record.get("exit_filled_qty") or 0) != 0
+                or int(record.get("protected_qty") or 0) < qty
+                or oid not in leg_order_ids
+                or any(record.get(k) for k in _PROTECTED_UNSAFE)):
+            return False
+        if not journal_db or str(getattr(journal_db, "account_id", "") or "") != account:
+            return False
+        if not all(isinstance(book, list) for book in
+                   (current_trades, current_positions, current_holdings, current_forever)):
+            return False
+        # Protect against a mistaken session identity or stale/partial book.
+        for trade in current_trades:
+            if not isinstance(trade, dict) or not str(trade.get("securityId") or "").strip():
+                return False
+            if str(trade.get("securityId")) == sec:
+                return False
+        first_at, fills = journal_db.owner_lot_basis(account, sec, seg, prod, oid)
+        today = datetime.fromtimestamp(float(now), IST).date()
+        if datetime.fromtimestamp(float(first_at), IST).date() >= today:
+            return False
+        if (not fills or sum(int(f["traded_quantity"]) for f in fills) != qty):
+            return False
+        proof = (account, sec, qty)
+        fresh = isinstance(gate_books, dict) and (
+            (gate_books.get("protected_verified") or {}).get(oid) == proof
+            and not (gate_books.get("errors") or {}).get(oid)
+        )
+        if gate_books is not None:
+            if not fresh:
+                return False  # Never reuse a prior gate result during recheck.
+        elif session_proof != (today.isoformat(), *proof):
+            return False
+        aggregate = sum(
+            max(0, int(other.get("filled_qty") or 0)
+                - int(other.get("exit_filled_qty") or 0))
+            for other in all_open_records
+            if (str(other.get("security_id") or "") == sec
+                and str(other.get("segment") or "").upper() == seg
+                and str(other.get("product_type") or "").upper() == prod)
+        )
+        observed, status = observed_open_quantity(
+            current_positions, current_holdings, security_id=sec,
+            segment=seg, product=prod, account_id=account,
+        )
+        if status != "VERIFIED_SETTLED_HOLDINGS" or observed != aggregate or aggregate < qty:
+            return False
+        group_ids = {
+            str(r.get("orderId") or "")
+            for r in current_forever if isinstance(r, dict)
+            and (str(r.get("orderId") or "") in leg_order_ids
+                 or (record.get("correlation_id") and
+                     str(r.get("correlationId") or "") == str(record["correlation_id"])))
+        }
+        if not group_ids:
+            return False
+        for gid in group_ids:
+            rows = [r for r in current_forever if isinstance(r, dict)
+                    and str(r.get("orderId") or "") == gid]
+            verified = verify_forever_oco_group(
+                matching_rows=rows, forever_order_id=gid,
+                expected_security_id=sec, expected_qty=qty,
+                expected_account_id=account, expected_segment=seg,
+                expected_product_type=prod,
+            )
+            if verified.is_verified and gid != oid:
+                return True
+        return False
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError,
+            OSError, sqlite3.Error):
+        return False

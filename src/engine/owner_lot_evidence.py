@@ -233,7 +233,118 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             decision = "Verified original purchases and settled ownership"
             batch["verified"].update({oid: (account, security, parents[oid]) for oid in acked})
         db.record_system_event("OWNER_LOT_EVIDENCE", decision, json.dumps(evidence))
+    if isinstance(orders, list):
+        batch["get_order_book"] = orders
     if isinstance(holdings, list):
         batch["get_holdings"] = holdings
     if isinstance(forever, list):
         batch["get_forever_orders"] = forever
+
+
+def prepare_protected_prior_day_buy_history(broker, db, batch, positions, day_trades, now):
+    """Admit NO old-order exemption unless full prior-day protected BUY history is fresh.
+
+    This runs within GATE_BOOKS, once per serialized whole-account gate pass.
+    A missing/contradictory result is a failed proof, never a broker SELL or
+    permission to relax protection / coverage. No lifecycle writes occur.
+    """
+    rows = db.get_open_positions_lifecycle()
+    if not isinstance(rows, list):
+        raise ValueError("Protected BUY history: lifecycle journal unavailable")
+    today = datetime.fromtimestamp(now, IST).date()
+    targets = []
+    for row in rows:
+        if (str(row.get("position_state") or "").upper() != "PROTECTED"
+                or str(row.get("protection_route") or "").upper() != "FOREVER_OCO"
+                or str(row.get("product_type") or "").upper() not in ("CNC", "MTF")):
+            continue
+        try:
+            qty = int(row.get("confirmed_open_qty") or 0)
+            if (qty <= 0 or int(row.get("entry_qty") or 0) != qty
+                    or int(row.get("buy_filled_qty") or 0) != qty
+                    or int(row.get("protected_qty") or 0) < qty
+                    or int(row.get("sell_filled_qty") or 0) != 0
+                    or row.get("manual_exit_detected") or row.get("orphaned_legs_detected")):
+                continue
+            first_at, _ = db.owner_lot_basis(
+                db.account_id, str(row["security_id"]),
+                str(row["exchange_segment"]), str(row["product_type"]),
+                str(row["parent_order_id"]),
+            )
+            if datetime.fromtimestamp(float(first_at), IST).date() >= today:
+                continue
+            targets.append(row)
+        except (ValueError, TypeError, KeyError):
+            # No durable old BUY identity: keep the ordinary parent read.
+            continue
+    if not targets:
+        return
+    account = str(getattr(getattr(broker, "cfg", None), "dhan_client_id", "") or "").strip()
+    if not account or account != str(db.account_id or "").strip():
+        raise ValueError("Protected BUY history: account mismatch")
+    profile = batch.get("account")
+    if profile is None:
+        profile = broker.get_authenticated_profile_id(allow_refresh=False)
+        batch["account"] = profile
+    if profile != account:
+        raise ValueError("Protected BUY history: broker profile mismatch")
+    holdings = batch.get("get_holdings")
+    if holdings is None:
+        holdings = broker.get_holdings()
+    orders = batch.get("get_order_book")
+    if orders is None:
+        orders = broker.get_order_book()
+    forever = batch.get("get_forever_orders")
+    if forever is None:
+        forever = broker.get_forever_orders()
+    if not all(isinstance(book, list) for book in (holdings, orders, forever)):
+        raise ValueError("Protected BUY history: required broker book unavailable")
+    # A missing order identity must never be interpreted as a legitimate empty book.
+    if any(not isinstance(o, dict) or not str(o.get("orderId") or "").strip() for o in orders):
+        raise ValueError("Protected BUY history: malformed current order book")
+
+    for row in targets:
+        oid = str(row["parent_order_id"])
+        sec = str(row["security_id"])
+        seg = str(row["exchange_segment"])
+        prod = str(row["product_type"])
+        qty = int(row["confirmed_open_qty"])
+        try:
+            # Every journal-owned parent of this contract must be represented
+            # in the historical check, so a sibling cannot conceal an exit.
+            siblings = {
+                str(r["parent_order_id"]): int(r["confirmed_open_qty"])
+                for r in rows
+                if (str(r.get("security_id")) == sec
+                    and str(r.get("exchange_segment")) == seg
+                    and str(r.get("product_type")) == prod
+                    and int(r.get("confirmed_open_qty") or 0) > 0)
+            }
+            observed, source = observed_open_quantity(
+                positions, holdings, security_id=sec, segment=seg,
+                product=prod, account_id=account,
+            )
+            if source != "VERIFIED_SETTLED_HOLDINGS" or observed != sum(siblings.values()):
+                raise ValueError("Protected BUY history: settled quantity mismatch")
+            holding = next((h for h in holdings if str(h.get("securityId") or "") == sec), None)
+            if not isinstance(holding, dict):
+                raise ValueError("Protected BUY history: holding missing")
+            evidence = {}
+            verify_owner_history(broker, db, account, sec, seg, prod, siblings,
+                                 holding, day_trades, now, evidence)
+            batch.setdefault("protected_verified", {})[oid] = (account, sec, qty)
+        except ExecutionConflict as exc:
+            # A confirmed historical SELL is positive conflicting evidence;
+            # the gate must block even if the old BUY endpoint is readable.
+            batch.setdefault("errors", {})[oid] = (
+                "Protected original BUY history contains a SELL: " + str(exc)
+            )
+        except (ValueError, TypeError, KeyError, IndexError):
+            # This is an optional *read omission*, not an added prerequisite
+            # for an otherwise successful legacy protected-position pass.
+            # If history cannot certify the old BUY, retain its original
+            # order-specific GET and all existing fail-closed semantics.
+            continue
+    batch["get_holdings"] = holdings
+    batch["get_forever_orders"] = forever
+    batch["get_order_book"] = orders
