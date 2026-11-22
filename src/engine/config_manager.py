@@ -4804,9 +4804,16 @@ class ConfigChangeTracker:
         verify_delay_sec: float = 0.05,
         check_service_fn: Optional[Callable[[], Any]] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-        max_wait = verify_delay_sec if is_isolated_test_environment() else max(verify_delay_sec, 6.0)
+        # On a production VM, systemd can report RUNNING before the new trading
+        # process publishes its PID-bound active-version acknowledgement. A
+        # 6-second window may expire during an observed 7.87-second request-to-
+        # acknowledgement startup, leaving durable Owner intent at STARTING
+        # even when runtime verification later passes. This is observation only:
+        # every poll still requires fresh PID/starttime, config hash, mode and
+        # systemd identity; a missing/invalid acknowledgement still fails closed.
+        max_wait = verify_delay_sec if is_isolated_test_environment() else max(verify_delay_sec, 20.0)
         poll_interval = 0.01 if is_isolated_test_environment() else 0.25
-        start_poll = time.time()
+        start_poll = time.monotonic()
         last_info = None
         last_err = "Verification timed out"
         while True:
@@ -4821,7 +4828,7 @@ class ConfigChangeTracker:
             last_err = err
             if ok:
                 return True, info, "Verified"
-            if time.time() - start_poll >= max_wait:
+            if time.monotonic() - start_poll >= max_wait:
                 return False, last_info, last_err
             time.sleep(poll_interval)
 
