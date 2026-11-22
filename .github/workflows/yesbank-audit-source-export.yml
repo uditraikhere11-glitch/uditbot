@@ -1,0 +1,21 @@
+name: Isolated YESBANK checkout export (development only)
+on:
+  push:
+    branches: [audit/yesbank-final-polish-20261122]
+permissions:
+  contents: read
+jobs:
+  source-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Export tracked source only
+        run: git archive --format=zip --output=uditbot_tracked_source.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audit-source-snapshot
+          path: uditbot_tracked_source.zip
+          retention-days: 1
