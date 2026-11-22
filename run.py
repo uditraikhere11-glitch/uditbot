@@ -112,6 +112,7 @@ session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else ses
 
 async def main():
     outbox_worker = None
+    runtime_evidence_task = None
     client = None
     try:
         # Construct Telethon inside asyncio.run's *running* event loop.
@@ -153,6 +154,25 @@ async def main():
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         print("🛡️ Persistent Protection Watcher activated (monitoring resting fills & OCO/Super legs through market close)")
+
+        # V17 operational UI evidence must run in THIS production listener.
+        # systemd starts run.py, not src.main.start_telegram_listener().
+        # The snapshot is read-only; failures must never modify trading gates.
+        async def _publish_ui_runtime_evidence():
+            from src.engine.operational_snapshot import publish_operational_snapshot
+            while True:
+                try:
+                    publish_operational_snapshot(
+                        pipeline, telegram_connected=bool(client.is_connected())
+                    )
+                except Exception as exc:
+                    logging.getLogger("run").warning(
+                        "Cannot publish read-only runtime evidence: %s",
+                        type(exc).__name__,
+                    )
+                await asyncio.sleep(10)
+
+        runtime_evidence_task = asyncio.create_task(_publish_ui_runtime_evidence())
 
         def _dispatch_notification_sync(formatted_text: str) -> bool:
             if pipeline.notifier.enabled:
@@ -268,6 +288,8 @@ async def main():
         await client.run_until_disconnected()
     finally:
         try:
+            if runtime_evidence_task is not None:
+                runtime_evidence_task.cancel()
             if outbox_worker:
                 outbox_worker.stop()
         finally:
