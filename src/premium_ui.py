@@ -29,6 +29,22 @@ def premium_instance_name() -> str:
     return 'UDITBOT'
 
 
+def premium_configured_dhan_label() -> str:
+    """Masked saved account identifier, not a broker connectivity assertion.
+
+    This function intentionally reads the configured DHAN_CLIENT_ID only.
+    An authenticated Dhan profile call is required to claim connectivity.
+    """
+    from src.config import parse_env_dict
+
+    account = str(parse_env_dict('.env').get('DHAN_CLIENT_ID', '')).strip()
+    if not account:
+        return 'Not configured'
+    if len(account) < 4 or not account.isascii() or not account.isdigit():
+        return 'Configured'
+    return '***' + account[-4:]
+
+
 @lru_cache(maxsize=1)
 def premium_styles() -> str:
     content = (_ASSET_DIR / 'premium_ui.css').read_text(encoding='utf-8')
@@ -53,6 +69,8 @@ def premium_nav(page: str) -> str:
     public_brand = raw_name if raw_name.casefold().endswith('bot') else raw_name + 'Bot'
     brand = escape(public_brand, quote=True)
     initial = escape(raw_name[:1].upper() or 'A', quote=True)
+    # Never render a complete client ID or describe a saved identifier as CONNECTED.
+    dhan_label = escape(premium_configured_dhan_label(), quote=True)
     destinations = (
         ('dashboard', '/#dashboard', '⌂', 'Dashboard'),
         ('control', '/#control', '▷', 'Control'),
@@ -77,6 +95,7 @@ def premium_nav(page: str) -> str:
   <a class="v17p-brand" href="/" aria-label="{brand} dashboard"><span aria-hidden="true">⌁</span>{brand}</a>
   <nav class="v17p-desktop-tabs" aria-label="Main navigation">{links('v17p-top-link', initial_current=True)}</nav>
   <div class="v17p-top-actions">
+    <span class="v17p-dhan-badge" aria-label="Saved Dhan account: {dhan_label}; connection not verified here" title="Saved account identifier only; verify connectivity in Dashboard or Health">Dhan <strong>{dhan_label}</strong></span>
     <span id="v17p-runtime-chip" class="v17p-runtime-chip" aria-live="polite">UNVERIFIED</span>
     <button type="button" id="premiumThemeToggle" class="v17p-theme-btn" aria-label="Toggle light or dark appearance" aria-pressed="false">☼</button>
     <button type="button" id="v17pAccountOpen" class="v17p-account" aria-label="Open account and navigation menu" aria-controls="premNav" aria-expanded="false">{initial}</button>
