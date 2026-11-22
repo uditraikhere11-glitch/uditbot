@@ -47,6 +47,49 @@ jobs:
           set -o pipefail
           python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' \
             2>&1 | tee full_tests.log
+      - name: Independent backend-only full regression from pristine baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=27865aa4449d1a0ae31635f44b04d4d0fb858db0
+          CANDIDATE=$(git rev-parse HEAD)
+          BACKEND="$RUNNER_TEMP/uditbot-backend-only"
+          git worktree add --detach "$BACKEND" "$BASE"
+          git -C "$BACKEND" checkout "$CANDIDATE" -- \
+            src/engine/protection_watcher.py \
+            src/engine/reconciliation.py \
+            src/engine/settled_owner_read_policy.py \
+            src/journal/db.py \
+            tests/test_r06_reconciliation_recovery.py \
+            tests/test_settled_owner_read_policy.py \
+            tests/test_reconciliation_halt_aggregation.py \
+            tests/test_yesbank_restart_handoff.py \
+            tests/test_yesbank_governor_recovery.py \
+            tests/test_yesbank_nov22_e2e.py
+          (
+            cd "$BACKEND"
+            export PYTHONPATH="$BACKEND/tests/ci_offline:$BACKEND"
+            python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' \
+              2>&1 | tee "$GITHUB_WORKSPACE/backend_only_tests.log"
+            test "${PIPESTATUS[0]}" -eq 0
+          )
+      - name: Independent notification-only full regression from pristine baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=27865aa4449d1a0ae31635f44b04d4d0fb858db0
+          CANDIDATE=$(git rev-parse HEAD)
+          NOTIFICATION="$RUNNER_TEMP/uditbot-notification-only"
+          git worktree add --detach "$NOTIFICATION" "$BASE"
+          git -C "$NOTIFICATION" checkout "$CANDIDATE" -- \
+            run.py src/cli.py tests/test_startup_card_verified_runtime.py
+          (
+            cd "$NOTIFICATION"
+            export PYTHONPATH="$NOTIFICATION/tests/ci_offline:$NOTIFICATION"
+            python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' \
+              2>&1 | tee "$GITHUB_WORKSPACE/notification_only_tests.log"
+            test "${PIPESTATUS[0]}" -eq 0
+          )
       - name: Prepare independent backend and notification PR review artifacts
         shell: bash
         run: |
@@ -93,4 +136,6 @@ jobs:
             TESTED_AUDIT_COMMIT.txt
             targeted_tests.log
             full_tests.log
+            backend_only_tests.log
+            notification_only_tests.log
           retention-days: 30
