@@ -101,42 +101,52 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
   <a href="#health" data-v17-view="health">♡ System Health</a>
 </nav>
 <section id="v17-dashboard" class="v17-view-panel v17-dashboard" aria-label="Trading dashboard" hidden>
-  <div class="v17-page-heading"><h2>Trading Dashboard</h2><p>Verified service and configuration overview. Financial metrics are not provided by this read-only route.</p></div>
-  <div class="v17-summary-grid">
-    <div class="v17-summary-card"><span class="v17-summary-icon" aria-hidden="true">◉</span><span class="v17-summary-label">Bot service</span><strong id="v17-db-service">VERIFYING</strong><small>From authenticated service status</small></div>
-    <div class="v17-summary-card"><span class="v17-summary-icon" aria-hidden="true">▣</span><span class="v17-summary-label">Trading mode</span><strong id="v17-db-mode">UNVERIFIED</strong><small>Running mode only when verified</small></div>
-    <div class="v17-summary-card"><span class="v17-summary-icon" aria-hidden="true">▤</span><span class="v17-summary-label">Equity AMO</span><strong id="v17-db-equity">UNVERIFIED</strong><small>Saved setting, not a broker fill</small></div>
-    <div class="v17-summary-card"><span class="v17-summary-icon" aria-hidden="true">◇</span><span class="v17-summary-label">F&amp;O AMO</span><strong id="v17-db-fno">UNVERIFIED</strong><small>Entry only; no automatic protection</small></div>
-    <div class="v17-summary-card"><span class="v17-summary-icon" aria-hidden="true">✓</span><span class="v17-summary-label">Runtime evidence</span><strong id="v17-db-verified">PENDING</strong><small>Never inferred from saved settings</small></div>
+  <div class="v17p-pagehead">
+    <div><h1>Trading Dashboard</h1><p>Overview of trading operations, account and system status</p></div>
+    <div class="v17p-status-pills"><span id="v17p-dhan" class="v17p-pill">Dhan: Not independently verified</span><span id="v17p-token" class="v17p-pill">Token validity: Not verified</span></div>
   </div>
-  <h2 class="v17-quick-title">Quick Access</h2>
-  <div class="v17-quick-grid">
-    <a class="v17-quick-tile" href="#control"><span aria-hidden="true">▷</span><strong>Trading Controls</strong><small>Start, Stop and verify service</small><b aria-hidden="true">›</b></a>
-    <a class="v17-quick-tile" href="/setup"><span aria-hidden="true">⚙</span><strong>Configuration</strong><small>Review the native Setup form</small><b aria-hidden="true">›</b></a>
-    <a class="v17-quick-tile" href="#health"><span aria-hidden="true">♡</span><strong>System Health</strong><small>Read-only safety checks</small><b aria-hidden="true">›</b></a>
-    <a class="v17-quick-tile" href="#amo"><span aria-hidden="true">▣</span><strong>AMO Orders</strong><small>Inspect settings and journal</small><b aria-hidden="true">›</b></a>
-    <a class="v17-quick-tile" href="/setup/telegram-designer"><span aria-hidden="true">✉</span><strong>Telegram Designer</strong><small>Edit supported message templates</small><b aria-hidden="true">›</b></a>
+  <div id="v17p-owner-warning" class="v17p-warning" role="status" aria-live="polite" hidden></div>
+  <div class="v17p-kpis">
+    <div id="v17p-service-card" class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Trading Service</span><strong id="v17-db-service">VERIFYING</strong><small>Trading bot</small></div>
+    <div id="v17p-mode-card" class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Trading Mode</span><strong id="v17-db-mode">UNVERIFIED</strong><small>Execution mode</small></div>
+    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Reconciliation</span><strong id="v17p-reconciliation">UNVERIFIED</strong><small>Broker positions not verified by this route</small></div>
+    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>Protection Watcher</span><strong id="v17p-protection">UNVERIFIED</strong><small>Heartbeat and broker protection unverified</small></div>
+    <div class="v17p-kpi"><span class="v17p-kpi-label"><i class="v17p-dot" aria-hidden="true"></i>New Entries Gate</span><strong id="v17p-gate">UNVERIFIED</strong><small>Live entry permission not proved by this route</small></div>
+  </div>
+  <div class="v17p-offscreen-data" aria-hidden="true"><span id="v17-db-equity">UNVERIFIED</span><span id="v17-db-fno">UNVERIFIED</span><span id="v17-db-verified">UNVERIFIED</span></div>
+  <h2 class="v17p-quick-title">Quick Access</h2>
+  <div class="v17p-quick">
+    <a href="#control"><span class="v17p-quick-icon" aria-hidden="true">▷</span><span><b>Trading Controls</b><small>Start, Stop, Restart and mode</small></span></a>
+    <a href="/setup"><span class="v17p-quick-icon" aria-hidden="true">⚙</span><span><b>Configuration</b><small>Strategy, sizing, SL/Target, AMO</small></span></a>
+    <a href="/setup/telegram-designer"><span class="v17p-quick-icon" aria-hidden="true">➤</span><span><b>Telegram Designer</b><small>Alerts, reports and messages</small></span></a>
+    <a href="#health"><span class="v17p-quick-icon" aria-hidden="true">♡</span><span><b>System Health</b><small>Run read-only checks</small></span></a>
+    <a href="#amo"><span class="v17p-quick-icon" aria-hidden="true">▣</span><span><b>AMO Orders</b><small>Equity and F&amp;O AMO management</small></span></a>
+    <a href="#health"><span class="v17p-quick-icon" aria-hidden="true">▥</span><span><b>Reports &amp; Logs</b><small>Health summary and available checks</small></span></a>
   </div>
 </section>
 <section id="v17-control" class="v17-view-panel" aria-label="Bot operating state">
+  <div class="v17p-pagehead"><div><h1>Trading Controls</h1><p>Manage trading service, mode and runtime operations</p></div></div>
   <div class="grid">
-    <div class="tile"><div class="label">Bot service</div>
+    <div class="tile"><div class="label">Service Status</div>
       <div class="status-line"><span id="service-beacon" class="status-beacon" aria-hidden="true"></span><div id="service" class="value">Checking…</div></div>
       <div id="service-detail" class="detail">Verifying VM service state</div></div>
-    <div class="tile"><div class="label">Trading mode</div>
+    <div class="tile"><div class="label">Trading Mode</div>
       <div class="status-line"><span id="mode-beacon" class="status-beacon" aria-hidden="true"></span><div id="mode" class="value">UNKNOWN</div></div>
-      <div id="mode-detail" class="detail">Running configuration pending verification</div></div>
+      <div class="v17p-mode-pills" role="group" aria-label="Verified trading mode (read only)"><span id="v17p-mode-live">LIVE</span><span id="v17p-mode-test">TEST</span></div>
+      <div id="mode-detail" class="detail">Running configuration pending verification</div><a class="v17p-mode-link" href="/setup#setup-execution">Change mode in Setup</a></div>
   </div>
   <div class="buttons">
-    <button id="start" class="btn-start" type="button" disabled>▶ Start Bot</button>
-    <button id="stop" class="btn-stop" type="button" disabled>■ Stop Bot</button>
+    <button id="start" class="btn-start" type="button" disabled>▶ Start</button>
+    <button id="stop" class="btn-stop" type="button" disabled>■ Stop</button>
+    <button id="restart" type="button" disabled>⟳ Restart</button>
     <button id="health" type="button">♡ Health Check</button>
   </div>
   <div id="info" class="status-note" role="status" aria-live="polite">Read-only status is loading. No action has been taken.</div>
 
 </section>
 <section id="v17-amo-settings" class="v17-view-panel" aria-label="After market order controls" hidden>
-  <h2>After Market Order Settings</h2>
+  <div class="v17p-pagehead"><div><h1>AMO Orders</h1><p>Manage Equity and F&amp;O after-market orders</p></div></div>
+  <h2 class="v17p-amo-section-title">After Market Order Settings</h2>
   <div class="row"><div><div class="row-title">Equity AMO</div>
     <div class="row-sub">NSE cash equity · CNC LIMIT · dispatch at OPEN</div></div>
     <input id="equity-amo" class="toggle" type="checkbox" role="switch" aria-label="Enable Equity AMO" disabled>
@@ -168,7 +178,8 @@ const csrf=document.querySelector('meta[name="control-csrf"]').content;
 const v17ViewNames = new Set(['dashboard','control','amo','health']);
 function v17ShowView() {
   const requested=window.location.hash.slice(1).toLowerCase();
-  const active=v17ViewNames.has(requested)?requested:'control';
+  const active=v17ViewNames.has(requested)?requested:'dashboard';
+  if((active==='dashboard'||active==='control')&&window.v17pDashboardHealthReady===true)loadDashboardHealth();
   for (const id of ['dashboard','control','amo-settings','amo-orders','system-health']) {
     const el=$(id==='dashboard'?'v17-dashboard':id==='control'?'v17-control':id==='amo-settings'?'v17-amo-settings':id);
     if (!el) continue;
@@ -184,6 +195,7 @@ window.addEventListener('hashchange',v17ShowView);
 v17ShowView();
 
 let current=null;
+let ownerIntentSafe=false;
 const setText=(id,value)=>{$(id).textContent=String(value??'UNKNOWN')};
 function safeStatus(status){
   return (typeof status==='string'&&status.trim())?status.trim():'UNKNOWN';
@@ -215,10 +227,23 @@ async function refreshStatus(){
     setText('service-detail',s.service_detail||'Verified state from trading_bot.service');
     const mode=(s.runtime_verified===true)?safeStatus(s.running_mode):'UNVERIFIED';
     setText('mode',mode);
+    const headerChip=$('v17p-runtime-chip');
+    if(headerChip){
+      headerChip.className='v17p-runtime-chip';
+      if(verifiedRunning&&(mode==='LIVE'||mode==='TEST')){
+        headerChip.textContent=mode;
+        headerChip.classList.add(mode==='LIVE'?'v17p-chip-live':'v17p-chip-test');
+      }else if(['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)){
+        headerChip.textContent='STOPPED';headerChip.classList.add('v17p-chip-stopped');
+      }else headerChip.textContent='UNVERIFIED';
+    }
     $('mode-beacon').classList.toggle('is-active',verifiedRunning&&mode==='LIVE');
+    $('v17p-mode-live').classList.toggle('selected',verifiedRunning&&mode==='LIVE');
+    $('v17p-mode-test').classList.toggle('selected',verifiedRunning&&mode==='TEST');
     setText('mode-detail',s.runtime_verified===true?'Active running configuration verified':'Saved mode: '+safeStatus(s.saved_mode));
     $('start').disabled=!['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
     $('stop').disabled=state!=='RUNNING';
+    $('restart').disabled=state!=='RUNNING'||s.runtime_verified!==true||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true||!ownerIntentSafe;
     $('equity-amo').checked=s.equity_amo_saved===true;
     $('equity-amo').disabled=s.equity_amo_can_edit!==true;
     $('fno-amo').checked=s.fno_amo_saved===true;
@@ -229,14 +254,19 @@ async function refreshStatus(){
       ' · F&O runtime: '+(s.fno_amo_active===true?'ON':s.fno_amo_active===false?'OFF':'UNVERIFIED')+
       ' · F&O route: broker native AMO /orders (entry only)');
     setText('v17-db-service',state.replace(/_/g,' '));
+    $('v17p-service-card').classList.toggle('verified',verifiedRunning);
+    $('v17p-mode-card').classList.toggle('verified',verifiedRunning&&(mode==='LIVE'||mode==='TEST'));
     setText('v17-db-mode',mode);
     setText('v17-db-equity',s.equity_amo_saved===true?'SAVED ON':s.equity_amo_saved===false?'SAVED OFF':'UNKNOWN');
     setText('v17-db-fno',s.fno_amo_saved===true?'SAVED ON':s.fno_amo_saved===false?'SAVED OFF':'UNKNOWN');
     setText('v17-db-verified',s.runtime_verified===true&&state==='RUNNING'?'VERIFIED':'UNVERIFIED');
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
-  }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;
+  }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;
+    $('v17p-service-card').classList.remove('verified');$('v17p-mode-card').classList.remove('verified');
     $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active');
+    $('v17p-mode-live').classList.remove('selected');$('v17p-mode-test').classList.remove('selected');
     $('equity-amo').disabled=true;$('fno-amo').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
+    $('v17p-runtime-chip').textContent='UNVERIFIED';$('v17p-runtime-chip').className='v17p-runtime-chip';
     for(const id of ['v17-db-service','v17-db-mode','v17-db-equity','v17-db-fno','v17-db-verified'])setText(id,'UNVERIFIED');
     setText('info','Cannot verify bot state: '+err.message+' (controls disabled)')}
 }
@@ -245,11 +275,15 @@ async function serviceAction(action){
   const live=(current.saved_mode==='LIVE');
   if(action==='start'&&live&&!confirm('Start UDITBOT in LIVE mode? Real Dhan orders may be placed.'))return;
   if(action==='stop'&&!confirm('Request a safe bot stop? Existing live orders may require reconciliation.'))return;
-  $('start').disabled=true;$('stop').disabled=true;setText('info','Requesting '+action+'; awaiting verification…');
+  if(action==='restart'&&(
+     current.service_state!=='RUNNING'||current.runtime_verified!==true||
+     current.transition_gate_active===true||current.tracker_v2_apply_blocked===true||!ownerIntentSafe))return;
+  if(action==='restart'&&!confirm('Restart the trading service? This interrupts the running listener and may require reconciliation. Real orders can be affected. Continue?'))return;
+  $('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;setText('info','Requesting '+action+'; awaiting verification…');
   let resultMessage='';
   try{
     const r=await requestJSON('/setup/service-control',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action,confirm_live:action==='start'&&live,csrf_token:csrf,reason:'Owner requested '+action+' from Control Center'})});
+      body:JSON.stringify({action,confirm_live:(action==='start'||action==='restart')&&live,csrf_token:csrf,reason:'Owner requested '+action+' from Control Center'})});
     resultMessage=r.message||r.error||('Request '+action+' received.');
     if(r.requires_live_confirmation){
       resultMessage='LIVE action requires explicit confirmation; no action performed.';
@@ -266,17 +300,55 @@ async function serviceAction(action){
 }
 $('start').addEventListener('click',()=>serviceAction('start'));
 $('stop').addEventListener('click',()=>serviceAction('stop'));
+$('restart').addEventListener('click',()=>serviceAction('restart'));
+function reflectDashboardHealth(result){
+  const checks=Array.isArray(result.checks)?result.checks:[];
+  const owner=checks.find(x=>x.name==='Owner service intent');
+  ownerIntentSafe=Boolean(owner&&owner.status==='PASS');
+  const restartReady=current&&current.service_state==='RUNNING'&&current.runtime_verified===true&&
+    current.transition_gate_active!==true&&current.tracker_v2_apply_blocked!==true;
+  $('restart').disabled=!(ownerIntentSafe&&restartReady);
+  const account=checks.find(x=>x.name==='Dhan broker authentication');
+  const token=checks.find(x=>x.name==='Dhan token file');
+  const watcher=checks.find(x=>x.name==='Order protection watcher');
+  const banner=$('v17p-owner-warning');
+  const critical=checks.filter(x=>x.status==='FAIL'||x.status==='WARN');
+  $('health-state').classList.toggle('v17p-health-warning',critical.length>0);
+  if(critical.length){
+    banner.textContent='Attention: '+critical.map(x=>String(x.name)+': '+String(x.status)+' — '+String(x.detail)).join(' · ');
+    banner.hidden=false;
+  }else banner.hidden=true;
+  if(owner && owner.status==='WARN') banner.hidden=false;
+  setText('v17p-dhan',account&&account.status==='PASS'?'Dhan: Verified':'Dhan: Not independently verified');
+  setText('v17p-token',token&&token.status==='PASS'?'Token file: Present (validity unverified)':'Token validity: Not verified');
+  // The current health endpoint does not assert reconciliation or entry permission.
+  setText('v17p-reconciliation','UNVERIFIED');
+  setText('v17p-gate','UNVERIFIED');
+  setText('v17p-protection',watcher&&watcher.status==='FAIL'?'CHECK REQUIRED':'UNVERIFIED');
+}
+let v17pDashboardHealthRequested=false;
+window.v17pDashboardHealthReady=true;
+if(!window.location.hash||window.location.hash==='#dashboard'||window.location.hash==='#control')loadDashboardHealth();
+async function loadDashboardHealth(){
+  if(v17pDashboardHealthRequested)return;
+  v17pDashboardHealthRequested=true;
+  try{reflectDashboardHealth(await requestJSON('/control/health'))}
+  catch(_){setText('v17p-dhan','Dhan: Not independently verified');}
+}
 $('v17-health-run').addEventListener('click',()=>{ $('health').click(); });
 $('health').addEventListener('click',async()=>{
   $('health').disabled=true;$('v17-health-run').disabled=true;setText('health-state','Running read-only checks…');$('checks').replaceChildren();
   try{
     const r=await requestJSON('/control/health');
     setText('health-state',r.summary||'Health checks returned');
+    reflectDashboardHealth(r);
     for(const check of (Array.isArray(r.checks)?r.checks:[])){
       const el=document.createElement('div');el.className='check';
       const name=document.createElement('strong');name.textContent=String(check.name||'Check');
       const detail=document.createElement('span');detail.className='muted';
       detail.textContent=String(check.status||'UNKNOWN')+' · '+String(check.detail||'');
+      const tone=String(check.status||'UNKNOWN');
+      el.classList.add('v17p-check-'+tone.toLowerCase());
       el.append(name,detail);$('checks').append(el);
     }
   }catch(err){setText('health-state','Health check unavailable: '+err.message)}
