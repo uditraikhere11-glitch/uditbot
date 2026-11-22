@@ -189,7 +189,6 @@ class StartupReconciliationGate:
         self._active_pass_holdings: Optional[List[Dict[str, Any]]] = None
         self._active_pass_forever_orders: Optional[List[Dict[str, Any]]] = None
         # Keep protected reconciliation audit rows immutable.
-        self._halt_audit_buckets: Dict[str, Dict[str, Any]] = {}
 
     @property
     def is_accepting_entries(self) -> bool:
@@ -197,48 +196,46 @@ class StartupReconciliationGate:
         return self._accepting_entries and not self.stop_manager.is_stopped()
 
     def halt_new_entries(self, reason: str) -> None:
+        """Fail closed first, then durably aggregate identical audit events.
+
+        Aggregation never controls the gate, cannot override STOP, and is
+        independent of watcher or trade reconciliation decisions.
         """
-        11-F / 15-E: Immediately closes the entry gate when unprotected fill exposure,
-        an UNKNOWN order outcome, or a runtime broker reconciliation failure is detected.
-        """
-        now = time.monotonic()
-        audit_reason = str(reason)
-        summary = None
         with self._entry_state_lock:
-            was_open = self._accepting_entries or self.state != ReconciliationState.BLOCKED
-            self._halt_generation += 1  # Never suppress the safety barrier
+            transitioned = (
+                self._accepting_entries or self.state != ReconciliationState.BLOCKED
+            )
+            self._halt_generation += 1
             self._accepting_entries = False
             self.state = ReconciliationState.BLOCKED
             self.last_error = reason
-            previous = self._halt_audit_buckets.get(audit_reason)
-            if (not was_open and previous is not None
-                    and now - previous["started"] < 300.0):
-                previous["repeats"] += 1
-                emit_halt = False
-            else:
-                if previous is not None and previous["repeats"]:
-                    summary = (audit_reason, previous["repeats"])
-                self._halt_audit_buckets[audit_reason] = {
-                    "started": now, "repeats": 0,
-                }
-                emit_halt = True
-        if summary is not None and hasattr(self.db, "record_system_event"):
+        # Every call above closes the gate even when SQLite is unavailable.
+        aggregated = getattr(self.db, "record_reconciliation_halt_occurrence", None)
+        if callable(aggregated):
             try:
-                self.db.record_system_event(
-                    "RECONCILIATION_GATE_HALTED_REPEAT_SUMMARY",
-                    f"{summary[1]} additional occurrences: {summary[0]}",
+                new_event = aggregated(reason, state_transition=transitioned)
+            except Exception as exc:
+                logger.error(
+                    "[RECONCILIATION] Halt telemetry failed (%s); gate remains BLOCKED",
+                    type(exc).__name__,
                 )
-            except Exception:
-                pass
-        if emit_halt:
-            logger.critical(
-                "🛑 [RECONCILIATION GATE HALTED] Blocking all new entries: %s", reason
-            )
+                new_event = True  # preserve first/changed evidence if possible
+                if hasattr(self.db, "record_system_event"):
+                    try:
+                        self.db.record_system_event("RECONCILIATION_GATE_HALTED", reason)
+                    except Exception:
+                        pass
+        else:
+            new_event = True
             if hasattr(self.db, "record_system_event"):
                 try:
                     self.db.record_system_event("RECONCILIATION_GATE_HALTED", reason)
                 except Exception:
                     pass
+        if new_event:
+            logger.critical(
+                "🛑 [RECONCILIATION GATE HALTED] Blocking all new entries: %s", reason
+            )
 
     def is_healthy_for_resume(self) -> bool:
         """04-E: Checks whether reconciliation state has zero unresolved intents or protection before clearing STOP."""

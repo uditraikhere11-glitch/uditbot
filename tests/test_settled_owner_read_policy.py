@@ -35,9 +35,20 @@ class SettledOwnerReadPolicy(unittest.TestCase):
         self.assertTrue(self.permitted())
         self.assertTrue(self.permitted(record=self.b,leg_order_ids={"BUY-B"},
                      gate_books={"verified":{"BUY-B":("ACCOUNT","11915",1)}}))
-    def test_routine_requires_same_day_historical_proof(self):
-        self.assertTrue(self.permitted(gate_books=None))
-        self.assertFalse(self.permitted(gate_books=None,record=dict(self.a,owner_history_day="2026-11-21")))
+    def test_recovery_requires_fresh_historical_proof(self):
+        # Cached date is explicitly insufficient while reconciliation is blocked.
+        self.assertFalse(self.permitted(gate_books=None))
+        self.assertFalse(self.permitted(gate_books={"verified":{}}))
+        self.assertTrue(self.permitted())
+        # Healthy settled positions can use the date cache for bounded routine
+        # surveillance, but stale or unreadable states may not.
+        stable = dict(self.a, position_state="UNPROTECTED_MANUAL_RISK",
+                      reconciliation_required=False, unreadable_broker_response=False,
+                      manual_exit_detected=False)
+        self.assertTrue(self.permitted(gate_books=None, record=stable))
+        self.assertFalse(self.permitted(gate_books=None,record=dict(stable,owner_history_day="2026-11-21")))
+        self.assertFalse(self.permitted(gate_books=None,record=dict(stable,unreadable_broker_response=True)))
+        self.assertFalse(self.permitted(gate_books=None,record=dict(stable,reconciliation_required=True)))
     def test_live_exit_or_pending_mutation_never_qualifies(self):
         self.assertFalse(self.permitted(leg_order_ids={"BUY-A","SELL-EXIT"}))
         for field in ("sl_order_id","tp_order_id","pending_oco","cancel_uncertain",

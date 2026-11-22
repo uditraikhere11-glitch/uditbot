@@ -87,11 +87,20 @@ def may_omit_prior_day_buy_trade_read(
         if (datetime.fromtimestamp(float(first_at), IST).date() >= today
                 or not fills or sum(int(f["traded_quantity"]) for f in fills) != qty):
             return False
+        # A transition OUT of RECONCILIATION_REQUIRED must never trust a
+        # previously cached owner_history_day. Only this serialized gate pass
+        # can furnish fresh, complete, account-bound historical BUY/SELL proof.
         proof_in_gate = (isinstance(gate_books, dict)
                          and (gate_books.get("verified") or {}).get(oid)
                          == (account, sec, qty))
-        proof_today = record.get("owner_history_day") == today.isoformat()
-        if not (proof_in_gate or proof_today):
+        routine_proof_today = (
+            state == "UNPROTECTED_MANUAL_RISK"
+            and not record.get("reconciliation_required")
+            and not record.get("unreadable_broker_response")
+            and not record.get("manual_exit_detected")
+            and record.get("owner_history_day") == today.isoformat()
+        )
+        if not (proof_in_gate or routine_proof_today):
             return False
         aggregate = 0
         for other in all_open_records:

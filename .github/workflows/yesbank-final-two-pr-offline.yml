@@ -1,0 +1,96 @@
+name: YESBANK final 2-PR offline acceptance
+on:
+  push:
+    branches: [audit/yesbank-final-polish-20261122]
+permissions:
+  contents: read
+jobs:
+  independent-offline-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install real declared runtime/test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Enable offline network perimeter
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+      - name: Compile entire integrated Python tree
+        run: python -B -m compileall -q run.py src tests
+      - name: Exact dual-YESBANK and safety acceptance tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest -v \
+            tests.test_yesbank_nov22_e2e \
+            tests.test_settled_owner_read_policy \
+            tests.test_reconciliation_halt_aggregation \
+            tests.test_yesbank_restart_handoff \
+            tests.test_yesbank_governor_recovery \
+            tests.test_r06_reconciliation_recovery \
+            tests.test_owner_lot_restart \
+            tests.test_r02_read_governor \
+            tests.test_historical_fill_reconciliation_h01_h17 \
+            tests.test_startup_card_verified_runtime \
+            tests.test_health_and_system_message_designer \
+            2>&1 | tee targeted_tests.log
+      - name: Full offline integration suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py' \
+            2>&1 | tee full_tests.log
+      - name: Prepare independent backend and notification PR review artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=27865aa4449d1a0ae31635f44b04d4d0fb858db0
+          backend=(
+            src/engine/protection_watcher.py
+            src/engine/reconciliation.py
+            src/engine/settled_owner_read_policy.py
+            src/journal/db.py
+            tests/test_r06_reconciliation_recovery.py
+            tests/test_settled_owner_read_policy.py
+            tests/test_reconciliation_halt_aggregation.py
+            tests/test_yesbank_restart_handoff.py
+            tests/test_yesbank_governor_recovery.py
+            tests/test_yesbank_nov22_e2e.py
+          )
+          notification=(
+            run.py
+            src/cli.py
+            tests/test_startup_card_verified_runtime.py
+          )
+          git diff --binary "$BASE" HEAD -- "${backend[@]}" > yesbank_backend.patch
+          git diff --binary "$BASE" HEAD -- "${notification[@]}" > yesbank_notification.patch
+          zip -q -9 yesbank_backend_changed_files.zip "${backend[@]}"
+          zip -q -9 yesbank_notification_changed_files.zip "${notification[@]}"
+          sha256sum yesbank_backend.patch yesbank_notification.patch \
+            yesbank_backend_changed_files.zip yesbank_notification_changed_files.zip \
+            > SHA256SUMS.txt
+          echo "$BASE" > BASELINE_SHA.txt
+          git rev-parse HEAD > TESTED_AUDIT_COMMIT.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: yesbank-two-pr-tested-artifacts
+          path: |
+            yesbank_backend.patch
+            yesbank_notification.patch
+            yesbank_backend_changed_files.zip
+            yesbank_notification_changed_files.zip
+            SHA256SUMS.txt
+            BASELINE_SHA.txt
+            TESTED_AUDIT_COMMIT.txt
+            targeted_tests.log
+            full_tests.log
+          retention-days: 30
