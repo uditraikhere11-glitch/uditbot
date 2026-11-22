@@ -1,0 +1,38 @@
+name: V17 offline pinned Telethon wheelhouse
+on:
+  push:
+    branches:
+      - dev/uditbot-v17-v9-fidelity-20261122
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wheelhouse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build pinned public dependency wheelhouse
+        run: |
+          python -m pip wheel --wheel-dir offline_wheels --no-deps \
+            'telethon==1.38.1' 'pyaes==1.6.1' 'rsa==4.9.1' 'pyasn1==0.6.5'
+          python - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          items={}
+          for f in sorted(Path('offline_wheels').glob('*.whl')):
+              items[f.name]=hashlib.sha256(f.read_bytes()).hexdigest()
+          assert len(items)==4,(len(items),items)
+          Path('offline_wheels/MANIFEST.json').write_text(json.dumps(items,indent=2,sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: V17-Pinned-Telethon-Offline-Wheels
+          path: offline_wheels/
+          if-no-files-found: error
+          retention-days: 7
