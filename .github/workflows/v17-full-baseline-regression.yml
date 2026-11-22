@@ -1,0 +1,43 @@
+name: V17 complete source regression (offline, no live operations)
+on:
+  push:
+    branches:
+      - dev/uditbot-v17-v9-fidelity-20261122
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  full-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime and test requirements (before network barrier)
+        run: python -m pip install -r requirements-test.txt 'pytest>=8,<10'
+      - name: Offline barrier and local test state
+        run: |
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+          test ! -f .env
+      - name: Full authoritative checkout regression
+        run: |
+          python -m pytest -q -p no:cacheprovider tests \
+            --junitxml=v17-baseline-full-suite.xml 2>&1 | tee v17-baseline-full-suite.log
+      - name: Upload reproducible results, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: V17-Full-Baseline-Regression
+          path: |
+            v17-baseline-full-suite.xml
+            v17-baseline-full-suite.log
+          if-no-files-found: warn
+          retention-days: 14
