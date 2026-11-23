@@ -99,7 +99,7 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
         if not isinstance(rows, list) or getattr(rows, "ok", True) is not True:
             err = str(getattr(rows, "error", "") or "")
             source = ("LOCAL_GOVERNOR_NO_GET"
-                      if "local" in err.lower() and "defer" in err.lower()
+                      if "LOCAL_DHAN_GET_DEFERRAL" in err or ("local" in err.lower() and "defer" in err.lower())
                       else "BROKER_OR_UNKNOWN")
             raise ValueError("Historical pagination incomplete (HTTP %s; source=%s)" %
                              (getattr(rows, "status_code", 0), source))
