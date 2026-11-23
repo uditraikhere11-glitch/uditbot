@@ -126,10 +126,10 @@ class FocusedV17PresentationContracts(unittest.TestCase):
 
     def test_accessible_type_floor_weights_and_iphone_controls(self):
         css = read('src/premium_ui.css')
-        px = [float(x) for x in re.findall(r'font-size\\s*:\\s*([\\d.]+)px', css)]
+        px = [float(x) for x in re.findall(r'font-size\s*:\s*([\d.]+)px', css)]
         self.assertTrue(px)
         self.assertGreaterEqual(min(px), 12)
-        weights = {int(x) for x in re.findall(r'font-weight\\s*:\\s*(\\d+)', css)}
+        weights = {int(x) for x in re.findall(r'font-weight\s*:\s*(\d+)', css)}
         self.assertTrue(weights.issubset({400,500,600,700}), weights)
         self.assertIn('font-variant-numeric:tabular-nums', css)
         self.assertIn('font-size:16px!important;line-height:1.45', css)
