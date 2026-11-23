@@ -43,6 +43,26 @@ def assert_setup(page, width: int, setup_html: str) -> None:
     page.goto("http://uditbot.test/setup", wait_until="domcontentloaded")
     page.locator(".v17p-setup-card[data-target='setup-execution']").wait_for()
     page.locator(".v17p-setup-card[data-target='setup-execution']").click()
+    # Drawer starts closed and must not be a clipped sidebar within Setup.
+    menu = page.evaluate("""() => {
+      const panel=document.getElementById('premNav');
+      const backdrop=document.getElementById('premNavBackdrop');
+      return {parent:panel.parentElement.tagName,
+              visible:getComputedStyle(panel).visibility,
+              right:panel.getBoundingClientRect().right,
+              expanded:document.getElementById('v17pAccountOpen').getAttribute('aria-expanded'),
+              backdropHidden:backdrop.hidden};
+    }""")
+    assert menu["parent"] == "BODY", (width, menu)
+    assert menu["visible"] == "hidden" and menu["right"] <= 1, (width, menu)
+    assert menu["expanded"] == "false" and menu["backdropHidden"], (width, menu)
+    page.locator("#v17pAccountOpen").click()
+    assert page.locator("#premNav").is_visible(), width
+    page.keyboard.press("Escape")
+    assert not page.locator("#premNav").is_visible(), width
+    assert page.locator("#v17pAccountOpen").get_attribute("aria-expanded") == "false"
+    # The same SVG mark is used in the topbar and account drawer.
+    assert page.locator(".v17p-brand svg.v17p-ub-mark .v17p-ub-letter").count() == 2
     for section in SECTIONS:
         if section != SECTIONS[0]:
             page.locator('.setup-section-jumps a[href="#' + section + '"]').click()
@@ -69,10 +89,14 @@ def assert_setup(page, width: int, setup_html: str) -> None:
         assert geometry["hiddenCards"] == 1, (width, section, geometry)
         assert not geometry["horizontalOverflow"], (width, section, geometry)
         if section == SECTIONS[0] and width in (1280, 1440, 1600, 1920):
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_function("window.scrollY === 0")
             page.screenshot(path=str(OUT / ("setup-" + str(width) + "-light.png")), full_page=True)
+            if width == 1440:
+                page.locator(".v17p-brand").screenshot(path=str(OUT / "monogram-1440-light.png"))
         if width == 1920 and section in ("setup-sizing", "setup-risk", "setup-protection"):
             page.screenshot(path=str(OUT / (section + "-1920.png")), full_page=True)
-    page.locator("#v17pViewAllSettings").count() == 1
+    assert page.locator("#v17pViewAllSettings").count() == 1
     # Native form: no clone, no second POST form, exact toggle payload.
     check = page.evaluate("""() => {
         const form=document.querySelector('form[action="/setup"]');
@@ -156,8 +180,12 @@ def main() -> None:
                     page.route("**/*", reply)
                     assert_setup(page, width, setup_html)
                     if width == 390:
+                        page.locator('.setup-section-jumps a[href="#setup-execution"]').click()
                         page.locator("#premiumThemeToggle").click()
+                        page.evaluate("window.scrollTo(0, 0)")
+                        page.wait_for_function("window.scrollY === 0")
                         page.screenshot(path=str(OUT / "setup-390-dark.png"), full_page=True)
+                        page.locator(".v17p-brand").screenshot(path=str(OUT / "monogram-390-dark.png"))
                     if width in (1280, 390):
                         for verified, mode, expect in ((False,"LIVE","UNVERIFIED"),
                                                        (True,"LIVE","LIVE"),
