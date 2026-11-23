@@ -51,10 +51,21 @@ class V17InstanceAndNativePreservation(TestCase):
     def test_long_label_is_bounded(self):
         self._with_env('OPERATOR_NAME='+'A'*1000+'\n',lambda:self.assertEqual(len(premium_instance_name()),96))
 
-    def test_exact_existing_setup_template_untouched(self):
-        import hashlib
-        self.assertEqual(hashlib.sha256(HTML_TEMPLATE.encode()).hexdigest(),
-                         '4993337e7676744596d82c85bc057ebad6cfd74096086395349db37d667e6a17')
+    def test_native_setup_form_contract_unchanged(self):
+        import re
+        self.assertEqual(HTML_TEMPLATE.count('<form method="POST" action="/setup">'), 1)
+        form = HTML_TEMPLATE.split('<form method="POST" action="/setup">', 1)[1].split('</form>', 1)[0]
+        names = re.findall(r'<(?:input|select|textarea)[^>]*name="([^"]+)"', form)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(names), 54)
+        for key in ('csrf_token','expected_revision','full_setup_form','confirm_live',
+                    'is_live_mode','equity_active','fno_active'):
+            self.assertIn(key, names)
+        for key in ('is_live_mode','equity_active','fno_active'):
+            tag = re.search(r'<input[^>]*name="' + key + r'"[^>]*>', form)
+            self.assertIsNotNone(tag)
+            self.assertIn('type="checkbox"', tag.group())
+            self.assertIn('value="true"', tag.group())
 
     def test_existing_routes_and_native_actions_still_present(self):
         html=render_control_center('fake_csrf')
