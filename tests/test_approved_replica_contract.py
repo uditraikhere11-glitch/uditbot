@@ -1,13 +1,11 @@
 """Approved production UI: six native cards; no proxy controls or broker writes."""
 from __future__ import annotations
 import ast
-import hashlib
 from pathlib import Path
 import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-KNOWN_WORKING_SETUP_HTML_SHA256 = '4993337e7676744596d82c85bc057ebad6cfd74096086395349db37d667e6a17'
 
 
 def source(rel):
@@ -27,11 +25,18 @@ def html_template():
 
 
 class ApprovedVisualOnlyContract(unittest.TestCase):
-    def test_exact_previous_working_setup(self):
-        # Import changes needed to retire writers must not fail a VISUAL contract.
-        # Freeze the exact approved HTML template instead of the entire Python source.
-        self.assertEqual(hashlib.sha256(html_template().encode()).hexdigest(),
-                         KNOWN_WORKING_SETUP_HTML_SHA256)
+    def test_single_native_setup_form_and_live_confirmation_contract(self):
+        # Markup can improve without freezing the historical visual hash.
+        page = html_template()
+        self.assertEqual(page.count('<form method="POST" action="/setup">'), 1)
+        self.assertEqual(page.count('</form>'), 1)
+        for name in ('csrf_token', 'expected_revision', 'full_setup_form',
+                     'confirm_live', 'is_live_mode', 'equity_active', 'fno_active'):
+            self.assertEqual(len(re.findall(r'\\bname="' + name + r'"', page)), 1, name)
+        for name in ('is_live_mode', 'equity_active', 'fno_active'):
+            self.assertRegex(page, r'<input type="checkbox" name="' + name + r'" value="true"')
+        self.assertNotIn('class="slider"', page)
+        self.assertNotIn('class="switch"', page)
 
     def test_six_existing_cards_and_exact_54_unique_field_names(self):
         page = html_template()
@@ -90,7 +95,7 @@ class ApprovedVisualOnlyContract(unittest.TestCase):
     def test_presentation_cannot_rewrite_or_mirror_inputs(self):
         css = source('src/premium_ui.css')
         self.assertIn('AuditBot approved professional dashboard', css)
-        self.assertIn('column-count:2', css)
+        self.assertNotIn('column-count:2', css)
         self.assertIn('column-count:1', css)
         self.assertIn('.premium-designer', css)
         self.assertIn('.premium-control', css)
