@@ -1728,7 +1728,7 @@ class JournalDB:
             ).fetchone()
             return row["event_type"] if row else None
 
-    def owner_lot_basis(self, account, security, segment, product, order_id):
+    def owner_lot_basis(self, account, security, segment, product, order_id, *, authorized_closed_sell_ids=()):
         """Anchor a history query to the original intent, including NULL-ID attestations."""
         if not account or account != self.account_id:
             raise ValueError("Owner lot journal account mismatch")
@@ -1740,11 +1740,14 @@ class JournalDB:
             ).fetchall()
             if len(intents) != 1 or not intents[0]["created_at"]:
                 raise ValueError("Original account-bound order date unavailable")
-            if conn.execute(
-                "SELECT 1 FROM fills WHERE security_id=? AND exchange_segment=? AND traded_at>=? "
-                "AND transaction_type='SELL' AND is_verified_trade=1 LIMIT 1",
+            sell_rows = conn.execute(
+                "SELECT exchange_trade_id FROM fills WHERE security_id=? AND exchange_segment=? AND traded_at>=? "
+                "AND transaction_type='SELL' AND is_verified_trade=1",
                 (security, segment, intents[0]["created_at"]),
-            ).fetchone():
+            ).fetchall()
+            allowed = set(authorized_closed_sell_ids)
+            if any(not row["exchange_trade_id"] or row["exchange_trade_id"] not in allowed
+                   for row in sell_rows):
                 raise ValueError("Journal contains a verified SELL requiring attribution")
             fills = conn.execute(
                 "SELECT f.exchange_trade_id, f.traded_quantity, f.traded_price, a.evidence_json "
@@ -1757,6 +1760,138 @@ class JournalDB:
             if not fills:
                 raise ValueError("Verified original BUY fills unavailable")
             return intents[0]["created_at"], [dict(r) for r in fills]
+
+    def get_closed_forever_sibling_evidence(
+        self, account: str, security: str, segment: str, product: str,
+        *, open_parent_ids: Tuple[str, ...], now: float,
+    ) -> Dict[str, Any]:
+        """Read-only closed-OCO sibling allowance; no unexplained same-security SELL is exempt.
+
+        This returns a *candidate* allowlist only. The gate must still match
+        each execution to the current Dhan tradebook/historical GET, compare
+        settled holdings and deny any unexplained order or active orphan OCO.
+        """
+        if (not account or account != self.account_id or not security
+                or not segment or product != "CNC" or not open_parent_ids):
+            raise ValueError("Closed sibling identity not verified")
+        ids = tuple(str(x) for x in open_parent_ids)
+        with self._get_conn() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM positions_lifecycle WHERE account_id=? AND security_id=? "
+                "AND exchange_segment=? AND product_type=? AND position_state='POSITION_CLOSED' "
+                "AND confirmed_open_qty=0 AND protection_route='FOREVER_OCO'",
+                (account, security, segment, product),
+            ).fetchall()]
+            if not rows:
+                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0}
+            expected: Dict[Tuple[str, str], Tuple[str, int, float]] = {}
+            orders: Dict[str, Tuple[str, int]] = {}
+            group_ids: set[str] = set()
+            sell_ids: set[str] = set()
+            total_sell = 0
+            today_sell = 0
+            for row in rows:
+                oid = str(row["parent_order_id"])
+                if oid in ids:
+                    raise ValueError("Open/closed parent overlap")
+                bought, sold = int(row["buy_filled_qty"] or 0), int(row["sell_filled_qty"] or 0)
+                if (bought <= 0 or sold != bought or int(row["entry_qty"] or 0) != bought
+                        or row.get("manual_exit_detected") or row.get("orphaned_legs_detected")):
+                    raise ValueError("Closed OCO lifecycle is contradictory")
+                intents = conn.execute(
+                    "SELECT created_at FROM order_intents WHERE broker_order_id=? AND "
+                    "account_id=? AND security_id=? AND exchange_segment=? AND product_type=?",
+                    (oid, account, security, segment, product),
+                ).fetchall()
+                if len(intents) != 1 or not intents[0]["created_at"] or float(intents[0]["created_at"]) > now:
+                    raise ValueError("Closed OCO BUY intent not uniquely attributed")
+                originals = [dict(x) for x in conn.execute(
+                    "SELECT * FROM fills WHERE broker_order_id=? AND parent_order_id=? "
+                    "AND security_id=? AND exchange_segment=? AND product_type=? "
+                    "AND UPPER(transaction_type)='BUY' AND is_verified_trade=1",
+                    (oid, oid, security, segment, product),
+                ).fetchall()]
+                if sum(int(x["traded_quantity"] or 0) for x in originals) != bought:
+                    raise ValueError("Closed OCO original BUY evidence incomplete")
+                groups = [str(x[0]) for x in conn.execute(
+                    "SELECT forever_order_id FROM protection_orders WHERE parent_order_id=? "
+                    "AND forever_order_id IS NOT NULL AND forever_order_id!=''",
+                    (oid,),
+                ).fetchall()]
+                if not groups or any(g in group_ids for g in groups):
+                    raise ValueError("Closed OCO group identity missing/overlapping")
+                group_ids.update(groups)
+                records = conn.execute(
+                    "SELECT record_json FROM watcher_orders WHERE order_id=?", (oid,),
+                ).fetchall()
+                if len(records) != 1:
+                    raise ValueError("Closed OCO watcher leg identity unavailable")
+                try:
+                    snapshot = json.loads(records[0]["record_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Closed OCO watcher record malformed") from exc
+                if not isinstance(snapshot, dict) or str(snapshot.get("security_id") or "") != security:
+                    raise ValueError("Closed OCO watcher contract mismatch")
+                leg_ids = {str(snapshot.get(k) or "").strip()
+                           for k in ("sl_order_id", "tp_order_id")}
+                leg_ids.discard("")
+                if not leg_ids:
+                    raise ValueError("Closed OCO child SELL leg not verified")
+                sell_records = [dict(x) for x in conn.execute(
+                    "SELECT * FROM fills WHERE parent_order_id=? AND security_id=? AND "
+                    "exchange_segment=? AND product_type=? AND UPPER(transaction_type)='SELL' "
+                    "AND is_verified_trade=1",
+                    (oid, security, segment, product),
+                ).fetchall()]
+                # Reconciled child fills may be represented through exit_allocations;
+                # never accept partial cross-parent allocation as full child proof.
+                sell_records += [dict(x) for x in conn.execute(
+                    "SELECT f.*, a.allocated_qty FROM exit_allocations a JOIN fills f "
+                    "ON f.exchange_trade_id=a.exchange_trade_id WHERE a.parent_order_id=? "
+                    "AND UPPER(f.transaction_type)='SELL' AND f.is_verified_trade=1",
+                    (oid,),
+                ).fetchall()]
+                seen_sells: set[str] = set()
+                exit_sum = 0
+                for trade in originals + sell_records:
+                    eid = str(trade.get("exchange_trade_id") or "").strip()
+                    side = str(trade.get("transaction_type") or "").strip().upper()
+                    order_id = str(trade.get("broker_order_id") or "").strip()
+                    quantity = trade.get("traded_quantity")
+                    price = trade.get("traded_price")
+                    at = trade.get("traded_at")
+                    if (not eid or eid == "0" or not order_id
+                            or type(quantity) is not int or quantity <= 0
+                            or type(at) not in (int, float) or not 0 < at <= now
+                            or type(price) not in (float, int) or not 0 < price
+                            or (side == "SELL" and order_id not in leg_ids)
+                            or (side == "SELL" and "allocated_qty" in trade
+                                and int(trade["allocated_qty"]) != quantity)):
+                        raise ValueError("Closed OCO execution identity incomplete")
+                    key = (order_id, eid)
+                    if key in expected:
+                        if (side == "SELL" and eid in seen_sells
+                                and expected[key] == (side, quantity, float(price), float(at))):
+                            continue  # same exact trade joined directly + allocation
+                        raise ValueError("Conflicting/duplicate closed OCO execution")
+                    expected[key] = (side, quantity, float(price), float(at))
+                    prior = orders.get(order_id)
+                    if prior is not None and prior[0] != side:
+                        raise ValueError("BUY and SELL share a broker order ID")
+                    orders[order_id] = (side, (prior[1] if prior else 0) + quantity)
+                    if side == "SELL":
+                        seen_sells.add(eid)
+                        sell_ids.add(eid)
+                        exit_sum += quantity
+                        if datetime.datetime.fromtimestamp(float(at), IST).date() == datetime.datetime.fromtimestamp(now, IST).date():
+                            today_sell += quantity
+                if exit_sum != sold:
+                    raise ValueError("Closed OCO SELL allocation does not cover entire BUY")
+                total_sell += exit_sum
+        return {"trades": expected, "order_fills": orders,
+                "forever_ids": tuple(sorted(group_ids)),
+                "sell_ids": tuple(sorted(sell_ids)), "sell_qty": total_sell,
+                "today_sell_qty": today_sell}
 
     def get_sell_fills_for_parent(self, parent_order_id: str) -> List[Dict[str, Any]]:
         """P0-A & P1-6: Returns canonical verified SELL fills for `parent_order_id`,

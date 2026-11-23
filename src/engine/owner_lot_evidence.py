@@ -23,7 +23,8 @@ class DematReview(ValueError):
 
 
 def verify_owner_history(broker, db, account, security, segment, product, parents,
-                         holding, day_trades, now, evidence, *, current_day_live_keys=()):
+                         holding, day_trades, now, evidence, *, current_day_live_keys=(),
+                         verified_closed_sibling_trades=None, authorized_closed_sell_ids=()):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -31,7 +32,13 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     expected = {}
     starts = []
     for oid, qty in parents.items():
-        created, fills = db.owner_lot_basis(account, security, segment, product, oid)
+        if authorized_closed_sell_ids:
+            created, fills = db.owner_lot_basis(
+                account, security, segment, product, oid,
+                authorized_closed_sell_ids=authorized_closed_sell_ids,
+            )
+        else:
+            created, fills = db.owner_lot_basis(account, security, segment, product, oid)
         starts.append(datetime.fromtimestamp(created, IST).date())
         if sum(f["traded_quantity"] for f in fills) != qty:
             raise ValueError("Original BUY quantity differs from open lot")
@@ -51,6 +58,9 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
         raise ValueError("Original order date in future")
     evidence.update(from_date=first.isoformat(), to_date=last.isoformat(), windows=[], executions=[])
     seen = set()
+    allowed_closed = verified_closed_sibling_trades or {}
+    seen_closed_history = set()
+    seen_closed_today = set()
 
     def inspect(rows, historical):
         for row in rows:
@@ -77,6 +87,23 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                 allow_missing_exchange_trade_id=historical)
             if not valid or normalized is None:
                 raise ValueError("Execution identity or quantity incomplete")
+            if key in allowed_closed:
+                expected_side, expected_qty, expected_price, expected_at = allowed_closed[key]
+                if (side != expected_side
+                        or row.get("exchangeSegment") != segment
+                        or row.get("productType") != product
+                        or int(row["tradedQuantity"]) != expected_qty
+                        or abs(float(row["tradedPrice"]) - expected_price) > 1e-6):
+                    raise ExecutionConflict("Closed sibling execution differs from journal allocation")
+                if historical:
+                    if key in seen_closed_history:
+                        raise ValueError("Duplicate closed sibling historical execution")
+                    seen_closed_history.add(key)
+                elif datetime.fromtimestamp(expected_at, IST).date() == last:
+                    if key in seen_closed_today:
+                        raise ExecutionConflict("Duplicate closed sibling live execution")
+                    seen_closed_today.add(key)
+                continue
             if side == "SELL" and normalized.get("exchangeTradeId"):
                 raise ExecutionConflict("Confirmed SELL requires attribution for owner-managed holding")
             if side != "BUY" or key not in expected:
@@ -114,6 +141,10 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     live_keys = set(current_day_live_keys)
     if not live_keys.issubset(expected.keys()) or (seen | live_keys) != expected.keys():
         raise ValueError("Complete history does not contain every original BUY")
+    current_closed = {k for k, row in allowed_closed.items()
+                      if datetime.fromtimestamp(row[3], IST).date() == last}
+    if (seen_closed_history | (seen_closed_today & current_closed)) != set(allowed_closed):
+        raise ValueError("Closed sibling complete broker execution history unavailable")
 
 
 def corroborated_external_sells(trades, account, security, segment, product, owned_ids):
@@ -198,7 +229,7 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                     db=db, positions=positions, holdings=holdings,
                     trade_book=day_trades, account=account, security=security,
                     segment=segment, product=product,
-                    parent_quantities=parents, now=now,
+                    parent_quantities=parents, now=now, forever=forever,
                 )
                 quantity = split_proof.total_qty
                 source = "VERIFIED_MIXED_CNC_DELIVERY"
@@ -213,14 +244,27 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             evidence["positions"] = [{k: r.get(k) for k in ("securityId", "exchangeSegment", "productType",
                                       "netQty", "buyQty", "sellQty")} for r in positions
                                      if str(r.get("securityId")) == security]
+            closed = {"trades": {}, "order_fills": {}, "forever_ids": (),
+                      "sell_ids": (), "today_sell_qty": 0}
+            if product == "CNC" and callable(getattr(db, "get_closed_forever_sibling_evidence", None)):
+                closed = db.get_closed_forever_sibling_evidence(
+                    account, security, segment, product,
+                    open_parent_ids=tuple(sorted(parents)), now=now,
+                )
+                evidence["verified_closed_sibling_orders"] = list(closed["order_fills"])
             if not isinstance(forever, list):
                 raise ValueError("Forever protection book unavailable")
             related_oco = [{k: r.get(k) for k in ("orderId", "orderStatus", "transactionType")}
                            for r in forever if str(r.get("securityId")) == security]
             evidence["forever_orders"] = related_oco
-            if len(acked) == len(parents) and any(str(r["orderStatus"]).upper() not in
-                    ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED") for r in related_oco):
-                raise ValueError("Forever order for owner-managed shares requires attribution")
+            if len(acked) == len(parents):
+                terminal = ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED",
+                            "TRADED", "FILLED", "COMPLETE", "CLOSED")
+                for r in related_oco:
+                    status = str(r["orderStatus"] or "").upper()
+                    group = str(r.get("orderId") or "")
+                    if status not in (terminal if group in closed["forever_ids"] else terminal[:4]):
+                        raise ValueError("Forever order for owner-managed shares requires attribution")
             relevant_orders = [{k: r.get(k) for k in ("orderId", "transactionType", "orderStatus", "filledQty")}
                                for r in orders if str(r.get("securityId")) == security
                                or (holding.get("isin") and r.get("isin") == holding["isin"])]
@@ -228,12 +272,20 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             verify_owner_history(broker, db, account, security, segment, product, parents,
                                  holding, day_trades, now, evidence,
                                  current_day_live_keys=(split_proof.intraday_trade_keys
-                                                        if split_proof is not None else ()))
+                                                        if split_proof is not None else ()),
+                                 verified_closed_sibling_trades=closed["trades"],
+                                 authorized_closed_sell_ids=closed["sell_ids"])
             for position in evidence["positions"]:
                 if not position["exchangeSegment"] or not position["productType"]:
                     raise ValueError("Position identity incomplete")
                 if position["productType"] == product and position["sellQty"] not in (None, 0, "0"):
-                    raise ValueError("Position reports selling activity requiring attribution")
+                    try:
+                        sold = int(position["sellQty"])
+                    except (TypeError, ValueError):
+                        raise ValueError("Malformed broker selling quantity") from None
+                    if (type(position["sellQty"]) is bool or sold <= 0
+                            or sold != closed["today_sell_qty"]):
+                        raise ValueError("Position reports selling activity requiring attribution")
             if any(not r.get("securityId") for r in orders):
                 raise ValueError("Current order security identity missing")
             for order in relevant_orders:
@@ -241,6 +293,14 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                 if status in ("REJECTED", "CANCELLED", "CANCELED", "EXPIRED") and str(order["filledQty"]) == "0":
                     continue
                 if status == "TRADED" and order["orderId"] in parents and order["transactionType"] == "BUY":
+                    continue
+                oinfo = closed["order_fills"].get(str(order["orderId"]))
+                if (oinfo is not None
+                        and status in ("TRADED", "COMPLETE", "FILLED", "CLOSED")
+                        and str(order["transactionType"] or "").upper() == oinfo[0]
+                        and type(order["filledQty"]) in (int, str)
+                        and str(order["filledQty"]).isdigit()
+                        and int(order["filledQty"]) == oinfo[1]):
                     continue
                 raise ValueError("Current order requires execution or pending-quantity review")
             if quantity < sum(parents.values()):

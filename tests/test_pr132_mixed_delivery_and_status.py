@@ -775,6 +775,8 @@ class MixedCNCHardeningFollowup(unittest.TestCase):
         }]
         return db, positions, holdings, trades, now_ts, verify_mixed_cnc_split, MixedCNCUnverified
 
+    @unittest.skipIf(importlib.util.find_spec("src.broker.yahoo_observer") is None,
+                     "Full repository broker verifier required")
     def test_prior_day_protected_forever_oco_lot_passes_without_manual_risk_ack(self):
         with tempfile.TemporaryDirectory() as td:
             db, positions, holdings, trades, now_ts, verify_fn, _ = self._seed_protected_and_new(td)
@@ -782,6 +784,14 @@ class MixedCNCHardeningFollowup(unittest.TestCase):
                 db=db, positions=positions, holdings=holdings, trade_book=trades,
                 account="9999990000", security="11915", segment="NSE_EQ", product="CNC",
                 parent_quantities={"221261123606908": 28, "221261124000001": 5}, now=now_ts,
+                forever=[
+                    dict(dhanClientId="9999990000", securityId="11915", exchangeSegment="NSE_EQ",
+                         productType="CNC", orderId="FO-YB-28", orderStatus="ACTIVE", transactionType="SELL",
+                         quantity=28, legName="TARGET_LEG", price=18.25),
+                    dict(dhanClientId="9999990000", securityId="11915", exchangeSegment="NSE_EQ",
+                         productType="CNC", orderId="FO-YB-28", orderStatus="ACTIVE", transactionType="SELL",
+                         quantity=28, legName="STOP_LOSS_LEG", triggerPrice=17.19),
+                ],
             )
             self.assertEqual(proof.settled_qty, 28)
             self.assertEqual(proof.intraday_qty, 5)

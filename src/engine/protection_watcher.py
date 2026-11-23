@@ -4501,7 +4501,7 @@ class ProtectionWatcher:
                         holdings=holdings_book, trade_book=trade_book,
                         account=expected_client_id, security=sec_id,
                         segment=seg, product=prod,
-                        parent_quantities=parent_quantities, now=now_ts,
+                        parent_quantities=parent_quantities, now=now_ts, forever=forever_book,
                     )
                     key = (sec_id, seg, prod)
                     gate_attested = bool(
@@ -5419,6 +5419,7 @@ class ProtectionWatcher:
                 logger.warning("[Protection] Watcher run() loop already active in this instance; skipping duplicate launch.")
                 return
             self._is_running = True
+            self._heartbeat_monotonic = time.monotonic()
 
         next_due = 0.0
         last_signature = None
@@ -5446,6 +5447,7 @@ class ProtectionWatcher:
         failure_holdoff = 0.0
         try:
             while True:
+                self._heartbeat_monotonic = time.monotonic()
                 if time.monotonic() < failure_holdoff:
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
@@ -5547,3 +5549,11 @@ class ProtectionWatcher:
         finally:
             with self._running_lock:
                 self._is_running = False
+                self._heartbeat_monotonic = None
+            # A LIVE watcher that exits cannot leave a previously HEALTHY gate
+            # latched OPEN.  Never cancel or modify resting protective orders.
+            gate = getattr(self.broker, "reconciliation_gate", None)
+            if (gate is not None
+                    and getattr(gate, "_require_live_watcher_liveness", False)
+                    and getattr(gate, "_accepting_entries", False)):
+                gate.halt_new_entries("Protection watcher task exited; independent broker recheck required")
