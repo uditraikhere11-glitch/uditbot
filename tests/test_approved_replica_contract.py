@@ -30,9 +30,10 @@ class ApprovedVisualOnlyContract(unittest.TestCase):
         page = html_template()
         self.assertEqual(page.count('<form method="POST" action="/setup">'), 1)
         self.assertEqual(page.count('</form>'), 1)
+        form = page.split('<form method="POST" action="/setup">', 1)[1].split('</form>', 1)[0]
         for name in ('csrf_token', 'expected_revision', 'full_setup_form',
                      'confirm_live', 'is_live_mode', 'equity_active', 'fno_active'):
-            self.assertEqual(len(re.findall(r'\bname="' + name + r'"', page)), 1, name)
+            self.assertEqual(len(re.findall(r'\bname="' + name + r'"', form)), 1, name)
         for name in ('is_live_mode', 'equity_active', 'fno_active'):
             self.assertRegex(page, r'<input type="checkbox" name="' + name + r'" value="true"')
         self.assertNotIn('class="slider"', page)
