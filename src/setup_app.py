@@ -314,7 +314,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       cursor: pointer;
     }
     
-    /* Toggle switch */
+    /* Accessible two-choice checkboxes: same native form payload, no slider track. */
     .toggle-row {
       display: flex;
       align-items: center;
@@ -329,24 +329,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .toggle-info h4 { font-size: 13px; font-weight: 600; color: #f1f5f9; margin-bottom: 2px; }
     .toggle-info p { font-size: 11px; color: #94a3b8; }
     
-    .switch {
-      position: relative;
-      display: inline-block;
-      width: 44px;
-      height: 24px;
-      flex-shrink: 0;
-    }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .slider {
-      position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-      background-color: #334155; transition: .25s; border-radius: 24px;
-    }
-    .slider:before {
-      position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px;
-      background-color: white; transition: .25s; border-radius: 50%;
-    }
-    input:checked + .slider { background-color: #3b82f6; }
-    input:checked + .slider:before { transform: translateX(20px); }
+    .setup-choice { display:inline-flex; align-items:center; position:relative; flex-shrink:0; cursor:pointer; }
     
     .mode-live {
       border-color: #f59e0b;
@@ -430,9 +413,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <h4>LIVE Trading Mode</h4>
             <p>Switch ON for real DhanHQ exchange order execution. Switch OFF for safe TEST mode (validation & visual cards only).</p>
           </div>
-          <label class="switch">
+          <label class="setup-choice" aria-label="Trading mode: unchecked TEST, checked LIVE">
             <input type="checkbox" name="is_live_mode" value="true" <!--LIVE_CHECKED-->>
-            <span class="slider"></span>
+            <span class="setup-choice-off" aria-hidden="true">TEST</span>
+            <span class="setup-choice-on" aria-hidden="true">LIVE</span>
           </label>
         </div>
 
@@ -442,9 +426,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <h4>Cash Equities (NSE_EQ)</h4>
               <p>Process cash equity buy signals</p>
             </div>
-            <label class="switch">
+            <label class="setup-choice" aria-label="Equity signals: unchecked OFF, checked ON">
               <input type="checkbox" name="equity_active" value="true" <!--EQUITY_CHECKED-->>
-              <span class="slider"></span>
+              <span class="setup-choice-off" aria-hidden="true">OFF</span>
+              <span class="setup-choice-on" aria-hidden="true">ON</span>
             </label>
           </div>
           <div class="toggle-row">
@@ -452,9 +437,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <h4>Stock Options (NSE_FNO)</h4>
               <p>Process stock options (CE/PE) signals</p>
             </div>
-            <label class="switch">
+            <label class="setup-choice" aria-label="F and O signals: unchecked OFF, checked ON">
               <input type="checkbox" name="fno_active" value="true" <!--FNO_CHECKED-->>
-              <span class="slider"></span>
+              <span class="setup-choice-off" aria-hidden="true">OFF</span>
+              <span class="setup-choice-on" aria-hidden="true">ON</span>
             </label>
           </div>
         </div>
