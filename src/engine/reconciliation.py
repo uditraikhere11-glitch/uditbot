@@ -192,8 +192,15 @@ class StartupReconciliationGate:
 
     @property
     def is_accepting_entries(self) -> bool:
-        """Trading gate: returns True ONLY if broker state has been verified healthy and STOP is inactive."""
-        return self._accepting_entries and not self.stop_manager.is_stopped()
+        """Trading gate also verifies the durable owner STOP/transition fence."""
+        if not self._accepting_entries or self.stop_manager.is_stopped():
+            return False
+        from src.engine.owner_service_admission import owner_entries_permitted
+        data_dir = getattr(getattr(self.broker, "cfg", None), "data_dir", None)
+        if not isinstance(data_dir, str) or not data_dir:
+            db_path = getattr(self.db, "db_path", None)
+            data_dir = os.path.dirname(db_path) if isinstance(db_path, str) and db_path else "data"
+        return owner_entries_permitted(data_dir)
 
     def halt_new_entries(self, reason: str) -> None:
         """Fail closed first, then durably aggregate identical audit events.
