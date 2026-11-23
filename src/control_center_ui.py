@@ -231,15 +231,17 @@ async function refreshStatus(){
   try{
     const s=await requestJSON('/control/status');current=s;
     const state=safeStatus(s.service_state);
-    setText('service',state.replace(/_/g,' '));
-    // The glow is a verified-status indicator, not a substitute for Health Check.
+    // Do not label an unverified systemd RUNNING report as verified.
     const verifiedRunning=state==='RUNNING'&&s.runtime_verified===true;
+    const serviceReadout=verifiedRunning?'RUNNING':(state==='RUNNING'?'UNVERIFIED':state.replace(/_/g,' '));
+    setText('service',serviceReadout);
     $('service-beacon').classList.toggle('is-active',verifiedRunning);
     $('service').classList.toggle('v17p-verified-running',verifiedRunning);
-    setText('service-detail',s.runtime_verified===true?
+    setText('service-detail',verifiedRunning?
       'Verified systemd trading_bot.service · Running mode: '+safeStatus(s.running_mode):
-      (s.service_detail||'Runtime evidence pending'));
-    const mode=(s.runtime_verified===true)?safeStatus(s.running_mode):'UNVERIFIED';
+      (state==='RUNNING'?'Service reports running · Runtime evidence unverified':(s.service_detail||'Runtime evidence pending')));
+    const reportedMode=safeStatus(s.running_mode);
+    const mode=verifiedRunning&&['LIVE','TEST'].includes(reportedMode)?reportedMode:'UNVERIFIED';
     setText('mode',mode);
     const headerChip=$('v17p-runtime-chip');
     if(headerChip){
@@ -252,9 +254,12 @@ async function refreshStatus(){
       }else headerChip.textContent='UNVERIFIED';
     }
     $('mode-beacon').classList.toggle('is-active',verifiedRunning&&mode==='LIVE');
+    $('mode-beacon').classList.toggle('is-test',verifiedRunning&&mode==='TEST');
+    $('mode').classList.toggle('v17p-verified-live',verifiedRunning&&mode==='LIVE');
+    $('mode').classList.toggle('v17p-verified-test',verifiedRunning&&mode==='TEST');
     $('v17p-mode-live').classList.toggle('selected',verifiedRunning&&mode==='LIVE');
     $('v17p-mode-test').classList.toggle('selected',verifiedRunning&&mode==='TEST');
-    setText('mode-detail',s.runtime_verified===true?'Running: '+mode+' · Saved: '+safeStatus(s.saved_mode)+' · Runtime verified':'Saved: '+safeStatus(s.saved_mode)+' · Running: unverified');
+    setText('mode-detail',verifiedRunning?'Running: '+mode+' · Saved: '+safeStatus(s.saved_mode)+' · Runtime verified':'Saved: '+safeStatus(s.saved_mode)+' · Running: unverified');
     for(const [target,id] of [['LIVE','v17p-mode-live'],['TEST','v17p-mode-test']]){
       $(id).disabled=s.mode_can_edit!==true||safeStatus(s.saved_mode)===target;
       $(id).setAttribute('aria-pressed',String(verifiedRunning&&mode===target));
@@ -273,9 +278,11 @@ async function refreshStatus(){
       ' · F&O AMO saved: '+(s.fno_amo_saved?'ON':'OFF')+
       ' · F&O runtime: '+(s.fno_amo_active===true?'ON':s.fno_amo_active===false?'OFF':'UNVERIFIED')+
       ' · F&O route: broker native AMO /orders (entry only)');
-    setText('v17-db-service',state.replace(/_/g,' '));
+    setText('v17-db-service',serviceReadout);
     $('v17p-service-card').classList.toggle('verified',verifiedRunning);
     $('v17p-mode-card').classList.toggle('verified',verifiedRunning&&(mode==='LIVE'||mode==='TEST'));
+    $('v17p-mode-card').classList.toggle('mode-live',verifiedRunning&&mode==='LIVE');
+    $('v17p-mode-card').classList.toggle('mode-test',verifiedRunning&&mode==='TEST');
     setText('v17-db-mode',mode);
     renderOperationalStatus(s);
     setText('v17-db-equity',s.equity_amo_saved===true?'SAVED ON':s.equity_amo_saved===false?'SAVED OFF':'UNKNOWN');
@@ -287,10 +294,11 @@ async function refreshStatus(){
       $('v17p-owner-warning').hidden=false;
       setText('v17p-owner-warning','Owner service intent: WARNING — Saved STOP conflicts with the running service; review before restart or mode change.');
     }
-    setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
+    setText('info',s.warning||('Service: '+serviceReadout+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
   }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;$('cancel-stop').disabled=true;
-    $('v17p-service-card').classList.remove('verified');$('v17p-mode-card').classList.remove('verified');
-    $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active');$('service').classList.remove('v17p-verified-running');
+    $('v17p-service-card').classList.remove('verified');$('v17p-mode-card').classList.remove('verified','mode-live','mode-test');
+    $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active','is-test');
+    $('service').classList.remove('v17p-verified-running');$('mode').classList.remove('v17p-verified-live','v17p-verified-test');
     $('v17p-mode-live').classList.remove('selected');$('v17p-mode-test').classList.remove('selected');
     $('equity-amo').disabled=true;$('fno-amo').disabled=true;$('v17p-mode-live').disabled=true;$('v17p-mode-test').disabled=true;setText('service','UNKNOWN');setText('mode','UNVERIFIED');
     $('v17p-runtime-chip').textContent='UNVERIFIED';$('v17p-runtime-chip').className='v17p-runtime-chip';
