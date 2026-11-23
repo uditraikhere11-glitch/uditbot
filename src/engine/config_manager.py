@@ -3293,9 +3293,33 @@ class ConfigChangeTracker:
                 return total_verified, None
 
             broker_Fatal_err: List[str] = []
+            # One broker-authoritative closure proof per parent per preflight.
+            closed_parent_proofs: Dict[Tuple[str, int, str], bool] = {}
 
             def _flat_closed_fill(corr_id: str, b_oid: str, filled: int, sec_id: str = "") -> bool:
                 """Verify genuine closure and durably retire ONLY that closed parent's stale gate."""
+                # Do not demand active SL/target protection for an already closed
+                # verified prior-day delivery parent. The common signed-CNC
+                # reconciler validates T+0 negative netQty and the journal helper
+                # requires zero current broker exposure on subsequent sessions.
+                close_key = (str(b_oid or ""), int(filled), str(sec_id or ""))
+                if close_key not in closed_parent_proofs:
+                    try:
+                        from src.engine.closed_parent_safety import verified_closed_delivery_parent
+                        closed_parent_proofs[close_key] = verified_closed_delivery_parent(
+                            db_path=db_path, account=current_account_id,
+                            parent_id=close_key[0], required_qty=close_key[1],
+                            security_id=close_key[2], broker=valid_live_broker,
+                            orders=list(order_book_by_id.values()),
+                            forever=[leg for group in fo_groups.values() for leg in group],
+                            super_orders=list(so_by_id.values()),
+                        )
+                    except Exception as exc:
+                        logger.warning("Closed parent safety inspection unavailable: %s",
+                                       type(exc).__name__)
+                        closed_parent_proofs[close_key] = False
+                if closed_parent_proofs[close_key]:
+                    return True
                 entry = order_book_by_id.get(b_oid) or order_book_by_corr.get(corr_id)
                 watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
                 previously_verified = False
@@ -4201,22 +4225,36 @@ class ConfigChangeTracker:
                 return existing_th
 
             def _daemon_loop():
+                last_broker_stop_probe = 0.0
+                last_ready = False
                 while not stop_ev.is_set():
                     if not os.path.exists(self.data_dir):
                         break
                     c_now = dict(_COORDINATOR_CONTEXTS.get(self.data_dir) or {})
                     try:
                         if self._has_active_or_deferred_work():
-                            self.run_control_coordinator_tick(
-                                env_path=c_now.get("env_path", abs_env),
-                                stop_state_path=c_now.get("stop_state_path", abs_stop),
-                                db_path=c_now.get("db_path", abs_db),
-                                broker=c_now.get("broker"),
-                                notifier=c_now.get("notifier"),
-                                systemctl_fn=c_now.get("systemctl_fn"),
-                                check_service_fn=c_now.get("check_service_fn"),
-                                verify_delay_sec=c_now.get("verify_delay_sec", verify_delay_sec),
-                            )
+                            # A deferred STOP must not consume Dhan read budget
+                            # every half-second while protection is unresolved.
+                            # Watcher readiness explicitly wakes an early check.
+                            ready = self.get_service_control_record().get("stop_ready_to_apply") is True
+                            now_probe = time.monotonic()
+                            # A persistent ready=True must not re-trigger
+                            # every 0.5s. Only its rising edge wakes one early
+                            # probe; later attempts obey the normal backoff.
+                            became_ready = ready and not last_ready
+                            last_ready = ready
+                            if became_ready or now_probe - last_broker_stop_probe >= 30.0:
+                                last_broker_stop_probe = now_probe
+                                self.run_control_coordinator_tick(
+                                    env_path=c_now.get("env_path", abs_env),
+                                    stop_state_path=c_now.get("stop_state_path", abs_stop),
+                                    db_path=c_now.get("db_path", abs_db),
+                                    broker=c_now.get("broker"),
+                                    notifier=c_now.get("notifier"),
+                                    systemctl_fn=c_now.get("systemctl_fn"),
+                                    check_service_fn=c_now.get("check_service_fn"),
+                                    verify_delay_sec=c_now.get("verify_delay_sec", verify_delay_sec),
+                                )
                     except Exception as e:
                         logger.debug(f"Coordinator daemon tick error: {e}")
 
@@ -4283,6 +4321,132 @@ class ConfigChangeTracker:
             if time.time() - start_poll >= max_wait:
                 return False, last_state, last_detail
             time.sleep(poll_interval)
+
+    def cancel_deferred_owner_stop(
+        self, env_path: str = ".env",
+    ) -> Dict[str, Any]:
+        """Explicit owner cancellation; never calls systemctl or the broker.
+
+        Shares the exact cross-process operation lock with the asynchronous
+        deferred-stop coordinator. A partial disk write retains an active gate.
+        """
+        with self.operation_lock(
+            operation_type="OWNER_CANCEL_DEFERRED_STOP",
+            operation_id="OWNER-STOP-CANCELLED",
+        ):
+            status = self.control_service("status", env_path=env_path)
+            try:
+                live_pid = int((status.get("systemd_properties") or {}).get("MainPID") or 0)
+            except (TypeError, ValueError, OverflowError):
+                live_pid = 0
+            owner = status.get("owner_intent") or {}
+            gate = status.get("transition_gate") or {}
+            mode = str(status.get("saved_mode") or "").upper()
+            previously_staged = (
+                owner.get("desired_service_state") == "RUNNING"
+                and owner.get("last_action") == "OWNER_CANCEL_STOP"
+                and owner.get("deferred_stop_pending") is False
+            )
+            pending_stop = (
+                owner.get("desired_service_state") == "STOPPED"
+                and owner.get("deferred_stop_pending") is True
+                and owner.get("observed_state") == "RUNNING"
+            )
+            if not (pending_stop or previously_staged):
+                return {"ok": False, "blocked_reason": "NO_DEFERRED_OWNER_STOP",
+                        "message": "No matching pending Owner STOP can be cancelled"}
+            if not (
+                status.get("service_state") == "RUNNING"
+                and status.get("runtime_verified") is True
+                and live_pid > 0
+                and status.get("running_mode") == mode
+                and mode in ("LIVE", "TEST")
+            ):
+                return {"ok": False, "blocked_reason": "RUNTIME_UNVERIFIED",
+                        "message": "Running service PID/configuration is not verified"}
+            if not (gate.get("active") is True and gate.get("ok") is True
+                    and gate.get("change_id") == "OWNER-STOP-PENDING"
+                    and gate.get("target_mode") == "STOPPED"):
+                return {"ok": False, "blocked_reason": "UNRELATED_TRANSITION",
+                        "message": "Transition gate does not belong to the deferred Owner STOP"}
+            if (self.has_unresolved_pending_operation()
+                    or os.path.exists(self.deferred_env_file)
+                    or os.path.exists(self.deferred_meta_file)):
+                return {"ok": False, "blocked_reason": "CONFIG_OPERATION_PENDING",
+                        "message": "Another configuration transaction requires review"}
+            from src.engine.runtime_evidence import read_private_json
+            try:
+                tx = read_private_json(os.path.join(
+                    self.data_dir, "config_restart_v2", "current_transaction.json"
+                ), missing_ok=True)
+                barrier = read_private_json(os.path.join(
+                    self.data_dir, "config_restart_v2", "apply_barrier.json"
+                ), missing_ok=True)
+            except (OSError, ValueError):
+                return {"ok": False, "blocked_reason": "RESTART_EVIDENCE_UNREADABLE",
+                        "message": "Previous restart evidence is unreadable"}
+            if ((tx is not None and tx.get("phase") not in
+                    ("VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE"))
+                    or (barrier is not None and barrier.get("active") is not False)):
+                return {"ok": False, "blocked_reason": "PRIOR_RESTART_UNRESOLVED",
+                        "message": "Previous service restart is not verified"}
+
+            if not previously_staged:
+                self.record_service_control_intent(
+                    desired_service_state="RUNNING",
+                    last_action="OWNER_CANCEL_STOP",
+                    reason="Owner explicitly cancelled deferred STOP; running process unchanged",
+                    requested_mode=mode, observed_state="RUNNING",
+                    deferred_stop_pending=False, stop_ready_to_apply=False,
+                )
+            recorded = self.get_service_control_record()
+            if not (recorded.get("desired_service_state") == "RUNNING"
+                    and recorded.get("deferred_stop_pending") is False
+                    and recorded.get("last_action") == "OWNER_CANCEL_STOP"):
+                return {"ok": False, "blocked_reason": "OWNER_INTENT_WRITE_FAILED",
+                        "message": "Cannot read back cancelled intent; transition remains active"}
+            # Revalidate the exact process before clearing the only remaining
+            # entry fence. Direct systemctl changes do not take this lock.
+            prior_clear = self.control_service("status", env_path=env_path)
+            try:
+                prior_clear_pid = int((prior_clear.get("systemd_properties") or {}).get("MainPID") or 0)
+            except (TypeError, ValueError, OverflowError):
+                prior_clear_pid = 0
+            if not (prior_clear.get("runtime_verified") is True
+                    and prior_clear.get("running_mode") == mode
+                    and prior_clear_pid == live_pid):
+                return {"ok": False, "blocked_reason": "RUNTIME_CHANGED_BEFORE_GATE_CLEAR",
+                        "message": "Process changed; pending transition remains active"}
+            cleared = self.set_transition_gate(
+                False, change_id="OWNER-STOP-CANCELLED", target_mode=mode,
+                reason="Verified running service; Owner explicitly cancelled STOP",
+            )
+            if not cleared.ok:
+                return {"ok": False, "blocked_reason": "GATE_WRITE_FAILED",
+                        "message": "Owner intent staged but safety gate remains active"}
+            after = self.control_service("status", env_path=env_path)
+            try:
+                after_pid = int((after.get("systemd_properties") or {}).get("MainPID") or 0)
+            except (TypeError, ValueError, OverflowError):
+                after_pid = 0
+            if not (after.get("runtime_verified") is True
+                    and after.get("service_state") == "RUNNING"
+                    and after_pid == live_pid
+                    and after.get("running_mode") == mode
+                    and after.get("transition_gate", {}).get("active") is False
+                    and after.get("owner_intent", {}).get("deferred_stop_pending") is False):
+                # A restart outside our operation lock may have raced with
+                # the final readback. Reassert the same retryable owner gate.
+                restored = self.set_transition_gate(
+                    True, change_id="OWNER-STOP-PENDING", target_mode="STOPPED",
+                    reason="Owner STOP cancellation requires fresh runtime verification",
+                )
+                return {"ok": False, "blocked_reason": "POSTCONDITION_UNVERIFIED",
+                        "gate_restored": bool(restored.ok),
+                        "message": "Process identity changed; transition remains blocked for explicit retry"}
+            return {"ok": True, "cancelled": True, "runtime_verified": True,
+                    "service_state": "RUNNING", "running_mode": mode,
+                    "message": "Deferred Owner STOP cancelled; service process unchanged"}
 
     def control_service(
         self,

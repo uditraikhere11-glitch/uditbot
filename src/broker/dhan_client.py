@@ -3896,10 +3896,16 @@ class DhanClient:
             resp = self._get_with_auth_recovery(url)
             status_code = int(getattr(resp, "status_code", 0) or 0)
             if status_code != 200:
-                err_text = str(getattr(resp, "text", "") or "")
+                if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
+                    # Locally synthesized response; no GET reached Dhan.
+                    return BrokerReadFailure(
+                        status=BrokerReadStatus.UNAVAILABLE.value,
+                        error=f"LOCAL_DHAN_GET_DEFERRAL historical page {page}; no broker request sent",
+                        status_code=status_code,
+                    )
                 return BrokerReadFailure(
                     status=BrokerReadStatus.FAILED.value,
-                    error=f"Dhan historical trades {from_date}..{to_date} page {page} failed (HTTP {status_code}): {err_text}",
+                    error=f"BROKER_HTTP_{status_code} historical trades {from_date}..{to_date} page {page}",
                     status_code=status_code,
                 )
             try:
