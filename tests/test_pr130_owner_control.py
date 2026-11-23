@@ -279,5 +279,125 @@ class CancellationApiTests(unittest.TestCase):
                 self.assertEqual(response.json()["cancelled"], True)
                 action.assert_called_once()
 
+
+class ThreePositionServiceControlTests(unittest.TestCase):
+    """Exact parent/child IDs and retained owner lots; fake broker only."""
+
+    def test_vedpower_closed_yesbank_acks_preserved_during_service_preflight(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from src.config import AppConfig, TradingMode
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "data"
+            data.mkdir()
+            env = root / ".env"
+            env.write_text("TRADING_MODE=LIVE\nDHAN_CLIENT_ID=FAKE\n")
+            stop = data / "emergency_stop.json"
+            stop.write_text(json.dumps({"is_stopped": False, "in_flight_orders": []}))
+            path = str(data / "trade_journal.db")
+            JournalDB(path, account_id="FAKE")
+            parents = [
+                ("221261102657708", "YESBANK-EQ", "11915", 15.52, "UNPROTECTED_MANUAL_RISK"),
+                ("23126110439808", "YESBANK-EQ", "11915", 15.51, "UNPROTECTED_MANUAL_RISK"),
+                ("321261120279408", "VEDPOWER-EQ", "750518", 34.69, "POSITION_CLOSED"),
+            ]
+            with sqlite3.connect(path) as con:
+                for oid, symbol, security, price, state in parents:
+                    now = time.time()
+                    con.execute("""INSERT INTO order_intents (
+                        correlation_id,account_id,symbol,security_id,exchange_segment,product_type,
+                        order_type,price,quantity,state,broker_order_id,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (oid,"FAKE",symbol,security,"NSE_EQ","CNC","LIMIT",
+                         price,1,"TRADED",oid,now-86400,now))
+                    con.execute("""INSERT INTO orders (
+                        correlation_id,broker_order_id,trading_mode,product_type,exchange_segment,
+                        symbol,security_id,order_type,price,quantity,filled_quantity,status,
+                        created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (oid,oid,"LIVE","CNC","NSE_EQ",symbol,security,"LIMIT",price,1,
+                         1,"TRADED",now-86400,now))
+                    watcher = dict(order_id=oid,correlation_id=oid,state="TRADED",symbol=symbol,
+                        security_id=security,segment="NSE_EQ",product_type="CNC",
+                        filled_qty=1,protected_qty=0,position_state=state,
+                        exit_filled_qty=1 if state=="POSITION_CLOSED" else 0)
+                    con.execute("INSERT INTO watcher_orders VALUES (?,?,?,?)",
+                                (oid,1,json.dumps(watcher),now))
+                    con.execute("""INSERT INTO positions_lifecycle (
+                        parent_order_id,account_id,symbol,security_id,exchange_segment,
+                        product_type,protection_route,position_state,entry_qty,buy_filled_qty,
+                        sell_filled_qty,confirmed_open_qty,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (oid,"FAKE",symbol,security,"NSE_EQ","CNC",
+                         "FOREVER_OCO" if security=="750518" else "MANUAL",
+                         state,1,1,1 if security=="750518" else 0,
+                         0 if security=="750518" else 1,now))
+                    con.execute("""INSERT INTO fills (
+                        broker_order_id,exchange_trade_id,symbol,traded_price,traded_quantity,
+                        traded_at,transaction_type,security_id,exchange_segment,product_type,
+                        parent_order_id,is_verified_trade) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (oid,oid+"-BUY",symbol,price,1,now-86400,"BUY",
+                         security,"NSE_EQ","CNC",oid,1))
+                    if security=="11915":
+                        con.execute("""INSERT INTO manual_risk_acknowledgements (
+                            parent_order_id,correlation_id,account_id,symbol,security_id,quantity,
+                            acknowledged_by,reason,status,acknowledged_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (oid,oid,"FAKE",symbol,security,1,"owner","retain",
+                             "UNPROTECTED_MANUAL_RISK",now-3600))
+                con.execute("""INSERT INTO fills (
+                    broker_order_id,exchange_trade_id,symbol,traded_price,traded_quantity,
+                    traded_at,transaction_type,security_id,exchange_segment,product_type,
+                    parent_order_id,is_verified_trade) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ("32126112357408","600110497","VEDPOWER-EQ",35.06,1,time.time(),
+                     "SELL","750518","NSE_EQ","CNC","321261120279408",1))
+                con.execute("""INSERT INTO protection_orders (
+                    parent_order_id,forever_order_id,symbol,sl_trigger,sl_limit,target_price,
+                    quantity,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    ("321261120279408","23132611201560","VEDPOWER-EQ",
+                     34.34,33.99,35.04,1,"POSITION_CLOSED_LOCAL",time.time()))
+                before = con.execute("""SELECT parent_order_id,quantity,status
+                    FROM manual_risk_acknowledgements ORDER BY parent_order_id""").fetchall()
+
+            exchange_time=datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+            child=dict(orderId="32126112357408",algoId="23132611201560",
+                dhanClientId="FAKE",exchangeSegment="NSE_EQ",productType="CNC",
+                securityId="750518",transactionType="SELL",orderStatus="TRADED",
+                quantity=1,filledQty=1,remainingQuantity=0)
+            forever=dict(orderId="23132611201560",orderStatus="TRIGGERED",
+                legName="TARGET_LEG",orderType="OCO",quantity=1,price=35.04,
+                transactionType="SELL",dhanClientId="FAKE",exchangeSegment="NSE_EQ",
+                productType="CNC",securityId="750518")
+            trade=dict(orderId="32126112357408",exchangeTradeId="600110497",
+                dhanClientId="FAKE",securityId="750518",exchangeSegment="NSE_EQ",
+                productType="CNC",transactionType="SELL",tradedQuantity=1,
+                tradedPrice=35.06,exchangeTime=exchange_time)
+            broker=MagicMock()
+            broker.cfg=AppConfig(trading_mode=TradingMode.LIVE,dhan_client_id="FAKE",
+                                 data_dir=str(data))
+            broker.get_order_book.return_value=[child]
+            broker.get_forever_orders.return_value=[forever]
+            broker.get_super_orders.return_value=[]
+            broker.get_positions.return_value=[dict(dhanClientId="FAKE",securityId="750518",
+                exchangeSegment="NSE_EQ",productType="CNC",netQty=-1)]
+            broker.get_holdings.return_value=[dict(securityId="750518",
+                totalQty=1,availableQty=0,dpQty=0,t1Qty=0)]
+            broker.get_trade_book.return_value=[trade]
+            broker.order_status.return_value=None
+            tracker=ConfigChangeTracker(data_dir=str(data))
+            outcome=tracker.reconcile_stale_journal_with_broker(
+                db_path=path,broker=broker,env_path=str(env),is_live_mode=True,
+                is_service_running=True,stop_state_path=str(stop))
+            self.assertTrue(outcome[0], outcome)
+            with sqlite3.connect(path) as con:
+                after=con.execute("""SELECT parent_order_id,quantity,status
+                    FROM manual_risk_acknowledgements ORDER BY parent_order_id""").fetchall()
+                self.assertEqual(before,after)
+                remaining=con.execute("""SELECT confirmed_open_qty FROM positions_lifecycle
+                    WHERE parent_order_id='321261120279408'""").fetchone()
+                self.assertEqual(remaining[0],0)
+            broker.place_order.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
