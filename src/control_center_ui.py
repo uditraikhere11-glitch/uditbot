@@ -261,8 +261,8 @@ async function refreshStatus(){
     }
     $('start').disabled=!['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
     $('stop').disabled=state!=='RUNNING';
-    $('cancel-stop').hidden=s.owner_stop_pending!==true;
-    $('cancel-stop').disabled=s.owner_stop_pending!==true||!verifiedRunning;
+    $('cancel-stop').hidden=s.owner_stop_cancel_available!==true;
+    $('cancel-stop').disabled=s.owner_stop_cancel_available!==true||!verifiedRunning;
     $('restart').disabled=state!=='RUNNING'||s.runtime_verified!==true||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true||!ownerIntentSafe;
     $('equity-amo').checked=s.equity_amo_saved===true;
     $('equity-amo').disabled=s.equity_amo_can_edit!==true;
@@ -331,7 +331,7 @@ $('start').addEventListener('click',()=>serviceAction('start'));
 $('stop').addEventListener('click',()=>serviceAction('stop'));
 $('restart').addEventListener('click',()=>serviceAction('restart'));
 async function cancelOwnerStop(){
-  if(!current||current.owner_stop_pending!==true)return;
+  if(!current||current.owner_stop_cancel_available!==true)return;
   if(!confirm('Cancel the pending Owner STOP and keep the existing trading service running? This does not restart the bot.'))return;
   $('cancel-stop').disabled=true;
   setText('info','Verifying Owner STOP cancellation; no restart requested…');

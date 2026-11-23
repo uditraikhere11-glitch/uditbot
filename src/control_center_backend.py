@@ -75,6 +75,21 @@ def _owner_stop_pending(tracker: ConfigChangeTracker) -> bool:
     return bool(isinstance(rec, dict) and rec.get("deferred_stop_pending"))
 
 
+def _owner_stop_cancellation_available(control: dict, gate: dict) -> bool:
+    """Permit an explicit retry after owner-intent save but gate-clear failure."""
+    if not (isinstance(control, dict) and isinstance(gate, dict)):
+        return False
+    if not (gate.get('ok') is True and gate.get('active') is True
+            and gate.get('change_id') == 'OWNER-STOP-PENDING'
+            and gate.get('target_mode') == 'STOPPED'):
+        return False
+    if (control.get('desired_service_state') == 'STOPPED'
+            and control.get('deferred_stop_pending') is True):
+        return True
+    return (control.get('desired_service_state') == 'RUNNING'
+            and control.get('deferred_stop_pending') is False
+            and control.get('last_action') == 'OWNER_CANCEL_STOP')
+
 def _single_key_change(content: str, enabled: bool, key: str = _CONFIG_KEY) -> str:
     """Preserve bytes outside one existing .env assignment (newline-style inclusive).
 
@@ -327,6 +342,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
         **observed,
         "owner_intent_status": owner.status,
         "owner_stop_pending": bool(stopping),
+        "owner_stop_cancel_available": _owner_stop_cancellation_available(raw.get("owner_intent") or {}, gate),
         "mode_can_edit": bool(can_edit and owner.status == "PASS"),
         "service_state": state,
         "config_file_revision": _revision_for_control(absolute_env),

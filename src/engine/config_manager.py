@@ -4405,6 +4405,18 @@ class ConfigChangeTracker:
                     and recorded.get("last_action") == "OWNER_CANCEL_STOP"):
                 return {"ok": False, "blocked_reason": "OWNER_INTENT_WRITE_FAILED",
                         "message": "Cannot read back cancelled intent; transition remains active"}
+            # Revalidate the exact process before clearing the only remaining
+            # entry fence. Direct systemctl changes do not take this lock.
+            prior_clear = self.control_service("status", env_path=env_path)
+            try:
+                prior_clear_pid = int((prior_clear.get("systemd_properties") or {}).get("MainPID") or 0)
+            except (TypeError, ValueError, OverflowError):
+                prior_clear_pid = 0
+            if not (prior_clear.get("runtime_verified") is True
+                    and prior_clear.get("running_mode") == mode
+                    and prior_clear_pid == live_pid):
+                return {"ok": False, "blocked_reason": "RUNTIME_CHANGED_BEFORE_GATE_CLEAR",
+                        "message": "Process changed; pending transition remains active"}
             cleared = self.set_transition_gate(
                 False, change_id="OWNER-STOP-CANCELLED", target_mode=mode,
                 reason="Verified running service; Owner explicitly cancelled STOP",
@@ -4423,8 +4435,15 @@ class ConfigChangeTracker:
                     and after.get("running_mode") == mode
                     and after.get("transition_gate", {}).get("active") is False
                     and after.get("owner_intent", {}).get("deferred_stop_pending") is False):
+                # A restart outside our operation lock may have raced with
+                # the final readback. Reassert the same retryable owner gate.
+                restored = self.set_transition_gate(
+                    True, change_id="OWNER-STOP-PENDING", target_mode="STOPPED",
+                    reason="Owner STOP cancellation requires fresh runtime verification",
+                )
                 return {"ok": False, "blocked_reason": "POSTCONDITION_UNVERIFIED",
-                        "message": "Cancellation persisted but final service verification failed"}
+                        "gate_restored": bool(restored.ok),
+                        "message": "Process identity changed; transition remains blocked for explicit retry"}
             return {"ok": True, "cancelled": True, "runtime_verified": True,
                     "service_state": "RUNNING", "running_mode": mode,
                     "message": "Deferred Owner STOP cancelled; service process unchanged"}

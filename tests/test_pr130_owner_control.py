@@ -107,13 +107,43 @@ class CancelDeferredStopTests(unittest.TestCase):
         def status(action, **kwargs):
             count[0] += 1
             result = self.fake_status(action, **kwargs)
-            if count[0] >= 2:
+            if count[0] >= 3:
                 result["systemd_properties"] = {"MainPID": 10002}
             return result
         with patch.object(self.tracker, "control_service", side_effect=status):
             result = self.tracker.cancel_deferred_owner_stop()
         self.assertFalse(result["ok"])
         self.assertEqual(result["blocked_reason"], "POSTCONDITION_UNVERIFIED")
+        self.assertTrue(self.tracker.inspect_transition_gate_status()["active"])
+        self.assertTrue(owner_intent_blocks_new_entries(str(self.root)))
+
+    def test_pid_change_before_gate_clear_stays_blocked(self):
+        calls = [0]
+        def status(action, **kwargs):
+            calls[0] += 1
+            data = self.fake_status(action, **kwargs)
+            if calls[0] >= 2:
+                data["systemd_properties"] = {"MainPID": 10002}
+            return data
+        with patch.object(self.tracker, "control_service", side_effect=status):
+            result = self.tracker.cancel_deferred_owner_stop()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["blocked_reason"], "RUNTIME_CHANGED_BEFORE_GATE_CLEAR")
+        self.assertTrue(self.tracker.inspect_transition_gate_status()["active"])
+
+    def test_partial_cancel_is_recoverable_from_webui(self):
+        from src.control_center_backend import _owner_stop_cancellation_available
+        self.tracker.record_service_control_intent(
+            desired_service_state="RUNNING", last_action="OWNER_CANCEL_STOP",
+            reason="Partial cancellation", requested_mode="LIVE",
+            observed_state="RUNNING", deferred_stop_pending=False)
+        gate = self.tracker.inspect_transition_gate_status(read_only=True)
+        self.assertTrue(_owner_stop_cancellation_available(
+            self.tracker.get_service_control_record(), gate))
+        self.assertFalse(_owner_stop_cancellation_available(
+            self.tracker.get_service_control_record(), {
+                "ok": True, "active": True,
+                "change_id": "OTHER", "target_mode": "STOPPED"}))
 
     def test_refuses_unverified_pid_or_config(self):
         def unverified(action, **kwargs):
