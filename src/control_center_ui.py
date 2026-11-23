@@ -139,6 +139,7 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:17px;
     <button id="start" class="btn-start" type="button" disabled>▶ Start</button>
     <button id="stop" class="btn-stop" type="button" disabled>■ Stop</button>
     <button id="restart" type="button" disabled>⟳ Restart</button>
+    <button id="cancel-stop" type="button" hidden disabled>Cancel Pending STOP / Keep Running</button>
   </div>
   <div id="info" class="status-note" role="status" aria-live="polite">Read-only status is loading. No action has been taken.</div>
 
@@ -260,6 +261,8 @@ async function refreshStatus(){
     }
     $('start').disabled=!['STOPPED_BY_OWNER','STOPPED_OTHER','FAILED'].includes(state)||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true;
     $('stop').disabled=state!=='RUNNING';
+    $('cancel-stop').hidden=!(state==='RUNNING'&&s.owner_stop_pending===true);
+    $('cancel-stop').disabled=!(state==='RUNNING'&&s.owner_stop_pending===true&&s.runtime_verified===true);
     $('restart').disabled=state!=='RUNNING'||s.runtime_verified!==true||s.transition_gate_active===true||s.tracker_v2_apply_blocked===true||!ownerIntentSafe;
     $('equity-amo').checked=s.equity_amo_saved===true;
     $('equity-amo').disabled=s.equity_amo_can_edit!==true;
@@ -286,6 +289,7 @@ async function refreshStatus(){
     }
     setText('info',s.warning||('Service: '+state+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
   }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;
+    $('cancel-stop').disabled=true;$('cancel-stop').hidden=true;
     $('v17p-service-card').classList.remove('verified');$('v17p-mode-card').classList.remove('verified');
     $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active');$('service').classList.remove('v17p-verified-running');
     $('v17p-mode-live').classList.remove('selected');$('v17p-mode-test').classList.remove('selected');
@@ -314,7 +318,7 @@ async function serviceAction(action){
     if(r.requires_live_confirmation){
       resultMessage='LIVE action requires explicit confirmation; no action performed.';
     }else if(r.deferred===true){
-      resultMessage='Stop deferred: '+(r.message||r.blocked_reason||'live order safety gate');
+      resultMessage=action.charAt(0).toUpperCase()+action.slice(1)+' deferred: '+(r.message||r.blocked_reason||'live order safety gate');
     }
   }catch(err){resultMessage='Action was not verified: '+err.message}
   // Always reacquire the authoritative state, including rejected/confirmation
@@ -327,6 +331,20 @@ async function serviceAction(action){
 $('start').addEventListener('click',()=>serviceAction('start'));
 $('stop').addEventListener('click',()=>serviceAction('stop'));
 $('restart').addEventListener('click',()=>serviceAction('restart'));
+$('cancel-stop').addEventListener('click',async()=>{
+  if(!current||current.service_state!=='RUNNING'||current.owner_stop_pending!==true)return;
+  if(!confirm('Cancel the pending Owner STOP and keep the verified trading service RUNNING?'))return;
+  $('cancel-stop').disabled=true;setText('info','Verifying Owner STOP cancellation…');
+  let msg='';
+  try{
+    const r=await requestJSON('/control/owner-stop/cancel',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({csrf_token:csrf,confirm:true})});
+    msg=r.message||'Cancellation result unverified';
+  }catch(err){msg='Cancellation was not verified: '+err.message;}
+  await refreshStatus();
+  if(current)setText('info',msg);
+});
 async function changeMode(mode){
   if(!current||current.mode_can_edit!==true||current.tracker_v2_apply_blocked===true)return;
   if(safeStatus(current.saved_mode)===mode)return;

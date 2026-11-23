@@ -4163,7 +4163,7 @@ class ConfigChangeTracker:
         Historical settings work remains on disk but is NEVER executed.
         The monitor rechecks the full broker/journal safety gate before stop.
         """
-        interval = poll_interval_sec if poll_interval_sec is not None else (0.03 if is_isolated_test_environment() else 0.5)
+        interval = poll_interval_sec if poll_interval_sec is not None else (0.03 if is_isolated_test_environment() else 30.0)
         abs_env = os.path.abspath(env_path)
         abs_stop = os.path.abspath(stop_state_path or os.path.join(self.data_dir, "emergency_stop.json"))
         abs_db = os.path.abspath(db_path or os.path.join(self.data_dir, "trade_journal.db"))
@@ -4284,6 +4284,103 @@ class ConfigChangeTracker:
                 return False, last_state, last_detail
             time.sleep(poll_interval)
 
+    def cancel_deferred_owner_stop(self, env_path: str = ".env") -> Dict[str, Any]:
+        """Explicit owner cancellation: no systemctl, broker call or order mutation.
+
+        The owner RUNNING record is committed before retiring the matching
+        OWNER-STOP-PENDING gate; the entry fence stays closed across the crash
+        boundary. An interrupted cancellation may be retried explicitly.
+        """
+        with self.operation_lock(
+            operation_type="OWNER_CANCEL_STOP", operation_id="OWNER-STOP-CANCELLED"
+        ):
+            status = self.control_service(action="status", env_path=env_path)
+            props = status.get("systemd_properties") or {}
+            pid = int(props.get("MainPID") or 0)
+            mode = str(status.get("saved_mode") or "").upper()
+            if not (status.get("service_state") == "RUNNING"
+                    and status.get("runtime_verified") is True
+                    and pid > 0 and mode in ("LIVE", "TEST")):
+                return {"ok": False, "error": "Active PID/configuration could not be verified"}
+
+            gate = status.get("transition_gate") or {}
+            owner = status.get("owner_intent") or {}
+            exact_gate = (gate.get("active") is True
+                          and gate.get("change_id") == "OWNER-STOP-PENDING"
+                          and gate.get("target_mode") == "STOPPED")
+            pending = (owner.get("desired_service_state") == "STOPPED"
+                       and owner.get("observed_state") == "RUNNING"
+                       and owner.get("deferred_stop_pending") is True
+                       and owner.get("last_action") == "OWNER_STOP")
+            resuming = (owner.get("desired_service_state") == "RUNNING"
+                        and owner.get("observed_state") == "RUNNING"
+                        and owner.get("deferred_stop_pending") is False
+                        and owner.get("last_action") == "OWNER_CANCEL_STOP")
+            if not exact_gate or not (pending or resuming):
+                return {"ok": False, "error": "Owner STOP changed; cancellation refused"}
+            if (self.has_unresolved_pending_operation()
+                    or os.path.exists(self.deferred_env_file)
+                    or os.path.exists(self.deferred_meta_file)):
+                return {"ok": False, "error": "Another configuration operation is pending"}
+
+            from src.engine.runtime_evidence import read_private_json
+            try:
+                tx = read_private_json(
+                    os.path.join(self.data_dir, "config_restart_v2", "current_transaction.json"),
+                    missing_ok=True,
+                )
+                barrier = read_private_json(
+                    os.path.join(self.data_dir, "config_restart_v2", "apply_barrier.json"),
+                    missing_ok=True,
+                )
+                if (tx is not None and tx.get("phase") not in (
+                        "VERIFIED", "SAVED_FOR_NEXT_START", "NO_CHANGE")):
+                    raise ValueError("unfinished restart transaction")
+                if barrier is not None and barrier.get("active") is not False:
+                    raise ValueError("unresolved restart barrier")
+            except (OSError, ValueError, TypeError):
+                return {"ok": False, "error": "Restart evidence unresolved"}
+
+            if pending:
+                self.record_service_control_intent(
+                    desired_service_state="RUNNING",
+                    last_action="OWNER_CANCEL_STOP",
+                    reason="Owner explicitly cancelled pending Stop; running PID verified",
+                    requested_mode=mode,
+                    observed_state="RUNNING",
+                    deferred_stop_pending=False,
+                    stop_ready_to_apply=False,
+                )
+            committed = self.get_service_control_record()
+            if (committed.get("desired_service_state") != "RUNNING"
+                    or committed.get("observed_state") != "RUNNING"
+                    or committed.get("deferred_stop_pending") is not False
+                    or committed.get("last_action") != "OWNER_CANCEL_STOP"):
+                return {"ok": False, "error": "Owner intent persistence failed; gate unchanged"}
+            result = self.set_transition_gate(
+                active=False, change_id="OWNER-STOP-CANCELLED",
+                target_mode=mode,
+                reason="Owner explicitly cancelled pending STOP after runtime verification",
+            )
+            if not result.ok:
+                return {"ok": False, "error": "Transition gate write failed; entries remain fenced"}
+
+            after = self.control_service(action="status", env_path=env_path)
+            new_pid = int((after.get("systemd_properties") or {}).get("MainPID") or 0)
+            new_owner = after.get("owner_intent") or {}
+            if not (after.get("service_state") == "RUNNING"
+                    and after.get("runtime_verified") is True and new_pid == pid
+                    and new_owner.get("desired_service_state") == "RUNNING"
+                    and new_owner.get("deferred_stop_pending") is False
+                    and (after.get("transition_gate") or {}).get("active") is False
+                    and (after.get("transition_gate") or {}).get("ok") is True):
+                return {"ok": False, "error": "Cancellation readback mismatch; manual review required"}
+            return {
+                "ok": True, "message": "Pending Owner STOP cancelled; service remains RUNNING",
+                "service_state": "RUNNING", "runtime_verified": True,
+                "restart_performed": False,
+            }
+
     def control_service(
         self,
         action: str,
@@ -4351,6 +4448,11 @@ class ConfigChangeTracker:
             }
 
         with self.operation_lock(operation_type=f"SERVICE_{act_clean.upper()}", operation_id=f"SVC-{act_clean.upper()}"):
+            if act_clean in ("start", "restart"):
+                ctrl = self.get_service_control_record()
+                if ctrl.get("desired_service_state") == "STOPPED" or ctrl.get("deferred_stop_pending") is True:
+                    return {"ok": False, "action": act_clean, "blocked_reason": "OWNER_STOP_PENDING",
+                            "message": "Pending Owner STOP must be explicitly cancelled before Start/Restart"}
             # Retired configuration histories are immutable. START/RESTART
             # cannot replay or supersede an already-issued uncertain restart.
             # Owner STOP retains precedence and remains independently usable.
