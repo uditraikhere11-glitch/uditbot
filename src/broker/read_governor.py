@@ -335,9 +335,16 @@ class ReadGovernor:
         def _op(conn):
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute('SELECT until,strikes FROM category_cooldown WHERE category=?',(cat,)).fetchone()
-            strikes = min((int(row[1]) if row and row[1] is not None else 0)+1,7)
+            previous_strikes = int(row[1]) if row and row[1] is not None else 0
             existing = float(row[0]) if row and row[0] is not None else 0.
-            until = max(existing,now+max(60*2**(strikes-1),delay or 0))
+            if existing > now:
+                # Concurrent 429 responses belong to the same cooldown window.
+                # Respect a longer Retry-After without escalating strikes again.
+                strikes = previous_strikes
+                until = max(existing, now + (delay or 0))
+            else:
+                strikes = min(previous_strikes + 1, 7)
+                until = max(existing, now + max(60 * 2**(strikes - 1), delay or 0))
             conn.execute('INSERT OR REPLACE INTO category_cooldown(category,until,strikes) VALUES (?,?,?)',
                          (cat,until,strikes))
             return until-now
