@@ -4226,6 +4226,7 @@ class ConfigChangeTracker:
 
             def _daemon_loop():
                 last_broker_stop_probe = 0.0
+                last_ready = False
                 while not stop_ev.is_set():
                     if not os.path.exists(self.data_dir):
                         break
@@ -4237,7 +4238,12 @@ class ConfigChangeTracker:
                             # Watcher readiness explicitly wakes an early check.
                             ready = self.get_service_control_record().get("stop_ready_to_apply") is True
                             now_probe = time.monotonic()
-                            if ready or now_probe - last_broker_stop_probe >= 30.0:
+                            # A persistent ready=True must not re-trigger
+                            # every 0.5s. Only its rising edge wakes one early
+                            # probe; later attempts obey the normal backoff.
+                            became_ready = ready and not last_ready
+                            last_ready = ready
+                            if became_ready or now_probe - last_broker_stop_probe >= 30.0:
                                 last_broker_stop_probe = now_probe
                                 self.run_control_coordinator_tick(
                                     env_path=c_now.get("env_path", abs_env),
