@@ -242,6 +242,186 @@ def _extract_leg_order_ids(row: dict) -> Set[str]:
     return ids
 
 
+def parse_verified_broker_trade(
+    row: Any,
+    *,
+    expected_account_id: str,
+    expected_security_id: str,
+    expected_segment: str,
+    expected_product_type: str,
+    expected_side: Optional[str] = None,
+) -> Dict[str, Any]:
+    """C6: Single normalized execution-evidence parser shared by watcher and reconciler.
+
+    Enforces exact account (when expected_account_id is set), contract (securityId,
+    exchangeSegment, productType), non-empty orderId and exchangeTradeId, side in
+    ('BUY', 'SELL'), strict positive integer tradedQuantity (rejecting float/bool),
+    strict positive finite tradedPrice, and valid exchange timestamp when present.
+    """
+    if not isinstance(row, dict):
+        raise ReconciliationEvidenceError("Malformed non-dict broker trade row")
+    acct = str(row.get("dhanClientId") or row.get("clientId") or "").strip()
+    exp_acct = str(expected_account_id or "").strip()
+    if exp_acct and acct != exp_acct:
+        raise ReconciliationEvidenceError("Broker trade account missing or mismatch")
+
+    sec = str(row.get("securityId") or "").strip()
+    seg = str(row.get("exchangeSegment") or "").strip().upper()
+    prod = str(row.get("productType") or "").strip().upper()
+    if not sec or not seg or not prod:
+        raise ReconciliationEvidenceError("Broker trade missing contract identity")
+    if (
+        sec.upper() != str(expected_security_id or "").strip().upper()
+        or seg != str(expected_segment or "").strip().upper()
+        or prod != str(expected_product_type or "").strip().upper()
+    ):
+        raise ReconciliationEvidenceError("Broker trade contract mismatch")
+
+    side = str(row.get("transactionType") or "").strip().upper()
+    if side not in ("BUY", "SELL"):
+        raise ReconciliationEvidenceError("Broker trade invalid transactionType")
+    if expected_side and side != str(expected_side).strip().upper():
+        raise ReconciliationEvidenceError("Broker trade side mismatch")
+
+    oid = str(row.get("orderId") or "").strip()
+    if not oid:
+        raise ReconciliationEvidenceError("Broker trade missing orderId")
+
+    etid = str(row.get("exchangeTradeId") or "").strip()
+    if not etid or etid.upper() in ("0", "NONE", "NULL"):
+        raise ReconciliationEvidenceError("Broker trade missing exchangeTradeId")
+
+    qty = _integer(row.get("tradedQuantity"), positive=True)
+    price = _price(row.get("tradedPrice"))
+
+    when_ts: Optional[float] = None
+    raw_time = next(
+        (row.get(k) for k in ("exchangeTime", "updateTime", "createTime") if str(row.get(k) or "").strip()),
+        None,
+    )
+    if raw_time is not None:
+        when_ts = _exchange_time(raw_time)
+
+    return {
+        "oid": oid,
+        "eid": etid,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "when": when_ts,
+        "account": acct,
+        "security_id": sec,
+        "segment": seg,
+        "product": prod,
+    }
+
+
+def validate_forever_oco_child_orders(
+    *,
+    forever_order_id: str,
+    expected_leg_qty: int,
+    key: tuple,
+    account: str,
+    orders: Optional[List[dict]],
+    sell_fill_qty_by_oid: Dict[str, int],
+) -> Set[str]:
+    """Shared fail-closed validator for Dhan Forever OCO spawned child SELL orders.
+
+    Used identically by `unified_exit_reconciliation._verify_protective_orders_safe`
+    and `protection_watcher.ProtectionWatcher.supervise_open_positions`.
+
+    Enforces:
+    - Exact `algoId == forever_order_id`, `transactionType == 'SELL'`, contract `(sec, seg, prod)`,
+      and `dhanClientId == account` (when present).
+    - No non-terminal child orders for `forever_order_id`.
+    - Every `TRADED` child order has positive `quantity`, positive `filledQty == quantity`,
+      and `remainingQuantity == 0` (rejecting contradictory broker rows).
+    - Every `TRADED` child order individually matches its own verified SELL fill quantity
+      in `sell_fill_qty_by_oid` (rejecting extra uncorroborated `TRADED` child orders).
+    - Non-`TRADED` terminal children (`CANCELLED`/`REJECTED`/`EXPIRED`) have zero filledQty
+      and zero attributed SELL fills.
+    - Total requested quantity, total `filledQty`, and total verified SELL fills across all
+      `TRADED` children each equal `expected_leg_qty`.
+    """
+    gid = str(forever_order_id or "").strip()
+    if not gid or not isinstance(orders, list):
+        raise ReconciliationEvidenceError(
+            f"Forever TRIGGERED protective leg ({gid}) lacks broker orderbook evidence"
+        )
+    leg_qty = _integer(expected_leg_qty, positive=True)
+
+    seen_child_oids: Set[str] = set()
+    traded_children: List[Tuple[str, int, int]] = []  # (child_oid, req_qty, filled_qty)
+
+    for ob in orders:
+        if not isinstance(ob, dict):
+            continue
+        if str(ob.get("algoId") or "").strip() != gid:
+            continue
+        child_oid = str(ob.get("orderId") or "").strip()
+        if not child_oid:
+            raise ReconciliationEvidenceError("Forever child order missing orderId")
+        if child_oid in seen_child_oids:
+            raise ReconciliationEvidenceError(f"Duplicate Forever child order {child_oid}")
+        seen_child_oids.add(child_oid)
+
+        if str(ob.get("securityId") or "").strip().upper() != key[0]:
+            raise ReconciliationEvidenceError("Forever child order security mismatch")
+        if not ob.get("exchangeSegment") or not ob.get("productType") or _identity(ob) != key:
+            raise ReconciliationEvidenceError("Forever child order contract mismatch")
+        ob_acct = str(ob.get("dhanClientId") or "").strip()
+        if account and ob_acct != account:
+            raise ReconciliationEvidenceError("Forever child order account missing or mismatch")
+        if str(ob.get("transactionType") or "").strip().upper() != "SELL":
+            raise ReconciliationEvidenceError("Forever child order side mismatch")
+
+        ob_st = str(ob.get("orderStatus") or "").strip().upper()
+        if ob_st not in _FINISHED:
+            raise ReconciliationEvidenceError("Outstanding or ambiguous protective order requires verification")
+
+        if ob_st == "TRADED":
+            ob_req = _integer(ob.get("quantity"), positive=True)
+            ob_filled = _integer(ob.get("filledQty"), positive=True)
+            ob_rem = _integer(ob.get("remainingQuantity"), positive=False)
+            if ob_rem != 0:
+                raise ReconciliationEvidenceError(
+                    f"Forever child order {child_oid} reports remainingQuantity={ob_rem} despite TRADED status"
+                )
+            if ob_filled != ob_req:
+                raise ReconciliationEvidenceError(
+                    f"Forever child order {child_oid} filledQty ({ob_filled}) != requested quantity ({ob_req})"
+                )
+            child_fill_qty = int(sell_fill_qty_by_oid.get(child_oid, 0))
+            if child_fill_qty != ob_filled:
+                raise ReconciliationEvidenceError(
+                    f"Forever child order {child_oid} TRADED filledQty ({ob_filled}) != verified SELL fills ({child_fill_qty})"
+                )
+            traded_children.append((child_oid, ob_req, ob_filled))
+        else:
+            raw_filled = ob.get("filledQty")
+            if raw_filled is None and ob_st == "REJECTED":
+                non_traded_filled = 0
+            else:
+                non_traded_filled = _integer(raw_filled, positive=False)
+            if non_traded_filled != 0 or int(sell_fill_qty_by_oid.get(child_oid, 0)) != 0:
+                raise ReconciliationEvidenceError(
+                    f"Non-TRADED Forever child order {child_oid} ({ob_st}) contradicts observed execution"
+                )
+
+    if not traded_children:
+        raise ReconciliationEvidenceError(
+            f"Forever TRIGGERED protective leg ({gid}) has no TRADED algoId-linked child SELL order"
+        )
+
+    total_req = sum(req for _, req, _ in traded_children)
+    total_filled = sum(filled for _, _, filled in traded_children)
+    if total_req != leg_qty or total_filled != leg_qty:
+        raise ReconciliationEvidenceError(
+            f"Forever child order quantity mismatch for {gid}: leg_qty={leg_qty}, req={total_req}, filled={total_filled}"
+        )
+    return {cid for cid, _, _ in traded_children}
+
+
 def _verify_protective_orders_safe(
     *,
     forever: List[dict],
@@ -249,6 +429,7 @@ def _verify_protective_orders_safe(
     key: tuple,
     account: str,
     broker_evidence: Dict[str, dict],
+    orders: Optional[List[dict]] = None,
 ) -> Set[str]:
     """UREC-005, P0-4 & P1-5: Schema-aware, order-ID-bound verification of protective orders.
 
@@ -289,14 +470,59 @@ def _verify_protective_orders_safe(
             and str(r.get("securityId") or "").strip().upper() == key[0]
         ]
         traded_legs = [r for r in all_grp if str(r.get("orderStatus") or "").upper() == "TRADED"]
+        triggered_legs = [r for r in all_grp if str(r.get("orderStatus") or "").upper() == "TRIGGERED"]
         non_closed_non_traded = [
             r for r in all_grp
             if str(r.get("orderStatus") or "").upper() not in (_CLOSED | {"TRADED"})
         ]
-        if non_closed_non_traded or not traded_legs or len(traded_legs) > 1:
+        is_oco = _classify_forever_group_is_oco(all_grp)
+
+        # Live Dhan Forever OCO execution schema: /v2/forever/all keeps the triggered leg as
+        # orderStatus="TRIGGERED" (often omitting the cancelled sibling leg), while /v2/orders
+        # spawns a child SELL order linked via algoId == gid with orderStatus="TRADED".
+        if non_closed_non_traded:
+            non_closed_non_triggered = [
+                r for r in all_grp
+                if str(r.get("orderStatus") or "").upper() not in (_CLOSED | {"TRIGGERED"})
+            ]
+            if (
+                not isinstance(orders, list)
+                or non_closed_non_triggered
+                or len(triggered_legs) != 1
+                or traded_legs
+            ):
+                raise ReconciliationEvidenceError("Outstanding or ambiguous protective order requires verification")
+            trig_leg = triggered_legs[0]
+            if is_oco:
+                trig_leg_name = str(trig_leg.get("legName") or "").strip().upper()
+                if trig_leg_name not in ("TARGET_LEG", "STOP_LOSS_LEG") or {_identity(r) for r in all_grp} != {key}:
+                    raise ReconciliationEvidenceError("Outstanding or ambiguous protective order requires verification")
+                seen_trig_legs: Set[str] = set()
+                for r in all_grp:
+                    ln = str(r.get("legName") or "").strip().upper()
+                    if ln:
+                        if ln in seen_trig_legs:
+                            raise ReconciliationEvidenceError("Duplicate or conflicting Forever OCO leg identity")
+                        seen_trig_legs.add(ln)
+            leg_qty = _integer(trig_leg.get("quantity"), positive=True)
+            sell_fill_qty_by_oid: Dict[str, int] = {}
+            for v in broker_evidence.values():
+                if v.get("side") == "SELL" and v.get("oid"):
+                    v_oid = str(v["oid"]).strip()
+                    sell_fill_qty_by_oid[v_oid] = sell_fill_qty_by_oid.get(v_oid, 0) + int(v["qty"])
+            validate_forever_oco_child_orders(
+                forever_order_id=gid,
+                expected_leg_qty=leg_qty,
+                key=key,
+                account=account,
+                orders=orders,
+                sell_fill_qty_by_oid=sell_fill_qty_by_oid,
+            )
+            continue
+
+        if not traded_legs or len(traded_legs) > 1:
             raise ReconciliationEvidenceError("Outstanding or ambiguous protective order requires verification")
 
-        is_oco = _classify_forever_group_is_oco(all_grp)
         if is_oco:
             if (len(all_grp) != 2 or {_identity(r) for r in all_grp} != {key}
                     or {r.get("legName") for r in all_grp} != {"TARGET_LEG", "STOP_LOSS_LEG"}):
@@ -313,6 +539,25 @@ def _verify_protective_orders_safe(
 
         traded_leg = traded_legs[0]
         leg_qty = _integer(traded_leg.get("quantity"), positive=True)
+        has_algo_children = isinstance(orders, list) and any(
+            isinstance(ob, dict) and str(ob.get("algoId") or "").strip() == gid
+            for ob in orders
+        )
+        if has_algo_children:
+            sell_fill_qty_by_oid_t: Dict[str, int] = {}
+            for v in broker_evidence.values():
+                if v.get("side") == "SELL" and v.get("oid"):
+                    v_oid = str(v["oid"]).strip()
+                    sell_fill_qty_by_oid_t[v_oid] = sell_fill_qty_by_oid_t.get(v_oid, 0) + int(v["qty"])
+            validate_forever_oco_child_orders(
+                forever_order_id=gid,
+                expected_leg_qty=leg_qty,
+                key=key,
+                account=account,
+                orders=orders,
+                sell_fill_qty_by_oid=sell_fill_qty_by_oid_t,
+            )
+            continue
         allowed_oids = _extract_leg_order_ids(traded_leg)
         matched_sell_qty = sum(
             v["qty"]
@@ -504,7 +749,7 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
     _verify_protective_orders_safe(
         forever=_read(read_required, "get_forever_orders", "Forever orders"),
         super_orders=_read(read_required, "get_super_orders", "Super orders"),
-        key=key, account=account, broker_evidence=evidence)
+        key=key, account=account, broker_evidence=evidence, orders=orders)
     return _signed_cnc_delivery_sell_reconciles(
         positions=positions, holdings=holdings, key=key, account=account, projected=open_qty, broker_evidence=evidence)
 
@@ -796,7 +1041,8 @@ def reconcile_verified_exits(
                     fill = _broker_trade(row, account, key, "SELL")
                     proof[fill["eid"]] = dict(fill, side="SELL")
             _verify_protective_orders_safe(forever=forever, super_orders=super_orders,
-                                          key=key, account=account, broker_evidence=proof)
+                                          key=key, account=account, broker_evidence=proof,
+                                          orders=order_book)
             if any(str(row.get("securityId")) == key[0] and row.get("orderStatus") not in _FINISHED
                    for row in order_book):
                 raise ReconciliationEvidenceError("Outstanding broker order during exit recovery")
@@ -1068,6 +1314,7 @@ def reconcile_verified_exits(
             key=key,
             account=account,
             broker_evidence={**closed_proof, **broker_evidence},
+            orders=order_book,
         )
 
         shared_ids = parent_oids & {str(r["broker_order_id"]) for r in exits_for_contract}

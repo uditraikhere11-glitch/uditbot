@@ -55,7 +55,14 @@ from src.engine.settled_owner_read_policy import (
     may_omit_protected_prior_day_buy_trade_read,
     durably_identified_prior_day_protected_buy,
 )
-from src.engine.holding_quantity import observed_open_quantity
+from src.engine.holding_quantity import aggregate_holdings, observed_open_quantity
+from src.engine.unified_exit_reconciliation import (
+    ReconciliationEvidenceError,
+    _integer as _strict_integer,
+    _price as _strict_price,
+    parse_verified_broker_trade,
+    validate_forever_oco_child_orders,
+)
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
 from src.journal.db import RejectedProtectionNeedsReview, generate_correlation_id
@@ -1030,6 +1037,7 @@ class ProtectionWatcher:
                 }
                 self._hydrate_loaded_record_defaults(rec, is_term=(fill_q >= req_q))
 
+            prev_position_state = str(rec.get("position_state") or "").strip().upper()
             rec["order_id"] = oid
             rec["correlation_id"] = cid
             rec["symbol"] = str(symbol or rec.get("symbol") or "")
@@ -1104,7 +1112,52 @@ class ProtectionWatcher:
                 if ((pending.get(oid), terminal.get(oid)) != (self.pending.get(oid), self.terminal_orders.get(oid))
                         or (disk_pending.get(oid), disk_terminal.get(oid)) != (pending.get(oid), terminal.get(oid))):
                     raise RuntimeError("Verified exit watcher readback failed")
-            return dict(rec)
+            emit_closed_event = (
+                closed_q > 0
+                and open_q == 0
+                and rec.get("position_state") == PositionLifecycleState.POSITION_CLOSED.value
+                and not rec.get("position_closed_notified", False)
+            )
+            closed_snapshot = dict(rec)
+
+        if emit_closed_event:
+            if self.journal_db and hasattr(self.journal_db, "mark_protection_orders_closed"):
+                try:
+                    self.journal_db.mark_protection_orders_closed(oid, status="POSITION_CLOSED_LOCAL")
+                except Exception as prot_err:
+                    logger.error(
+                        "[Protection] Failed to mark local protection_orders closed for %s: %s",
+                        oid, prot_err,
+                    )
+            notified_ok = False
+            if self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
+                try:
+                    self.execution_reporter.process_exit_event(
+                        closed_snapshot,
+                        "POSITION_CLOSED",
+                        observed_at=ts,
+                        triggered_leg=str(closed_snapshot.get("triggered_leg") or ""),
+                        sell_qty=closed_q,
+                        buy_vwap=float(closed_snapshot.get("buy_vwap") or avg_fill_price or 0.0),
+                        sell_vwap=float(closed_snapshot.get("exit_vwap") or verified_sell_vwap or 0.0),
+                        realized_pnl=float(closed_snapshot.get("realized_pnl") or verified_realized_pnl or 0.0),
+                    )
+                    notified_ok = True
+                except Exception as notif_err:
+                    logger.error(
+                        "[Protection] POSITION_CLOSED notification failed for %s; will retry on next pass: %s",
+                        oid, notif_err,
+                    )
+            else:
+                notified_ok = True
+            if notified_ok:
+                with self._lock:
+                    target_rec = self.terminal_orders.get(oid) or self.pending.get(oid)
+                    if isinstance(target_rec, dict):
+                        target_rec["position_closed_notified"] = True
+                        closed_snapshot["position_closed_notified"] = True
+                        self._save()
+        return closed_snapshot
 
     def check_once(self) -> bool:
         with self._pass_lock:
@@ -3443,6 +3496,12 @@ class ProtectionWatcher:
         forever_book = [] if native_amo_only else _safe_list_call("get_forever_orders")
         trade_book = _safe_list_call("get_trade_book")
         positions_book = _safe_list_call("get_positions")
+        order_book: Optional[List[Dict[str, Any]]] = (
+            list(gate_books["get_order_book"])
+            if (gate_books is not None and gate_books.get("share") and "get_order_book" in gate_books)
+            else None
+        )
+        order_book_loaded = order_book is not None
         needs_holdings = any(
             str(r.get("product_type") or "").upper() in ("CNC", "MTF") for r in open_recs
         )
@@ -3486,25 +3545,168 @@ class ProtectionWatcher:
         terminal_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "CLOSED", "TRADED"}
         dead_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
 
-        # Precompute all verified leg order IDs across all tracked bot orders to detect cross-order collisions
-        all_bot_leg_owners: Dict[str, str] = {}
         with self._lock:
             all_known_recs = list(self.pending.values()) + list(self.terminal_orders.values())
+
+        # A Forever OCO ID is a *group*, not an exchange SELL order ID.  A
+        # historical aggregate group can legitimately protect two old BUY lots.
+        # Admit shared GROUP coverage only for a fresh, wholly resting OCO
+        # whose quantity matches the entire same-account contract exposure.
+        # An exchange child (or triggered/part-filled/ambiguous group) NEVER
+        # shares parent ownership: those executions require independent journal
+        # allocation and keep the entry gate fail-closed until reconciled.
+        broker_forever_group_ids = {
+            str(r.get("orderId") or "").strip()
+            for r in forever_book or [] if isinstance(r, dict) and r.get("orderId")
+        }
+        eligible_shared_forever_ids: Set[str] = set()
+        if snapshot_complete and isinstance(forever_book, list) and isinstance(trade_book, list):
+            claims: Dict[str, List[dict]] = {}
+            for shared_rec in open_recs:
+                if self._resolve_protection_route(shared_rec) != ProtectionRoute.FOREVER_OCO.value:
+                    continue
+                for group_id in set(str(x or "").strip()
+                                    for x in (shared_rec.get("confirmed_protection_ids") or [])):
+                    if group_id:
+                        claims.setdefault(group_id, []).append(shared_rec)
+            for group_id, owners in claims.items():
+                owner_ids = {str(r.get("order_id") or "") for r in owners}
+                if len(owners) < 2 or len(owner_ids) != len(owners):
+                    continue
+                # Closed or stale other-owner claims invalidate reuse of an
+                # aggregate group. A group must not hide ownership conflicts.
+                all_claimants = {
+                    str(r.get("order_id") or "")
+                    for r in all_known_recs if isinstance(r, dict)
+                    and (
+                        group_id in {str(x or "").strip() for x in (r.get("confirmed_protection_ids") or [])}
+                        or group_id in {str(r.get(k) or "").strip() for k in ("forever_order_id", "oco_order_id")}
+                        or group_id in {str(x or "").strip() for x in (r.get("verified_leg_order_ids") or [])}
+                    )
+                }
+                if all_claimants != owner_ids:
+                    continue
+                reference = owners[0]
+                security = str(reference.get("security_id") or "").strip()
+                segment = str(reference.get("segment") or "NSE_EQ").strip().upper()
+                product = str(reference.get("product_type") or "CNC").strip().upper()
+                account = str(getattr(self.journal_db, "account_id", "") or getattr(
+                    getattr(self.broker, "cfg", None), "dhan_client_id", "") or "").strip()
+                if not security or not account or product not in ("CNC", "MTF"):
+                    continue
+                same_contract = [
+                    r for r in open_recs
+                    if str(r.get("security_id") or "").strip() == security
+                    and str(r.get("segment") or "NSE_EQ").strip().upper() == segment
+                    and str(r.get("product_type") or "CNC").strip().upper() == product
+                ]
+                if len(same_contract) != len(owners) or any(r not in owners for r in same_contract):
+                    continue
+                if any(
+                    str(r.get("position_state") or "").upper() != PositionLifecycleState.PROTECTED.value
+                    or int(r.get("filled_qty") or 0) <= 0
+                    or int(r.get("exit_filled_qty") or 0) != 0
+                    or int(r.get("protected_qty") or 0) < int(r.get("filled_qty") or 0)
+                    or set(str(x or "").strip() for x in (r.get("confirmed_protection_ids") or [])) != {group_id}
+                    or (r.get("account_id") and str(r["account_id"]).strip() != account)
+                    or any(r.get(flag) for flag in (
+                        "manual_exit_detected", "external_unlinked_sell_observed", "unverified_trade_detected",
+                        "reconciliation_required", "persistence_uncertain", "orphaned_legs_detected",
+                        "uncommitted_broker_sell_trades", "pending_oco"))
+                    for r in owners
+                ):
+                    continue
+                if any(
+                    isinstance(t, dict) and str(t.get("securityId") or "").strip() == security
+                    for t in trade_book
+                ):
+                    continue
+                group_rows = [r for r in forever_book if isinstance(r, dict)
+                              and str(r.get("orderId") or "").strip() == group_id]
+                if (len(group_rows) != 2
+                        or {str(r.get("legName") or "").upper() for r in group_rows}
+                        != {"TARGET_LEG", "STOP_LOSS_LEG"}):
+                    continue
+                combined = sum(int(r.get("filled_qty") or 0) for r in owners)
+                if any(
+                    str(fr.get("dhanClientId") or "").strip() != account
+                    or str(fr.get("securityId") or "").strip() != security
+                    or str(fr.get("exchangeSegment") or "").strip().upper() != segment
+                    or str(fr.get("productType") or "").strip().upper() != product
+                    or str(fr.get("transactionType") or "").strip().upper() != "SELL"
+                    or str(fr.get("orderStatus") or "").strip().upper() not in active_states
+                    or type(fr.get("quantity")) is not int or fr["quantity"] != combined
+                    for fr in group_rows
+                ):
+                    continue
+                owned, source = observed_open_quantity(
+                    positions_book, holdings_book, security_id=security,
+                    segment=segment, product=product, account_id=account,
+                )
+                if source != "VERIFIED_SETTLED_HOLDINGS" or owned != combined:
+                    continue
+                # Keep the broker's authoritative 2-leg OCO verifier in the
+                # shared-coverage admission path as well as the startup gate.
+                # No duplicated heuristic may accept an invalid resting order.
+                proof = verify_forever_oco_group(
+                    matching_rows=group_rows, forever_order_id=group_id,
+                    expected_security_id=security, expected_qty=combined,
+                    expected_account_id=account, expected_segment=segment,
+                    expected_product_type=product,
+                )
+                if proof.is_verified and int(proof.protected_quantity) == combined:
+                    eligible_shared_forever_ids.add(group_id)
+
+        # C5 & C8: Precompute typed owner maps across all tracked bot orders with fail-closed collision detection
+        all_bot_leg_owners: Dict[str, str] = {}
+        all_bot_forever_owners: Dict[str, str] = {}
+        owner_id_collisions: Dict[str, Set[str]] = {}
+
+        def _register_owner(target_map: Dict[str, str], key_id: str, owner_oid: str) -> bool:
+            ks_i = str(key_id or "").strip()
+            ow_i = str(owner_oid or "").strip()
+            if not ks_i or not ow_i:
+                return True
+            prev = target_map.get(ks_i)
+            if prev is not None and prev != ow_i:
+                if target_map is all_bot_forever_owners and ks_i in eligible_shared_forever_ids:
+                    # Group-level resting coverage, not ownership of a SELL fill.
+                    return True
+                owner_id_collisions.setdefault(ks_i, {prev}).add(ow_i)
+                return False
+            target_map[ks_i] = ow_i
+            return True
+
         for k_rec in all_known_recs:
             if not isinstance(k_rec, dict):
                 continue
             k_oid = str(k_rec.get("order_id") or "").strip()
             if not k_oid:
                 continue
-            all_bot_leg_owners[k_oid] = k_oid
+            k_route = self._resolve_protection_route(k_rec)
+            _register_owner(all_bot_leg_owners, k_oid, k_oid)
             for v_id in (k_rec.get("verified_leg_order_ids") or []):
                 vs = str(v_id or "").strip()
-                if vs and not vs.startswith("SUPER-"):
-                    all_bot_leg_owners[vs] = k_oid
+                if vs and not vs.startswith("SUPER-") and vs not in broker_forever_group_ids:
+                    _register_owner(all_bot_leg_owners, vs, k_oid)
             for cid_k in (k_rec.get("confirmed_protection_ids") or []):
                 cs = str(cid_k or "").strip()
                 if cs and not cs.startswith("SUPER-"):
-                    all_bot_leg_owners[cs] = k_oid
+                    if k_route == ProtectionRoute.FOREVER_OCO.value:
+                        _register_owner(all_bot_forever_owners, cs, k_oid)
+                    else:
+                        _register_owner(all_bot_leg_owners, cs, k_oid)
+            for explicit_fo_k in ("forever_order_id", "oco_order_id"):
+                ef_k = str(k_rec.get(explicit_fo_k) or "").strip()
+                if ef_k and not ef_k.startswith("SUPER-"):
+                    _register_owner(all_bot_forever_owners, ef_k, k_oid)
+            if self.journal_db and hasattr(self.journal_db, "get_protection_order_ids_for_parent"):
+                try:
+                    for db_fid in self.journal_db.get_protection_order_ids_for_parent(k_oid):
+                        if db_fid and not db_fid.startswith("SUPER-"):
+                            _register_owner(all_bot_forever_owners, db_fid, k_oid)
+                except Exception:
+                    pass
 
         for rec in open_recs:
             oid = str(rec.get("order_id") or "").strip()
@@ -3560,10 +3762,45 @@ class ProtectionWatcher:
                         leg_id_to_name.setdefault(ex_id, "STOP_LOSS_LEG")
                     elif explicit_key == "tp_order_id":
                         leg_id_to_name.setdefault(ex_id, "TARGET_LEG")
+            forever_group_ids: Set[str] = set()
+            exchange_child_sell_order_ids: Set[str] = set()
             for cid_p in (rec.get("confirmed_protection_ids") or []):
                 s_cid = str(cid_p or "").strip()
                 if s_cid and not s_cid.startswith("SUPER-"):
-                    leg_order_ids.add(s_cid)
+                    if route == ProtectionRoute.FOREVER_OCO.value:
+                        forever_group_ids.add(s_cid)
+                        _register_owner(all_bot_forever_owners, s_cid, oid)
+                    else:
+                        leg_order_ids.add(s_cid)
+                        _register_owner(all_bot_leg_owners, s_cid, oid)
+            for explicit_fo in ("forever_order_id", "oco_order_id"):
+                ef_id = str(rec.get(explicit_fo) or "").strip()
+                if ef_id and not ef_id.startswith("SUPER-"):
+                    forever_group_ids.add(ef_id)
+                    _register_owner(all_bot_forever_owners, ef_id, oid)
+            if self.journal_db and hasattr(self.journal_db, "get_protection_order_ids_for_parent"):
+                try:
+                    for db_fid in self.journal_db.get_protection_order_ids_for_parent(oid):
+                        if db_fid and not db_fid.startswith("SUPER-"):
+                            forever_group_ids.add(db_fid)
+                            _register_owner(all_bot_forever_owners, db_fid, oid)
+                except Exception:
+                    pass
+            # Remove any Forever group ID that may have been persisted into verified_leg_order_ids in earlier runs
+            leg_order_ids -= (forever_group_ids - {oid})
+            collided_for_parent = [
+                cid_col for cid_col, owners_set in owner_id_collisions.items()
+                if oid in owners_set
+            ]
+            if collided_for_parent:
+                col_msg = f"Open holding {oid}: conflicting bot owner claim on IDs {sorted(collided_for_parent)}"
+                logger.critical(f"[Protection] 🚨 {col_msg}")
+                rec["reconciliation_required"] = True
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(col_msg)
+                changed = True
+                leg_order_ids -= set(collided_for_parent)
+                forever_group_ids -= set(collided_for_parent)
 
             leg_cancel_states: Dict[str, str] = {}
             if isinstance(rec.get("orphaned_leg_cancel_states"), dict):
@@ -3709,7 +3946,7 @@ class ProtectionWatcher:
                     r for r in forever_book
                     if isinstance(r, dict)
                     and (
-                        str(r.get("orderId") or "").strip() in leg_order_ids
+                        str(r.get("orderId") or "").strip() in (forever_group_ids | leg_order_ids)
                         or (rec_corr and str(r.get("correlationId") or "").strip() == rec_corr)
                     )
                     and (not sec_id or str(r.get("securityId") or "").strip() == sec_id)
@@ -3724,8 +3961,15 @@ class ProtectionWatcher:
                         f_oid = str(fr.get("orderId") or "").strip()
                         f_leg = str(fr.get("legName") or "").strip().upper()
                         if f_oid:
-                            leg_order_ids.add(f_oid)
-                            all_bot_leg_owners[f_oid] = oid
+                            if not _register_owner(all_bot_forever_owners, f_oid, oid):
+                                col_fo_msg = f"Open holding {oid}: Forever OCO ID {f_oid} claimed by multiple parents"
+                                logger.critical(f"[Protection] 🚨 {col_fo_msg}")
+                                rec["reconciliation_required"] = True
+                                if gate is not None and hasattr(gate, "halt_new_entries"):
+                                    gate.halt_new_entries(col_fo_msg)
+                                changed = True
+                                continue
+                            forever_group_ids.add(f_oid)
                             if f_leg in ("TARGET_LEG", "STOP_LOSS_LEG"):
                                 leg_id_to_name[f_oid] = f_leg
                         f_st = str(fr.get("orderStatus") or "").strip().upper()
@@ -3742,6 +3986,109 @@ class ProtectionWatcher:
                             any_active = True
                             all_dead = False
                             resting_protective_qty = max(resting_protective_qty, int(fr.get("quantity") or 0))
+                    triggered_fo_rows: Dict[str, Tuple[str, int]] = {}
+                    for fr in fo_matches:
+                        f_oid_t = str(fr.get("orderId") or "").strip()
+                        f_st_t = str(fr.get("orderStatus") or "").strip().upper()
+                        f_leg_t = str(fr.get("legName") or "").strip().upper()
+                        if f_oid_t and f_st_t in ("TRIGGERED", "PART_TRADED", "TRADED"):
+                            try:
+                                f_qty_t = int(fr.get("quantity") or 0)
+                            except (TypeError, ValueError):
+                                f_qty_t = 0
+                            triggered_fo_rows[f_oid_t] = (f_leg_t, f_qty_t)
+                    if triggered_fo_rows:
+                        if not order_book_loaded:
+                            order_book = _safe_list_call("get_order_book")
+                            order_book_loaded = True
+                        if isinstance(order_book, list) and isinstance(trade_book, list):
+                            # C6: Use the single shared strict execution-evidence parser for tradebook rows
+                            tb_sell_by_oid: Dict[str, int] = {}
+                            seen_tb_etid_to_oid: Dict[str, str] = {}
+                            tb_parse_failed = False
+                            for tb_r in trade_book:
+                                if not isinstance(tb_r, dict):
+                                    continue
+                                if str(tb_r.get("securityId") or "").strip() != sec_id:
+                                    continue
+                                if str(tb_r.get("transactionType") or "").strip().upper() != "SELL":
+                                    continue
+                                if (
+                                    str(tb_r.get("exchangeSegment") or "").strip().upper() != seg
+                                    or str(tb_r.get("productType") or "").strip().upper() != prod
+                                ):
+                                    continue
+                                try:
+                                    parsed_tb = parse_verified_broker_trade(
+                                        tb_r,
+                                        expected_account_id=expected_client_id,
+                                        expected_security_id=sec_id,
+                                        expected_segment=seg,
+                                        expected_product_type=prod,
+                                        expected_side="SELL",
+                                    )
+                                except ReconciliationEvidenceError:
+                                    tb_parse_failed = True
+                                    continue
+                                tb_etid = parsed_tb["eid"]
+                                tb_oid = parsed_tb["oid"]
+                                prev_oid_for_etid = seen_tb_etid_to_oid.get(tb_etid)
+                                if prev_oid_for_etid is not None:
+                                    if prev_oid_for_etid != tb_oid:
+                                        tb_parse_failed = True
+                                    continue
+                                seen_tb_etid_to_oid[tb_etid] = tb_oid
+                                tb_sell_by_oid[tb_oid] = tb_sell_by_oid.get(tb_oid, 0) + parsed_tb["qty"]
+                            if tb_parse_failed:
+                                tb_sell_by_oid = {}
+
+                            for f_oid_t, (trig_leg_name, f_qty_t) in triggered_fo_rows.items():
+                                has_any_algo_child = any(
+                                    isinstance(ob, dict) and str(ob.get("algoId") or "").strip() == f_oid_t
+                                    for ob in order_book
+                                )
+                                if not has_any_algo_child:
+                                    continue
+                                try:
+                                    verified_child_oids = validate_forever_oco_child_orders(
+                                        forever_order_id=f_oid_t,
+                                        expected_leg_qty=f_qty_t,
+                                        key=(sec_id.upper(), seg, prod),
+                                        account=expected_client_id,
+                                        orders=order_book,
+                                        sell_fill_qty_by_oid=tb_sell_by_oid,
+                                    )
+                                except ReconciliationEvidenceError as child_err:
+                                    # Contradictory or incomplete child order evidence must fail closed
+                                    # unless child is merely still pending/unfilled without contradiction.
+                                    child_statuses = {
+                                        str(ob.get("orderStatus") or "").strip().upper()
+                                        for ob in order_book
+                                        if isinstance(ob, dict) and str(ob.get("algoId") or "").strip() == f_oid_t
+                                    }
+                                    if "TRADED" in child_statuses:
+                                        rec["unverified_trade_detected"] = True
+                                        rec["unverified_trade_reason"] = str(child_err)
+                                        if gate is not None and hasattr(gate, "halt_new_entries"):
+                                            gate.halt_new_entries(
+                                                f"Open holding {oid}: Forever OCO child validation failed ({child_err})"
+                                            )
+                                        changed = True
+                                    continue
+                                for child_oid in sorted(verified_child_oids):
+                                    if child_oid and not child_oid.startswith("SUPER-"):
+                                        if not _register_owner(all_bot_leg_owners, child_oid, oid):
+                                            col_c_msg = f"Open holding {oid}: Forever child order {child_oid} claimed by multiple parents"
+                                            logger.critical(f"[Protection] 🚨 {col_c_msg}")
+                                            rec["reconciliation_required"] = True
+                                            if gate is not None and hasattr(gate, "halt_new_entries"):
+                                                gate.halt_new_entries(col_c_msg)
+                                            changed = True
+                                            continue
+                                        exchange_child_sell_order_ids.add(child_oid)
+                                        leg_order_ids.add(child_oid)
+                                        if trig_leg_name in ("TARGET_LEG", "STOP_LOSS_LEG"):
+                                            leg_id_to_name[child_oid] = trig_leg_name
                     rec["verified_leg_order_ids"] = sorted(leg_order_ids - {oid})
                     rec["verified_leg_map"] = dict(leg_id_to_name)
                     if len(fo_trig_legs) == 1:
@@ -3935,8 +4282,9 @@ class ProtectionWatcher:
                 self._protected_buy_history_session = new_proof
             if hasattr(self.broker, "get_trades_for_order"):
                 parent_reads_complete = True
+                _skip_fo_ids = forever_group_ids - exchange_child_sell_order_ids if "forever_group_ids" in locals() else set()
                 for l_oid in sorted(leg_order_ids):
-                    if l_oid.startswith("SUPER-"):
+                    if l_oid.startswith("SUPER-") or l_oid in _skip_fo_ids:
                         continue
                     if l_oid == oid and (omit_old_buy_read or omit_protected_old_buy_read
                                          or historical_parent_unverified):
@@ -3997,12 +4345,14 @@ class ProtectionWatcher:
                 b_oid_cur = str(st_row.get("orderId") or oid).strip()
                 if self.journal_db and hasattr(self.journal_db, "record_fill"):
                     try:
+                        exp_price = float(st_row["tradedPrice"])
+                        exp_qty = int(st_row["tradedQuantity"])
                         self.journal_db.record_fill(
                             broker_order_id=b_oid_cur,
                             exchange_trade_id=etid_cur,
                             symbol=rec["symbol"],
-                            traded_price=float(st_row["tradedPrice"]),
-                            traded_quantity=int(st_row["tradedQuantity"]),
+                            traded_price=exp_price,
+                            traded_quantity=exp_qty,
                             traded_at=now_ts,
                             transaction_type="SELL",
                             security_id=sec_id,
@@ -4013,9 +4363,32 @@ class ProtectionWatcher:
                         )
                         if hasattr(self.journal_db, "get_fill_by_exchange_trade_id"):
                             persisted_row = self.journal_db.get_fill_by_exchange_trade_id(etid_cur)
-                            if not isinstance(persisted_row, dict) or str(persisted_row.get("parent_order_id") or "").strip() != oid:
+                            persisted_ok = False
+                            if isinstance(persisted_row, dict):
+                                try:
+                                    p_price = float(persisted_row.get("traded_price"))
+                                    p_qty = int(persisted_row.get("traded_quantity") or 0)
+                                    persisted_ok = (
+                                        bool(persisted_row.get("is_verified_trade"))
+                                        and str(persisted_row.get("exchange_trade_id") or "").strip() == etid_cur
+                                        and str(persisted_row.get("broker_order_id") or "").strip() == b_oid_cur
+                                        and str(persisted_row.get("parent_order_id") or "").strip() == oid
+                                        and str(persisted_row.get("transaction_type") or "").strip().upper() == "SELL"
+                                        and str(persisted_row.get("security_id") or "").strip() == sec_id
+                                        and str(persisted_row.get("exchange_segment") or "").strip().upper() == seg
+                                        and str(persisted_row.get("product_type") or "").strip().upper() == prod
+                                        and p_qty == exp_qty
+                                        and math.isfinite(p_price)
+                                        and math.isfinite(exp_price)
+                                        and abs(p_price - exp_price) < 1e-6
+                                    )
+                                except (TypeError, ValueError):
+                                    persisted_ok = False
+                            if not persisted_ok:
                                 journal_persistence_failed = True
-                                journal_failure_reasons.append(f"Fill {etid_cur} not present in SQLite after record_fill")
+                                journal_failure_reasons.append(
+                                    f"Fill {etid_cur} postcondition mismatch in SQLite after record_fill"
+                                )
                                 uncommitted_sell_trades.append(dict(st_row))
                     except Exception as db_err:
                         journal_persistence_failed = True
@@ -4064,22 +4437,6 @@ class ProtectionWatcher:
 
             confirmed_open_qty = max(0, buy_filled - sell_qty)
 
-            # 3. Account-bound holdings evidence, shared with startup verification.
-            broker_net_qty, quantity_evidence = observed_open_quantity(
-                positions_book, holdings_book,
-                security_id=sec_id, segment=seg, product=prod,
-                account_id=expected_client_id,
-            )
-            if quantity_evidence not in ("VERIFIED_POSITIONS", "VERIFIED_SETTLED_HOLDINGS"):
-                broker_net_qty = None
-                rec["broker_quantity_unverified"] = True
-                rec["broker_quantity_evidence"] = quantity_evidence
-                if gate is not None and hasattr(gate, "halt_new_entries"):
-                    gate.halt_new_entries(
-                        f"Open holding {oid}: broker quantity unverified ({quantity_evidence})"
-                    )
-                changed = True
-
             # Compute aggregate open bot quantity across all open parent orders sharing (sec_id, seg, prod)
             # Use max(sell_qty, broker_observed_sell_qty) when checking manual exit so a broker-filled exit with a local DB error
             # is recognized as a persistence error rather than a manual external sale.
@@ -4097,6 +4454,158 @@ class ProtectionWatcher:
                         o_buy = int(o_rec.get("filled_qty") or 0)
                         o_sell = max(int(o_rec.get("exit_filled_qty") or 0), int(o_rec.get("broker_observed_exit_filled_qty") or 0))
                         aggregate_contract_open_qty += max(0, o_buy - o_sell)
+
+            # 3. Account-bound holdings evidence, shared with startup verification.
+            broker_net_qty, quantity_evidence = observed_open_quantity(
+                positions_book, holdings_book,
+                security_id=sec_id, segment=seg, product=prod,
+                account_id=expected_client_id,
+            )
+            if (
+                quantity_evidence == "NEGATIVE_CNC_POSITION_REVIEW"
+                and prod in ("CNC", "MTF")
+                and seg in ("NSE_EQ", "BSE_EQ")
+                and isinstance(positions_book, list)
+                and isinstance(holdings_book, list)
+                and isinstance(trade_book, list)
+                and not journal_persistence_failed
+                and sell_qty > 0
+            ):
+                # Reconcile signed T+0 CNC delivery sale (netQty < 0 alongside settled holdings)
+                # strictly when an explicit holdings row exists AND all same-day SELL fills are
+                # verified bot-owned exits matching net_day and settled + net_day == aggregate open.
+                try:
+                    pos_nets = []
+                    pos_ok = True
+                    for prow in positions_book:
+                        if not isinstance(prow, dict):
+                            pos_ok = False
+                            break
+                        if str(prow.get("securityId") or "").strip() != sec_id:
+                            continue
+                        if (
+                            str(prow.get("exchangeSegment") or "").strip().upper() != seg
+                            or str(prow.get("productType") or "").strip().upper() != prod
+                        ):
+                            continue
+                        p_acct = str(prow.get("dhanClientId") or "").strip()
+                        if expected_client_id and p_acct and p_acct != expected_client_id:
+                            pos_ok = False
+                            break
+                        raw_net = prow.get("netQty")
+                        if isinstance(raw_net, bool) or raw_net is None:
+                            pos_ok = False
+                            break
+                        pos_nets.append(int(raw_net))
+                    holdings_map = aggregate_holdings(holdings_book, account_id=expected_client_id)
+                    if pos_ok and len(pos_nets) == 1 and pos_nets[0] < 0 and sec_id in holdings_map:
+                        net_day = pos_nets[0]
+                        settled_qty = holdings_map[sec_id]
+                        today_buys = 0
+                        today_sells = 0
+                        seen_waiver_etids: Set[str] = set()
+                        jdb_ref = getattr(self, "journal_db", None)
+                        trades_ok = bool(jdb_ref and hasattr(jdb_ref, "get_fill_by_exchange_trade_id"))
+                        for trow in (trade_book if trades_ok else ()):
+                            if not isinstance(trow, dict):
+                                trades_ok = False
+                                break
+                            if str(trow.get("securityId") or "").strip() != sec_id:
+                                continue
+                            # C4: Never silently skip same-security trades on another exchange or productType
+                            if (
+                                str(trow.get("exchangeSegment") or "").strip().upper() != seg
+                                or str(trow.get("productType") or "").strip().upper() != prod
+                            ):
+                                trades_ok = False
+                                break
+                            t_acct = str(trow.get("dhanClientId") or trow.get("clientId") or "").strip()
+                            if expected_client_id and t_acct != expected_client_id:
+                                trades_ok = False
+                                break
+                            t_side = str(trow.get("transactionType") or "").strip().upper()
+                            t_oid_c = str(trow.get("orderId") or "").strip()
+                            t_etid_c = str(trow.get("exchangeTradeId") or "").strip()
+                            raw_tq = trow.get("tradedQuantity")
+                            raw_tp = trow.get("tradedPrice")
+                            if (
+                                not t_oid_c
+                                or not t_etid_c
+                                or t_etid_c.upper() in ("0", "NONE", "NULL")
+                                or t_etid_c in seen_waiver_etids
+                                or isinstance(raw_tq, bool)
+                                or isinstance(raw_tq, float)
+                                or raw_tq is None
+                                or isinstance(raw_tp, bool)
+                                or raw_tp is None
+                            ):
+                                trades_ok = False
+                                break
+                            tq = int(raw_tq)
+                            tp = float(raw_tp)
+                            if tq <= 0 or tp <= 0.0 or not (tp == tp and tp != float("inf") and tp != float("-inf")):
+                                trades_ok = False
+                                break
+                            seen_waiver_etids.add(t_etid_c)
+                            # C2, C3, C4: Both BUY and SELL same-security rows must be durably journaled
+                            # with matching contract, quantity, finite price, and exact single-parent ownership
+                            # (MULTI_LOT_ALLOCATED is conservatively deferred to unified_exit_reconciliation).
+                            expected_owner = all_bot_leg_owners.get(t_oid_c)
+                            if not expected_owner or t_side not in ("BUY", "SELL"):
+                                trades_ok = False
+                                break
+                            j_fill = jdb_ref.get_fill_by_exchange_trade_id(t_etid_c)
+                            if not isinstance(j_fill, dict):
+                                trades_ok = False
+                                break
+                            j_raw_p = j_fill.get("traded_price")
+                            if isinstance(j_raw_p, bool) or j_raw_p is None:
+                                trades_ok = False
+                                break
+                            j_prc = float(j_raw_p)
+                            j_parent = str(j_fill.get("parent_order_id") or "").strip()
+                            if (
+                                not bool(j_fill.get("is_verified_trade"))
+                                or str(j_fill.get("transaction_type") or "").strip().upper() != t_side
+                                or str(j_fill.get("broker_order_id") or "").strip() != t_oid_c
+                                or str(j_fill.get("security_id") or "").strip() != sec_id
+                                or str(j_fill.get("exchange_segment") or "").strip().upper() != seg
+                                or str(j_fill.get("product_type") or "").strip().upper() != prod
+                                or int(j_fill.get("traded_quantity") or 0) != tq
+                                or not (j_prc > 0.0 and j_prc == j_prc and j_prc != float("inf"))
+                                or abs(j_prc - tp) >= 1e-6
+                                or not j_parent
+                                or j_parent == "MULTI_LOT_ALLOCATED"
+                                or j_parent != expected_owner
+                            ):
+                                trades_ok = False
+                                break
+                            if t_side == "BUY":
+                                today_buys += tq
+                            else:
+                                today_sells += tq
+                        if (
+                            trades_ok
+                            and today_sells > 0
+                            and (today_buys - today_sells) == net_day
+                            and settled_qty >= -net_day
+                            and (settled_qty + net_day) == aggregate_contract_open_qty
+                        ):
+                            broker_net_qty = settled_qty + net_day
+                            quantity_evidence = "VERIFIED_SIGNED_CNC_DELIVERY"
+                            rec["broker_quantity_unverified"] = False
+                            rec["broker_quantity_evidence"] = quantity_evidence
+                except Exception:
+                    pass
+            if quantity_evidence not in ("VERIFIED_POSITIONS", "VERIFIED_SETTLED_HOLDINGS", "VERIFIED_SIGNED_CNC_DELIVERY"):
+                broker_net_qty = None
+                rec["broker_quantity_unverified"] = True
+                rec["broker_quantity_evidence"] = quantity_evidence
+                if gate is not None and hasattr(gate, "halt_new_entries"):
+                    gate.halt_new_entries(
+                        f"Open holding {oid}: broker quantity unverified ({quantity_evidence})"
+                    )
+                changed = True
 
             stale_manual_record = (
                 prev_pos_state == "RECONCILIATION_REQUIRED"
@@ -4626,6 +5135,8 @@ class ProtectionWatcher:
                 rec["confirmed_position_open_qty"] = 0
                 rec["reconciliation_required"] = False
                 rec["persistence_uncertain"] = False
+                rec["broker_quantity_unverified"] = False
+                rec["external_unlinked_sell_observed"] = False
                 rec["last_persistence_error"] = ""
                 rec["position_state"] = PositionLifecycleState.POSITION_CLOSED.value
                 # Commit position lifecycle to SQLite BEFORE confirming closure or emitting POSITION_CLOSED notification
@@ -4636,17 +5147,35 @@ class ProtectionWatcher:
                     if gate is not None and hasattr(gate, "halt_new_entries"):
                         gate.halt_new_entries(f"Failed to persist POSITION_CLOSED lifecycle row for {rec['symbol']} ({oid})")
                 else:
-                    if self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
-                        self.execution_reporter.process_exit_event(
-                            rec,
-                            "POSITION_CLOSED",
-                            observed_at=now_ts,
-                            triggered_leg=triggered_leg,
-                            sell_qty=sell_qty,
-                            buy_vwap=buy_vwap,
-                            sell_vwap=sell_vwap,
-                            realized_pnl=realized_pnl,
-                        )
+                    if self.journal_db and hasattr(self.journal_db, "mark_protection_orders_closed"):
+                        try:
+                            self.journal_db.mark_protection_orders_closed(oid, status="POSITION_CLOSED_LOCAL")
+                        except Exception as prot_err:
+                            logger.error(
+                                "[Protection] Failed to mark local protection_orders closed for %s: %s",
+                                oid, prot_err,
+                            )
+                    if not rec.get("position_closed_notified", False):
+                        if self.execution_reporter and hasattr(self.execution_reporter, "process_exit_event"):
+                            try:
+                                self.execution_reporter.process_exit_event(
+                                    rec,
+                                    "POSITION_CLOSED",
+                                    observed_at=now_ts,
+                                    triggered_leg=triggered_leg,
+                                    sell_qty=sell_qty,
+                                    buy_vwap=buy_vwap,
+                                    sell_vwap=sell_vwap,
+                                    realized_pnl=realized_pnl,
+                                )
+                                rec["position_closed_notified"] = True
+                            except Exception as notif_err:
+                                logger.error(
+                                    "[Protection] POSITION_CLOSED notification failed for %s; will retry: %s",
+                                    oid, notif_err,
+                                )
+                        else:
+                            rec["position_closed_notified"] = True
                 changed = True
             elif 0 < sell_qty < buy_filled:
                 part_pnl = round((sell_vwap - buy_vwap) * sell_qty, 2) if (buy_vwap > 0 and sell_vwap > 0) else 0.0
