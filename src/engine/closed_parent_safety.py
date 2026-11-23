@@ -4,6 +4,8 @@ This is a service-control safety verifier, not a lifecycle repair action.
 It reuses the strict signed-delivery reconciliation predicate for T+0 exits.
 """
 from __future__ import annotations
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import math
 import sqlite3
 from contextlib import contextmanager
@@ -152,6 +154,12 @@ def verified_closed_delivery_parent(
                 negative[0], positions, holdings, trades, db, account, read_required
             ) is True
 
+        # A same-day SELL cannot be considered settled just because today's
+        # broker trade book is unexpectedly empty.
+        today_ist = datetime.now(ZoneInfo('Asia/Kolkata')).date()
+        if any(datetime.fromtimestamp(float(sell.get('traded_at') or 0), ZoneInfo('Asia/Kolkata')).date() >= today_ist
+               for sell in sells):
+            return False
         # A later delivery session cannot use today's trade book to corroborate
         # the historical SELL. Require verified journal proof and fresh zero risk.
         if any(str(t.get("securityId") or "") == security_id for t in trades):

@@ -4335,6 +4335,10 @@ class ConfigChangeTracker:
             operation_id="OWNER-STOP-CANCELLED",
         ):
             status = self.control_service("status", env_path=env_path)
+            try:
+                live_pid = int((status.get("systemd_properties") or {}).get("MainPID") or 0)
+            except (TypeError, ValueError, OverflowError):
+                live_pid = 0
             owner = status.get("owner_intent") or {}
             gate = status.get("transition_gate") or {}
             mode = str(status.get("saved_mode") or "").upper()
@@ -4354,6 +4358,7 @@ class ConfigChangeTracker:
             if not (
                 status.get("service_state") == "RUNNING"
                 and status.get("runtime_verified") is True
+                and live_pid > 0
                 and status.get("running_mode") == mode
                 and mode in ("LIVE", "TEST")
             ):
@@ -4408,8 +4413,13 @@ class ConfigChangeTracker:
                 return {"ok": False, "blocked_reason": "GATE_WRITE_FAILED",
                         "message": "Owner intent staged but safety gate remains active"}
             after = self.control_service("status", env_path=env_path)
+            try:
+                after_pid = int((after.get("systemd_properties") or {}).get("MainPID") or 0)
+            except (TypeError, ValueError, OverflowError):
+                after_pid = 0
             if not (after.get("runtime_verified") is True
                     and after.get("service_state") == "RUNNING"
+                    and after_pid == live_pid
                     and after.get("running_mode") == mode
                     and after.get("transition_gate", {}).get("active") is False
                     and after.get("owner_intent", {}).get("deferred_stop_pending") is False):

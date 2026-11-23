@@ -87,6 +87,7 @@ class CancelDeferredStopTests(unittest.TestCase):
         return {
             "service_state": "RUNNING", "runtime_verified": True,
             "saved_mode": "LIVE", "running_mode": "LIVE",
+            "systemd_properties": {"MainPID": 10001},
             "owner_intent": self.tracker.get_service_control_record(),
             "transition_gate": self.tracker.inspect_transition_gate_status(read_only=True),
         }
@@ -100,6 +101,19 @@ class CancelDeferredStopTests(unittest.TestCase):
         self.assertFalse(self.tracker.inspect_transition_gate_status()["active"])
         self.assertTrue(all(x == "status" for x in self.calls))
         self.assertFalse(owner_intent_blocks_new_entries(str(self.root)))
+
+    def test_changed_pid_invalidates_owner_cancellation(self):
+        count = [0]
+        def status(action, **kwargs):
+            count[0] += 1
+            result = self.fake_status(action, **kwargs)
+            if count[0] >= 2:
+                result["systemd_properties"] = {"MainPID": 10002}
+            return result
+        with patch.object(self.tracker, "control_service", side_effect=status):
+            result = self.tracker.cancel_deferred_owner_stop()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["blocked_reason"], "POSTCONDITION_UNVERIFIED")
 
     def test_refuses_unverified_pid_or_config(self):
         def unverified(action, **kwargs):
@@ -209,6 +223,10 @@ class ClosedDeliveryParentTests(unittest.TestCase):
         self.broker.get_positions.return_value = []
         self.broker.get_holdings.return_value = []
         self.broker.get_trade_book.return_value = []
+        # A same-day empty broker tradebook is not T+1 proof.
+        self.assertFalse(verified_closed_delivery_parent(**self.kw))
+        with sqlite3.connect(self.dbfile) as con:
+            con.execute("UPDATE fills SET traded_at=? WHERE transaction_type='SELL'", (time.time() - 86400,))
         self.assertTrue(verified_closed_delivery_parent(**self.kw))
         self.broker.get_holdings.return_value = [
             {"securityId":"750518","totalQty":1,"availableQty":1}
