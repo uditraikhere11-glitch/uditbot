@@ -140,12 +140,12 @@ jobs:
               for key in ('is_live_mode', 'equity_active', 'fno_active'):
                   tag = re.search(r'<input[^>]*name="' + key + r'"[^>]*>', form)
                   assert tag and 'type="checkbox"' in tag.group() and 'value="true"' in tag.group(), key
-              assert 'class="slider"' not in template and 'class="switch"' not in template
               # Allow HTML string edits only: controllers, validation and routes stay identical.
               declarations[0].value = ast.Constant(value='PRESENTATION_ONLY_HTML')
               return names, ast.dump(tree, include_attributes=False)
           before_names, before_backend = inspected(before_src)
           after_names, after_backend = inspected(after_src)
+          assert 'class="slider"' not in after_src and 'class="switch"' not in after_src, 'Slider controls remain'
           assert before_names == after_names, 'Native Setup field names/order changed'
           assert before_backend == after_backend, 'Backend Setup Python changed'
           subprocess.run(['git', 'diff', '--check', base, head], check=True)
