@@ -207,6 +207,7 @@ def _operational_evidence(tracker: ConfigChangeTracker, raw: Dict[str, Any],
                           cfg: AppConfig, data_dir: str) -> Dict[str, Any]:
     """Correlate the 10-second producer heartbeat with systemd/PID/starttime."""
     unknown = {"reconciliation": "UNVERIFIED", "protection_watcher": "UNVERIFIED",
+               "protection_supervision": "UNVERIFIED",
                "new_entries_gate": "UNVERIFIED", "telegram_listener": "UNVERIFIED", "runtime_evidence_at": None}
     if raw.get("runtime_verified") is not True or raw.get("service_state") != "RUNNING":
         return unknown
@@ -218,11 +219,13 @@ def _operational_evidence(tracker: ConfigChangeTracker, raw: Dict[str, Any],
         return unknown
     recon = data["reconciliation"]
     watcher = "ACTIVE" if data["watcher_running"] is True else "INACTIVE"
+    supervision = "VERIFIED" if data["watcher_supervision_verified"] is True else "UNVERIFIED"
     # An open gate is credible only after a healthy recon AND clear STOP intent.
     gate = "OPEN" if data["entries_open"] and recon == "HEALTHY" else "BLOCKED"
     telegram = ("CONNECTED" if data.get("telegram_connected") is True else
                 "DISCONNECTED" if data.get("telegram_connected") is False else "UNVERIFIED")
     return {"reconciliation": recon, "protection_watcher": watcher,
+            "protection_supervision": supervision,
             "new_entries_gate": gate, "telegram_listener": telegram,
             "runtime_evidence_at": data["created_at"]}
 
@@ -452,9 +455,11 @@ def build_control_health(env_path: str = ".env") -> Dict[str, Any]:
           "WARN" if recon == "BLOCKED" else "UNKNOWN",
           "Process-matched runtime evidence" if recon != "UNVERIFIED" else "Fresh process snapshot unavailable")
     watcher = runtime["protection_watcher"]
-    check("Order protection watcher", "PASS" if watcher == "ACTIVE" else
-          "WARN" if watcher == "INACTIVE" else "UNKNOWN",
-          "Watcher loop active (does not prove every open leg)" if watcher == "ACTIVE"
+    supervision = runtime["protection_supervision"]
+    check("Order protection watcher", "PASS" if watcher == "ACTIVE" and supervision == "VERIFIED" else
+          "WARN" if watcher in ("ACTIVE", "INACTIVE") else "UNKNOWN",
+          "Watcher loop active, latest required broker supervision read complete; individual legs must still be verified" if watcher == "ACTIVE" and supervision == "VERIFIED"
+          else "Watcher loop active but fresh broker supervision unverified" if watcher == "ACTIVE"
           else "Watcher loop inactive" if watcher == "INACTIVE" else "Watcher heartbeat not independently verified")
     gate_state = runtime["new_entries_gate"]
     check("New entries gate", "PASS" if gate_state == "OPEN" and intent.status == "PASS" else

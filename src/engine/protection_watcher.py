@@ -1166,6 +1166,7 @@ class ProtectionWatcher:
                 # Pending protection can mutate the broker before supervision.
                 gate_books["share"] = False
             self._supervision_read_complete = False
+            self._supervision_success_at = None
             changed = False
             current_time = self.clock()
 
@@ -4461,6 +4462,67 @@ class ProtectionWatcher:
                 security_id=sec_id, segment=seg, product=prod,
                 account_id=expected_client_id,
             )
+            mixed_proof = None
+            # PR132: never treat a current-day 28-share BUY as a sale of the
+            # two earlier acknowledged DP shares. The generic ambiguity
+            # remains fail-closed; only a current, all-parent, trade-ID-bound
+            # split with a SAME-DAY full historical audit can resolve it.
+            if (quantity_evidence == "CNC_POSITIONS_HOLDINGS_CONTRADICT"
+                    and prod == "CNC" and snapshot_complete
+                    and parent_reads_complete and not journal_persistence_failed
+                    and self.journal_db is not None
+                    and hasattr(self.journal_db, "get_open_positions_lifecycle")):
+                try:
+                    from src.engine.mixed_cnc_evidence import verify_mixed_cnc_split
+                    lifecycle_rows = self.journal_db.get_open_positions_lifecycle()
+                    contract_rows = [
+                        r for r in lifecycle_rows
+                        if str(r.get("security_id") or "").strip() == sec_id
+                        and str(r.get("exchange_segment") or "").strip().upper() == seg
+                        and str(r.get("product_type") or "").strip().upper() == prod
+                        and int(r.get("confirmed_open_qty") or 0) > 0
+                    ]
+                    parent_quantities = {
+                        str(r["parent_order_id"]): int(r["confirmed_open_qty"])
+                        for r in contract_rows
+                    }
+                    watcher_quantities = {
+                        str(r.get("order_id") or "").strip(): max(0,
+                            int(r.get("filled_qty") or 0) - int(r.get("exit_filled_qty") or 0))
+                        for r in open_recs
+                        if str(r.get("security_id") or "").strip() == sec_id
+                        and str(r.get("segment") or "NSE_EQ").strip().upper() == seg
+                        and str(r.get("product_type") or "CNC").strip().upper() == prod
+                    }
+                    if parent_quantities != watcher_quantities:
+                        raise ValueError("Watcher/journal mixed parents disagree")
+                    proposed = verify_mixed_cnc_split(
+                        db=self.journal_db, positions=positions_book,
+                        holdings=holdings_book, trade_book=trade_book,
+                        account=expected_client_id, security=sec_id,
+                        segment=seg, product=prod,
+                        parent_quantities=parent_quantities, now=now_ts,
+                    )
+                    key = (sec_id, seg, prod)
+                    gate_attested = bool(
+                        gate_books is not None
+                        and gate_books.get("mixed_verified", {}).get(key) == proposed
+                    )
+                    durable_attested = bool(
+                        hasattr(self.journal_db, "has_verified_mixed_cnc_history_today")
+                        and self.journal_db.has_verified_mixed_cnc_history_today(
+                            expected_client_id, sec_id, seg, prod,
+                            parent_quantities, now=now_ts,
+                        )
+                    )
+                    if not (gate_attested or durable_attested):
+                        raise ValueError("Current mixed CNC history has not been fully attested")
+                    mixed_proof = proposed
+                    broker_net_qty = proposed.total_qty
+                    quantity_evidence = "VERIFIED_MIXED_CNC_DELIVERY"
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    # Never substitute generic arithmetic or a previous snapshot.
+                    mixed_proof = None
             if (
                 quantity_evidence == "NEGATIVE_CNC_POSITION_REVIEW"
                 and prod in ("CNC", "MTF")
@@ -4597,7 +4659,7 @@ class ProtectionWatcher:
                             rec["broker_quantity_evidence"] = quantity_evidence
                 except Exception:
                     pass
-            if quantity_evidence not in ("VERIFIED_POSITIONS", "VERIFIED_SETTLED_HOLDINGS", "VERIFIED_SIGNED_CNC_DELIVERY"):
+            if quantity_evidence not in ("VERIFIED_POSITIONS", "VERIFIED_SETTLED_HOLDINGS", "VERIFIED_SIGNED_CNC_DELIVERY", "VERIFIED_MIXED_CNC_DELIVERY"):
                 broker_net_qty = None
                 rec["broker_quantity_unverified"] = True
                 rec["broker_quantity_evidence"] = quantity_evidence
@@ -4605,6 +4667,11 @@ class ProtectionWatcher:
                     gate.halt_new_entries(
                         f"Open holding {oid}: broker quantity unverified ({quantity_evidence})"
                     )
+                changed = True
+            elif (rec.get("broker_quantity_unverified") is not False
+                  or rec.get("broker_quantity_evidence") != quantity_evidence):
+                rec["broker_quantity_unverified"] = False
+                rec["broker_quantity_evidence"] = quantity_evidence
                 changed = True
 
             stale_manual_record = (
@@ -4625,7 +4692,10 @@ class ProtectionWatcher:
                 and broker_net_qty < aggregate_contract_open_qty and sell_qty < buy_filled
             )
             manual_risk_quantity_unverified = (
-                manual_risk_candidate and confirmed_open_qty > 0 and (quantity_evidence != "VERIFIED_SETTLED_HOLDINGS"
+                manual_risk_candidate and confirmed_open_qty > 0 and (
+                    quantity_evidence not in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY")
+                    or (quantity_evidence == "VERIFIED_MIXED_CNC_DELIVERY" and (
+                        mixed_proof is None or oid not in mixed_proof.settled_parent_ids))
                     or broker_net_qty != aggregate_contract_open_qty or not snapshot_complete)
             )
             if entry_only_unlinked_reduction or manual_risk_quantity_unverified:
@@ -4681,8 +4751,16 @@ class ProtectionWatcher:
                 "orphaned_leg_cancel_states", "retry_reserved", "entry_timeout_elapsed",
                 "protected_qty",
             ))
-            history_ok = gate_books is not None and gate_books["verified"].get(oid) == (
-                expected_client_id, sec_id, effective_parent_open_qty)
+            history_ok = bool(
+                gate_books is not None and gate_books["verified"].get(oid) == (
+                    expected_client_id, sec_id, effective_parent_open_qty)
+            )
+            if (not history_ok and mixed_proof is not None
+                    and oid in mixed_proof.settled_parent_ids
+                    and rec.get("owner_history_day") == datetime.fromtimestamp(now_ts, IST).date().isoformat()):
+                # Verified immutable full-day evidence exists in SQLite,
+                # and the current live broker snapshots still match exactly.
+                history_ok = True
             if manual_risk_candidate and prod in ("CNC", "MTF") and confirmed_open_qty:
                 if not profile_checked:
                     profile_checked = True
@@ -4747,7 +4825,7 @@ class ProtectionWatcher:
                 and broker_net_qty == aggregate_contract_open_qty
                 # Historical settled positions cannot be 'recovered' merely
                 # from fresh current-day CNC BUYs when Demat quantity is zero.
-                and quantity_evidence == "VERIFIED_SETTLED_HOLDINGS"
+                and quantity_evidence in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY")
                 and snapshot_complete
             )
 
@@ -5096,7 +5174,7 @@ class ProtectionWatcher:
                 rec["reconciliation_required"] = False
                 rec["unreadable_broker_response"] = False
                 rec["broker_quantity_unverified"] = False
-                rec["broker_quantity_evidence"] = "VERIFIED_SETTLED_HOLDINGS"
+                rec["broker_quantity_evidence"] = quantity_evidence
                 if not self._sync_position_lifecycle(rec):
                     rec.clear()
                     rec.update(previous)
@@ -5243,6 +5321,7 @@ class ProtectionWatcher:
         # Only a completed pass with all required books readable consumes the
         # one-shot closed-session allowance.
         self._supervision_read_complete = snapshot_complete and all_parent_reads_ok
+        self._supervision_success_at = now_ts if self._supervision_read_complete else None
         return changed
 
     def should_poll(self, is_market_open_fn: Optional[Callable[[], bool]] = None) -> bool:
@@ -5420,6 +5499,10 @@ class ProtectionWatcher:
                                     if now >= last_notice:
                                         logger.error("[Protection] Broker governor preflight failed: %s", type(exc).__name__)
                             if wait > 0:
+                                # The previous completed read cannot certify the
+                                # current deferred supervision cycle.
+                                self._supervision_read_complete = False
+                                self._supervision_success_at = None
                                 blocked_reason = blocked_reason or "Broker GET admission deferred; fresh position evidence unavailable"
                                 gate = getattr(self.broker, "reconciliation_gate", None)
                                 if gate is not None and hasattr(gate, "halt_new_entries"):
@@ -5452,6 +5535,8 @@ class ProtectionWatcher:
                                 # arriving during the worker must not be swallowed by it.
                                 last_signature = signature
                 except Exception as exc:
+                    self._supervision_read_complete = False
+                    self._supervision_success_at = None
                     logger.error("[Protection] Watcher loop error: %s", type(exc).__name__)
                     gate = getattr(self.broker, "reconciliation_gate", None)
                     if gate is not None and getattr(gate, "is_accepting_entries", False):

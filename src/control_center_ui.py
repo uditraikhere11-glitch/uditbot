@@ -373,10 +373,12 @@ function renderOperationalStatus(s){
   const details=[['v17p-reconciliation','reconciliation'],['v17p-protection','protection_watcher'],['v17p-gate','new_entries_gate']];
   for(const [id,key] of details){
     const value=String(s[key]||'UNVERIFIED');
-    setText(id,value);
+    const supervision=String(s.protection_supervision||'UNVERIFIED');
+    setText(id,key==='protection_watcher'&&value==='ACTIVE'?
+      'ACTIVE · '+supervision:value);
     const card=$(id).closest('.v17p-kpi');
     const isVerified=(key==='reconciliation'&&value==='HEALTHY')||
-      (key==='protection_watcher'&&value==='ACTIVE')||
+      (key==='protection_watcher'&&value==='ACTIVE'&&supervision==='VERIFIED')||
       (key==='new_entries_gate'&&value==='OPEN'&&s.owner_intent_status==='PASS');
     if(card){
       card.classList.toggle('verified',isVerified);
@@ -385,8 +387,8 @@ function renderOperationalStatus(s){
         const descriptions={
           reconciliation:isVerified?'Fresh process-matched reconciliation evidence':
             'Reconciliation '+value.toLowerCase()+'; check Health for details',
-          protection_watcher:isVerified?'Fresh watcher-loop heartbeat; individual order legs not proven':
-            'Watcher '+value.toLowerCase()+'; individual order legs not proven',
+          protection_watcher:isVerified?'Fresh broker supervision read completed; individual order legs still require broker proof':
+            'Watcher '+value.toLowerCase()+'; broker supervision '+supervision.toLowerCase(),
           new_entries_gate:isVerified?'Fresh healthy gate; Owner STOP intent clear':
             'Entry gate '+value.toLowerCase()+'; verify owner intent and reconciliation'
         };
