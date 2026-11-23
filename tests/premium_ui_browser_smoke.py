@@ -57,9 +57,17 @@ def assert_setup(page, width: int, setup_html: str) -> None:
     assert menu["visible"] == "hidden" and menu["right"] <= 1, (width, menu)
     assert menu["expanded"] == "false" and menu["backdropHidden"], (width, menu)
     page.locator("#v17pAccountOpen").click()
-    assert page.locator("#premNav").is_visible(), width
+    page.wait_for_function("""() => {
+      const p=document.getElementById('premNav');
+      return p.classList.contains('open') && getComputedStyle(p).visibility==='visible' &&
+             p.getBoundingClientRect().right > 10;
+    }""")
     page.keyboard.press("Escape")
-    assert not page.locator("#premNav").is_visible(), width
+    page.wait_for_function("""() => {
+      const p=document.getElementById('premNav');
+      return !p.classList.contains('open') && getComputedStyle(p).visibility==='hidden' &&
+             p.getBoundingClientRect().right <= 1;
+    }""")
     assert page.locator("#v17pAccountOpen").get_attribute("aria-expanded") == "false"
     # The same SVG mark is used in the topbar and account drawer.
     assert page.locator(".v17p-brand svg.v17p-ub-mark .v17p-ub-letter").count() == 2
