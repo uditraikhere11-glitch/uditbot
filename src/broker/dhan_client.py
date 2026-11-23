@@ -846,8 +846,7 @@ class DhanClient:
         self.last_funds_is_fallback: bool = False
 
     def _is_isolated_test_default_token_path(self, token_path: str) -> bool:
-        import sys
-        if ("unittest" in sys.modules or "pytest" in sys.modules) and os.environ.get("AUDITBOT_ALLOW_HOME_TOKEN_IN_TESTS") != "1":
+        if os.environ.get("AUDITBOT_TEST_ISOLATION") == "1":
             default_home_tok = os.path.abspath(os.path.expanduser("~/.dhan_token"))
             if os.path.abspath(token_path) == default_home_tok:
                 return True
@@ -2313,6 +2312,7 @@ class DhanClient:
                         return self.get_ltp(
                             exchange_segment, security_id, retry=False, symbol=symbol,
                             now_utc=now_utc, max_quote_age_sec=max_quote_age_sec,
+                            cmp_policy=cmp_policy,
                         )
                 return False, 0.0, f"Dhan auth error ({resp.status_code}): {resp.text}"
             return False, 0.0, f"Dhan LTP API error ({resp.status_code}): {resp.text}"
