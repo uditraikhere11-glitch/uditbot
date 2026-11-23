@@ -253,6 +253,24 @@ class CoordinatorPacingTests(unittest.TestCase):
                 self.assertEqual(tick.call_count, 1)
 
 
+    def test_persistent_ready_flag_does_not_burst_repeated_broker_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = ConfigChangeTracker(data_dir=tmp)
+            with patch.object(tracker, "_has_active_or_deferred_work", return_value=True), \
+                 patch.object(tracker, "get_service_control_record", return_value={
+                     "desired_service_state": "STOPPED",
+                     "deferred_stop_pending": True,
+                     "stop_ready_to_apply": True,
+                 }), \
+                 patch.object(tracker, "run_control_coordinator_tick") as tick:
+                tracker.start_coordinator_daemon(
+                    env_path=".env", poll_interval_sec=0.01, stop_when_idle=False,
+                )
+                time.sleep(0.12)
+                tracker.stop_coordinator_daemon()
+                self.assertEqual(tick.call_count, 1)
+
+
 class CancellationApiTests(unittest.TestCase):
     def test_csrf_and_explicit_intent_required(self):
         from fastapi import FastAPI
