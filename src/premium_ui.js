@@ -15,6 +15,12 @@
   const closer=document.getElementById('premNavClose');
   const panel=document.getElementById('premNav');
   const backdrop=document.getElementById('premNavBackdrop');
+  // Keep the drawer/backdrop in the body overlay layer on every route.
+  // Setup embeds shared navigation inside a styled container, which can
+  // otherwise clip a fixed panel into a visible left-edge strip.
+  // Move ONLY presentation nodes, never native forms, fields, or state.
+  if(panel && panel.parentElement!==document.body) document.body.appendChild(panel);
+  if(backdrop && backdrop.parentElement!==document.body) document.body.appendChild(backdrop);
   let menuOpen=false;
   function syncMenu() {
     if(!panel||!backdrop)return;
