@@ -151,6 +151,10 @@ async def main():
             config_version_hash=compute_config_version(cfg) if hasattr(cfg, "data_dir") else "",
         )
 
+        # Fast serialized recovery hook when a rotated Dhan token is adopted from disk
+        from src.engine.token_rotation_recovery import install_token_rotation_fast_recovery
+        install_token_rotation_fast_recovery(pipeline.broker, pipeline.reconciliation_gate)
+
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         print("🛡️ Persistent Protection Watcher activated (monitoring resting fills & OCO/Super legs through market close)")
