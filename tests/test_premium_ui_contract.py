@@ -136,9 +136,14 @@ class FocusedV17PresentationContracts(unittest.TestCase):
         self.assertIn('.setup-choice:focus-within', css)
 
     def test_svg_marks_favicon_and_six_category_icons(self):
-        from src.premium_ui import _AUDITBOT_MARK, premium_nav, premium_styles
+        from src.premium_ui import _AUDITBOT_MARK, _AUDITBOT_IMAGE_B64, premium_nav, premium_styles
+        import base64
+        import hashlib
         import xml.etree.ElementTree as ET
         ET.fromstring(_AUDITBOT_MARK)
+        self.assertEqual(hashlib.sha256(base64.b64decode(_AUDITBOT_IMAGE_B64)).hexdigest(),
+                         '8f6fa6821be00e6b3bfbc3625817461ea096f76e9c6570bf736cfe72dcaa3cac')
+        self.assertIn('data:image/png;base64,', _AUDITBOT_MARK)
         self.assertIn('data:image/svg+xml,', premium_styles())
         self.assertNotIn('⌁', read('src/premium_ui.py'))
         self.assertEqual(premium_nav('setup').count('class="v17p-audit-mark"'), 2)
