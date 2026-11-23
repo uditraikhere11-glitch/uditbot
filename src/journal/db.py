@@ -1911,6 +1911,68 @@ class JournalDB:
             )
             return cur.lastrowid
 
+    def has_verified_mixed_cnc_history_today(
+        self, account: str, security: str, segment: str, product: str,
+        parent_quantities: dict, *, now: float,
+    ) -> bool:
+        """Read-only reuse of a SAME-DAY immutable full historical owner audit.
+
+        This never substitutes for current tradebook, positions, holdings,
+        owner ACKs, or active protection. It only avoids historical pagination
+        on every routine watcher poll after a successful whole-account pass.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        try:
+            zone = ZoneInfo("Asia/Kolkata")
+            today = datetime.fromtimestamp(float(now), zone).date()
+            expected = {str(k): int(v) for k, v in parent_quantities.items()}
+            if not expected or any(not k or q <= 0 for k, q in expected.items()):
+                return False
+            with self._get_conn() as conn:
+                events = conn.execute(
+                    "SELECT payload, created_at FROM system_events "
+                    "WHERE event_type='OWNER_LOT_EVIDENCE' AND "
+                    "description='Verified original purchases and settled ownership' "
+                    "ORDER BY id DESC LIMIT 30"
+                ).fetchall()
+            for event in events:
+                if datetime.fromtimestamp(float(event["created_at"]), zone).date() != today:
+                    continue
+                obj = json.loads(event["payload"])
+                if not isinstance(obj, dict):
+                    continue
+                mixed = obj.get("mixed_split")
+                if not isinstance(mixed, dict):
+                    continue
+                if (str(obj.get("account")) != str(account)
+                        or str(obj.get("security")) != str(security)
+                        or str(obj.get("segment")) != str(segment)
+                        or str(obj.get("product")) != str(product)
+                        or obj.get("quantity_source") != "VERIFIED_MIXED_CNC_DELIVERY"
+                        or obj.get("to_date") != today.isoformat()
+                        or not obj.get("windows")
+                        or not isinstance(obj.get("parents"), dict)
+                        or {str(k): int(v) for k, v in obj["parents"].items()} != expected):
+                    continue
+                settled_ids = set(mixed.get("settled_parent_ids") or [])
+                current_ids = set(mixed.get("intraday_parent_ids") or [])
+                if (str(mixed.get("account")) != str(account)
+                        or str(mixed.get("security")) != str(security)
+                        or str(mixed.get("segment")) != str(segment)
+                        or str(mixed.get("product")) != str(product)
+                        or int(mixed.get("settled_qty") or 0) <= 0
+                        or int(mixed.get("intraday_qty") or 0) <= 0
+                        or settled_ids & current_ids
+                        or settled_ids | current_ids != set(expected)
+                        or sum(expected[k] for k in settled_ids) != int(mixed["settled_qty"])
+                        or sum(expected[k] for k in current_ids) != int(mixed["intraday_qty"])):
+                    continue
+                return True
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+            return False
+        return False
+
     def record_reconciliation_halt_occurrence(
         self, reason: str, *, state_transition: bool = False,
         observed_at: Optional[float] = None, window_sec: float = 300.0,

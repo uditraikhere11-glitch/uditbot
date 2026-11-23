@@ -155,16 +155,39 @@ async def main():
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
         print("🛡️ Persistent Protection Watcher activated (monitoring resting fills & OCO/Super legs through market close)")
 
-        # V17 operational UI evidence must run in THIS production listener.
-        # systemd starts run.py, not src.main.start_telegram_listener().
-        # The snapshot is read-only; failures must never modify trading gates.
+        # WebUI and Telegram consume one process-matched source of truth.
+        # This producer is read-only; status messages never change the gate.
+        from src.notifier.runtime_status import RuntimeStatusTransitions
+        runtime_transitions = RuntimeStatusTransitions()
+        runtime_card_armed = False
+
+        def _enqueue_runtime_card(card: str) -> int:
+            # The generic dispatch wrapper reports True even after a failed
+            # SQLite INSERT. Use the actual outbox result for reliable retry.
+            return pipeline.db.enqueue_outbox("SYSTEM_RUNTIME_STATUS", {
+                "text": card, "event_type": "SYSTEM_RUNTIME_STATUS",
+                "priority": "NORMAL", "timestamp": time.time(),
+            })
+
         async def _publish_ui_runtime_evidence():
             from src.engine.operational_snapshot import publish_operational_snapshot
             while True:
                 try:
-                    publish_operational_snapshot(
+                    truth = publish_operational_snapshot(
                         pipeline, telegram_connected=bool(client.is_connected())
                     )
+                    if isinstance(truth, dict) and runtime_card_armed and cfg.log_group_id:
+                        next_card = runtime_transitions.observe(
+                            truth, instance=cfg.instance_name,
+                            mode=getattr(cfg.trading_mode, "value", cfg.trading_mode),
+                        )
+                        if next_card:
+                            row_id = await asyncio.to_thread(
+                                _enqueue_runtime_card, next_card
+                            )
+                            if not isinstance(row_id, int) or row_id <= 0:
+                                raise RuntimeError("Runtime status outbox enqueue unverified")
+                            runtime_transitions.confirm_queued(truth)
                 except Exception as exc:
                     logging.getLogger("run").warning(
                         "Cannot publish read-only runtime evidence: %s",
@@ -198,17 +221,15 @@ async def main():
             from src.cli import format_startup_online_card
             pending_cnt = len(pipeline.db.get_non_terminal_intents()) if hasattr(pipeline.db, "get_non_terminal_intents") else 0
             unprot_cnt = len(pipeline.db.get_unprotected_orders()) if hasattr(pipeline.db, "get_unprotected_orders") else 0
-            # Read current gate/watcher truth immediately before queuing.
+            # Same canonical evidence as the WebUI's next process snapshot.
+            from src.engine.operational_snapshot import collect_operational_snapshot
+            startup_truth = collect_operational_snapshot(
+                pipeline, telegram_connected=bool(client.is_connected())
+            )
             gate_now = pipeline.reconciliation_gate
-            watcher_now = pipeline.watcher
-            gate_live = (
-                gate_now.is_accepting_entries is True
-                and str(getattr(getattr(gate_now, "state", None), "value", "")) == "HEALTHY"
-            )
-            watcher_live = (
-                getattr(watcher_now, "_is_running", None) is True
-                and getattr(watcher_now, "_supervision_read_complete", None) is True
-            )
+            gate_live = (startup_truth["entries_open"] is True
+                         and startup_truth["reconciliation"] == "HEALTHY")
+            watcher_live = startup_truth["watcher_supervision_verified"] is True
             startup_card = format_startup_online_card(
                 cfg,
                 allowed_chats_count=len(allowed_chats),
@@ -216,11 +237,14 @@ async def main():
                 reconciliation_msg=(rec_msg if gate_live else
                     str(getattr(gate_now, "last_error", "") or "Current gate is not verified healthy")),
                 watcher_verified=watcher_live,
+                snapshot_at=startup_truth["created_at"],
                 unresolved_intents_count=pending_cnt,
                 unprotected_positions_count=unprot_cnt,
                 is_stopped=pipeline.stop_manager.is_stopped(),
             )
             await asyncio.to_thread(pipeline.dispatch_notification, "SYSTEM_STARTUP", startup_card)
+            runtime_transitions.arm(startup_truth)
+            runtime_card_armed = True
 
         print(f"\n⚡ Listening for live signals on {len(allowed_chats)} authorized channels...\n")
 

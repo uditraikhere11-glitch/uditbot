@@ -6,6 +6,7 @@ import json
 from src.broker.dhan_client import DhanClient, MAX_HISTORICAL_TRADE_WINDOW_DAYS
 from src.engine.market import IST
 from src.engine.holding_quantity import observed_open_quantity
+from src.engine.mixed_cnc_evidence import verify_mixed_cnc_split
 
 # Scoped to the thread and lifetime of one independent full gate pass.
 GATE_BOOKS = ContextVar("owner_lot_gate_books", default=None)
@@ -22,7 +23,7 @@ class DematReview(ValueError):
 
 
 def verify_owner_history(broker, db, account, security, segment, product, parents,
-                         holding, day_trades, now, evidence):
+                         holding, day_trades, now, evidence, *, current_day_live_keys=()):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -106,7 +107,12 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
         evidence["windows"].append([start.isoformat(), end.isoformat(), len(rows)])
         inspect(rows, True)
         start = end + timedelta(days=1)
-    if seen != expected.keys():
+    # The historical endpoint may not publish today's settled executions
+    # immediately. In the *strict mixed CNC* path only, the new-day fills
+    # have already been verified against account-bound live tradebook AND
+    # durable exchange IDs. Never replace yesterday's historical evidence.
+    live_keys = set(current_day_live_keys)
+    if not live_keys.issubset(expected.keys()) or (seen | live_keys) != expected.keys():
         raise ValueError("Complete history does not contain every original BUY")
 
 
@@ -182,7 +188,25 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                     raise ValueError(f"{review}: independently reviewed movement evidence required")
             if not isinstance(orders, list):
                 raise ValueError("Current order book unavailable")
-            if source != "VERIFIED_SETTLED_HOLDINGS":
+            # A current-session CNC BUY can coexist with older DP shares.
+            # Only an exact, account-bound BUY-fill split may replace the
+            # generic fail-closed contradiction, and historical execution
+            # verification must still succeed below before admission.
+            split_proof = None
+            if source == "CNC_POSITIONS_HOLDINGS_CONTRADICT" and product == "CNC":
+                split_proof = verify_mixed_cnc_split(
+                    db=db, positions=positions, holdings=holdings,
+                    trade_book=day_trades, account=account, security=security,
+                    segment=segment, product=product,
+                    parent_quantities=parents, now=now,
+                )
+                quantity = split_proof.total_qty
+                source = "VERIFIED_MIXED_CNC_DELIVERY"
+                evidence.update(
+                    quantity=quantity, quantity_source=source,
+                    mixed_split=split_proof.to_audit_dict(),
+                )
+            if source not in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY"):
                 raise ValueError("Settled holding unavailable: " + source)
             holding = next(r for r in holdings if str(r.get("securityId")) == security)
             evidence["holding"] = {k: holding.get(k) for k in ("isin", "totalQty", "dpQty", "t1Qty", "availableQty")}
@@ -202,7 +226,9 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                or (holding.get("isin") and r.get("isin") == holding["isin"])]
             evidence["orders"] = relevant_orders
             verify_owner_history(broker, db, account, security, segment, product, parents,
-                                 holding, day_trades, now, evidence)
+                                 holding, day_trades, now, evidence,
+                                 current_day_live_keys=(split_proof.intraday_trade_keys
+                                                        if split_proof is not None else ()))
             for position in evidence["positions"]:
                 if not position["exchangeSegment"] or not position["productType"]:
                     raise ValueError("Position identity incomplete")
@@ -237,6 +263,11 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
         else:
             decision = "Verified original purchases and settled ownership"
             batch["verified"].update({oid: (account, security, parents[oid]) for oid in acked})
+            if split_proof is not None:
+                # The full historical BUY/SELL attestation above has now
+                # succeeded; watcher may consume this fresh pass-specific
+                # proof, never a generic addition of broker quantities.
+                batch.setdefault("mixed_verified", {})[(security, segment, product)] = split_proof
         db.record_system_event("OWNER_LOT_EVIDENCE", decision, json.dumps(evidence))
     if isinstance(orders, list):
         batch["get_order_book"] = orders

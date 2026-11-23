@@ -558,6 +558,7 @@ def format_startup_online_card(
     unprotected_positions_count: int = 0,
     is_stopped: bool = False,
     watcher_verified: bool = True,
+    snapshot_at: float | None = None,
 ) -> str:
     """
     H14: Formats the startup Telegram card with explicit separation between
@@ -573,6 +574,9 @@ def format_startup_online_card(
     unres_n = int(unresolved_intents_count or 0)
     unprot_n = int(unprotected_positions_count or 0)
     entries_open = bool(reconciliation_ok and not is_stopped and unres_n == 0 and unprot_n == 0)
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    at = datetime.fromtimestamp(float(snapshot_at), ZoneInfo("Asia/Kolkata")).strftime("%H:%M:%S") if snapshot_at is not None else "UNVERIFIED"
 
     def _styled_startup(card: str) -> str:
         from src.notifier.message_designer import render as render_designed_message
@@ -592,6 +596,7 @@ def format_startup_online_card(
             f"🟢 <b>{name} Online</b>\n"
             f"Mode: {mode}\n"
             f"Listener: Active {allowed_chats_count} channel{'s' if allowed_chats_count != 1 else ''}\n"
+            f"Startup snapshot: {at}\n"
             f"Reconciliation: Healthy\n"
             f"Protection Watcher: Active and Verified\n"
             f"New Entries Gate: Open"
@@ -610,6 +615,7 @@ def format_startup_online_card(
         f"🟡 <b>{name} Online — Verification Required</b>\n"
         f"Mode: {mode}\n"
         f"Listener: Active {allowed_chats_count} channel{'s' if allowed_chats_count != 1 else ''}\n"
+        f"Startup snapshot: {at}\n"
         f"Reconciliation: {rec_status}\n"
         f"Protection Watcher: {prot_status}\n"
         f"New Entries Gate: {'Open (watcher unverified)' if entries_open else 'Blocked'}"
