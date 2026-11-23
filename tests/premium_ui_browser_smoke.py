@@ -69,8 +69,10 @@ def assert_setup(page, width: int, setup_html: str) -> None:
              p.getBoundingClientRect().right <= 1;
     }""")
     assert page.locator("#v17pAccountOpen").get_attribute("aria-expanded") == "false"
-    # The same SVG mark is used in the topbar and account drawer.
-    assert page.locator(".v17p-brand svg.v17p-ub-mark .v17p-ub-letter").count() == 2
+    # The same shared AuditBot mark appears in header and instance drawer.
+    assert page.locator(".v17p-brand svg.v17p-audit-mark .v17p-audit-a").count() == 1
+    assert page.locator("#premNav svg.v17p-audit-mark .v17p-audit-a").count() == 1
+    assert page.locator(".v17p-brand-name").inner_text() == "AuditBot"
     for section in SECTIONS:
         if section != SECTIONS[0]:
             page.locator('.setup-section-jumps a[href="#' + section + '"]').click()
