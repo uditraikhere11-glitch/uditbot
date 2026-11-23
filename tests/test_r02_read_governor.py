@@ -74,8 +74,14 @@ class ReadControlTests(unittest.TestCase):
         self.g.admit()
 
     def test_invalid_header_uses_exponential_cooldown(self):
+        # Multiple 429 responses within one active window count as one strike.
         for header in ('nonsense', 'nan', '-1'):
             self.g.throttled(header)
+        # A subsequent 429 in each *new* window still increases backoff.
+        self.now += 61
+        self.g.throttled('nonsense')  # strike 2: 120 seconds
+        self.now += 121
+        self.g.throttled('nonsense')  # strike 3: 240 seconds
         self.now += 239
         with self.assertRaises(ReadDeferred):
             self.g.admit()
