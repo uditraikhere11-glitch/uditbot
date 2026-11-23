@@ -326,6 +326,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     return {
         **observed,
         "owner_intent_status": owner.status,
+        "owner_stop_pending": bool(stopping),
         "mode_can_edit": bool(can_edit and owner.status == "PASS"),
         "service_state": state,
         "config_file_revision": _revision_for_control(absolute_env),
@@ -538,6 +539,33 @@ def register_control_center_routes(app: FastAPI, csrf_token: str) -> None:
                           "equity_amo_can_edit": False, "equity_amo_active": None,
                            "fno_amo_can_edit": False, "fno_amo_active": None,
                           "warning": "Unable to verify service configuration"}, 503)
+
+    @app.post("/control/cancel-pending-stop")
+    async def cancel_pending_stop(request: Request):
+        """Explicit CSRF-protected owner decision; never issues systemctl."""
+        if "application/json" not in request.headers.get("content-type", "").lower():
+            return _json({"error": "JSON request required"}, 415)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json({"error": "Malformed request"}, 400)
+        if (not isinstance(body, dict) or set(body) !=
+                {"csrf_token", "confirm_keep_running"}):
+            return _json({"error": "Invalid owner-control request"}, 400)
+        if (not isinstance(body.get("csrf_token"), str)
+                or body["csrf_token"] != csrf_token):
+            return _json({"error": "Invalid CSRF token"}, 403)
+        if body.get("confirm_keep_running") is not True:
+            return _json({"error": "Explicit keep-running confirmation required"}, 422)
+        try:
+            _cfg, env_path, data_dir = _config_and_paths()
+            tracker = ConfigChangeTracker(data_dir=data_dir)
+            result = tracker.cancel_deferred_owner_stop(env_path=env_path)
+            return _json(result, 200 if result.get("ok") else 409)
+        except (OSError, ValueError, TimeoutError):
+            return _json({"error": "Owner control cannot be verified"}, 409)
+        except Exception:
+            return _json({"error": "Owner cancellation unavailable"}, 503)
 
     @app.get("/control/health")
     def get_control_health():
