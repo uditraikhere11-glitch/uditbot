@@ -153,7 +153,11 @@ async def main():
 
         # Fast serialized recovery hook when a rotated Dhan token is adopted from disk
         from src.engine.token_rotation_recovery import install_token_rotation_fast_recovery
-        install_token_rotation_fast_recovery(pipeline.broker, pipeline.reconciliation_gate)
+        # The offline runner tests use a minimal pipeline without a broker.
+        # The real TradingBotPipeline always supplies the Dhan broker.
+        broker = getattr(pipeline, "broker", None)
+        if broker is not None:
+            install_token_rotation_fast_recovery(broker, pipeline.reconciliation_gate)
 
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
