@@ -336,7 +336,10 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     from src.engine.tracker_v2_health import owner_intent_health
     owner = owner_intent_health(state, raw.get("owner_intent"))
     observed = _operational_evidence(tracker, raw, cfg, data_dir)
-    if owner.status != "PASS" and observed["new_entries_gate"] == "OPEN":
+    if (owner.status != "PASS" or gate.get("ok") is not True
+            or gate.get("active") is not False) and observed["new_entries_gate"] == "OPEN":
+        # A healthy reconciliation heartbeat alone cannot override a pending
+        # owner transition, including an interrupted Cancel Pending STOP.
         observed["new_entries_gate"] = "REVIEW_REQUIRED"
     return {
         **observed,
