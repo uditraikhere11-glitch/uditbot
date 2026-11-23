@@ -90,7 +90,8 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         self.broker.get_trades_for_order.reset_mock()
         self.broker.get_historical_trades.reset_mock()
 
-    def test_all_three_old_parent_buys_skipped_but_active_oco_read_is_mandatory(self):
+    def test_all_three_old_parent_buys_skipped_but_active_oco_book_is_mandatory(self):
+        self.broker.get_forever_orders.reset_mock()
         ok,msg=self.gate_once()
         self.assertTrue(ok,msg)
         self.assertTrue(self.gate.is_accepting_entries)
@@ -101,7 +102,8 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         attempted=[str(c.args[0]) for c in self.broker.get_trades_for_order.call_args_list]
         self.assertNotIn(VED,attempted)
         for oid in ORDERS:self.assertNotIn(oid,attempted)
-        self.assertIn(OCO,attempted)
+        self.assertNotIn(OCO,attempted)
+        self.assertTrue(self.broker.get_forever_orders.called)
         self.assertGreaterEqual(self.broker.get_historical_trades.call_count,2)
         self.assertEqual(self.watcher._supervision_read_complete,True)
 
@@ -138,7 +140,7 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         self.assertTrue(self.gate.is_accepting_entries)
         attempted=[c.args[0] for c in self.broker.get_trades_for_order.call_args_list]
         self.assertNotIn(VED,attempted)
-        self.assertIn(OCO,attempted)
+        self.assertNotIn(OCO,attempted)
         self.assert_ack_and_no_sell()
 
     def test_missing_historical_original_buy_blocks_without_retrying_old_buy_or_OCO(self):
@@ -146,9 +148,11 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         self.broker.get_historical_trades.return_value = r01.as_read_list([
             self.fx._normalized(self.fx.first), self.fx._normalized(self.fx.second)
         ])
-        # A Dhan 429 on the obsolete original lookup would place *all* GET
-        # requests into a 60-second category cooldown. The corrected watcher
-        # must not send this lookup and still MUST query the active OCO SELL.
+        # A Dhan 429 on either the obsolete original BUY endpoint or the
+        # Forever GROUP ID would cause a category cooldown. The corrected
+        # watcher supervises this live OCO through its current broker book;
+        # only independently identified exchange CHILD order IDs are valid
+        # inputs to get_trades_for_order.
         attempts=[]
         def old_lookup_fails(oid):
             attempts.append(oid)
@@ -163,7 +167,7 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         self.assertFalse(ok)
         self.assertFalse(self.gate.is_accepting_entries)
         self.assertNotIn(VED,attempts)
-        self.assertIn(OCO,attempts)
+        self.assertNotIn(OCO,attempts)
         self.assertTrue(any("ORIGINAL_BUY_MISSING_FROM_HISTORY" in line
                             for line in captured.output),captured.output)
         with closing(self.gov._connect()) as db:
@@ -243,16 +247,24 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
         self.assertFalse(ok)
         self.assertFalse(self.gate.is_accepting_entries)
 
-    def test_active_oco_leg_trade_read_unavailable_fails_closed(self):
+    def test_active_oco_broker_book_unavailable_fails_closed(self):
+        # Absence of a trusted Forever book is a genuine broker-evidence failure.
+        # A Forever OCO group ID is NOT an exchange order ID, so its daily
+        # /trades/{id} endpoint must never be queried as a substitute.
+        self.broker.get_forever_orders.return_value = BrokerReadFailure(
+            BrokerReadStatus.UNAVAILABLE.value, "Synthetic OCO book denied", 429,
+        )
         self.broker.get_trades_for_order.side_effect=lambda oid: (
             BrokerReadFailure(BrokerReadStatus.UNAVAILABLE.value,
-                              "Synthetic OCO exit GET denied",429) if oid==OCO
+                              "Synthetic OCO group GET denied", 429) if oid==OCO
             else r01.as_read_list([])
         )
+        self.broker.get_forever_orders.reset_mock()
         ok,_=self.gate_once()
         self.assertFalse(ok)
         self.assertFalse(self.gate.is_accepting_entries)
-        self.assertIn(OCO,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
+        self.assertTrue(self.broker.get_forever_orders.called)
+        self.assertNotIn(OCO,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
 
     def test_journal_write_failure_blocks(self):
         with patch.object(self.db,"upsert_position_lifecycle",
@@ -302,21 +314,23 @@ class VEDPOWERRecoveryAcrossDH904(VEDPOWERProtectedThreeHoldings):
         self.assertFalse(self.gate.is_accepting_entries)
         self.assertIn(VED,[c.args[0] for c in self.broker.get_trades_for_order.call_args_list])
 
-    def test_after_success_routine_uses_process_scoped_proof_and_reads_live_exit(self):
+    def test_after_success_routine_uses_process_scoped_proof_and_live_oco_book(self):
         ok,reason=self.gate_once()
         self.assertTrue(ok,reason)
         self.broker.get_trades_for_order.reset_mock()
+        self.broker.get_forever_orders.reset_mock()
         self.watcher.check_once()
+        self.assertTrue(self.broker.get_forever_orders.called)
         attempted=[c.args[0] for c in self.broker.get_trades_for_order.call_args_list]
         self.assertNotIn(VED,attempted)
-        self.assertIn(OCO,attempted)
+        self.assertNotIn(OCO,attempted)
         self.restart()
         self.assertFalse(hasattr(self.watcher,"_protected_buy_history_session"))
         self.broker.get_trades_for_order.reset_mock()
         self.watcher.check_once()
         # A clean legacy protected record without prior unreadable evidence
-        # retains its original fallback; an already-unreadable parent instead
-        # uses the fail-closed, no-repeat path tested above.
+        # may retain the original BUY fallback after restart. This must NOT
+        # cause a per-order GET for the separate Forever group identifier.
         attempted=[c.args[0] for c in self.broker.get_trades_for_order.call_args_list]
         self.assertIn(VED,attempted)
-        self.assertIn(OCO,attempted)
+        self.assertNotIn(OCO,attempted)

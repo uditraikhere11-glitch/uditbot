@@ -3545,6 +3545,90 @@ class ProtectionWatcher:
         terminal_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "CLOSED", "TRADED"}
         dead_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
 
+        # A Forever OCO ID is a *group*, not an exchange SELL order ID.  A
+        # historical aggregate group can legitimately protect two old BUY lots.
+        # Admit shared GROUP coverage only for a fresh, wholly resting OCO
+        # whose quantity matches the entire same-account contract exposure.
+        # An exchange child (or triggered/part-filled/ambiguous group) NEVER
+        # shares parent ownership: those executions require independent journal
+        # allocation and keep the entry gate fail-closed until reconciled.
+        broker_forever_group_ids = {
+            str(r.get("orderId") or "").strip()
+            for r in forever_book or [] if isinstance(r, dict) and r.get("orderId")
+        }
+        eligible_shared_forever_ids: Set[str] = set()
+        if snapshot_complete and isinstance(forever_book, list) and isinstance(trade_book, list):
+            claims: Dict[str, List[dict]] = {}
+            for shared_rec in open_recs:
+                if self._resolve_protection_route(shared_rec) != ProtectionRoute.FOREVER_OCO.value:
+                    continue
+                for group_id in set(str(x or "").strip()
+                                    for x in (shared_rec.get("confirmed_protection_ids") or [])):
+                    if group_id:
+                        claims.setdefault(group_id, []).append(shared_rec)
+            for group_id, owners in claims.items():
+                if len(owners) < 2 or len({str(r.get("order_id") or "") for r in owners}) != len(owners):
+                    continue
+                reference = owners[0]
+                security = str(reference.get("security_id") or "").strip()
+                segment = str(reference.get("segment") or "NSE_EQ").strip().upper()
+                product = str(reference.get("product_type") or "CNC").strip().upper()
+                account = str(getattr(self.journal_db, "account_id", "") or getattr(
+                    getattr(self.broker, "cfg", None), "dhan_client_id", "") or "").strip()
+                if not security or not account or product not in ("CNC", "MTF"):
+                    continue
+                same_contract = [
+                    r for r in open_recs
+                    if str(r.get("security_id") or "").strip() == security
+                    and str(r.get("segment") or "NSE_EQ").strip().upper() == segment
+                    and str(r.get("product_type") or "CNC").strip().upper() == product
+                ]
+                if len(same_contract) != len(owners) or any(r not in owners for r in same_contract):
+                    continue
+                if any(
+                    str(r.get("position_state") or "").upper() != PositionLifecycleState.PROTECTED.value
+                    or int(r.get("filled_qty") or 0) <= 0
+                    or int(r.get("exit_filled_qty") or 0) != 0
+                    or int(r.get("protected_qty") or 0) < int(r.get("filled_qty") or 0)
+                    or set(str(x or "").strip() for x in (r.get("confirmed_protection_ids") or [])) != {group_id}
+                    or (r.get("account_id") and str(r["account_id"]).strip() != account)
+                    or any(r.get(flag) for flag in (
+                        "manual_exit_detected", "external_unlinked_sell_observed", "unverified_trade_detected",
+                        "reconciliation_required", "persistence_uncertain", "orphaned_legs_detected",
+                        "uncommitted_broker_sell_trades", "pending_oco"))
+                    for r in owners
+                ):
+                    continue
+                if any(
+                    isinstance(t, dict) and str(t.get("securityId") or "").strip() == security
+                    for t in trade_book
+                ):
+                    continue
+                group_rows = [r for r in forever_book if isinstance(r, dict)
+                              and str(r.get("orderId") or "").strip() == group_id]
+                if (len(group_rows) != 2
+                        or {str(r.get("legName") or "").upper() for r in group_rows}
+                        != {"TARGET_LEG", "STOP_LOSS_LEG"}):
+                    continue
+                combined = sum(int(r.get("filled_qty") or 0) for r in owners)
+                if any(
+                    str(fr.get("dhanClientId") or "").strip() != account
+                    or str(fr.get("securityId") or "").strip() != security
+                    or str(fr.get("exchangeSegment") or "").strip().upper() != segment
+                    or str(fr.get("productType") or "").strip().upper() != product
+                    or str(fr.get("transactionType") or "").strip().upper() != "SELL"
+                    or str(fr.get("orderStatus") or "").strip().upper() not in active_states
+                    or type(fr.get("quantity")) is not int or fr["quantity"] != combined
+                    for fr in group_rows
+                ):
+                    continue
+                owned, source = observed_open_quantity(
+                    positions_book, holdings_book, security_id=security,
+                    segment=segment, product=product, account_id=account,
+                )
+                if source == "VERIFIED_SETTLED_HOLDINGS" and owned == combined:
+                    eligible_shared_forever_ids.add(group_id)
+
         # C5 & C8: Precompute typed owner maps across all tracked bot orders with fail-closed collision detection
         all_bot_leg_owners: Dict[str, str] = {}
         all_bot_forever_owners: Dict[str, str] = {}
@@ -3557,6 +3641,9 @@ class ProtectionWatcher:
                 return True
             prev = target_map.get(ks_i)
             if prev is not None and prev != ow_i:
+                if target_map is all_bot_forever_owners and ks_i in eligible_shared_forever_ids:
+                    # Group-level resting coverage, not ownership of a SELL fill.
+                    return True
                 owner_id_collisions.setdefault(ks_i, {prev}).add(ow_i)
                 return False
             target_map[ks_i] = ow_i
@@ -3574,7 +3661,7 @@ class ProtectionWatcher:
             _register_owner(all_bot_leg_owners, k_oid, k_oid)
             for v_id in (k_rec.get("verified_leg_order_ids") or []):
                 vs = str(v_id or "").strip()
-                if vs and not vs.startswith("SUPER-"):
+                if vs and not vs.startswith("SUPER-") and vs not in broker_forever_group_ids:
                     _register_owner(all_bot_leg_owners, vs, k_oid)
             for cid_k in (k_rec.get("confirmed_protection_ids") or []):
                 cs = str(cid_k or "").strip()
