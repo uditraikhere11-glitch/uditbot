@@ -481,7 +481,7 @@ html.v17p-preview-shell .v17p-topbar{
   color:var(--v17p-text);width:100%;box-shadow:0 1px 3px #202a3810;
 }
 html.v17p-preview-shell .v17p-brand{font-size:21px;font-weight:700;letter-spacing:-.65px;color:var(--v17p-text);text-decoration:none;white-space:nowrap}
-html.v17p-preview-shell .v17p-brand>span{display:inline-flex;vertical-align:middle;margin-right:9px;color:inherit}
+html.v17p-preview-shell .v17p-brand>span:first-child{display:inline-flex;vertical-align:middle;margin-right:9px;color:inherit}
 html.v17p-preview-shell .v17p-desktop-tabs{display:flex;align-items:center;gap:5px;flex:1;min-width:0;justify-content:center}
 html.v17p-preview-shell .v17p-desktop-tabs a{display:flex;gap:5px;align-items:center;padding:10px 13px;white-space:nowrap;text-decoration:none;color:var(--v17p-muted);font-weight:600;font-size:13px;border-radius:9px}
 html.v17p-preview-shell .v17p-desktop-tabs a[aria-current="page"]{background:#141b29;color:#fff}
@@ -756,15 +756,17 @@ html.v17p-preview-shell #v17-reports h2{font-size:17px;margin:20px 0 10px}
 
 /* PR137: coherent type scale and full-width Setup sections. */
 html.v17p-preview-shell .v17p-brand{display:inline-flex;align-items:center;font-weight:700;letter-spacing:-.02em}
-html.v17p-preview-shell .v17p-ub-mark{display:block;width:38px;height:38px;flex:none}
-html.v17p-preview-shell .v17p-ub-mark .v17p-ub-tile{fill:#f0f6ff;stroke:#c3d5ec}
-html.v17p-preview-shell .v17p-ub-mark .v17p-ub-letter{fill:none;stroke:#143861}
-html.v17p-preview-shell .v17p-ub-mark .v17p-ub-signal{fill:#2a8dea}
-html.v17p-preview-shell.v17p-dark .v17p-ub-mark .v17p-ub-tile{fill:#22344d;stroke:#486381}
-html.v17p-preview-shell.v17p-dark .v17p-ub-mark .v17p-ub-letter{stroke:#eff6ff}
-html.v17p-preview-shell.v17p-dark .v17p-ub-mark .v17p-ub-signal{fill:#69b8ff}
+html.v17p-preview-shell .v17p-audit-mark{display:block;width:38px;height:38px;flex:none}
+html.v17p-preview-shell .v17p-audit-mark .v17p-audit-tile{fill:#13243b;stroke:#44617e}
+html.v17p-preview-shell .v17p-audit-mark .v17p-audit-a{stroke:#f1f7ff}
+html.v17p-preview-shell .v17p-audit-mark .v17p-audit-pulse{stroke:#55c1f5}
+html.v17p-preview-shell .v17p-audit-mark .v17p-audit-point{fill:#55c1f5}
+html.v17p-preview-shell.v17p-dark .v17p-audit-mark .v17p-audit-tile{fill:#1c2b41;stroke:#5b7698}
+html.v17p-preview-shell .v17p-brand-name{display:inline-block;min-width:0;white-space:nowrap}
+html.v17p-preview-shell .v17p-instance-label{font-size:12px;font-weight:600;color:var(--v17p-muted);white-space:nowrap;max-width:144px;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:1100px){html.v17p-preview-shell .v17p-instance-label{display:none}}
 html.v17p-preview-shell #premNav .prem-brand-icon{background:transparent!important;border:0!important;border-radius:0;width:43px;height:43px;flex-basis:43px}
-html.v17p-preview-shell #premNav .prem-brand-icon .v17p-ub-mark{width:43px;height:43px}
+html.v17p-preview-shell #premNav .prem-brand-icon .v17p-audit-mark{width:43px;height:43px}
 html.v17p-preview-shell.premium-setup form[action="/setup"]{display:block;column-count:1;column-width:auto;width:100%;max-width:1040px;margin:0 auto}
 html.v17p-preview-shell.premium-setup form[action="/setup"]>.section-card{width:100%;max-width:none;break-inside:auto;min-width:0}
 html.v17p-preview-shell.premium-setup .v17p-setup-toolbar{max-width:1040px;margin-inline:auto}
@@ -808,4 +810,4 @@ html.v17p-preview-shell.premium-control #v17-control>.buttons #restart:disabled{
 
 /* PR137: the account drawer is always an on-demand overlay, not a desktop sidebar. */
 html:not(.v17p-preview-shell) #premNav:not(.open){visibility:hidden!important;transform:translateX(-110%)!important}
-@media(max-width:390px){html.v17p-preview-shell .v17p-brand>span{margin-right:7px}html.v17p-preview-shell .v17p-ub-mark{width:35px;height:35px}}
+@media(max-width:390px){html.v17p-preview-shell .v17p-brand>span{margin-right:7px}html.v17p-preview-shell .v17p-audit-mark{width:35px;height:35px}}
