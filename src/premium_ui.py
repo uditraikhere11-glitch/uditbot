@@ -11,23 +11,22 @@ from urllib.parse import quote
 _ASSET_DIR = Path(__file__).resolve().parent
 _PAGES = frozenset({'setup', 'control', 'designer'})
 
-# One shared vector monogram for the topbar, account drawer and tab favicon.
-# Crisp viewBox geometry and currentColor strokes work in both appearance modes.
-_UB_MARK = (
-    '<svg class="v17p-ub-mark" xmlns="http://www.w3.org/2000/svg" '
+# AuditBot is the shared trading system. The logo never varies by VM/user.
+# UditBot/AmanBot remain configured instance labels, not separate brands.
+_AUDITBOT_MARK = (
+    '<svg class="v17p-audit-mark" xmlns="http://www.w3.org/2000/svg" '
     'viewBox="0 0 48 48" aria-hidden="true" focusable="false" '
     'fill="none" stroke-linecap="round" stroke-linejoin="round">'
-    '<rect class="v17p-ub-tile" x="2" y="2" width="44" height="44" '
-    'rx="12" fill="#f0f6ff" stroke="#c3d5ec" stroke-width="1.4"/>'
-    '<path class="v17p-ub-letter" d="M11.5 14v13c0 4.6 2.7 7.4 6.8 7.4s6.8-2.8 6.8-7.4V14" '
-    'stroke="#143861" stroke-width="2.9"/>'
-    '<path class="v17p-ub-letter" d="M29.1 14v20.5M29.1 14h3.3c3.6 0 5.8 2 5.8 4.8'
-    's-2.2 4.8-5.8 4.8h-3.3m0 0h3.8c3.7 0 5.9 2 5.9 5.1'
-    ' -2.2 5.3-5.9 5.3h-3.8" stroke="#143861" stroke-width="2.65"/>'
-    '<circle class="v17p-ub-signal" cx="25.1" cy="14" r="2" fill="#2a8dea"/>'
+    '<rect class="v17p-audit-tile" x="2" y="2" width="44" height="44" rx="12" '
+    'fill="#13243b" stroke="#44617e" stroke-width="1.5"/>'
+    '<path class="v17p-audit-a" d="M12.25 35 24 12.4 35.75 35" '
+    'stroke="#f1f7ff" stroke-width="3.35"/>'
+    '<path class="v17p-audit-pulse" d="M14.8 28.2h6.3l2.4-4.8 3.15 8.1 2.35-4.35h4.2" '
+    'stroke="#55c1f5" stroke-width="2.5"/>'
+    '<circle class="v17p-audit-point" cx="36.2" cy="11" r="2.15" fill="#55c1f5"/>'
     '</svg>'
 )
-_UB_FAVICON = quote(_UB_MARK, safe='')
+_AUDITBOT_FAVICON = quote(_AUDITBOT_MARK, safe='')
 
 
 def premium_instance_name() -> str:
@@ -68,7 +67,7 @@ def premium_configured_dhan_label() -> str:
 def premium_styles() -> str:
     content = (_ASSET_DIR / 'premium_ui.css').read_text(encoding='utf-8')
     return ('<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,'
-            + _UB_FAVICON + '">\n<style>\n' + content + '\n</style>')
+            + _AUDITBOT_FAVICON + '">\n<style>\n' + content + '\n</style>')
 
 
 @lru_cache(maxsize=1)
@@ -112,20 +111,21 @@ def premium_nav(page: str) -> str:
             )
         return '\n'.join(rows)
     return f"""<header class="v17p-topbar" aria-label="AuditBot application header">
-  <a class="v17p-brand" href="/" aria-label="{brand} dashboard"><span aria-hidden="true">{_UB_MARK}</span>{brand}</a>
+  <a class="v17p-brand" href="/" aria-label="AuditBot dashboard, {brand} instance"><span aria-hidden="true">{_AUDITBOT_MARK}</span><span class="v17p-brand-name">AuditBot</span></a>
   <nav class="v17p-desktop-tabs" aria-label="Main navigation">{links('v17p-top-link', initial_current=True)}</nav>
   <div class="v17p-top-actions">
     <span class="v17p-dhan-badge" aria-label="Saved Dhan account: {dhan_label}; connection not verified here" title="Saved account identifier only; verify connectivity in Dashboard or Health">Dhan <strong>{dhan_label}</strong></span>
+    <span class="v17p-instance-label" title="Configured bot instance: {brand}">{brand}</span>
     <span id="v17p-runtime-chip" class="v17p-runtime-chip" aria-live="polite">UNVERIFIED</span>
     <button type="button" id="premiumThemeToggle" class="v17p-theme-btn" aria-label="Toggle light or dark appearance" aria-pressed="false">☼</button>
-    <button type="button" id="v17pAccountOpen" class="v17p-account" aria-label="Open account and navigation menu" aria-controls="premNav" aria-expanded="false">{initial}</button>
+    <button type="button" id="v17pAccountOpen" class="v17p-account" aria-label="Open {brand} account and navigation menu" aria-controls="premNav" aria-expanded="false">{initial}</button>
   </div>
 </header>
 <div id="premNavBackdrop" class="prem-nav-backdrop" hidden></div>
 <nav id="premNav" class="prem-nav" aria-label="AuditBot navigation" aria-hidden="true">
   <button id="premNavClose" type="button" class="prem-nav-close" aria-label="Close navigation">✕</button>
-  <div class="prem-brand"><span class="prem-brand-icon" aria-hidden="true">{_UB_MARK}</span>
-    <div><strong>{brand}</strong><small>Powered by AuditBot · Trading System</small></div></div>
+  <div class="prem-brand"><span class="prem-brand-icon" aria-hidden="true">{_AUDITBOT_MARK}</span>
+    <div><strong>{brand}</strong><small>AuditBot · Trading System</small></div></div>
   <div class="prem-nav-group">WORKSPACE</div>
   <a href="/#dashboard"><span aria-hidden="true">⌂</span>Dashboard</a>
   <a href="/#control"><span aria-hidden="true">▷</span>Trading Controls</a>
