@@ -732,8 +732,8 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
             protection_route="SUPER_ORDER", observed_at=1730200600.0,
         )
         self.assertIn("Status: Position Closed (Target Hit)", c_closed)
-        self.assertIn("Entry BUY VWAP: ₹100.00", c_closed)
-        self.assertIn("Exit SELL VWAP: ₹103.00", c_closed)
+        self.assertIn("Entry Price: ₹100.00", c_closed)
+        self.assertIn("Exit Price: ₹103.00", c_closed)
         self.assertIn("Gross Realized P&amp;L: +₹375.00", c_closed)
 
     # ------------------------------------------------------------------

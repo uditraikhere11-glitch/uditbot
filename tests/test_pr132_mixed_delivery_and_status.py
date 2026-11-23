@@ -683,3 +683,142 @@ class LegacyNULLTradeIdMixedCNC(unittest.TestCase):
     def test_legacy_attestation_broker_account_mismatch_rejected(self):
         self.old_attestation['dhanClientId']='OTHER'
         with self.assertRaises(MixedCNCUnverified): self.fx.proof()
+
+
+import tempfile
+
+
+class MixedCNCHardeningFollowup(unittest.TestCase):
+    """Follow-up hardening tests for prior-day PROTECTED lots, strict types, and carry-forward guards."""
+
+    def _seed_protected_and_new(self, td):
+        from datetime import datetime, timedelta
+        from src.engine.market import IST
+        from src.journal.db import JournalDB
+        from src.engine.mixed_cnc_evidence import verify_mixed_cnc_split, MixedCNCUnverified
+
+        now_ts = datetime(2026, 11, 24, 11, 0, 0, tzinfo=IST).timestamp()
+        prior_ts = (datetime(2026, 11, 24, 11, 0, 0, tzinfo=IST) - timedelta(days=1)).timestamp()
+        db = JournalDB(str(Path(td) / "j.db"), account_id="1113731536")
+        with db._get_conn() as conn:
+            # Prior-day PROTECTED 28-share lot (no manual-risk ACK)
+            conn.execute(
+                """INSERT INTO order_intents (
+                    correlation_id, symbol, trading_symbol, security_id, exchange_segment, product_type,
+                    order_type, price, quantity, protection_route, state, broker_order_id, account_id,
+                    created_at, updated_at
+                ) VALUES ('BUY-YB-28', 'YESBANK', 'YESBANK', '11915', 'NSE_EQ', 'CNC', 'LIMIT',
+                          17.72, 28, 'FOREVER_OCO', 'TRADED', '221261123606908', '1113731536', ?, ?)""",
+                (prior_ts, prior_ts),
+            )
+            conn.execute(
+                """INSERT INTO fills (
+                    broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity,
+                    traded_at, transaction_type, security_id, exchange_segment, product_type,
+                    parent_order_id, is_verified_trade
+                ) VALUES ('221261123606908', '609978137', 'YESBANK', 17.72, 28, ?, 'BUY',
+                          '11915', 'NSE_EQ', 'CNC', '221261123606908', 1)""",
+                (prior_ts,),
+            )
+            conn.execute(
+                """INSERT INTO positions_lifecycle (
+                    parent_order_id, account_id, symbol, trading_symbol, security_id,
+                    exchange_segment, product_type, protection_route, position_state,
+                    entry_qty, buy_filled_qty, buy_vwap, protected_qty, sl_price,
+                    target_price, sell_filled_qty, sell_vwap, confirmed_open_qty,
+                    realized_pnl, updated_at
+                ) VALUES ('221261123606908', '1113731536', 'YESBANK', 'YESBANK', '11915',
+                          'NSE_EQ', 'CNC', 'FOREVER_OCO', 'PROTECTED', 28, 28, 17.72,
+                          28, 17.19, 18.25, 0, 0.0, 28, 0.0, ?)""",
+                (prior_ts,),
+            )
+            conn.execute(
+                """INSERT INTO protection_orders (
+                    parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit,
+                    target_price, quantity, status, created_at, protection_route
+                ) VALUES ('221261123606908', 'FO-YB-28', 'YESBANK', 17.19, 17.02, 18.25,
+                          28, 'ACTIVE_CONFIRMED', ?, 'FOREVER_OCO')""",
+                (prior_ts,),
+            )
+            # New today 5-share BUY lot
+            conn.execute(
+                """INSERT INTO order_intents (
+                    correlation_id, symbol, trading_symbol, security_id, exchange_segment, product_type,
+                    order_type, price, quantity, protection_route, state, broker_order_id, account_id,
+                    created_at, updated_at
+                ) VALUES ('BUY-YB-5', 'YESBANK', 'YESBANK', '11915', 'NSE_EQ', 'CNC', 'LIMIT',
+                          18.00, 5, 'FOREVER_OCO', 'TRADED', '221261124000001', '1113731536', ?, ?)""",
+                (now_ts - 60, now_ts - 60),
+            )
+            conn.execute(
+                """INSERT INTO fills (
+                    broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity,
+                    traded_at, transaction_type, security_id, exchange_segment, product_type,
+                    parent_order_id, is_verified_trade
+                ) VALUES ('221261124000001', '700000001', 'YESBANK', 18.00, 5, ?, 'BUY',
+                          '11915', 'NSE_EQ', 'CNC', '221261124000001', 1)""",
+                (now_ts - 60,),
+            )
+        positions = [{
+            "dhanClientId": "1113731536", "securityId": "11915", "exchangeSegment": "NSE_EQ",
+            "productType": "CNC", "netQty": 5, "dayBuyQty": 5, "daySellQty": 0,
+            "carryForwardBuyQty": 0, "carryForwardSellQty": 0,
+        }]
+        holdings = [{
+            "dhanClientId": "1113731536", "securityId": "11915", "isin": "INE528G01035",
+            "totalQty": 28, "dpQty": 28, "t1Qty": 0, "availableQty": 28,
+        }]
+        trades = [{
+            "dhanClientId": "1113731536", "orderId": "221261124000001", "exchangeTradeId": "700000001",
+            "securityId": "11915", "isin": "INE528G01035", "exchangeSegment": "NSE_EQ",
+            "productType": "CNC", "transactionType": "BUY", "tradedQuantity": 5, "tradedPrice": 18.00,
+        }]
+        return db, positions, holdings, trades, now_ts, verify_mixed_cnc_split, MixedCNCUnverified
+
+    def test_prior_day_protected_forever_oco_lot_passes_without_manual_risk_ack(self):
+        with tempfile.TemporaryDirectory() as td:
+            db, positions, holdings, trades, now_ts, verify_fn, _ = self._seed_protected_and_new(td)
+            proof = verify_fn(
+                db=db, positions=positions, holdings=holdings, trade_book=trades,
+                account="1113731536", security="11915", segment="NSE_EQ", product="CNC",
+                parent_quantities={"221261123606908": 28, "221261124000001": 5}, now=now_ts,
+            )
+            self.assertEqual(proof.settled_qty, 28)
+            self.assertEqual(proof.intraday_qty, 5)
+            self.assertEqual(proof.total_qty, 33)
+
+    def test_prior_day_unprotected_without_ack_still_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            db, positions, holdings, trades, now_ts, verify_fn, err_cls = self._seed_protected_and_new(td)
+            with db._get_conn() as conn:
+                conn.execute("UPDATE positions_lifecycle SET position_state='UNPROTECTED', protected_qty=0 WHERE parent_order_id='221261123606908'")
+            with self.assertRaises(err_cls):
+                verify_fn(
+                    db=db, positions=positions, holdings=holdings, trade_book=trades,
+                    account="1113731536", security="11915", segment="NSE_EQ", product="CNC",
+                    parent_quantities={"221261123606908": 28, "221261124000001": 5}, now=now_ts,
+                )
+
+    def test_float_or_bool_trade_quantity_rejected(self):
+        for bad_qty in (5.0, True):
+            with self.subTest(bad_qty=bad_qty), tempfile.TemporaryDirectory() as td:
+                db, positions, holdings, trades, now_ts, verify_fn, err_cls = self._seed_protected_and_new(td)
+                trades[0]["tradedQuantity"] = bad_qty
+                with self.assertRaises(err_cls):
+                    verify_fn(
+                        db=db, positions=positions, holdings=holdings, trade_book=trades,
+                        account="1113731536", security="11915", segment="NSE_EQ", product="CNC",
+                        parent_quantities={"221261123606908": 28, "221261124000001": 5}, now=now_ts,
+                    )
+
+    def test_carry_forward_or_day_qty_mismatch_rejected(self):
+        for patch_pos in ({"carryForwardBuyQty": 2}, {"dayBuyQty": 4}):
+            with self.subTest(patch_pos=patch_pos), tempfile.TemporaryDirectory() as td:
+                db, positions, holdings, trades, now_ts, verify_fn, err_cls = self._seed_protected_and_new(td)
+                positions[0].update(patch_pos)
+                with self.assertRaises(err_cls):
+                    verify_fn(
+                        db=db, positions=positions, holdings=holdings, trade_book=trades,
+                        account="1113731536", security="11915", segment="NSE_EQ", product="CNC",
+                        parent_quantities={"221261123606908": 28, "221261124000001": 5}, now=now_ts,
+                    )
