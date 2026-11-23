@@ -13,17 +13,18 @@ _PAGES = frozenset({'setup', 'control', 'designer'})
 
 # AuditBot is the shared trading system. The logo never varies by VM/user.
 # UditBot/AmanBot remain configured instance labels, not separate brands.
+# Owner-approved AuditBot mark: symbol extracted from the supplied logo artwork.
+# The white/blue/green strokes remain unchanged, stored as a compact PNG data URI.
+_AUDITBOT_IMAGE_B64 = (
+    "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"
+)
 _AUDITBOT_MARK = (
     '<svg class="v17p-audit-mark" xmlns="http://www.w3.org/2000/svg" '
-    'viewBox="0 0 48 48" aria-hidden="true" focusable="false" '
-    'fill="none" stroke-linecap="round" stroke-linejoin="round">'
-    '<rect class="v17p-audit-tile" x="2" y="2" width="44" height="44" rx="12" '
-    'fill="#13243b" stroke="#44617e" stroke-width="1.5"/>'
-    '<path class="v17p-audit-a" d="M12.25 35 24 12.4 35.75 35" '
-    'stroke="#f1f7ff" stroke-width="3.35"/>'
-    '<path class="v17p-audit-pulse" d="M14.8 28.2h6.3l2.4-4.8 3.15 8.1 2.35-4.35h4.2" '
-    'stroke="#55c1f5" stroke-width="2.5"/>'
-    '<circle class="v17p-audit-point" cx="36.2" cy="11" r="2.15" fill="#55c1f5"/>'
+    'viewBox="0 0 112 112" aria-hidden="true" focusable="false">'
+    '<rect class="v17p-audit-tile" x="0" y="0" width="112" height="112" '
+    'rx="23" fill="#071727"/>'
+    '<image x="0" y="0" width="112" height="112" '
+    'href="data:image/png;base64,' + _AUDITBOT_IMAGE_B64 + '"/>'
     '</svg>'
 )
 _AUDITBOT_FAVICON = quote(_AUDITBOT_MARK, safe='')
