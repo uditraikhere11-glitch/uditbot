@@ -43,7 +43,9 @@ def owner_entries_permitted(data_dir: str) -> bool:
         owner = _record(root / "service_control_state.json")
         gate = _record(root / "mode_transition_gate.json")
         if owner is None and gate is None:
-            return True
+            # Once the coordinator lock exists, missing owner records are
+            # suspicious and must not reopen an entry gate.
+            return fd is None
         if owner is None:
             return False
         if (owner.get("desired_service_state") != "RUNNING"

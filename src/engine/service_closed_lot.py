@@ -46,6 +46,8 @@ def _verify(db_path, parent, required, expected_sec, account, broker, orders, fo
     with sqlite3.connect(uri, uri=True, timeout=3) as con:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only=ON")
+        # Pin lifecycle, fills, allocations and OCO rows to one WAL snapshot.
+        con.execute("BEGIN")
         pos = con.execute(
             "SELECT * FROM positions_lifecycle WHERE parent_order_id=?", (parent,),
         ).fetchone()

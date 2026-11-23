@@ -65,3 +65,9 @@ def test_missing_owner_with_gate_fails_closed():
         p=Path(d)
         save(p,"mode_transition_gate.json",{"active":False})
         assert not owner_entries_permitted(d)
+
+def test_missing_owner_records_with_existing_control_lock_block():
+    with TemporaryDirectory() as d:
+        p=Path(d)
+        (p/"config_operation.lock").write_text("")
+        assert not owner_entries_permitted(d)
