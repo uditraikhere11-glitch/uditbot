@@ -3295,7 +3295,18 @@ class ConfigChangeTracker:
             broker_Fatal_err: List[str] = []
 
             def _flat_closed_fill(corr_id: str, b_oid: str, filled: int, sec_id: str = "") -> bool:
-                """Verify genuine closure and durably retire ONLY that closed parent's stale gate."""
+                """Verify historical closure without manufacturing protection credit."""
+                if not has_unresolved_prot_attempts and valid_live_broker is not None:
+                    from src.engine.service_closed_lot import verified_service_closed_delivery_lot
+                    if verified_service_closed_delivery_lot(
+                        db_path=db_path, parent_order_id=b_oid, quantity=filled,
+                        expected_security_id=sec_id, account_id=current_account_id,
+                        broker=valid_live_broker,
+                        order_book=list(order_book_by_id.values()),
+                        forever_book=[leg for group in fo_groups.values() for leg in group],
+                        super_book=list(so_by_id.values()),
+                    ):
+                        return True
                 entry = order_book_by_id.get(b_oid) or order_book_by_corr.get(corr_id)
                 watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
                 previously_verified = False
