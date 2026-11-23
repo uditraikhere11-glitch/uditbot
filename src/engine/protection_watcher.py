@@ -3458,7 +3458,7 @@ class ProtectionWatcher:
             type(self.broker).__name__ == "DhanClient"
             and not hasattr(getattr(getattr(self.broker, "session", None), "get", None), "mock_calls")
             and "unittest.mock" not in str(type(getattr(getattr(self.broker, "session", None), "get", None)))
-            and (os.environ.get("AUDITBOT_TEST_ISOLATION") == "1" or "unittest" in os.sys.modules)
+            and os.environ.get("AUDITBOT_TEST_ISOLATION") == "1"
         )
 
         unreadable_books = set()
