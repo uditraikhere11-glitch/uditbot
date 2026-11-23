@@ -127,7 +127,19 @@ def test_following_day_flat_with_verified_historical_journal():
     with TemporaryDirectory() as d:
         path, broker, orders, forever = fixture(Path(d))
         broker.positions, broker.holdings, broker.trades = [], [], []
+        with sqlite3.connect(path) as con:
+            con.execute(
+                "UPDATE fills SET traded_at=? WHERE exchange_trade_id='600110497'",
+                ((datetime.now(IST) - timedelta(days=1)).timestamp(),),
+            )
         assert verify(path, broker, [], [])
+
+
+def test_same_day_empty_tradebook_does_not_pretend_following_session():
+    with TemporaryDirectory() as d:
+        path, broker, orders, forever = fixture(Path(d))
+        broker.positions, broker.holdings, broker.trades = [], [], []
+        assert not verify(path, broker, [], [])
 
 
 def test_manual_sell_wrong_algo_id_stays_blocked():

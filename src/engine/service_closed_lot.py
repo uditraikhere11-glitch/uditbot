@@ -220,6 +220,9 @@ def _verify(db_path, parent, required, expected_sec, account, broker, orders, fo
             return False
         return True
 
-    # Following-session case: no signed-negative inventory, no today's executions
-    # on this contract; the canonical, verified historical SELL remains durable.
+    # Following-session case: a fresh successful today's tradebook must not
+    # unexpectedly omit a SELL that the durable journal timestamps *today*.
+    # Never mistake a same-day stale/empty broker book for T+1 settlement.
+    if any(datetime.fromtimestamp(float(f["traded_at"]), IST).date() >= today for f in sells):
+        return False
     return net >= 0 and not sec_trades and settled + net == expected_open
