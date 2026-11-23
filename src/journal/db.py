@@ -1137,6 +1137,38 @@ class JournalDB:
             )
             return [dict(row) for row in cur.fetchall()]
 
+    def get_protection_order_ids_for_parent(self, parent_order_id: str) -> List[str]:
+        """Returns distinct non-empty forever_order_id values recorded for `parent_order_id`."""
+        pid = str(parent_order_id or "").strip()
+        if not pid:
+            return []
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT forever_order_id FROM protection_orders WHERE parent_order_id = ?",
+                (pid,),
+            )
+            return [
+                str(row[0]).strip()
+                for row in cur.fetchall()
+                if row and str(row[0] or "").strip()
+            ]
+
+    def mark_protection_orders_closed(self, parent_order_id: str, status: str = "POSITION_CLOSED_LOCAL") -> int:
+        """Marks active protection_orders rows with local lifecycle closure status (distinct from broker OCO cancel proof)."""
+        pid = str(parent_order_id or "").strip()
+        if not pid:
+            return 0
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE protection_orders
+                SET status = ?
+                WHERE parent_order_id = ? AND status IN ('ACTIVE', 'ACTIVE_CONFIRMED')
+                """,
+                (str(status), pid),
+            )
+            return cur.rowcount
+
     # --- Authoritative SQLite Watcher Persistence (08-F / Step 14) ---
 
     def save_watcher_state(self, pending: Dict[str, dict], terminal: Dict[str, dict]) -> None:
@@ -1524,7 +1556,55 @@ class JournalDB:
                     verified_flag,
                 ),
             )
-            return cur.rowcount == 1
+            if cur.rowcount == 1:
+                return True
+            target_parent = str(parent_order_id or "").strip()
+            sec_s = str(security_id or "").strip()
+            seg_s = str(exchange_segment or "").strip().upper()
+            prod_s = str(product_type or "").strip().upper()
+            if (
+                verified_flag == 1
+                and side == "SELL"
+                and etid
+                and boid
+                and target_parent
+                and target_parent != boid
+                and sec_s
+                and seg_s
+                and prod_s
+            ):
+                upd = conn.execute(
+                    """
+                    UPDATE fills
+                    SET parent_order_id = ?
+                    WHERE exchange_trade_id = ?
+                      AND broker_order_id = ?
+                      AND UPPER(transaction_type) = 'SELL'
+                      AND is_verified_trade = 1
+                      AND security_id = ?
+                      AND UPPER(exchange_segment) = ?
+                      AND UPPER(product_type) = ?
+                      AND traded_quantity = ?
+                      AND ABS(traded_price - ?) < 1e-6
+                      AND (parent_order_id IS NULL OR parent_order_id = '' OR parent_order_id = broker_order_id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM exit_allocations WHERE exchange_trade_id = ?
+                      )
+                    """,
+                    (
+                        target_parent,
+                        etid,
+                        boid,
+                        sec_s,
+                        seg_s,
+                        prod_s,
+                        int(traded_quantity),
+                        float(traded_price),
+                        etid,
+                    ),
+                )
+                return upd.rowcount == 1
+            return False
 
     def upsert_position_lifecycle(
         self,
@@ -3345,4 +3425,3 @@ class JournalDB:
                 "SELECT * FROM manual_risk_acknowledgements ORDER BY acknowledged_at ASC"
             ).fetchall()
             return [dict(r) for r in rows]
-

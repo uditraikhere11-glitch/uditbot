@@ -142,7 +142,7 @@ def durably_identified_prior_day_protected_buy(*, record, journal_db, account_id
         seg = str(record.get("segment") or "").strip().upper()
         prod = str(record.get("product_type") or "").strip().upper()
         account = str(account_id or "").strip()
-        qty = int(record.get("qty") or 0)
+        qty = int(record.get("qty") or record.get("requested_qty") or record.get("filled_qty") or 0)
         filled = int(record.get("filled_qty") or 0)
         if (not oid or not sec or not account or prod not in ("CNC", "MTF")
                 or str(record.get("state") or "").upper() != "TRADED"
@@ -188,7 +188,7 @@ def may_omit_protected_prior_day_buy_trade_read(
         seg = str(record.get("segment") or "").strip().upper()
         prod = str(record.get("product_type") or "").strip().upper()
         account = str(account_id or "").strip()
-        qty = int(record.get("qty") or 0)
+        qty = int(record.get("qty") or record.get("requested_qty") or record.get("filled_qty") or 0)
         filled = int(record.get("filled_qty") or 0)
         if (not oid or not sec or not account or prod not in ("CNC", "MTF")
                 or str(record.get("state") or "").upper() != "TRADED"
@@ -241,13 +241,26 @@ def may_omit_protected_prior_day_buy_trade_read(
         )
         if status != "VERIFIED_SETTLED_HOLDINGS" or observed != aggregate or aggregate < qty:
             return deny("SETTLED_HOLDINGS_NOT_VERIFIED")
+        candidate_forever_ids = {str(x).strip() for x in (leg_order_ids or ()) if str(x).strip()}
+        for rec_key in ("forever_order_id", "oco_order_id"):
+            val = str(record.get(rec_key) or "").strip()
+            if val and not val.startswith("SUPER-"):
+                candidate_forever_ids.add(val)
+        for cid_p in (record.get("confirmed_protection_ids") or ()):
+            c_val = str(cid_p or "").strip()
+            if c_val and not c_val.startswith("SUPER-"):
+                candidate_forever_ids.add(c_val)
+        if hasattr(journal_db, "get_protection_order_ids_for_parent"):
+            for db_fid in journal_db.get_protection_order_ids_for_parent(oid):
+                if db_fid and not db_fid.startswith("SUPER-"):
+                    candidate_forever_ids.add(db_fid)
         group_ids = {
-            str(r.get("orderId") or "")
+            str(r.get("orderId") or "").strip()
             for r in current_forever if isinstance(r, dict)
-            and (str(r.get("orderId") or "") in leg_order_ids
+            and (str(r.get("orderId") or "").strip() in candidate_forever_ids
                  or (record.get("correlation_id") and
-                     str(r.get("correlationId") or "") == str(record["correlation_id"])))
-        }
+                     str(r.get("correlationId") or "").strip() == str(record["correlation_id"]).strip()))
+        } - {""}
         if not group_ids:
             return deny("LINKED_FOREVER_OCO_GROUP_MISSING")
         for gid in group_ids:
