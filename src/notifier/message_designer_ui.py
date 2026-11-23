@@ -193,86 +193,26 @@ function drawType(){
   });
   renderFields();preview();
 }
-var mandatory = {
-  equity_amo:["✅ AMO Accepted by Dhan","⏳ Queued for market OPEN — NOT EXECUTED","A separate confirmation will follow only after a broker-verified fill or final rejection/cancellation."],
-  fno_amo:["✅ AMO Accepted by Dhan","⏳ Queued for market OPEN — NOT EXECUTED","A separate confirmation will follow only after a broker-verified fill or final rejection/cancellation.","⚠️ F&O AMO: No automatic SL/target."],
-  submitted:["⏳ Status: Order Submitted","Awaiting broker confirmation of execution."],
-  rejected:["❌ Status: Order Rejected","Dhan did not acknowledge the order."],
-  executed:["✅ Status: Order Executed","Filled: 75/75","🛡️ Protection: Pending Broker Verification"],
-  partial:["⏳ Status: Partially Executed","Filled: 25/75","🛡️ Protection: Pending Broker Verification"],
-  final:["❌ Status: Order CANCELLED","Filled: 0/75"],
-  unverified:["⚠️ Status: Fill Verification Pending","No confirmed execution yet."],
-  settings_update:[
-    "Trading bot: Restarted",
-    "Configuration: Verified",
-    "Changed Settings (2):",
-    "• Equity SL: 3% → 4%",
-    "• F&O Target: 3% → 5%"
-  ],
-  dhan_health:[
-    "🔑 Dhan authentication: ✅ VERIFIED",
-    "🔄 Token renewal: ✅ SUCCESS",
-    "💳 Dhan account identity: ✅ VERIFIED",
-    "⏳ Token expiration: ⚠️ Scheduled renewal pending",
-    "💰 Broker funds: ✅ VERIFIED",
-    "📚 Scrip master: ✅ OK",
-    "🛡️ Emergency STOP: ✅ INACTIVE",
-    "🚦 Next trading session readiness: ⏳ RENEWAL PENDING",
-    "📊 Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED"
-  ],
-  startup:[
-    "Mode: LIVE",
-    "Listener: Active 2 channels",
-    "Reconciliation: Healthy",
-    "Protection Watcher: Active and Verified",
-    "New Entries Gate: Open"
-  ]
-};
-function preview(){
+var previewSeq=0;
+async function preview(){
   if(!state||!defs)return;
-  var x=cfg(),lines=[],entries=[],locked=mandatory[current].slice();
-  lines.push((x.title_emoji?x.title_emoji+" ":"")+x.title);
-  x.fields.forEach(function(f){
-    var val=samples[f.key];
-    if(val===undefined||val===null||val==="")return;
-    if(current==="settings_update"&&f.key==="changed_keys"){
-      for(var i=0;i<locked.length;i++){
-        if(locked[i].startsWith("Changed Settings (")){
-          locked[i]=((f.emoji&&f.emoji!=="•")?f.emoji+" ":"")+
-            (f.label||"Changed Settings")+" "+locked[i].slice("Changed Settings ".length);
-          break;
-        }
-      }
-      return;
-    }
-    if(current==="startup"&&(f.key==="mode"||f.key==="channels")){
-      var prefix=f.key==="mode"?"Mode: ":"Listener: ";
-      for(var i=0;i<locked.length;i++){
-        if(locked[i].startsWith(prefix)){
-          locked[i]=((f.emoji&&f.emoji!=="•")?f.emoji+" ":"")+
-            (f.label||(f.key==="mode"?"Mode":"Listener"))+": "+locked[i].slice(prefix.length);
-          break;
-        }
-      }
-      return;
-    }
-    if(current==="startup"&&f.key==="instance"&&
-       x.title.toLowerCase().includes(String(val).toLowerCase()))return;
-    if(current==="dhan_health"&&["instance","event_time","mode"].includes(f.key))return;
-    entries.push((f.emoji?f.emoji+" ":"")+f.label+": "+val);
-  });
-  if(x.style==="compact"){for(var i=0;i<entries.length;i+=2)lines.push(entries.slice(i,i+2).join(" | "))}
-  else lines=lines.concat(entries);
-  if(x.separator==="line")lines.push("─────────────");
-  if(x.separator==="dots")lines.push("••••••••••");
-  if(x.style==="detailed")lines.push("");
-  if(x.footer)lines.push(x.footer);
-  if(locked.length&&x.status_emoji&&!["settings_update","dhan_health","startup"].includes(current)){
-    // Replace only the primary status icon for order cards; system safety icons are locked.
-    locked[0]=x.status_emoji+" "+locked[0].replace(/^(✅|❌|⏳|⚠️)\s*/u,"");
+  var x=cfg(),seq=++previewSeq;
+  try{
+    var res=await getJSON("/setup/telegram-designer/preview",{
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},
+      body:JSON.stringify({event:current,template:x}),
+      credentials:"same-origin"
+    });
+    if(seq!==previewSeq)return;
+    $("preview").textContent=res.plain;
+    $("preview-note").textContent=x.enabled
+      ?"Custom format ON — exact server-rendered output for new "+current.replace(/_/g," ")+" notifications."
+      :"Custom format OFF — showing exact default production Telegram message.";
+  }catch(e){
+    if(seq!==previewSeq)return;
+    $("preview-note").textContent="Preview validation error: "+e.message;
   }
-  $("preview").textContent=lines.concat(locked).join("\n");
-  $("preview-note").textContent=x.enabled?"Custom format enabled for new "+current.replace(/_/g," ")+" notifications.":"Custom format OFF — preview shows how it will look if enabled.";
 }
 function preset(kind){
   var x=cfg();var keys=kind==="minimal"?defs[current].fields.slice(0,3):
@@ -290,8 +230,16 @@ async function load(){
   try{
     var data=await getJSON("/setup/telegram-designer/config");
     state=data.settings;original=data.defaults;defs=data.events;labels=data.fields;emojiList=data.emojis;samples=data.samples;
-    Object.keys(defs).forEach(function(key){
-      var opt=document.createElement("option");opt.value=key;opt.textContent=["settings_update","dhan_health","startup"].includes(key)?defs[key].title:key.replace(/_/g," ").toUpperCase();$("event").appendChild(opt);
+    var groups=data.groups||[{label:"All Events",events:Object.keys(defs)}];
+    groups.forEach(function(g){
+      var og=document.createElement("optgroup");og.label=g.label;
+      (g.events||[]).forEach(function(key){
+        if(!defs[key])return;
+        var opt=document.createElement("option");opt.value=key;
+        opt.textContent=defs[key].title+" ("+key+")";
+        og.appendChild(opt);
+      });
+      $("event").appendChild(og);
     });$("event").value=current;
     emojiList.filter(Boolean).forEach(function(e){
       var b=document.createElement("button");b.type="button";b.title="Use as heading emoji";b.textContent=e;b.onclick=function(){cfg().title_emoji=e;drawType()};$("emoji-palette").appendChild(b);
