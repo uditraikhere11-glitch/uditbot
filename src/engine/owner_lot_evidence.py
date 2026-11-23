@@ -97,7 +97,13 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
         end = min(start + timedelta(days=MAX_HISTORICAL_TRADE_WINDOW_DAYS), last)
         rows = broker.get_historical_trades(start.isoformat(), end.isoformat())
         if not isinstance(rows, list) or getattr(rows, "ok", True) is not True:
-            raise ValueError("Historical pagination incomplete (HTTP %s)" % getattr(rows, "status_code", 0))
+            code = getattr(rows, "status_code", 0)
+            reason = str(getattr(rows, "error", "") or "")
+            if "LOCAL_DHAN_GET_DEFERRAL" in reason:
+                raise ValueError(f"Historical pagination incomplete (LOCAL_GOVERNOR_DEFERRAL; HTTP {code})")
+            if code == 429:
+                raise ValueError("Historical pagination incomplete (BROKER_HTTP_429)")
+            raise ValueError("Historical pagination incomplete (HTTP %s)" % code)
         evidence["windows"].append([start.isoformat(), end.isoformat(), len(rows)])
         inspect(rows, True)
         start = end + timedelta(days=1)
