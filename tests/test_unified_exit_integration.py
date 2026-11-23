@@ -434,7 +434,9 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
                  "orderStatus": "TRADED", "transactionType": "SELL", "filledQty": 5, "dhanClientId": ACCOUNT},
             ],
             positions=[{"securityId": "5264", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 0, "dhanClientId": ACCOUNT}],
-            holdings=[],
+            # Explicit zero settled holdings is required when relative timestamps
+            # straddle IST midnight; an omitted holding is not verified zero.
+            holdings=[{"securityId": "5264", "totalQty": 0, "dpQty": 0}],
         )
         broker.place_forever_oco = Mock(side_effect=AssertionError("Must never place OCO on closed lot"))
         watcher = ProtectionWatcher(broker=broker, path=self.watcher_path, dry_run=False, journal_db=self.db)
