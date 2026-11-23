@@ -13,7 +13,16 @@ _PAGES = frozenset({'setup', 'control', 'designer'})
 
 # One shared vector monogram for the topbar, account drawer and tab favicon.
 # Crisp viewBox geometry and currentColor strokes work in both appearance modes.
-_UB_MARK = (\n    '<svg class="v17p-ub-mark" xmlns="http://www.w3.org/2000/svg" '\n    'viewBox="0 0 40 40" aria-hidden="true" focusable="false" '\n    'fill="none" stroke="currentColor" stroke-width="2.3" '\n    'stroke-linecap="round" stroke-linejoin="round">'\n    '<rect x="1.75" y="1.75" width="36.5" height="36.5" rx="10" stroke-width="1.5"/>'\n    '<path d="M10.5 12.5v11a5.5 5.5 0 0 0 11 0v-11"/>'\n    '<path d="M25 12.5h3.25a3.8 3.8 0 0 1 0 7.6H25m0-7.6v15m0-7.4h3.6a3.7 3.7 0 0 1 0 7.4H25"/>'\n    '</svg>'\n)
+_UB_MARK = (
+    '<svg class="v17p-ub-mark" xmlns="http://www.w3.org/2000/svg" '
+    'viewBox="0 0 40 40" aria-hidden="true" focusable="false" '
+    'fill="none" stroke="currentColor" stroke-width="2.3" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="1.75" y="1.75" width="36.5" height="36.5" rx="10" stroke-width="1.5"/>'
+    '<path d="M10.5 12.5v11a5.5 5.5 0 0 0 11 0v-11"/>'
+    '<path d="M25 12.5h3.25a3.8 3.8 0 0 1 0 7.6H25m0-7.6v15m0-7.4h3.6a3.7 3.7 0 0 1 0 7.4H25"/>'
+    '</svg>'
+)
 _UB_FAVICON = quote(_UB_MARK.replace('currentColor', '#2178bd'), safe='')
 
 
