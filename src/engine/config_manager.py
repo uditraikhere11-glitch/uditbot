@@ -4459,11 +4459,11 @@ class ConfigChangeTracker:
             }
 
         with self.operation_lock(operation_type=f"SERVICE_{act_clean.upper()}", operation_id=f"SVC-{act_clean.upper()}"):
-            if act_clean in ("start", "restart"):
+            if act_clean == "restart":
                 ctrl = self.get_service_control_record()
                 if ctrl.get("desired_service_state") == "STOPPED" or ctrl.get("deferred_stop_pending") is True:
                     return {"ok": False, "action": act_clean, "blocked_reason": "OWNER_STOP_PENDING",
-                            "message": "Pending Owner STOP must be explicitly cancelled before Start/Restart"}
+                            "message": "Pending Owner STOP must be explicitly cancelled before Restart"}
             # Retired configuration histories are immutable. START/RESTART
             # cannot replay or supersede an already-issued uncertain restart.
             # Owner STOP retains precedence and remains independently usable.
@@ -4674,6 +4674,19 @@ class ConfigChangeTracker:
                         require_systemd_active=True,
                     )
                     if ok_ver:
+                        ctrl = self.get_service_control_record()
+                        prior_stop = (ctrl.get("desired_service_state") == "STOPPED"
+                                      or ctrl.get("deferred_stop_pending") is True)
+                        if prior_stop:
+                            # An explicit Owner START may cancel a prior STOP
+                            # only after positive current PID/hash/mode proof.
+                            g = self.inspect_transition_gate_status(read_only=True)
+                            if g.get("active") is True and not (
+                                    g.get("change_id") == "OWNER-STOP-PENDING"
+                                    and g.get("target_mode") == "STOPPED"):
+                                return {"ok": False, "action": "start",
+                                        "blocked_reason": "UNRELATED_TRANSITION",
+                                        "message": "Cannot clear an unrelated active transition"}
                         self.record_service_control_intent(
                             desired_service_state="RUNNING",
                             last_action="OWNER_START",
@@ -4681,6 +4694,21 @@ class ConfigChangeTracker:
                             requested_mode=saved_mode,
                             observed_state=ServiceOperatingState.RUNNING.value,
                         )
+                        if prior_stop:
+                            new_ctrl = self.get_service_control_record()
+                            if (new_ctrl.get("desired_service_state") != "RUNNING"
+                                    or new_ctrl.get("deferred_stop_pending") is not False):
+                                return {"ok": False, "action": "start",
+                                        "blocked_reason": "OWNER_INTENT_WRITE_FAILED"}
+                            if g.get("active") is True:
+                                gate_result = self.set_transition_gate(
+                                    False, change_id="OWNER-START-CANCELLED-STOP",
+                                    target_mode=saved_mode,
+                                    reason="Explicit Owner START cancelled pending STOP after PID verification",
+                                )
+                                if not gate_result.ok or self.inspect_transition_gate_status().get("active") is not False:
+                                    return {"ok": False, "action": "start",
+                                            "blocked_reason": "TRANSITION_GATE_WRITE_FAILED"}
                         return {
                             "ok": True,
                             "action": "start",
