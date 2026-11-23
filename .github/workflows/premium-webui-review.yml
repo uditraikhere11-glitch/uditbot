@@ -9,6 +9,7 @@ on:
       - 'src/premium_ui.*'
       - 'src/approved_replica.*'
       - 'tests/test_approved_replica_contract.py'
+      - 'tests/test_v17_personalized_presentation.py'
       - 'tests/test_premium_ui_contract.py'
       - 'tests/premium_ui_browser_smoke.py'
       - '.github/workflows/premium-webui-review.yml'
@@ -58,7 +59,7 @@ jobs:
               'src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
               'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
               'src/approved_replica.css', 'src/approved_replica.js',
-              'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py',
+              'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_v17_personalized_presentation.py',
               'tests/test_webui_integrated_acceptance.py', 'tests/test_webui_reliability_remaining.py',
               '.github/workflows/premium-webui-review.yml',
           }
@@ -100,7 +101,7 @@ jobs:
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
                      'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
                      'src/approved_replica.css', 'src/approved_replica.js',
-                     'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
+                     'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_v17_personalized_presentation.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           if set(paths) - set(allowed):
               before = subprocess.check_output(['git', 'show', base + ':src/setup_app.py'])
@@ -153,7 +154,7 @@ jobs:
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
                      'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
                      'src/approved_replica.css', 'src/approved_replica.js',
-                     'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
+                     'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_v17_personalized_presentation.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           assert set(paths).issubset(allowed), f'Unexpected changed file(s): {set(paths) - set(allowed)}'
           manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head, 'files': {}, 'removed_files': []}
