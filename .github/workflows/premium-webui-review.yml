@@ -9,7 +9,9 @@ on:
       - 'src/premium_ui.*'
       - 'src/approved_replica.*'
       - 'tests/test_approved_replica_contract.py'
+      - 'tests/test_v17_personalized_presentation.py'
       - 'tests/test_premium_ui_contract.py'
+      - 'tests/premium_ui_browser_smoke.py'
       - '.github/workflows/premium-webui-review.yml'
 
 permissions:
@@ -38,6 +40,11 @@ jobs:
           python -m unittest -v tests.test_premium_ui_contract tests.test_control_center_ui_contract tests.test_message_designer tests.test_approved_replica_contract
           git diff --check -- . ':!src/setup_app.py'
           python -m unittest -v tests.test_approved_replica_contract
+      - name: Run real-browser presentation and status truth smoke (offline)
+        run: |
+          python -m pip install "playwright>=1.50,<2.0"
+          python -m playwright install chromium
+          PYTHONPATH=. python tests/premium_ui_browser_smoke.py
       - name: Classify UI-only PR packaging scope
         id: scope
         env:
@@ -52,7 +59,7 @@ jobs:
               'src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
               'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
               'src/approved_replica.css', 'src/approved_replica.js',
-              'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py',
+              'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_v17_personalized_presentation.py',
               'tests/test_webui_integrated_acceptance.py', 'tests/test_webui_reliability_remaining.py',
               '.github/workflows/premium-webui-review.yml',
           }
@@ -94,7 +101,7 @@ jobs:
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
                      'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
                      'src/approved_replica.css', 'src/approved_replica.js',
-                     'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
+                     'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_v17_personalized_presentation.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           if set(paths) - set(allowed):
               before = subprocess.check_output(['git', 'show', base + ':src/setup_app.py'])
@@ -109,16 +116,45 @@ jobs:
                   'of obsolete legacy-writer import. Source ZIP supplied by dedicated retirement workflow.\\n',
                   encoding='utf-8')
               raise SystemExit(0)
-          # A UI-only PR must preserve the historical exact Setup blob.
-          setup_blob = subprocess.check_output(['git', 'rev-parse', head + ':src/setup_app.py'], text=True).strip()
-          assert setup_blob == 'c8a81e63d3045229c97cbe7e5f58085b2395e6bf', 'Working Setup changed'
-          subprocess.run(['git', 'diff', '--check', base, head, '--', '.', ':(exclude)src/setup_app.py'], check=True)
+          # UI edits may change the Setup HTML; enforce the original POST contract
+          # and prevent every backend Python AST change instead of pinning a blob.
+          import ast
+          import re
+          before_src = subprocess.check_output(['git', 'show', base + ':src/setup_app.py'], text=True)
+          after_src = Path('src/setup_app.py').read_text(encoding='utf-8')
+          def inspected(source):
+              tree = ast.parse(source)
+              declarations = [node for node in tree.body
+                              if isinstance(node, ast.Assign) and any(
+                                  isinstance(target, ast.Name) and target.id == 'HTML_TEMPLATE'
+                                  for target in node.targets)]
+              assert len(declarations) == 1, 'Missing or duplicated Setup HTML_TEMPLATE'
+              template = ast.literal_eval(declarations[0].value)
+              assert template.count('<form method="POST" action="/setup">') == 1, 'Setup form contract changed'
+              form = template.split('<form method="POST" action="/setup">', 1)[1].split('</form>', 1)[0]
+              names = re.findall(r'<(?:input|select|textarea)[^>]*name="([^"]+)"', form)
+              assert len(names) == len(set(names)) == 54, 'Setup field count or uniqueness changed'
+              required = {'csrf_token', 'expected_revision', 'full_setup_form', 'confirm_live',
+                          'is_live_mode', 'equity_active', 'fno_active'}
+              assert required.issubset(names), 'Safety or native toggle fields missing'
+              for key in ('is_live_mode', 'equity_active', 'fno_active'):
+                  tag = re.search(r'<input[^>]*name="' + key + r'"[^>]*>', form)
+                  assert tag and 'type="checkbox"' in tag.group() and 'value="true"' in tag.group(), key
+              # Allow HTML string edits only: controllers, validation and routes stay identical.
+              declarations[0].value = ast.Constant(value='PRESENTATION_ONLY_HTML')
+              return names, ast.dump(tree, include_attributes=False)
+          before_names, before_backend = inspected(before_src)
+          after_names, after_backend = inspected(after_src)
+          assert 'class="slider"' not in after_src and 'class="switch"' not in after_src, 'Slider controls remain'
+          assert before_names == after_names, 'Native Setup field names/order changed'
+          assert before_backend == after_backend, 'Backend Setup Python changed'
+          subprocess.run(['git', 'diff', '--check', base, head], check=True)
           paths = subprocess.check_output(['git', 'diff', '--name-only', base, head], text=True).splitlines()
           assert paths, 'No changes to package'
           allowed = ('src/setup_app.py', 'src/control_center_ui.py', 'src/notifier/message_designer_ui.py',
                      'src/premium_ui.py', 'src/premium_ui.css', 'src/premium_ui.js',
                      'src/approved_replica.css', 'src/approved_replica.js',
-                     'tests/test_premium_ui_contract.py', 'tests/test_approved_replica_contract.py', 'tests/test_webui_integrated_acceptance.py',
+                     'tests/test_premium_ui_contract.py', 'tests/premium_ui_browser_smoke.py', 'tests/test_approved_replica_contract.py', 'tests/test_v17_personalized_presentation.py', 'tests/test_webui_integrated_acceptance.py',
                      'tests/test_webui_reliability_remaining.py', '.github/workflows/premium-webui-review.yml')
           assert set(paths).issubset(allowed), f'Unexpected changed file(s): {set(paths) - set(allowed)}'
           manifest = {'pr': int(os.environ['PR_NUMBER']), 'base': base, 'head': head, 'files': {}, 'removed_files': []}

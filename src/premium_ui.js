@@ -15,6 +15,12 @@
   const closer=document.getElementById('premNavClose');
   const panel=document.getElementById('premNav');
   const backdrop=document.getElementById('premNavBackdrop');
+  // Keep the drawer/backdrop in the body overlay layer on every route.
+  // Setup embeds shared navigation inside a styled container, which can
+  // otherwise clip a fixed panel into a visible left-edge strip.
+  // Move ONLY presentation nodes, never native forms, fields, or state.
+  if(panel && panel.parentElement!==document.body) document.body.appendChild(panel);
+  if(backdrop && backdrop.parentElement!==document.body) document.body.appendChild(backdrop);
   let menuOpen=false;
   function syncMenu() {
     if(!panel||!backdrop)return;
@@ -115,20 +121,38 @@
       landing.className='v17p-setup-landing';
       landing.setAttribute('aria-label','Configuration categories');
       const cards=[
-        ['setup-execution','⚙','lilac','Trading Mode & Segments','LIVE/TEST mode, cash and options'],
-        ['setup-telegram','♧','violet','Signal & Telegram','Operator, channels and signal ingestion'],
-        ['setup-broker','◈','sea','Dhan Credentials','Client ID, PIN, TOTP and token'],
-        ['setup-sizing','▤','amber','Sizing & Pricing','Budgets, lots, price policy and quantity'],
-        ['setup-risk','⬡','sea','Risk & Limits','Exposure, funds, daily and drawdown limits'],
-        ['setup-protection','♡','lilac','Protection & Timing','SL, targets, watcher and timing rules']
+        ['setup-execution','lilac','Trading Mode & Segments','LIVE/TEST mode, cash and options'],
+        ['setup-telegram','violet','Signal & Telegram','Operator, channels and signal ingestion'],
+        ['setup-broker','sea','Dhan Credentials','Client ID, PIN, TOTP and token'],
+        ['setup-sizing','amber','Sizing & Pricing','Budgets, lots, price policy and quantity'],
+        ['setup-risk','sea','Risk & Limits','Exposure, funds, daily and drawdown limits'],
+        ['setup-protection','lilac','Protection & Timing','SL, targets, watcher and timing rules']
       ];
+      // All six category icons use matching 20px vector strokes, not font glyphs.
+      const iconPaths={
+        'setup-execution':['M13 2 3 14h9l-1 8 10-12h-9l1-8Z'],
+        'setup-telegram':['M22 2 3 11l8 2 2 8 9-19Z','m11 13 6-6'],
+        'setup-broker':['M3 10 12 3l9 7','M5 10v10','M9 10v10','M15 10v10','M19 10v10','M3 21h18'],
+        'setup-sizing':['M4 4h16v16H4z','M8 16v-4','M12 16V8','M16 16v-6'],
+        'setup-risk':['M12 2 4 5v6c0 5 3 8 8 11 5-3 8-6 8-11V5Z','M12 8v5','M12 17h.01'],
+        'setup-protection':['M12 22s9-4 9-11V5l-9-3-9 3v6c0 7 9 11 9 11Z','m8.5 12 2.5 2.5 5-5']
+      };
       const grid=document.createElement('div');grid.className='v17p-setup-grid';
-      for(const [id,glyph,tone,title,detail] of cards){
+      for(const [id,tone,title,detail] of cards){
         const button=document.createElement('button');
         button.type='button';button.className='v17p-setup-card';
         button.dataset.target=id;
         const icon=document.createElement('span');icon.className='v17p-category-icon '+tone;
-        icon.setAttribute('aria-hidden','true');icon.textContent=glyph;
+        icon.setAttribute('aria-hidden','true');
+        const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+        svg.setAttribute('viewBox','0 0 24 24');
+        svg.setAttribute('aria-hidden','true');
+        for(const d of iconPaths[id]){
+          const shape=document.createElementNS('http://www.w3.org/2000/svg','path');
+          shape.setAttribute('d',d);
+          svg.appendChild(shape);
+        }
+        icon.appendChild(svg);
         const content=document.createElement('span');
         const bold=document.createElement('b');bold.textContent=title;
         const small=document.createElement('small');small.textContent=detail;
@@ -149,12 +173,13 @@
       back.textContent='← All categories';
       const label=document.createElement('strong');label.id='v17p-setup-current-title';
       toolbar.append(back,label);landing.insertAdjacentElement('afterend',toolbar);
-      const labels=Object.fromEntries(cards.map(([id,_glyph,_tone,title])=>[id,title]));
+      const labels=Object.fromEntries(cards.map(([id,_tone,title])=>[id,title]));
 
       function showSetup(view,{focus=false}={}){
         const selected=ids.includes(view)?view:(view==='setup-all'?'setup-all':'home');
         const home=selected==='home';
         root.classList.toggle('v17p-setup-collapsed',home);
+        root.classList.toggle('v17p-setup-single',ids.includes(selected));
         landing.hidden=!home;toolbar.hidden=home;
         label.textContent=selected==='setup-all'?'All Setup settings':(labels[selected]||'');
         if(liveConsent)liveConsent.hidden=!home && selected!=='setup-all' && selected!=='setup-execution';
