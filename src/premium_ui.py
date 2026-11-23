@@ -125,7 +125,7 @@ def premium_nav(page: str) -> str:
 <nav id="premNav" class="prem-nav" aria-label="AuditBot navigation" aria-hidden="true">
   <button id="premNavClose" type="button" class="prem-nav-close" aria-label="Close navigation">✕</button>
   <div class="prem-brand"><span class="prem-brand-icon" aria-hidden="true">{_AUDITBOT_MARK}</span>
-    <div><strong>{brand}</strong><small>AuditBot · Trading System</small></div></div>
+    <div><strong>{brand}</strong><small>Powered by AuditBot · Trading System</small></div></div>
   <div class="prem-nav-group">WORKSPACE</div>
   <a href="/#dashboard"><span aria-hidden="true">⌂</span>Dashboard</a>
   <a href="/#control"><span aria-hidden="true">▷</span>Trading Controls</a>
