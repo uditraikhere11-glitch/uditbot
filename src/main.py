@@ -157,6 +157,12 @@ class TradingBotPipeline:
             watcher=self.watcher,
             stop_manager=self.stop_manager,
         )
+        # Real service-process LIVE listeners require a running, freshly
+        # supervising watcher before any new order can pass the gate. Offline
+        # synthetic gate fixtures have no asynchronously scheduled watcher.
+        self.reconciliation_gate._require_live_watcher_liveness = (
+            service_process and config.trading_mode == TradingMode.LIVE
+        )
         self.broker.reconciliation_gate = self.reconciliation_gate
         self.latency_monitor = GLOBAL_LATENCY_MONITOR
         self.latency_monitor.bind_db(self.db, force_reload=True)

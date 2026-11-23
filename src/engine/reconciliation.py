@@ -174,6 +174,7 @@ class StartupReconciliationGate:
         self.stop_manager = stop_manager
         self.state = ReconciliationState.INITIALIZING
         self._accepting_entries: bool = False
+        self._require_live_watcher_liveness = False
         self.last_reconciled_at: float = 0.0
         self.last_error: str = ""
         self.unresolved_count: int = 0
@@ -196,6 +197,23 @@ class StartupReconciliationGate:
         """Trading gate: returns True ONLY if broker state has been verified healthy and STOP is inactive."""
         if not self._accepting_entries or self.stop_manager.is_stopped():
             return False
+        # Service-process LIVE admission is not the same as a green UI card.
+        # The gate can hold a prior HEALTHY result while the watcher task dies
+        # or its last broker supervision becomes stale. Reject *new orders*
+        # without cancelling/restoring existing protective exits.
+        if self._require_live_watcher_liveness:
+            watcher = self.watcher
+            now = time.time()
+            mono = time.monotonic()
+            heartbeat = getattr(watcher, "_heartbeat_monotonic", None)
+            proof_at = getattr(watcher, "_supervision_success_at", None)
+            if (getattr(watcher, "_is_running", None) is not True
+                    or getattr(watcher, "_supervision_read_complete", None) is not True
+                    or type(heartbeat) not in (int, float)
+                    or not 0 <= mono - heartbeat <= 30.0
+                    or type(proof_at) not in (int, float)
+                    or not 0 <= now - proof_at <= 300.0):
+                return False
         cfg = getattr(self.broker, "cfg", None)
         data_dir = str(getattr(cfg, "data_dir", "") or "")
         if not data_dir:

@@ -147,7 +147,12 @@ def format_signal_accepted(meta: Mapping[str, Any], quantity: int) -> str:
     return "\n".join(lines)
 
 
-def format_order_submitted(meta: Mapping[str, Any], quantity: int) -> str:
+def format_order_submitted(
+    meta: Mapping[str, Any],
+    quantity: int,
+    *,
+    template_override: Optional[Mapping[str, Any]] = None,
+) -> str:
     lines = _top(meta, quantity)
     if meta.get("is_amo"):
         lines.extend(("", "🌙 <b>Status: AMO Submitted</b>",
@@ -176,10 +181,17 @@ def format_order_submitted(meta: Mapping[str, Any], quantity: int) -> str:
         "submitted", values,
         ["⏳ <b>Status: Order Submitted</b>", "Awaiting Dhan execution confirmation."],
         data_dir=meta.get("data_dir"),
+        template_override=template_override,
     ) or original)
 
 
-def format_order_failed(meta: Mapping[str, Any], quantity: int, *, uncertain: bool = False) -> str:
+def format_order_failed(
+    meta: Mapping[str, Any],
+    quantity: int,
+    *,
+    uncertain: bool = False,
+    template_override: Optional[Mapping[str, Any]] = None,
+) -> str:
     lines = _top(meta, quantity)
     if uncertain:
         lines.extend(("", "⚠️ <b>Status: Submission Unconfirmed</b>", "Broker response uncertain; automatic re-entry is not implied."))
@@ -200,8 +212,11 @@ def format_order_failed(meta: Mapping[str, Any], quantity: int, *, uncertain: bo
                 if uncertain else
                 ["❌ <b>Status: Order Rejected</b>", "Dhan did not acknowledge the order."])
     event = "unverified" if uncertain else "rejected"
-    return render_custom_telegram(event, values, required,
-                                  data_dir=meta.get("data_dir")) or original
+    return render_custom_telegram(
+        event, values, required,
+        data_dir=meta.get("data_dir"),
+        template_override=template_override,
+    ) or original
 
 
 def format_order_outcome(
@@ -216,6 +231,7 @@ def format_order_outcome(
     sl_price: Optional[float] = None,
     target_price: Optional[float] = None,
     protection_route: Optional[str] = None,
+    template_override: Optional[Mapping[str, Any]] = None,
 ) -> str:
     entry_only = bool(meta.get("entry_only_amo"))
     if entry_only:
@@ -295,13 +311,17 @@ def format_order_outcome(
     if filled_qty > 0:
         protection = protection_label
         required.append("🛡️ Protection: " + protection)
-    return render_custom_telegram(event, values, required,
-                                  data_dir=meta.get("data_dir")) or original
+    return render_custom_telegram(
+        event, values, required,
+        data_dir=meta.get("data_dir"),
+        template_override=template_override,
+    ) or original
 
 
 def format_amo_acknowledged(
     meta: Mapping[str, Any], quantity: int, broker_status: str, *,
     allow_unverified: bool = False,
+    template_override: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Dhan AMO acknowledgement; F&O may show its order ID and entry-only warning.
 
@@ -364,6 +384,7 @@ def format_amo_acknowledged(
     return (render_custom_telegram(
         "fno_amo" if meta.get("entry_only_amo") else "equity_amo",
         values, required, data_dir=meta.get("data_dir"),
+        template_override=template_override,
     ) or original)
 
 
@@ -378,30 +399,27 @@ def format_protection_lifecycle_card(
     protection_route: Optional[str] = None,
     observed_at: Optional[float] = None,
     reason: str = "",
+    template_override: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """P0-07: Formats PROTECTION_PENDING, PROTECTION_VERIFIED_ACTIVE, PROTECTION_UNVERIFIED, and PROTECTION_REJECTED cards."""
     sym = _safe(meta.get("symbol", "UNKNOWN"))
     st = str(state_key or "").upper()
     if st in ("PROTECTION_VERIFIED", "PROTECTION_VERIFIED_ACTIVE"):
-        lines = [
-            f"🛡️ <b>Protection Verified:</b> {sym}",
-            "✅ Verified active broker protection for confirmed filled quantity.",
-        ]
+        event_key = "protection_verified"
+        status_line = "✅ Verified active broker protection for confirmed filled quantity."
+        lines = [f"🛡️ <b>Protection Verified:</b> {sym}", status_line]
     elif st == "PROTECTION_PENDING":
-        lines = [
-            f"⏳ <b>Protection Pending:</b> {sym}",
-            "Submitting/modifying protective SL & Target legs on Dhan.",
-        ]
+        event_key = "protection_pending"
+        status_line = "⏳ Submitting/modifying protective SL & Target legs on Dhan."
+        lines = [f"⏳ <b>Protection Pending:</b> {sym}", "Submitting/modifying protective SL & Target legs on Dhan."]
     elif st == "PROTECTION_UNVERIFIED":
-        lines = [
-            f"⚠️ <b>Protection Unverified:</b> {sym}",
-            f"Broker readback has not yet confirmed active SL/Target legs ({_safe(reason or 'awaiting readback')}).",
-        ]
+        event_key = "protection_unverified"
+        status_line = f"⚠️ Broker readback has not yet confirmed active SL/Target legs ({_safe(reason or 'awaiting readback')})."
+        lines = [f"⚠️ <b>Protection Unverified:</b> {sym}", f"Broker readback has not yet confirmed active SL/Target legs ({_safe(reason or 'awaiting readback')})."]
     else:
-        lines = [
-            f"🚨 <b>Protection Rejected / Halted:</b> {sym}",
-            f"Protective leg failed verification ({_safe(reason or 'rejected by broker')}). New entries halted.",
-        ]
+        event_key = "protection_rejected"
+        status_line = f"🚨 Protective leg failed verification ({_safe(reason or 'rejected by broker')}). New entries halted."
+        lines = [f"🚨 <b>Protection Rejected / Halted:</b> {sym}", f"Protective leg failed verification ({_safe(reason or 'rejected by broker')}). New entries halted."]
     if protection_route:
         lines.append(f"• Protection Route: {_safe(protection_route)}")
     if total_qty > 0:
@@ -410,7 +428,20 @@ def format_protection_lifecycle_card(
         lines.append(f"• SL / Target Levels: {_money(sl_price)} / {_money(target_price)}")
     if observed_at:
         lines.append(f"🕒 Verified At: {_ist(observed_at)}")
-    return "\n".join(lines)
+    original = "\n".join(lines)
+    values = {
+        "symbol": meta.get("symbol"),
+        "protection_route": protection_route,
+        "protected_qty": f"{protected_qty}/{total_qty}" if total_qty > 0 else None,
+        "sl_target": f"{_money(sl_price)} / {_money(target_price)}" if (sl_price and target_price and sl_price > 0 and target_price > 0) else None,
+        "mode": meta.get("mode"),
+        "event_time": _ist(observed_at) if observed_at else None,
+    }
+    return (render_custom_telegram(
+        event_key, values, [status_line],
+        data_dir=meta.get("data_dir"),
+        template_override=template_override,
+    ) or original)
 
 
 def format_exit_lifecycle_card(
@@ -427,67 +458,100 @@ def format_exit_lifecycle_card(
     target_price: Optional[float] = None,
     protection_route: Optional[str] = None,
     observed_at: Optional[float] = None,
+    template_override: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """
     P0-03 & P0-07: Formats TARGET_TRIGGERED, SL_TRIGGERED, EXIT_PARTIAL_FILLED, EXIT_FILLED, and POSITION_CLOSED cards.
     Never claims an exit fill when only a trigger has occurred, and never exposes broker Order IDs.
     """
-    sym = _safe(meta.get("symbol", "UNKNOWN"))
     st = str(state_key or "").upper()
     lines = _top(meta, total_qty)
     if buy_vwap is not None and buy_vwap > 0:
-        lines.append(f"• Entry BUY VWAP: {_money(buy_vwap)}")
+        lines.append(f"• Entry Price: {_money(buy_vwap)}")
     if protection_route:
         lines.append(f"• Protection Route: {_safe(protection_route)}")
     if sl_price and target_price and sl_price > 0 and target_price > 0:
         lines.append(f"• Active SL / Target: {_money(sl_price)} / {_money(target_price)}")
 
+    required: list[str] = []
+    event_key = "position_closed"
     if st == "TARGET_TRIGGERED":
-        lines.extend((
-            "",
+        event_key = "target_triggered"
+        required = [
             "🎯 <b>Status: Target Leg Triggered (Awaiting Fill)</b>",
             "Target leg was triggered on the exchange; awaiting tradebook SELL fill confirmation.",
             f"• Exit Filled: {sell_qty}/{total_qty}",
-        ))
+        ]
+        lines.extend(("", *required))
     elif st == "SL_TRIGGERED":
-        lines.extend((
-            "",
+        event_key = "sl_triggered"
+        required = [
             "🛑 <b>Status: Stop-Loss Leg Triggered (Awaiting Fill)</b>",
             "Stop-Loss leg was triggered on the exchange; awaiting tradebook SELL fill confirmation.",
             f"• Exit Filled: {sell_qty}/{total_qty}",
-        ))
+        ]
+        lines.extend(("", *required))
     elif st == "EXIT_PARTIAL_FILLED":
+        event_key = "exit_partial_filled"
         rem_qty = max(0, total_qty - sell_qty)
-        lines.extend((
-            "",
+        required = [
             "⏳ <b>Status: Exit Partially Executed</b>",
             f"• Exit Filled: {sell_qty}/{total_qty} (Remaining Open: {rem_qty})",
-        ))
+        ]
+        lines.extend(("", *required))
         if sell_vwap is not None and sell_vwap > 0:
-            lines.append(f"• Exit SELL VWAP: {_money(sell_vwap)}")
+            lines.append(f"• Exit Price: {_money(sell_vwap)}")
         if realized_pnl is not None:
             lines.append(f"• Realized Gross P&amp;L (Partial): {_signed_money(realized_pnl)}")
     elif st in ("RECONCILIATION_REQUIRED", "PERSISTENCE_UNCERTAIN"):
-        lines.extend((
-            "",
+        event_key = "reconciliation_required"
+        required = [
             "⚠️ <b>Status: Reconciliation Required (Persistence Uncertain)</b>",
             "Broker exit fill was observed, but local SQLite journal commit did not succeed. New entries halted until durable reconciliation completes.",
             f"• Durable Exit Recorded: {sell_qty}/{total_qty}",
-        ))
+        ]
+        lines.extend(("", *required))
     elif st in ("EXIT_FILLED", "POSITION_CLOSED"):
+        event_key = "position_closed"
         leg_label = "Target Hit" if "TARGET" in str(triggered_leg).upper() else ("Stop-Loss Hit" if "STOP" in str(triggered_leg).upper() else "Exit Confirmed")
-        lines.extend((
-            "",
+        required = [
             f"🏁 <b>Status: Position Closed ({_safe(leg_label)})</b>",
             f"• Exit Filled: {sell_qty}/{total_qty} (Open Quantity: 0)",
-        ))
+        ]
+        lines.extend(("", *required))
         if sell_vwap is not None and sell_vwap > 0:
-            lines.append(f"• Exit SELL VWAP: {_money(sell_vwap)}")
+            lines.append(f"• Exit Price: {_money(sell_vwap)}")
             lines.append(f"• Exit Trade Value: {_money(sell_vwap * sell_qty)}")
         if realized_pnl is not None:
             lines.append(f"• Gross Realized P&amp;L: {_signed_money(realized_pnl)}")
     lines.extend(_tail(meta, observed_at, "Exit Observed"))
-    return "\n".join(lines)
+    original = "\n".join(lines)
+    q_age = meta.get("quote_age_sec")
+    values = {
+        "symbol": meta.get("symbol"),
+        "contract": meta.get("contract"),
+        "action": meta.get("action"),
+        "segment": meta.get("segment"),
+        "quantity": total_qty,
+        "yahoo_cmp": _money(meta.get("yahoo_cmp")) if meta.get("yahoo_cmp") else None,
+        "limit_price": _money(meta.get("limit_price")) if meta.get("limit_price") else None,
+        "entry_price": _money(buy_vwap) if (buy_vwap is not None and buy_vwap > 0) else None,
+        "exit_price": _money(sell_vwap) if (sell_vwap is not None and sell_vwap > 0) else None,
+        "exit_trade_value": _money(sell_vwap * sell_qty) if (sell_vwap is not None and sell_vwap > 0 and sell_qty > 0) else None,
+        "realized_pnl": _signed_money(realized_pnl) if realized_pnl is not None else None,
+        "protection_route": protection_route,
+        "sl_target": f"{_money(sl_price)} / {_money(target_price)}" if (sl_price and target_price and sl_price > 0 and target_price > 0) else None,
+        "exit_filled": f"{sell_qty}/{total_qty}",
+        "quote_age": f"{float(q_age):.2f}s (Accepted under configured policy)" if q_age is not None else None,
+        "source": meta.get("source"),
+        "mode": meta.get("mode"),
+        "exit_time": _ist(observed_at) if observed_at else None,
+    }
+    return (render_custom_telegram(
+        event_key, values, required,
+        data_dir=meta.get("data_dir"),
+        template_override=template_override,
+    ) or original)
 
 
 class OrderStatusReporter:
