@@ -3545,6 +3545,9 @@ class ProtectionWatcher:
         terminal_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "CLOSED", "TRADED"}
         dead_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
 
+        with self._lock:
+            all_known_recs = list(self.pending.values()) + list(self.terminal_orders.values())
+
         # A Forever OCO ID is a *group*, not an exchange SELL order ID.  A
         # historical aggregate group can legitimately protect two old BUY lots.
         # Admit shared GROUP coverage only for a fresh, wholly resting OCO
@@ -3567,7 +3570,21 @@ class ProtectionWatcher:
                     if group_id:
                         claims.setdefault(group_id, []).append(shared_rec)
             for group_id, owners in claims.items():
-                if len(owners) < 2 or len({str(r.get("order_id") or "") for r in owners}) != len(owners):
+                owner_ids = {str(r.get("order_id") or "") for r in owners}
+                if len(owners) < 2 or len(owner_ids) != len(owners):
+                    continue
+                # Closed or stale other-owner claims invalidate reuse of an
+                # aggregate group. A group must not hide ownership conflicts.
+                all_claimants = {
+                    str(r.get("order_id") or "")
+                    for r in all_known_recs if isinstance(r, dict)
+                    and (
+                        group_id in {str(x or "").strip() for x in (r.get("confirmed_protection_ids") or [])}
+                        or group_id in {str(r.get(k) or "").strip() for k in ("forever_order_id", "oco_order_id")}
+                        or group_id in {str(x or "").strip() for x in (r.get("verified_leg_order_ids") or [])}
+                    )
+                }
+                if all_claimants != owner_ids:
                     continue
                 reference = owners[0]
                 security = str(reference.get("security_id") or "").strip()
@@ -3626,7 +3643,18 @@ class ProtectionWatcher:
                     positions_book, holdings_book, security_id=security,
                     segment=segment, product=product, account_id=account,
                 )
-                if source == "VERIFIED_SETTLED_HOLDINGS" and owned == combined:
+                if source != "VERIFIED_SETTLED_HOLDINGS" or owned != combined:
+                    continue
+                # Keep the broker's authoritative 2-leg OCO verifier in the
+                # shared-coverage admission path as well as the startup gate.
+                # No duplicated heuristic may accept an invalid resting order.
+                proof = verify_forever_oco_group(
+                    matching_rows=group_rows, forever_order_id=group_id,
+                    expected_security_id=security, expected_qty=combined,
+                    expected_account_id=account, expected_segment=segment,
+                    expected_product_type=product,
+                )
+                if proof.is_verified and int(proof.protected_quantity) == combined:
                     eligible_shared_forever_ids.add(group_id)
 
         # C5 & C8: Precompute typed owner maps across all tracked bot orders with fail-closed collision detection
@@ -3649,8 +3677,6 @@ class ProtectionWatcher:
             target_map[ks_i] = ow_i
             return True
 
-        with self._lock:
-            all_known_recs = list(self.pending.values()) + list(self.terminal_orders.values())
         for k_rec in all_known_recs:
             if not isinstance(k_rec, dict):
                 continue
