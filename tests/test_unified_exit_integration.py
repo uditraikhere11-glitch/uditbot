@@ -129,7 +129,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
                  "orderStatus": "TRADED", "transactionType": "SELL", "filledQty": 1, "dhanClientId": ACCOUNT},
             ],
             positions=[{"securityId": "5264", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 0, "dhanClientId": ACCOUNT}],
-            holdings=[],
+            holdings=[dict(securityId="5264", totalQty=0, dpQty=0)],
         )
         watcher = ProtectionWatcher(broker=broker, path=self.watcher_path, dry_run=False, journal_db=self.db)
         gate = StartupReconciliationGate(broker=broker, journal_db=self.db, watcher=watcher, stop_manager=self.stop_mgr)
@@ -260,7 +260,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
     def test_reentry_ignores_only_verified_closed_lot(self):
         ts = datetime.now(IST).replace(hour=9, minute=0, second=0)
         trades, orders = self._round_trip("B1", ts, 2, "S1")
-        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[])
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
         gate = self._gate(broker)
         self.assertEqual(gate.run_startup_reconciliation()[0], True)
         t2, o2 = self._round_trip("B2", ts + timedelta(hours=1), 3, "S2")
@@ -276,7 +276,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
 
     def test_four_simultaneous_gate_checks_link_once(self):
         trades, orders = self._round_trip("CONCURRENT", datetime.now(IST) - timedelta(minutes=1), 2, "EXIT")
-        gate = self._gate(self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[]))
+        gate = self._gate(self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)]))
         barrier = Barrier(4)
 
         def check():
@@ -296,7 +296,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
 
     def test_shared_super_id_requires_matching_terminal_leg(self):
         trades, orders = self._round_trip("SUP1", datetime.now(IST) - timedelta(minutes=1), 1, "SUP1")
-        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[])
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
         gate = self._gate(broker)
         self.assertFalse(gate.run_startup_reconciliation()[0])
         broker.get_super_orders.return_value.append(dict(orders[0], orderStatus="CLOSED", legDetails=[
@@ -311,7 +311,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         with self.db._get_conn() as conn:
             conn.execute("UPDATE order_intents SET quantity=10, state='CANCELLED' WHERE broker_order_id='PART'")
         orders[0].update(orderStatus="CANCELLED", quantity=10)
-        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[])
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
         for _ in range(2):
             ok, reason = self._gate(broker).run_startup_reconciliation()
             self.assertTrue(ok, reason)
