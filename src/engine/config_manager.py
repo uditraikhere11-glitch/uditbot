@@ -194,13 +194,8 @@ SIX_STEP_NAMES: Tuple[str, ...] = (
 
 
 def is_isolated_test_environment() -> bool:
-    """Returns True when executing inside unit tests so real systemd/network calls are blocked."""
-    import sys
-    return (
-        os.environ.get("AUDITBOT_TEST_ISOLATION") == "1"
-        or "unittest" in sys.modules
-        or "pytest" in sys.modules
-    )
+    """Only explicitly opted-in test runs suppress real systemd/network actions."""
+    return os.environ.get("AUDITBOT_TEST_ISOLATION") == "1"
 
 
 def _fsync_directory(parent_dir: str) -> None:
