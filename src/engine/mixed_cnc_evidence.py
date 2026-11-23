@@ -94,7 +94,27 @@ def verify_mixed_cnc_split(
             raise MixedCNCUnverified("Other same-security broker position requires attribution")
     if len(pos_matches) != 1:
         raise MixedCNCUnverified("Mixed CNC position contract is ambiguous")
-    current_net = int(str(pos_matches[0]["netQty"]).strip())
+    pos_row = pos_matches[0]
+    raw_net = pos_row.get("netQty")
+    if isinstance(raw_net, (bool, float)) or raw_net is None:
+        raise MixedCNCUnverified("Malformed position netQty")
+    current_net = int(str(raw_net).strip())
+    for cf_key in ("carryForwardBuyQty", "carryForwardSellQty"):
+        if cf_key in pos_row and pos_row[cf_key] is not None:
+            raw_cf = pos_row[cf_key]
+            if isinstance(raw_cf, (bool, float)):
+                raise MixedCNCUnverified(f"Malformed position {cf_key}")
+            if int(str(raw_cf).strip()) != 0:
+                raise MixedCNCUnverified("Carry-forward position quantity overlaps settled holdings")
+    if (
+        "dayBuyQty" in pos_row and pos_row["dayBuyQty"] is not None
+        and "daySellQty" in pos_row and pos_row["daySellQty"] is not None
+    ):
+        raw_db, raw_ds = pos_row["dayBuyQty"], pos_row["daySellQty"]
+        if isinstance(raw_db, (bool, float)) or isinstance(raw_ds, (bool, float)):
+            raise MixedCNCUnverified("Malformed position dayBuyQty/daySellQty")
+        if int(str(raw_db).strip()) - int(str(raw_ds).strip()) != current_net:
+            raise MixedCNCUnverified("Position day buy/sell quantities disagree with netQty")
     settled_qty = aggregate_holdings(holdings, account_id=account).get(security)
     holding_rows = [h for h in holdings if str(h.get("securityId") or "").strip() == security]
     if len(holding_rows) != 1 or not holding_rows[0].get("isin"):
@@ -194,11 +214,29 @@ def verify_mixed_cnc_split(
             settled_ids.append(oid)
             old_qty += raw_qty
             ack = getattr(db, "is_manual_risk_acknowledged", None)
-            if not callable(ack) or ack(
+            ack_ok = callable(ack) and ack(
                 oid, oid, expected_account_id=account,
                 expected_security_id=security, required_qty=raw_qty,
-            ) is not True:
-                raise MixedCNCUnverified("Prior-day parent lacks exact owner ACK")
+            ) is True
+            protected_ok = False
+            if not ack_ok and hasattr(db, "get_position_lifecycle"):
+                life = db.get_position_lifecycle(oid)
+                if isinstance(life, dict):
+                    has_prot_order = True
+                    if hasattr(db, "get_protection_order_ids_for_parent"):
+                        has_prot_order = bool(db.get_protection_order_ids_for_parent(oid))
+                    protected_ok = (
+                        has_prot_order
+                        and str(life.get("account_id") or "").strip() == account
+                        and str(life.get("security_id") or "").strip() == security
+                        and str(life.get("exchange_segment") or "").strip().upper() == segment
+                        and str(life.get("product_type") or "").strip().upper() == product
+                        and str(life.get("position_state") or "").strip().upper() == "PROTECTED"
+                        and int(life.get("confirmed_open_qty") or 0) == raw_qty
+                        and int(life.get("protected_qty") or 0) >= raw_qty
+                    )
+            if not (ack_ok or protected_ok):
+                raise MixedCNCUnverified("Prior-day parent lacks exact owner ACK or active protection")
             review = getattr(db, "owner_lot_review_reason", None)
             if callable(review) and review(account, oid):
                 raise MixedCNCUnverified("Prior-day parent has durable movement conflict")
@@ -223,10 +261,14 @@ def verify_mixed_cnc_split(
                 or (tis and tis != isin) or not tid or tid == "0"
                 or key in seen_today or key not in expected_today):
             raise MixedCNCUnverified("Unattributed BUY/SELL or identity conflict in current trade book")
+        raw_q = t.get("tradedQuantity")
+        raw_p = t.get("tradedPrice")
+        if isinstance(raw_q, (bool, float)) or raw_q is None or isinstance(raw_p, bool) or raw_p is None:
+            raise MixedCNCUnverified("Malformed exchange trade fill")
         try:
-            qty = int(t["tradedQuantity"])
-            price = float(t["tradedPrice"])
-        except (KeyError, TypeError, ValueError):
+            qty = int(raw_q)
+            price = float(raw_p)
+        except (TypeError, ValueError):
             raise MixedCNCUnverified("Malformed exchange trade fill") from None
         exp_qty, exp_price = expected_today[key]
         if qty != exp_qty or not math.isfinite(price) or abs(price - exp_price) > 1e-6:
