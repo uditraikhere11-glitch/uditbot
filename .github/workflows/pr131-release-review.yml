@@ -1,0 +1,69 @@
+name: PR131 exact-baseline offline source review bundle
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/pr131-release-review.yml'
+permissions:
+  contents: read
+jobs:
+  exact-changed-files-review:
+    if: ${{ github.event.pull_request.head.ref == 'fix/pr130-owner-control-closure-20261123' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Exact baseline and syntax
+        run: |
+          set -euo pipefail
+          BASE=9f6e778966562a14b21d1e93e0f170d76ecdbb19
+          git cat-file -e "$BASE^{commit}"
+          test "$(git merge-base HEAD "$BASE")" = "$BASE"
+          git diff --check "$BASE" HEAD
+          python -B -m compileall -q src tests
+      - name: Generate exact 9f6e778 changed-files ZIP, patch and checksums
+        run: |
+          python - <<'PY'
+          import hashlib, subprocess, zipfile
+          from pathlib import Path
+          base='9f6e778966562a14b21d1e93e0f170d76ecdbb19'
+          head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          names=subprocess.check_output(
+              ['git','diff','--name-only','--diff-filter=ACMR',base,head],text=True
+          ).splitlines()
+          assert names and all(n.startswith(('src/','tests/','.github/workflows/pr131-release-review.yml')) for n in names)
+          diff=subprocess.check_output(['git','diff','--binary','--full-index',base,head])
+          assert diff
+          output=Path('UDITBOT_PR131_CHANGED_FILES.zip')
+          checks=[]
+          with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED) as z:
+              for name in names:
+                  content=Path(name).read_bytes()
+                  z.writestr(name,content)
+                  checks.append(f'{hashlib.sha256(content).hexdigest()}  {name}')
+              z.writestr('REVIEW/PR131_full.patch',diff)
+              z.writestr('REVIEW/SHA256SUMS.txt','\n'.join(checks)+'\n')
+              z.writestr('REVIEW/BASE_SHA.txt',base+'\n')
+              z.writestr('REVIEW/HEAD_SHA.txt',head+'\n')
+              z.writestr('REVIEW/NOTICE.txt','Offline source review only. No deployment, merge, Dhan or Telegram calls.\n')
+          with zipfile.ZipFile(output) as z:
+              for line in z.read('REVIEW/SHA256SUMS.txt').decode().splitlines():
+                  digest,path=line.split('  ',1)
+                  assert hashlib.sha256(z.read(path)).hexdigest()==digest
+          print(f'PR131 bundle: {len(names)} changed files from {base[:8]} at {head[:8]}')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PR131-exact-changed-files
+          path: UDITBOT_PR131_CHANGED_FILES.zip
+          if-no-files-found: error
