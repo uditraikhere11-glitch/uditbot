@@ -15,15 +15,19 @@ _PAGES = frozenset({'setup', 'control', 'designer'})
 # Crisp viewBox geometry and currentColor strokes work in both appearance modes.
 _UB_MARK = (
     '<svg class="v17p-ub-mark" xmlns="http://www.w3.org/2000/svg" '
-    'viewBox="0 0 40 40" aria-hidden="true" focusable="false" '
-    'fill="none" stroke="currentColor" stroke-width="2.3" '
-    'stroke-linecap="round" stroke-linejoin="round">'
-    '<rect x="1.75" y="1.75" width="36.5" height="36.5" rx="10" stroke-width="1.5"/>'
-    '<path d="M10.5 12.5v11a5.5 5.5 0 0 0 11 0v-11"/>'
-    '<path d="M25 12.5h3.25a3.8 3.8 0 0 1 0 7.6H25m0-7.6v15m0-7.4h3.6a3.7 3.7 0 0 1 0 7.4H25"/>'
+    'viewBox="0 0 48 48" aria-hidden="true" focusable="false" '
+    'fill="none" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect class="v17p-ub-tile" x="2" y="2" width="44" height="44" '
+    'rx="12" fill="#f0f6ff" stroke="#c3d5ec" stroke-width="1.4"/>'
+    '<path class="v17p-ub-letter" d="M11.5 14v13c0 4.6 2.7 7.4 6.8 7.4s6.8-2.8 6.8-7.4V14" '
+    'stroke="#143861" stroke-width="2.9"/>'
+    '<path class="v17p-ub-letter" d="M29.1 14v20.5M29.1 14h3.3c3.6 0 5.8 2 5.8 4.8' 
+    's-2.2 4.8-5.8 4.8h-3.3m0 0h3.8c3.7 0 5.9 2 5.9 5.1' 
+    ' -2.2 5.3-5.9 5.3h-3.8" stroke="#143861" stroke-width="2.65"/>'
+    '<circle class="v17p-ub-signal" cx="25.1" cy="14" r="2" fill="#2a8dea"/>'
     '</svg>'
 )
-_UB_FAVICON = quote(_UB_MARK.replace('currentColor', '#2178bd'), safe='')
+_UB_FAVICON = quote(_UB_MARK, safe='')
 
 
 def premium_instance_name() -> str:
