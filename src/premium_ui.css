@@ -756,9 +756,15 @@ html.v17p-preview-shell #v17-reports h2{font-size:17px;margin:20px 0 10px}
 
 /* PR137: coherent type scale and full-width Setup sections. */
 html.v17p-preview-shell .v17p-brand{display:inline-flex;align-items:center;font-weight:700;letter-spacing:-.02em}
-html.v17p-preview-shell .v17p-ub-mark{display:block;width:35px;height:35px;flex:none;stroke:currentColor;fill:none}
-html.v17p-preview-shell #premNav .prem-brand-icon{background:var(--v17p-soft)!important;border:1px solid var(--v17p-edge);border-radius:10px;width:42px;height:42px;flex-basis:42px}
-html.v17p-preview-shell #premNav .prem-brand-icon .v17p-ub-mark{width:35px;height:35px}
+html.v17p-preview-shell .v17p-ub-mark{display:block;width:38px;height:38px;flex:none}
+html.v17p-preview-shell .v17p-ub-mark .v17p-ub-tile{fill:#f0f6ff;stroke:#c3d5ec}
+html.v17p-preview-shell .v17p-ub-mark .v17p-ub-letter{fill:none;stroke:#143861}
+html.v17p-preview-shell .v17p-ub-mark .v17p-ub-signal{fill:#2a8dea}
+html.v17p-preview-shell.v17p-dark .v17p-ub-mark .v17p-ub-tile{fill:#22344d;stroke:#486381}
+html.v17p-preview-shell.v17p-dark .v17p-ub-mark .v17p-ub-letter{stroke:#eff6ff}
+html.v17p-preview-shell.v17p-dark .v17p-ub-mark .v17p-ub-signal{fill:#69b8ff}
+html.v17p-preview-shell #premNav .prem-brand-icon{background:transparent!important;border:0!important;border-radius:0;width:43px;height:43px;flex-basis:43px}
+html.v17p-preview-shell #premNav .prem-brand-icon .v17p-ub-mark{width:43px;height:43px}
 html.v17p-preview-shell.premium-setup form[action="/setup"]{display:block;column-count:1;column-width:auto;width:100%;max-width:1040px;margin:0 auto}
 html.v17p-preview-shell.premium-setup form[action="/setup"]>.section-card{width:100%;max-width:none;break-inside:auto;min-width:0}
 html.v17p-preview-shell.premium-setup .v17p-setup-toolbar{max-width:1040px;margin-inline:auto}
@@ -799,3 +805,7 @@ html.v17p-preview-shell.premium-control #v17-control>.buttons #restart:disabled{
 @media(max-width:1050px){html.v17p-preview-shell.premium-setup .section-card .grid-3{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){html.v17p-preview-shell.premium-setup .section-card .grid-2,html.v17p-preview-shell.premium-setup .section-card .grid-3{grid-template-columns:1fr}html.v17p-preview-shell.premium-setup input,html.v17p-preview-shell.premium-setup select{font-size:16px!important;line-height:1.45}}
 @media(prefers-reduced-motion:reduce){html.v17p-preview-shell #service-beacon.is-active,html.v17p-preview-shell #mode-beacon.is-active,html.v17p-preview-shell #v17p-service-card.verified .v17p-dot,html.v17p-preview-shell #v17p-mode-card.verified.mode-live .v17p-dot{animation:none}}
+
+/* PR137: the account drawer is always an on-demand overlay, not a desktop sidebar. */
+html:not(.v17p-preview-shell) #premNav:not(.open){visibility:hidden!important;transform:translateX(-110%)!important}
+@media(max-width:390px){html.v17p-preview-shell .v17p-brand>span{margin-right:7px}html.v17p-preview-shell .v17p-ub-mark{width:35px;height:35px}}
