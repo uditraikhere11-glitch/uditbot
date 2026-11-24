@@ -12,19 +12,19 @@ from unittest.mock import Mock
 from src.engine.reconciliation import StartupReconciliationGate, ReconciliationState
 from src.engine.protection_watcher import ProtectionWatcher
 from src.journal.db import JournalDB
-from tests.test_ia001_yesbank_actual_watcher import ThreeParentRealWatcher as _Fixture
+from tests import test_ia001_yesbank_actual_watcher as _synthetic
 
 
 class FullStartupThreeParentYESBANK(unittest.TestCase):
     # The source fixture defines immutable synthetic identities on its class.
-    ACCOUNT = _Fixture.ACCOUNT
-    SECURITY = _Fixture.SECURITY
-    FIRST = _Fixture.FIRST
-    SECOND = _Fixture.SECOND
-    THIRD = _Fixture.THIRD
-    GROUP = _Fixture.GROUP
-    setUp = _Fixture.setUp
-    _assert_no_mutation = _Fixture._assert_no_mutation
+    ACCOUNT = _synthetic.ThreeParentRealWatcher.ACCOUNT
+    SECURITY = _synthetic.ThreeParentRealWatcher.SECURITY
+    FIRST = _synthetic.ThreeParentRealWatcher.FIRST
+    SECOND = _synthetic.ThreeParentRealWatcher.SECOND
+    THIRD = _synthetic.ThreeParentRealWatcher.THIRD
+    GROUP = _synthetic.ThreeParentRealWatcher.GROUP
+    setUp = _synthetic.ThreeParentRealWatcher.setUp
+    _assert_no_mutation = _synthetic.ThreeParentRealWatcher._assert_no_mutation
 
     def gate(self, *, stopped=False, db=None, watcher=None):
         self.broker.cfg = NS(
