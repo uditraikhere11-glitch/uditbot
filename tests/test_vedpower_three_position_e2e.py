@@ -51,6 +51,10 @@ class VEDPOWERProtectedThreeHoldings(SyntheticNov22Fixture):
                 "'LIMIT',100,1,'ACKED',?,?)",
                 (CID,VED,"VEDPOWER",SEC,created,created),
             )
+            conn.execute(
+                "INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
+                (VED, OCO),
+            )
         self.db.apply_attested_historical_order_fill(
             correlation_id=CID, broker_order_id=VED, expected_account_id=r01.ACCOUNT,
             symbol="VEDPOWER", security_id=SEC, exchange_segment="NSE_EQ",

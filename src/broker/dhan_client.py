@@ -3576,6 +3576,7 @@ class DhanClient:
             return False, [], f"Malformed trades payload: expected dict or list of dicts, got {type(payload).__name__}"
 
         validated: List[Dict[str, Any]] = []
+        explicit_fills: Dict[str, Dict[str, Any]] = {}
         exp_oid = str(expected_order_id or "").strip()
         exp_acct = str(expected_account_id or "").strip()
         exp_sec = str(expected_security_id or "").strip()
@@ -3638,7 +3639,15 @@ class DhanClient:
             norm_item["tradedPrice"] = price
             norm_item["transactionType"] = t_side or exp_side or "BUY"
             norm_item["exchangeTradeId"] = etid or f"{t_oid or exp_oid or 'ORD'}-TRD-{idx + 1}"
+            norm_item["_has_explicit_transaction_type"] = bool(t_side)
             norm_item["_has_explicit_exchange_trade_id"] = bool(etid)
+            if etid:
+                previous = explicit_fills.get(etid)
+                if previous is not None:
+                    if previous != norm_item:
+                        return False, [], f"Conflicting duplicate exchangeTradeId in trade record #{idx}"
+                    continue
+                explicit_fills[etid] = norm_item
             validated.append(norm_item)
 
         return True, validated, "OK"

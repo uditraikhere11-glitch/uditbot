@@ -13,7 +13,7 @@ import json
 import math
 from typing import Any, Mapping
 
-from src.engine.holding_quantity import aggregate_holdings, observed_open_quantity
+from src.engine.holding_quantity import QuantityUnverified, _quantity, aggregate_holdings, observed_open_quantity
 from src.engine.market import IST
 
 
@@ -107,31 +107,27 @@ def verify_mixed_cnc_split(
         if str(row.get("exchangeSegment") or "").strip().upper() == segment and str(
             row.get("productType") or "").strip().upper() == product:
             pos_matches.append(row)
-        elif str(row.get("netQty") or "0").strip() not in ("0", "+0", "-0"):
-            raise MixedCNCUnverified("Other same-security broker position requires attribution")
+        else:
+            try:
+                sibling_net = _quantity(row.get("netQty"), signed=True)
+            except QuantityUnverified as exc:
+                raise MixedCNCUnverified("Other same-security position lacks verified quantity") from exc
+            if sibling_net != 0:
+                raise MixedCNCUnverified("Other same-security broker position requires attribution")
     if len(pos_matches) != 1:
         raise MixedCNCUnverified("Mixed CNC position contract is ambiguous")
-    pos_row = pos_matches[0]
-    raw_net = pos_row.get("netQty")
-    if isinstance(raw_net, (bool, float)) or raw_net is None:
-        raise MixedCNCUnverified("Malformed position netQty")
-    current_net = _strict_int(raw_net, "netQty", allow_negative=True)
-    for cf_key in ("carryForwardBuyQty", "carryForwardSellQty"):
-        if cf_key in pos_row and pos_row[cf_key] is not None:
-            raw_cf = pos_row[cf_key]
-            if isinstance(raw_cf, (bool, float)):
-                raise MixedCNCUnverified(f"Malformed position {cf_key}")
-            if _strict_int(raw_cf, cf_key) != 0:
-                raise MixedCNCUnverified("Carry-forward position quantity overlaps settled holdings")
-    if (
-        "dayBuyQty" in pos_row and pos_row["dayBuyQty"] is not None
-        and "daySellQty" in pos_row and pos_row["daySellQty"] is not None
-    ):
-        raw_db, raw_ds = pos_row["dayBuyQty"], pos_row["daySellQty"]
-        if isinstance(raw_db, (bool, float)) or isinstance(raw_ds, (bool, float)):
-            raise MixedCNCUnverified("Malformed position dayBuyQty/daySellQty")
-        if _strict_int(raw_db, "dayBuyQty") - _strict_int(raw_ds, "daySellQty") != current_net:
-            raise MixedCNCUnverified("Position day buy/sell quantities disagree with netQty")
+    position = pos_matches[0]
+    try:
+        current_net = _quantity(position["netQty"], signed=True)
+        for key in ("carryForwardBuyQty", "carryForwardSellQty"):
+            if key in position and _quantity(position[key]) != 0:
+                raise MixedCNCUnverified("Carry-forward quantity overlaps settled holdings")
+        if "dayBuyQty" in position or "daySellQty" in position:
+            day_net = _quantity(position.get("dayBuyQty")) - _quantity(position.get("daySellQty"))
+            if day_net != current_net:
+                raise MixedCNCUnverified("Day quantities disagree with broker net quantity")
+    except QuantityUnverified as exc:
+        raise MixedCNCUnverified("Malformed broker position components") from exc
     settled_qty = aggregate_holdings(holdings, account_id=account).get(security)
     holding_rows = [h for h in holdings if str(h.get("securityId") or "").strip() == security]
     if len(holding_rows) != 1 or not holding_rows[0].get("isin"):
@@ -314,7 +310,7 @@ def verify_mixed_cnc_split(
         if isinstance(raw_q, (bool, float)) or raw_q is None or isinstance(raw_p, bool) or raw_p is None:
             raise MixedCNCUnverified("Malformed exchange trade fill")
         try:
-            qty = int(raw_q)
+            qty = _quantity(raw_q)
             price = float(raw_p)
         except (TypeError, ValueError):
             raise MixedCNCUnverified("Malformed exchange trade fill") from None

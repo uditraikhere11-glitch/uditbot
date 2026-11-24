@@ -217,6 +217,8 @@ def _operational_evidence(tracker: ConfigChangeTracker, raw: Dict[str, Any],
                                   expected_account_id=str(cfg.dhan_client_id or ""))
     if data is None:
         return unknown
+    from src.engine.operational_snapshot import MAX_AGE_SECONDS, MAX_SUPERVISION_AGE_SECONDS
+    import time
     recon = data["reconciliation"]
     watcher = "ACTIVE" if data["watcher_running"] is True else "INACTIVE"
     supervision = "VERIFIED" if data["watcher_supervision_verified"] is True else "UNVERIFIED"
@@ -224,10 +226,14 @@ def _operational_evidence(tracker: ConfigChangeTracker, raw: Dict[str, Any],
     gate = "OPEN" if data["entries_open"] and recon == "HEALTHY" else "BLOCKED"
     telegram = ("CONNECTED" if data.get("telegram_connected") is True else
                 "DISCONNECTED" if data.get("telegram_connected") is False else "UNVERIFIED")
+    expires_at = data["created_at"] + MAX_AGE_SECONDS
+    if supervision == "VERIFIED":
+        expires_at = min(expires_at, (data.get("watcher_supervision_at") or 0) + MAX_SUPERVISION_AGE_SECONDS)
     return {"reconciliation": recon, "protection_watcher": watcher,
             "protection_supervision": supervision,
             "new_entries_gate": gate, "telegram_listener": telegram,
-            "runtime_evidence_at": data["created_at"]}
+            "runtime_evidence_at": data["created_at"],
+            "runtime_evidence_ttl": max(0.0, expires_at - time.time())}
 
 
 def build_control_reports(env_path: str = ".env") -> Dict[str, Any]:
@@ -287,6 +293,10 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     cfg, absolute_env, data_dir = _config_and_paths(env_path)
     tracker = ConfigChangeTracker(data_dir=data_dir)
     raw = tracker.control_service(action="status", env_path=absolute_env)
+    return _build_control_status(tracker, raw, cfg, absolute_env, data_dir)
+
+
+def _build_control_status(tracker, raw, cfg, absolute_env, data_dir):
     state = str(raw.get("service_state") or "UNKNOWN")
     verified = raw.get("runtime_verified") is True and state == "RUNNING"
     saved = bool(cfg.equity_amo_enabled)
@@ -339,7 +349,7 @@ def build_control_status(env_path: str = ".env") -> Dict[str, Any]:
     from src.engine.tracker_v2_health import owner_intent_health
     owner = owner_intent_health(state, raw.get("owner_intent"))
     observed = _operational_evidence(tracker, raw, cfg, data_dir)
-    if (owner.status != "PASS" or gate.get("ok") is not True
+    if (v2_blocked or owner.status != "PASS" or gate.get("ok") is not True
             or gate.get("active") is not False) and observed["new_entries_gate"] == "OPEN":
         # A healthy reconciliation heartbeat alone cannot override a pending
         # owner transition, including an interrupted Cancel Pending STOP.
@@ -438,8 +448,8 @@ def build_control_health(env_path: str = ".env") -> Dict[str, Any]:
           type(expiry) in (int, float) and expiry > time.time() else
           "FAIL" if type(expiry) in (int, float) and expiry <= time.time() else "UNKNOWN",
           broker.get("token_expiration_ist") or "No broker/JWT-verified expiry evidence")
-    runtime_listener = _operational_evidence(tracker, status, cfg, data_dir)
-    tg_state = runtime_listener["telegram_listener"]
+    runtime = _build_control_status(tracker, status, cfg, absolute_env, data_dir)
+    tg_state = runtime["telegram_listener"]
     check("Telegram connection", "PASS" if tg_state == "CONNECTED" else
           "WARN" if tg_state == "DISCONNECTED" else "UNKNOWN",
           "Telegram client connected; receiving monitored channel messages and outbound delivery are not tested" if tg_state == "CONNECTED" else
@@ -449,7 +459,6 @@ def build_control_health(env_path: str = ".env") -> Dict[str, Any]:
     gate = tracker.inspect_transition_gate_status(read_only=True)
     check("Transition safety gate", "WARN" if gate.get("active", True) else "PASS", "Active or unverified" if gate.get("active", True) else "Not active")
     check("Configuration coordinator", "WARN" if _pending(tracker) else "PASS", "Change pending" if _pending(tracker) else "No pending update detected")
-    runtime = _operational_evidence(tracker, status, cfg, data_dir)
     recon = runtime["reconciliation"]
     check("Reconciliation", "PASS" if recon == "HEALTHY" else
           "WARN" if recon == "BLOCKED" else "UNKNOWN",
@@ -463,9 +472,9 @@ def build_control_health(env_path: str = ".env") -> Dict[str, Any]:
           else "Watcher loop inactive" if watcher == "INACTIVE" else "Watcher heartbeat not independently verified")
     gate_state = runtime["new_entries_gate"]
     check("New entries gate", "PASS" if gate_state == "OPEN" and intent.status == "PASS" else
-          "WARN" if gate_state == "BLOCKED" or intent.status == "WARN" else "UNKNOWN",
+          "WARN" if gate_state in ("BLOCKED", "REVIEW_REQUIRED") or intent.status == "WARN" else "UNKNOWN",
           "Open based on fresh healthy process evidence" if gate_state == "OPEN" and intent.status == "PASS"
-          else "Blocked or owner intent requires review" if gate_state == "BLOCKED" or intent.status == "WARN"
+          else "Blocked or owner intent requires review" if gate_state in ("BLOCKED", "REVIEW_REQUIRED") or intent.status == "WARN"
           else "Live gate status unverified")
     summary = "Read-only health checks completed: " + ", ".join(f"{x}: {sum(c['status']==x for c in checks)}" for x in ("PASS", "WARN", "FAIL", "UNKNOWN"))
     return {"summary": summary, "checks": checks}

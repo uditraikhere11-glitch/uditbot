@@ -227,6 +227,10 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             created_ts=mon_ts,
         )
 
+        with self.db._get_conn() as conn:
+            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
+                         ("900001102657701", "FO-YES-1"))
+
         hist_trade = {
             "dhanClientId": FAKE_ACCT,
             "orderId": "900001102657701",
@@ -279,6 +283,21 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
     # H02: Two independent 1-share trades, same symbol, different order IDs and dates
     # ------------------------------------------------------------------
     def test_h02_two_independent_1_share_trades_same_symbol_different_order_ids_and_dates(self):
+        self._two_independent_lots(bind_second=True)
+
+    def test_same_security_group_cannot_protect_a_different_unbound_parent(self):
+        self._two_independent_lots(bind_second=False)
+
+    def test_oversized_bound_group_blocks_gate_and_second_lot_credit(self):
+        self._two_independent_lots(bind_second=True, second_group_qty=2)
+
+    def _two_independent_lots(self, bind_second, second_group_qty=1):
+        with self.db._get_conn() as conn:
+            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
+                         ("900001102657701", "FO-FIRST"))
+            if bind_second:
+                conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
+                             ("900001104398802", "FO-SECOND"))
         nov2_ts = datetime.datetime(2026, 11, 2, 14, 1, 18, tzinfo=IST).timestamp()
         nov4_ts = datetime.datetime(2026, 11, 4, 11, 25, 21, tzinfo=IST).timestamp()
         self._seed_acked_intent(
@@ -329,7 +348,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if url.endswith("/fundlimit"):
                 return _http_resp(200, {"availabelBalance": 5000.0})
             if url.endswith("/forever/orders"):
-                return _http_resp(200, _active_forever_oco_rows("FO-YES-2", "11915", 2))
+                return _http_resp(200, _active_forever_oco_rows("FO-FIRST", "11915", 1) + _active_forever_oco_rows("FO-SECOND", "11915", second_group_qty))
             if url.endswith("/super/orders") or url.endswith("/trades") or url.endswith("/positions") or url.endswith("/orders"):
                 return _http_resp(200, [])
             if "/orders/external/" in url or "/orders/900001102657701" in url or "/orders/900001104398802" in url:
@@ -344,7 +363,12 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
 
         with patch.object(self.client.session, "get", side_effect=fake_get):
             ok, msg = self.gate.run_startup_reconciliation()
-            self.assertTrue(ok, msg)
+            expected_healthy = bind_second and second_group_qty == 1
+            self.assertEqual(ok, expected_healthy, msg)
+            self.assertEqual(self.gate.is_accepting_entries, expected_healthy)
+            second = self.watcher.terminal_orders["900001104398802"]
+            self.assertEqual(second["protected_qty"], int(expected_healthy))
+            self.assertNotIn("FO-FIRST", second.get("confirmed_protection_ids", []))
 
         a1 = self.db.get_position_accounting("900001102657701")
         a2 = self.db.get_position_accounting("900001104398802")

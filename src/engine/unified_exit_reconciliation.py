@@ -94,7 +94,7 @@ def _broker_trade(row: dict, account: str, contract: tuple, side: str) -> dict:
         raise ReconciliationEvidenceError("Trade contract identity changed")
     if str(row.get("dhanClientId") or "").strip() != account:
         raise ReconciliationEvidenceError("Trade broker account unverified")
-    if str(row.get("transactionType") or "").upper() != side:
+    if str(row.get("transactionType") or "").strip().upper() != side:
         raise ReconciliationEvidenceError("Trade BUY/SELL side mismatch")
     oid = str(row.get("orderId") or "").strip()
     eid = str(row.get("exchangeTradeId") or "").strip()
@@ -181,19 +181,20 @@ def _query_historical_sells(
                 continue
             if row.get("dhanClientId") != account:
                 raise ReconciliationEvidenceError("Historical execution account differs")
-            if row.get("transactionType") == "BUY" and str(row.get("orderId")) not in parents:
+            side = str(row.get("transactionType") or "").strip().upper()
+            if side not in {"BUY", "SELL"}:
+                raise ReconciliationEvidenceError("Historical execution side unverified")
+            if side == "BUY" and str(row.get("orderId")) not in parents:
                 if _exchange_time(row.get("exchangeTime")) >= created_at:
                     raise ReconciliationEvidenceError("Competing historical BUY requires allocation review")
             if required_eids is not None:
                 if eid not in required_eids:
-                    if row.get("transactionType") == "SELL" and _exchange_time(row.get("exchangeTime")) >= created_at and eid not in known_sell_ids:
+                    if side == "SELL" and _exchange_time(row.get("exchangeTime")) >= created_at and eid not in known_sell_ids:
                         raise ReconciliationEvidenceError("Additional historical SELL requires allocation review")
                     continue
                 normalized = _broker_trade(row, account, contract, "SELL")
             else:
-                if _identity(row) != contract:
-                    continue
-                if str(row.get("transactionType") or "").upper() != "SELL":
+                if side != "SELL":
                     continue
                 normalized = _broker_trade(row, account, contract, "SELL")
                 if normalized["when"] < created_at:

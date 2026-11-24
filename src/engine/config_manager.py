@@ -2701,7 +2701,7 @@ class ConfigChangeTracker:
         # NEVER create an empty database merely to make the safety check pass!
         if verified_orders_to_restore or disk_watcher_terminal:
             try:
-                from src.journal.db import JournalDB
+                from src.journal.db import JournalDB, write_protection_order
                 restored_db = JournalDB(abs_db)
                 now_ts = time.time()
                 with restored_db._get_conn() as conn:
@@ -2733,13 +2733,10 @@ class ConfigChangeTracker:
                             ),
                         )
                     for vp in verified_prot_to_restore:
-                        conn.execute(
-                            """
-                            INSERT OR REPLACE INTO protection_orders (
-                                parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit, target_price, quantity, status, created_at
-                            ) VALUES (?, ?, ?, 0.0, 0.0, 0.0, ?, ?, ?)
-                            """,
-                            (vp["parent_order_id"], vp["forever_order_id"], vp["symbol"], vp["quantity"], vp["status"], now_ts),
+                        write_protection_order(
+                            conn, parent_id=vp["parent_order_id"], protection_id=vp["forever_order_id"],
+                            symbol=vp["symbol"], sl_trigger=0.0, sl_limit=0.0, target_price=0.0,
+                            quantity=vp["quantity"], status=vp["status"], created_at=now_ts,
                         )
             except Exception as restore_err:
                 return False, f"JOURNAL_ERROR: Failed to restore verified broker state into journal: {restore_err}"

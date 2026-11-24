@@ -245,6 +245,24 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self.assertEqual(gate.state, ReconciliationState.HEALTHY)
         self.assertTrue(gate.is_accepting_entries)
 
+    def test_historical_manual_exit_with_unclassified_competing_fill_preserves_parent(self):
+        parent = "PDSL-BUY"
+        buy_time = datetime.now(IST) - timedelta(days=2)
+        self._seed_pdsl_open_buy(buy_oid=parent, buy_ts=buy_time)
+        ambiguous = _trade("OTHER-ORDER", "OTHER-EXEC", "UNKNOWN", 1,
+                           buy_time + timedelta(minutes=3), 403.0)
+        sell = _trade("SELL", "SELL-EXEC", "SELL", 1,
+                      buy_time + timedelta(days=1), 420.0)
+        broker = self._make_broker(trade_book=[], order_book=[], positions=[],
+                                   holdings=[], hist_trades=[ambiguous, sell])
+        for _ in range(2):
+            self.db = JournalDB(self.db_path, account_id=ACCOUNT)
+            gate = self._gate(broker)
+            ok, reason = gate.run_startup_reconciliation()
+            self.assertFalse(ok, reason)
+            self.assertEqual(self.db.get_position_lifecycle(parent)["confirmed_open_qty"], 1)
+            self.assertEqual(self.db.get_sell_fills_for_parent(parent), [])
+
     def _gate(self, broker):
         watcher = ProtectionWatcher(broker, path=self.watcher_path, journal_db=self.db)
         gate = StartupReconciliationGate(broker, self.db, watcher, self.stop_mgr)

@@ -398,16 +398,20 @@ class RuntimeSnapshotContract(unittest.TestCase):
             body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
             type_ignores=[]))
         self.at = stamp(23, 15, 10)
+        from src.engine.tracker_v2_safety import inspect_apply_barrier
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
         os_fake = NS(getpid=lambda: 77777, path=os.path)
         time_fake = NS(time=lambda: self.at + 1)
         ns = dict(os=os_fake, time=time_fake, Any=object, proc_starttime=lambda pid: 53,
+                  inspect_apply_barrier=inspect_apply_barrier,
                   account_fingerprint=lambda a: hashlib.sha256(a.encode()).hexdigest(),
                   MAX_AGE_SECONDS=35, MAX_SUPERVISION_AGE_SECONDS=300,
                   FILE_NAME="runtime_operational_snapshot.json")
         exec(compile(code, str(file), "exec"), ns)
         self.ns = ns
         self.pipeline = NS(
-            cfg=NS(dhan_client_id="SYNTHETIC"),
+            cfg=NS(dhan_client_id="SYNTHETIC", data_dir=directory.name),
             reconciliation_gate=NS(state=NS(value="HEALTHY"),
                                    is_accepting_entries=True, last_reconciled_at=self.at),
             watcher=NS(_is_running=True, _supervision_read_complete=True,

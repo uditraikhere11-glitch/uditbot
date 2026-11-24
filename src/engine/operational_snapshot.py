@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from src.engine.config_manager import write_json_atomic
+from src.engine.tracker_v2_safety import inspect_apply_barrier
 from src.engine.runtime_evidence import proc_starttime, read_private_json
 
 FILE_NAME = "runtime_operational_snapshot.json"
@@ -28,7 +29,14 @@ def collect_operational_snapshot(
     """Build the common WebUI/Telegram process-matched readiness truth."""
     gate = pipeline.reconciliation_gate
     watcher = pipeline.watcher
-    state = str(getattr(getattr(gate, "state", None), "value", "UNKNOWN")).upper()
+    from contextlib import nullcontext
+    with getattr(gate, "_entry_state_lock", nullcontext()):
+        state = str(getattr(getattr(gate, "state", None), "value", "UNKNOWN")).upper()
+        entry_open = gate.is_accepting_entries is True and state == "HEALTHY"
+        reconciled_at = float(getattr(gate, "last_reconciled_at", 0.0) or 0.0)
+    if entry_open:
+        barrier_path = os.path.join(pipeline.cfg.data_dir, "config_restart_v2", "apply_barrier.json")
+        entry_open = inspect_apply_barrier(barrier_path).allowed
     pid = os.getpid()
     starttime = proc_starttime(pid)
     if starttime is None:
@@ -40,20 +48,19 @@ def collect_operational_snapshot(
                    and 0 <= now - success_at <= MAX_SUPERVISION_AGE_SECONDS)
     watcher_verified = bool(watcher_running and proof_fresh
                             and getattr(watcher, "_supervision_read_complete", None) is True)
-    entry_open = gate.is_accepting_entries is True
     snapshot = {
         "schema": 2,
         "created_at": now,
         "pid": pid,
         "process_starttime": starttime,
         "account_fingerprint": account_fingerprint(pipeline.cfg.dhan_client_id),
-        "reconciliation": state if state in ("HEALTHY", "BLOCKED", "INITIALIZING") else "UNKNOWN",
+        "reconciliation": state if state in ("HEALTHY", "BLOCKED", "RECONCILING", "INITIALIZING") else "UNKNOWN",
         "watcher_running": watcher_running,
         "watcher_supervision_verified": watcher_verified,
         "watcher_supervision_at": float(success_at) if watcher_verified else None,
         "telegram_connected": telegram_connected if type(telegram_connected) is bool else None,
         "entries_open": entry_open,
-        "last_reconciled_at": float(getattr(gate, "last_reconciled_at", 0.0) or 0.0),
+        "last_reconciled_at": reconciled_at,
     }
     return snapshot
 
@@ -92,7 +99,7 @@ def read_verified_snapshot(
         stamp = item.get("created_at")
         if type(stamp) not in (int, float) or not -3 <= now - stamp <= MAX_AGE_SECONDS:
             return None
-        if item.get("reconciliation") not in ("HEALTHY", "BLOCKED", "INITIALIZING", "UNKNOWN"):
+        if item.get("reconciliation") not in ("HEALTHY", "BLOCKED", "RECONCILING", "INITIALIZING", "UNKNOWN"):
             return None
         if type(item.get("watcher_running")) is not bool or type(item.get("entries_open")) is not bool:
             return None

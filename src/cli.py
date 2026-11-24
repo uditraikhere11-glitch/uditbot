@@ -559,6 +559,7 @@ def format_startup_online_card(
     is_stopped: bool = False,
     watcher_verified: bool = True,
     snapshot_at: float | None = None,
+    gate_open: bool | None = None,
 ) -> str:
     """
     H14: Formats the startup Telegram card with explicit separation between
@@ -573,7 +574,7 @@ def format_startup_online_card(
     mode = html.escape(str(getattr(configured_mode, "value", configured_mode)))
     unres_n = int(unresolved_intents_count or 0)
     unprot_n = int(unprotected_positions_count or 0)
-    entries_open = bool(reconciliation_ok and not is_stopped and unres_n == 0 and unprot_n == 0)
+    entries_open = bool(gate_open is not False and reconciliation_ok and not is_stopped and unres_n == 0 and unprot_n == 0)
     from datetime import datetime
     from zoneinfo import ZoneInfo
     at = datetime.fromtimestamp(float(snapshot_at), ZoneInfo("Asia/Kolkata")).strftime("%H:%M:%S") if snapshot_at is not None else "UNVERIFIED"

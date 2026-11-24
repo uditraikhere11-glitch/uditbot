@@ -227,8 +227,6 @@ async def main():
         # Enqueue startup readiness card via durable outbox (H14: separate listener, entry gate, reconciliation & protection)
         if cfg.log_group_id:
             from src.cli import format_startup_online_card
-            pending_cnt = len(pipeline.db.get_non_terminal_intents()) if hasattr(pipeline.db, "get_non_terminal_intents") else 0
-            unprot_cnt = len(pipeline.db.get_unprotected_orders()) if hasattr(pipeline.db, "get_unprotected_orders") else 0
             # Same canonical evidence as the WebUI's next process snapshot.
             from src.engine.operational_snapshot import collect_operational_snapshot
             startup_truth = collect_operational_snapshot(
@@ -241,14 +239,12 @@ async def main():
             startup_card = format_startup_online_card(
                 cfg,
                 allowed_chats_count=len(allowed_chats),
-                reconciliation_ok=gate_live,
-                reconciliation_msg=(rec_msg if gate_live else
+                reconciliation_ok=startup_truth["reconciliation"] == "HEALTHY",
+                gate_open=gate_live,
+                reconciliation_msg=("" if startup_truth["reconciliation"] == "HEALTHY" else
                     str(getattr(gate_now, "last_error", "") or "Current gate is not verified healthy")),
                 watcher_verified=watcher_live,
                 snapshot_at=startup_truth["created_at"],
-                unresolved_intents_count=pending_cnt,
-                unprotected_positions_count=unprot_cnt,
-                is_stopped=pipeline.stop_manager.is_stopped(),
             )
             await asyncio.to_thread(pipeline.dispatch_notification, "SYSTEM_STARTUP", startup_card)
             runtime_transitions.arm(startup_truth)

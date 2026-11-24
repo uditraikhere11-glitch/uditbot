@@ -65,7 +65,7 @@ from src.engine.unified_exit_reconciliation import (
 )
 from src.engine.market import IST, is_lifecycle_open, is_market_open
 from src.instruments.resolver import INDEX_SYMBOLS
-from src.journal.db import RejectedProtectionNeedsReview, generate_correlation_id
+from src.journal.db import RejectedProtectionNeedsReview, generate_correlation_id, write_protection_order
 from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
 from src.engine.watch_poll_policy import watcher_cadence_seconds, supervision_read_requirement, manual_risk_only, has_urgent_obligation, supervision_preflight_priority
 
@@ -1328,14 +1328,16 @@ class ProtectionWatcher:
                             return self.journal_db.record_fill(**values)
                         except Exception:
                             fill_persist_failed = True
+                            rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                            rec["reconciliation_required"] = True
+                            rec["persistence_uncertain"] = True
+                            if values.get("is_verified_trade"):
+                                rec["entry_fill_evidence_required"] = values["exchange_trade_id"]
+                            rec["filled_qty"] = prev_filled
                             if rec.get("entry_only_amo"):
-                                rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
-                                rec["reconciliation_required"] = True
-                                rec["persistence_uncertain"] = True
-                                rec["filled_qty"] = prev_filled
                                 rec["confirmed_position_open_qty"] = max(0, prev_filled - int(rec.get("exit_filled_qty") or 0))
-                                if gate is not None and hasattr(gate, "halt_new_entries"):
-                                    gate.halt_new_entries(f"Entry-only AMO {order_id}: fill persistence failed")
+                            if gate is not None and hasattr(gate, "halt_new_entries"):
+                                gate.halt_new_entries(f"Order {order_id}: fill persistence failed")
                             raise
 
                     recorded_real_trades = False
@@ -1344,7 +1346,16 @@ class ProtectionWatcher:
                             t_res = self.broker.get_trades_for_order(order_id)
                             if isinstance(t_res, list) and len(t_res) > 0:
                                 for tr in t_res:
-                                    if isinstance(tr, dict) and tr.get("exchangeTradeId") and float(tr.get("tradedPrice") or 0) > 0:
+                                    if (
+                                        isinstance(tr, dict)
+                                        and tr.get("exchangeTradeId")
+                                        and tr.get("_has_explicit_exchange_trade_id", True)
+                                        and tr.get("_has_explicit_transaction_type", True)
+                                        and str(tr.get("transactionType") or "").strip().upper() == "BUY"
+                                        and str(tr.get("orderId") or "").strip() == str(order_id)
+                                        and str(tr.get("securityId") or "").strip() == str(rec.get("security_id") or "")
+                                        and float(tr.get("tradedPrice") or 0) > 0
+                                    ):
                                         record_entry_fill(
                                             broker_order_id=order_id,
                                             exchange_trade_id=str(tr["exchangeTradeId"]),
@@ -1359,9 +1370,16 @@ class ProtectionWatcher:
                                             parent_order_id=order_id,
                                             is_verified_trade=True,
                                         )
+                                        if tr["exchangeTradeId"] == rec.get("entry_fill_evidence_required"):
+                                            rec.pop("entry_fill_evidence_required")
+                                            rec["persistence_uncertain"] = False
                                         recorded_real_trades = True
                         except Exception:
                             recorded_real_trades = False
+                    if rec.get("entry_fill_evidence_required"):
+                        rec["filled_qty"] = prev_filled
+                        changed = True
+                        continue
                     if not recorded_real_trades and not fill_persist_failed:
                         try:
                             avg_p = float(st.get("averageTradedPrice") or 0.0)
@@ -1381,6 +1399,10 @@ class ProtectionWatcher:
                             )
                         except Exception:
                             pass
+                    if fill_persist_failed and not rec.get("entry_only_amo"):
+                        changed = True
+                        continue
+
                     if not fill_persist_failed and rec.get("entry_only_amo") and rec.get("persistence_uncertain"):
                         rec["persistence_uncertain"] = False
                         rec["reconciliation_required"] = False
@@ -1715,23 +1737,10 @@ class ProtectionWatcher:
             try:
                 f_id = forever_id or f"NONE-{rec['order_id']}"
                 with self.journal_db._get_conn() as conn:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO protection_orders (
-                            parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit, target_price, quantity, status, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            rec["order_id"],
-                            str(f_id),
-                            rec["symbol"],
-                            float(sl_trigger),
-                            float(sl_limit),
-                            float(target_price),
-                            int(new_qty),
-                            status_label,
-                            self.clock(),
-                        ),
+                    write_protection_order(
+                        conn, parent_id=rec["order_id"], protection_id=str(f_id), symbol=rec["symbol"],
+                        sl_trigger=sl_trigger, sl_limit=sl_limit, target_price=target_price,
+                        quantity=new_qty, status=status_label, created_at=self.clock(),
                     )
             except Exception as e:
                 logger.warning(f"[Protection] Could not record {status_label} order to journal: {e}")
@@ -1867,6 +1876,41 @@ class ProtectionWatcher:
             except Exception:
                 forever_book = None
 
+        if inspect.getattr_static(self.broker, "evaluate_forever_oco_protection", None) is not None and callable(self.broker.evaluate_forever_oco_protection):
+            try:
+                eval_res = self.broker.evaluate_forever_oco_protection(
+                    forever_order_id=str(oco_id),
+                    expected_security_id=str(rec["security_id"]),
+                    expected_qty=int(expected_qty),
+                    expected_sl_trigger=levels.sl_trigger,
+                    expected_target_price=levels.target_price,
+                    tick_size=inst_tick,
+                    expected_segment=str(rec.get("segment") or "NSE_EQ"),
+                    expected_product_type=str(rec.get("product_type") or "CNC"),
+                    forever_orders_snapshot=forever_book,
+                )
+                if not isinstance(eval_res, ProtectionVerificationResult):
+                    return False, "Malformed broker protection verification", False
+                # A mismatch or a triggered leg must retain its pending association.
+                terminal = False
+                if eval_res.is_terminal_or_invalid and forever_book:
+                    group = [
+                        row for row in forever_book if isinstance(row, dict)
+                        and str(row.get("orderId", "")) == str(oco_id)
+                    ]
+                    terminal = bool(group) and all(
+                        str(row.get("orderStatus", "")).upper() in {"CANCELLED", "EXPIRED", "REJECTED"}
+                        and str(row.get("securityId", "")) == str(rec["security_id"])
+                        and str(row.get("productType", "")).upper() == str(rec.get("product_type") or "CNC").upper()
+                        and str(row.get("exchangeSegment", "")).upper() == str(rec.get("segment") or "NSE_EQ").upper()
+                        and str(row.get("transactionType", "")).upper() == "SELL"
+                        and str(row.get("dhanClientId", "")) == str(getattr(getattr(self.broker, "cfg", None), "dhan_client_id", None))
+                        for row in group
+                    )
+                return eval_res.is_verified, eval_res.reason, terminal
+            except Exception as exc:
+                return False, f"Broker protection verification unavailable: {exc}", False
+
         verify_fn = getattr(self.broker, "verify_forever_leg_active", None)
         if callable(verify_fn):
             try:
@@ -1902,24 +1946,6 @@ class ProtectionWatcher:
                 is_term_rej = any(s in str(v_msg).upper() for s in ("REJECTED", "CANCELLED", "EXPIRED", "TERMINAL"))
                 return v_ok, str(v_msg), is_term_rej
 
-        if hasattr(self.broker, "evaluate_forever_oco_protection") and callable(self.broker.evaluate_forever_oco_protection):
-            try:
-                eval_res = self.broker.evaluate_forever_oco_protection(
-                    forever_order_id=str(oco_id),
-                    expected_security_id=str(rec["security_id"]),
-                    expected_qty=int(expected_qty),
-                    expected_sl_trigger=levels.sl_trigger,
-                    expected_target_price=levels.target_price,
-                    tick_size=inst_tick,
-                    expected_segment=str(rec.get("segment") or "NSE_EQ"),
-                    expected_product_type=str(rec.get("product_type") or "CNC"),
-                    forever_orders_snapshot=forever_book,
-                )
-                if isinstance(eval_res, ProtectionVerificationResult):
-                    return bool(eval_res.is_verified), str(eval_res.reason), bool(eval_res.is_terminal_or_invalid)
-            except Exception:
-                pass
-
         if isinstance(forever_book, list) and forever_book:
             matching_rows = [
                 r for r in forever_book
@@ -1938,9 +1964,6 @@ class ProtectionWatcher:
             )
             return grp.is_verified, grp.reason, grp.is_terminal_or_invalid
 
-        if not self.require_broker_leg_confirmation and not forever_book:
-            return True, "Confirmed by OCO placement ACK", False
-
         return False, "Broker Forever leg verification unconfirmed", False
 
     def _verify_super_order_on_broker(
@@ -1955,6 +1978,24 @@ class ProtectionWatcher:
         Safety Correction B: Single authoritative Super Order protection verifier.
         Never falls back to accepting two TRADED legs or top-level `stopLossPrice`/`targetPrice` alone.
         """
+        if inspect.getattr_static(self.broker, "evaluate_super_order_protection", None) is not None and callable(self.broker.evaluate_super_order_protection):
+            try:
+                eval_res = self.broker.evaluate_super_order_protection(
+                    order_id=str(order_id),
+                    expected_security_id=str(rec["security_id"]),
+                    expected_qty=int(expected_qty),
+                    expected_sl_price=levels.sl_trigger,
+                    expected_target_price=levels.target_price,
+                    tick_size=inst_tick,
+                    expected_segment=str(rec.get("segment") or "NSE_FNO"),
+                    expected_product_type=str(rec.get("product_type") or "MARGIN"),
+                )
+                if not isinstance(eval_res, ProtectionVerificationResult):
+                    return False, "Malformed broker protection verification", False
+                return eval_res.is_verified, eval_res.reason, eval_res.is_terminal_or_invalid
+            except Exception as exc:
+                return False, f"Broker protection verification unavailable: {exc}", False
+
         verify_super_fn = getattr(self.broker, "verify_super_order_legs_active", None)
         if callable(verify_super_fn):
             try:
@@ -1972,23 +2013,6 @@ class ProtectionWatcher:
                     return v_ok, str(v_msg), is_term
             except Exception as e:
                 return False, f"Super order leg verification exception: {e}", False
-
-        if hasattr(self.broker, "evaluate_super_order_protection") and callable(self.broker.evaluate_super_order_protection):
-            try:
-                eval_res = self.broker.evaluate_super_order_protection(
-                    order_id=str(order_id),
-                    expected_security_id=str(rec["security_id"]),
-                    expected_qty=int(expected_qty),
-                    expected_sl_price=levels.sl_trigger,
-                    expected_target_price=levels.target_price,
-                    tick_size=inst_tick,
-                    expected_segment=str(rec.get("segment") or "NSE_FNO"),
-                    expected_product_type=str(rec.get("product_type") or "MARGIN"),
-                )
-                if isinstance(eval_res, ProtectionVerificationResult):
-                    return bool(eval_res.is_verified), str(eval_res.reason), bool(eval_res.is_terminal_or_invalid)
-            except Exception:
-                pass
 
         candidate = None
         if hasattr(self.broker, "get_super_orders"):
@@ -2036,6 +2060,26 @@ class ProtectionWatcher:
         is_super: bool,
         attempt_id: Optional[str] = None,
     ) -> None:
+        # Claim the broker group before crediting or resolving this parent.
+        if self.journal_db and hasattr(self.journal_db, "_get_conn"):
+            try:
+                with self.journal_db._get_conn() as conn:
+                    write_protection_order(
+                        conn, parent_id=rec["order_id"], protection_id=str(forever_or_super_id),
+                        symbol=rec["symbol"], sl_trigger=levels.sl_trigger, sl_limit=levels.sl_limit,
+                        target_price=levels.target_price, quantity=confirmed_qty,
+                        status=leg_status_label, created_at=self.clock(),
+                    )
+            except Exception as exc:
+                rec["protection_claim_uncertain"] = str(forever_or_super_id)
+                rec["reconciliation_required"] = True
+                rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
+                rec["protection_status"] = "UNVERIFIED"
+                gate = getattr(self.broker, "reconciliation_gate", None)
+                if gate is not None:
+                    gate.halt_new_entries(f"Protection ownership could not be persisted: {exc}")
+                self._sync_position_lifecycle(rec)
+                return
         if is_super:
             rec["protected_qty"] = int(confirmed_qty)
             rec["protected_value"] = cum_vwap * int(confirmed_qty)
@@ -2079,25 +2123,6 @@ class ProtectionWatcher:
             try:
                 if rec["protected_qty"] >= filled and hasattr(self.journal_db, "resolve_unprotected_orders"):
                     self.journal_db.resolve_unprotected_orders(rec["order_id"])
-                with self.journal_db._get_conn() as conn:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO protection_orders (
-                            parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit, target_price, quantity, status, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            rec["order_id"],
-                            str(forever_or_super_id),
-                            rec["symbol"],
-                            levels.sl_trigger,
-                            levels.sl_limit,
-                            levels.target_price,
-                            int(confirmed_qty),
-                            leg_status_label,
-                            self.clock(),
-                        ),
-                    )
             except Exception as e:
                 logger.warning(f"[Protection] Could not record protection order to journal: {e}")
 
@@ -2180,7 +2205,7 @@ class ProtectionWatcher:
                 attempt_tick,
             )
             if v_ok:
-                leg_label = "ACTIVE" if v_msg == "Confirmed by OCO placement ACK" else "ACTIVE_CONFIRMED"
+                leg_label = "ACTIVE_CONFIRMED"
                 _, cum_vwap = self._compute_chunk_and_vwap_prices(rec, st, filled, attempt_qty)
                 rec["pending_oco"] = None
                 self._record_confirmed_protection(
@@ -2337,7 +2362,7 @@ class ProtectionWatcher:
         with self._lock:
             # Defense in depth: an entry-only AMO is deliberately unmanaged;
             # do not convert it to an unsupported MARGIN Forever OCO.
-            if rec.get("entry_only_amo"):
+            if rec.get("entry_only_amo") or rec.get("protection_claim_uncertain"):
                 return False
             route_name = self._resolve_protection_route(rec)
             if route_name == ProtectionRoute.UNKNOWN.value:
@@ -2411,7 +2436,7 @@ class ProtectionWatcher:
                 )
                 self._record_confirmed_protection(
                     rec=rec,
-                    forever_or_super_id="DRY-OCO-SUCCESS",
+                    forever_or_super_id=f"DRY-OCO-{rec['order_id']}-{filled}",
                     confirmed_qty=target_qty,
                     executed_chunk_price=executed_chunk,
                     cum_vwap=cum_vwap,
@@ -2695,7 +2720,7 @@ class ProtectionWatcher:
                         inst_tick,
                     )
                     if v_ok:
-                        leg_status_label = "ACTIVE" if v_msg == "Confirmed by OCO placement ACK" else "ACTIVE_CONFIRMED"
+                        leg_status_label = "ACTIVE_CONFIRMED"
                         rec["pending_oco"] = None
                         self._record_confirmed_protection(
                             rec=rec,

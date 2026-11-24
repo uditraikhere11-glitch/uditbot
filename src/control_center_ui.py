@@ -206,6 +206,8 @@ window.addEventListener('hashchange',v17ShowView);
 v17ShowView();
 
 let current=null;
+let statusRequest=0;
+let evidenceExpiry;
 let ownerIntentSafe=false;
 const setText=(id,value)=>{$(id).textContent=String(value??'UNKNOWN')};
 function safeStatus(status){
@@ -228,8 +230,24 @@ async function requestJSON(url,options={}){
   return body;
 }
 async function refreshStatus(){
+  const request=++statusRequest;
+  const requestedAt=performance.now();
   try{
-    const s=await requestJSON('/control/status');current=s;
+    const s=await requestJSON('/control/status');
+    if(request!==statusRequest)return;
+    current=s;
+    clearTimeout(evidenceExpiry);
+    if(Number.isFinite(s.runtime_evidence_ttl)){
+      const remaining=s.runtime_evidence_ttl*1000-(performance.now()-requestedAt);
+      const expire=()=>{
+        if(current!==s)return;
+        Object.assign(s,{reconciliation:'UNVERIFIED',protection_watcher:'UNVERIFIED',
+          new_entries_gate:'UNVERIFIED',protection_supervision:'UNVERIFIED',runtime_evidence_at:null});
+        renderOperationalStatus(s);
+      };
+      if(remaining<=0)expire();
+      else evidenceExpiry=setTimeout(expire,remaining);
+    }
     const state=safeStatus(s.service_state);
     // Do not label an unverified systemd RUNNING report as verified.
     const verifiedRunning=state==='RUNNING'&&s.runtime_verified===true;
@@ -295,7 +313,7 @@ async function refreshStatus(){
       setText('v17p-owner-warning','Owner service intent: WARNING — Saved STOP conflicts with the running service; review before restart or mode change.');
     }
     setText('info',s.warning||('Service: '+serviceReadout+' · saved: '+safeStatus(s.saved_mode)+' · running: '+mode));
-  }catch(err){current=null;$('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;$('cancel-stop').disabled=true;
+  }catch(err){if(request!==statusRequest)return;current=null;renderOperationalStatus({});$('start').disabled=true;$('stop').disabled=true;$('restart').disabled=true;$('cancel-stop').disabled=true;
     $('v17p-service-card').classList.remove('verified');$('v17p-mode-card').classList.remove('verified','mode-live','mode-test');
     $('service-beacon').classList.remove('is-active');$('mode-beacon').classList.remove('is-active','is-test');
     $('service').classList.remove('v17p-verified-running');$('mode').classList.remove('v17p-verified-live','v17p-verified-test');
@@ -400,7 +418,9 @@ function renderOperationalStatus(s){
           new_entries_gate:isVerified?'Fresh healthy gate; Owner STOP intent clear':
             'Entry gate '+value.toLowerCase()+'; verify owner intent and reconciliation'
         };
-        description.textContent=descriptions[key];
+        const stamp=s.runtime_evidence_at;
+        description.textContent=descriptions[key]+(Number.isFinite(stamp)?
+          ' · Observed '+new Date(stamp*1000).toLocaleTimeString(): '');
       }
     }
   }
