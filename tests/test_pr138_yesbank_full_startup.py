@@ -16,6 +16,13 @@ from tests.test_ia001_yesbank_actual_watcher import ThreeParentRealWatcher as _F
 
 
 class FullStartupThreeParentYESBANK(unittest.TestCase):
+    # The source fixture defines immutable synthetic identities on its class.
+    ACCOUNT = _Fixture.ACCOUNT
+    SECURITY = _Fixture.SECURITY
+    FIRST = _Fixture.FIRST
+    SECOND = _Fixture.SECOND
+    THIRD = _Fixture.THIRD
+    GROUP = _Fixture.GROUP
     setUp = _Fixture.setUp
     _assert_no_mutation = _Fixture._assert_no_mutation
 
