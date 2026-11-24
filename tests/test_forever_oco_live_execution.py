@@ -837,13 +837,15 @@ class ForeverOcoLiveExecutionTests(unittest.TestCase):
                 security_id='OTHER-SEC', exchange_segment='NSE_EQ', product_type='CNC',
                 parent_order_id='CHILD-SELL', is_verified_trade=True,
             )
-            ok_cross = db.record_fill(
-                broker_order_id='CHILD-SELL', exchange_trade_id='E-CROSS', symbol='VEDPOWER',
-                traded_price=35.06, traded_quantity=1, transaction_type='SELL',
-                security_id=SEC_ID, exchange_segment='NSE_EQ', product_type='CNC',
-                parent_order_id=PARENT_OID, is_verified_trade=True,
-            )
-            self.assertFalse(ok_cross)
+            # A conflicting verified execution now raises, rather than being
+            # indistinguishable from a harmless idempotent replay.
+            with self.assertRaisesRegex(ValueError, 'Exchange trade ID conflicts'):
+                db.record_fill(
+                    broker_order_id='CHILD-SELL', exchange_trade_id='E-CROSS', symbol='VEDPOWER',
+                    traded_price=35.06, traded_quantity=1, transaction_type='SELL',
+                    security_id=SEC_ID, exchange_segment='NSE_EQ', product_type='CNC',
+                    parent_order_id=PARENT_OID, is_verified_trade=True,
+                )
             self.assertEqual(db.get_fill_by_exchange_trade_id('E-CROSS')['parent_order_id'], 'CHILD-SELL')
 
             db.record_fill(
@@ -958,7 +960,11 @@ class ForeverOcoLiveExecutionTests(unittest.TestCase):
             watcher.supervise_open_positions()
             self.assertEqual(watcher.terminal_orders[PARENT_OID]['position_state'], 'RECONCILIATION_REQUIRED')
             self.assertTrue(watcher.terminal_orders[PARENT_OID].get('persistence_uncertain'))
-            self.assertTrue(any('postcondition mismatch' in h for h in gate.halts))
+            self.assertTrue(any(
+                'Journal persistence failure' in h and
+                ('Exchange trade ID conflicts' in h or 'postcondition mismatch' in h)
+                for h in gate.halts
+            ), gate.halts)
 
         # C7: Telegram notification failure after SQLite commit retries on next pass with 0 duplicates
         class _FlakyReporter:
