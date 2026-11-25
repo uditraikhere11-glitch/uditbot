@@ -394,6 +394,112 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
                 self.assertIsNone(conn.execute("SELECT exchange_trade_id FROM fills WHERE broker_order_id=?",
                                                (parent,)).fetchone()[0])
 
+    def _archived_rollup_schema(self):
+        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
+        third = [r for r in self.history if r["orderId"] == self.THIRD]
+        self.assertEqual(len(third), 2)
+        self.history[:] = [r for r in self.history if r["orderId"] != self.THIRD]
+        aggregate = dict(third[0], exchangeTradeId="", tradedQuantity=28)
+        self.history.append(aggregate)
+        for oid in (self.FIRST, self.SECOND):
+            self.watcher.terminal_orders[oid].update(
+                external_unlinked_sell_observed=True,
+                unreadable_broker_response=True,
+                reconciliation_required=True,
+                position_state="RECONCILIATION_REQUIRED",
+            )
+        self.assertTrue(self.watcher._save())
+        return aggregate, third
+
+    def _assert_archived_rollup_blocked(self):
+        gate = StartupReconciliationGate(
+            self.broker, self.db, self.watcher, NS(is_stopped=lambda: False),
+        )
+        self.broker.reconciliation_gate = gate
+        ok, reason = gate.run_startup_reconciliation()
+        self.assertFalse(ok, reason)
+        self.assertFalse(gate.is_accepting_entries)
+        self.assert_retained()
+
+    def test_archived_rollup_full_startup_restart_and_durable_recovery(self):
+        self._archived_rollup_schema()
+        self.test_real_startup_restart_open_only_after_independent_validation()
+        reopened = JournalDB(str(self.root / "isolated-test-journal.db"),
+                             account_id=self.ACCOUNT)
+        _, terminal = reopened.load_watcher_state()
+        for oid in (self.FIRST, self.SECOND):
+            self.assertEqual(terminal[oid]["position_state"], "UNPROTECTED_MANUAL_RISK")
+            for flag in ("external_unlinked_sell_observed", "reconciliation_required",
+                         "broker_quantity_unverified"):
+                self.assertFalse(terminal[oid].get(flag))
+        with reopened._get_conn() as conn:
+            fills = conn.execute(
+                "SELECT exchange_trade_id, traded_quantity FROM fills WHERE parent_order_id=? "
+                "AND transaction_type='BUY' ORDER BY traded_quantity", (self.THIRD,)
+            ).fetchall()
+            self.assertEqual([r[1] for r in fills], [12, 16])
+            self.assertTrue(all(r[0] for r in fills))
+
+    def test_archived_rollup_wrong_quantity_low(self):
+        row, _ = self._archived_rollup_schema()
+        row["tradedQuantity"] = 27
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_wrong_quantity_high(self):
+        row, _ = self._archived_rollup_schema()
+        row["tradedQuantity"] = 29
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_wrong_price(self):
+        row, _ = self._archived_rollup_schema()
+        row["tradedPrice"] += 0.03
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_blank_live_sell_id(self):
+        self._archived_rollup_schema()
+        self.broker.get_trade_book.return_value[0]["exchangeTradeId"] = ""
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_duplicate(self):
+        row, _ = self._archived_rollup_schema()
+        self.history.append(dict(row))
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_mixed_exact_and_aggregate(self):
+        _, originals = self._archived_rollup_schema()
+        self.history.append(dict(originals[0]))
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_unknown_buy(self):
+        row, _ = self._archived_rollup_schema()
+        self.history.append(dict(row, orderId="UNKNOWN-BUY"))
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_wrong_segment(self):
+        row, _ = self._archived_rollup_schema()
+        row["exchangeSegment"] = "BSE_EQ"
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_wrong_product(self):
+        row, _ = self._archived_rollup_schema()
+        row["productType"] = "INTRADAY"
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_wrong_date(self):
+        row, _ = self._archived_rollup_schema()
+        row["exchangeTime"] = self.sell["exchangeTime"]
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_wrong_account(self):
+        row, _ = self._archived_rollup_schema()
+        row["dhanClientId"] = "OTHER"
+        self._assert_archived_rollup_blocked()
+
+    def test_archived_rollup_missing_exchange_order_identity(self):
+        row, _ = self._archived_rollup_schema()
+        row["exchangeOrderId"] = ""
+        self._assert_archived_rollup_blocked()
+
     def test_pinned_broker_method_uses_one_credential_snapshot(self):
         from src.broker.dhan_client import DhanClient, TradingMode
         client = object.__new__(DhanClient)
