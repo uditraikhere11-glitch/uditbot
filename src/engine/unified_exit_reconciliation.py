@@ -94,7 +94,7 @@ def _broker_trade(row: dict, account: str, contract: tuple, side: str) -> dict:
         raise ReconciliationEvidenceError("Trade contract identity changed")
     if str(row.get("dhanClientId") or "").strip() != account:
         raise ReconciliationEvidenceError("Trade broker account unverified")
-    if str(row.get("transactionType") or "").upper() != side:
+    if str(row.get("transactionType") or "").strip().upper() != side:
         raise ReconciliationEvidenceError("Trade BUY/SELL side mismatch")
     oid = str(row.get("orderId") or "").strip()
     eid = str(row.get("exchangeTradeId") or "").strip()
@@ -145,6 +145,7 @@ def _query_historical_sells(
     today_date: Optional[date] = None,
     parents: Set[str],
     known_sell_ids=(),
+    allowed_closed_buys=None,
 ) -> Dict[str, dict]:
     """Paginate bounded Dhan historical-trade windows from BUY date through today."""
     from src.broker.dhan_client import MAX_HISTORICAL_TRADE_WINDOW_DAYS
@@ -181,19 +182,39 @@ def _query_historical_sells(
                 continue
             if row.get("dhanClientId") != account:
                 raise ReconciliationEvidenceError("Historical execution account differs")
-            if row.get("transactionType") == "BUY" and str(row.get("orderId")) not in parents:
+            side = str(row.get("transactionType") or "").strip().upper()
+            if side not in {"BUY", "SELL"}:
+                raise ReconciliationEvidenceError("Historical execution side unverified")
+            if side == "BUY" and str(row.get("orderId")) not in parents:
                 if _exchange_time(row.get("exchangeTime")) >= created_at:
-                    raise ReconciliationEvidenceError("Competing historical BUY requires allocation review")
+                    # A *fully closed, independently audited* sibling OCO
+                    # BUY is not a competing candidate for the open 1+1 lots.
+                    # Confirm the exact historical execution, never just its
+                    # order ID; an unknown/unmatched BUY still blocks.
+                    expected = (allowed_closed_buys or {}).get(
+                        (str(row.get("orderId") or ""), eid)
+                    )
+                    if expected is None:
+                        raise ReconciliationEvidenceError("Competing historical BUY requires allocation review")
+                    try:
+                        qty = _integer(row.get("tradedQuantity"), positive=True)
+                        price = _price(row.get("tradedPrice"))
+                        when = _exchange_time(row.get("exchangeTime"))
+                        if (qty != expected[0] or abs(price - expected[1]) >= 1e-6
+                                or datetime.fromtimestamp(when, IST).date()
+                                != datetime.fromtimestamp(expected[2], IST).date()):
+                            raise ReconciliationEvidenceError("Closed sibling historical BUY conflicts with journal")
+                    except (TypeError, ValueError) as exc:
+                        raise ReconciliationEvidenceError("Closed sibling historical BUY proof invalid") from exc
+                    continue
             if required_eids is not None:
                 if eid not in required_eids:
-                    if row.get("transactionType") == "SELL" and _exchange_time(row.get("exchangeTime")) >= created_at and eid not in known_sell_ids:
+                    if side == "SELL" and _exchange_time(row.get("exchangeTime")) >= created_at and eid not in known_sell_ids:
                         raise ReconciliationEvidenceError("Additional historical SELL requires allocation review")
                     continue
                 normalized = _broker_trade(row, account, contract, "SELL")
             else:
-                if _identity(row) != contract:
-                    continue
-                if str(row.get("transactionType") or "").upper() != "SELL":
+                if side != "SELL":
                     continue
                 normalized = _broker_trade(row, account, contract, "SELL")
                 if normalized["when"] < created_at:
@@ -645,13 +666,21 @@ def _signed_cnc_delivery_sell_reconciles(
     """
     if key[2] not in ("CNC", "MTF"):
         return False
+    from src.engine.holding_quantity import _quantity
+    from src.engine.signed_cnc_delivery import validate_signed_position_components
     matches = []
+    matching_position = None
     for row in positions:
         if not isinstance(row, dict):
             return False
         if str(row.get("securityId") or "").strip().upper() != key[0]:
             continue
         if _identity(row) != key:
+            try:
+                if _quantity(row.get("netQty"), signed=True) != 0:
+                    return False
+            except ValueError:
+                return False
             continue
         if account and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account:
             return False
@@ -662,6 +691,7 @@ def _signed_cnc_delivery_sell_reconciles(
             if not re.fullmatch(r"-?[0-9]+", str(raw_net)):
                 return False
             matches.append(int(raw_net))
+            matching_position = row
         except (TypeError, ValueError):
             return False
     if len(matches) != 1 or matches[0] >= 0:
@@ -675,6 +705,7 @@ def _signed_cnc_delivery_sell_reconciles(
     if today_buys - today_sells != net_day:
         return False
     try:
+        validate_signed_position_components(matching_position, net_day, today_buys, today_sells)
         holdings_map = aggregate_holdings(holdings, account_id=account)
     except Exception:
         return False
@@ -983,6 +1014,7 @@ def reconcile_verified_exits(
     if prior_day_keys and callable(getattr(broker, "get_historical_trades", None)):
         if cached_holdings is None:
             cached_holdings = _read(read_required, "get_holdings", "holdings")
+        signed_holdings_cache = {}
         for k, earliest_ts in sorted(prior_day_keys.items()):
             lots_for_k = [r for r in live if _identity(r, journal=True) == k]
             expected_open = sum(int(r.get("confirmed_open_qty") or 0) for r in lots_for_k)
@@ -1000,9 +1032,43 @@ def reconcile_verified_exits(
                         (k[0],),
                     ).fetchall()
                 }
+            closed_buy_allowlist = {}
+            if _obs_src == "NEGATIVE_CNC_POSITION_REVIEW":
+                # Never use an unrelated historical BUY as FIFO evidence. The
+                # existing closed-OCO verifier binds exact BUY/SELL executions
+                # to an immutable closed parent, original intent and child leg.
+                from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                try:
+                    holdings_account = attest_signed_holdings(
+                        broker, cached_holdings, account, signed_holdings_cache,
+                    )
+                    verify_signed_cnc_delivery_quantity(
+                        db=db, positions=positions, holdings=cached_holdings,
+                        trade_book=trade_book, account=account,
+                        security=k[0], segment=k[1], product=k[2],
+                        expected_open_qty=expected_open,
+                        now=time.time(), holdings_profile_account=holdings_account,
+                    )
+                except (ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+                    raise ReconciliationEvidenceError(
+                        "Signed delivery holdings or closed sibling proof unavailable"
+                    ) from exc
+                closed = db.get_closed_forever_sibling_evidence(
+                    account, k[0], k[1], k[2],
+                    open_parent_ids=tuple(str(r["parent_order_id"]) for r in lots_for_k),
+                    now=time.time(),
+                )
+                closed_buy_allowlist = {
+                    key: (value[1], value[2], value[3])
+                    for key, value in closed["trades"].items()
+                    if value[0] == "BUY"
+                }
             hist_found = _query_historical_sells(
                 broker, account, k, earliest_ts,
-                required_eids=None, today_date=today_ist, parents={r["parent_order_id"] for r in lots_for_k},
+                required_eids=None, today_date=today_ist,
+                parents={r["parent_order_id"] for r in lots_for_k},
+                allowed_closed_buys=closed_buy_allowlist,
             )
             new_sells = {eid: item for eid, item in hist_found.items() if eid not in known_eids}
             if new_sells:

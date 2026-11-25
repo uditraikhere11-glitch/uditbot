@@ -83,6 +83,11 @@ class TestProtectionWatcher(unittest.TestCase):
             "averageTradedPrice": 3000.0,
         }
         self.mock_broker.place_forever_oco.return_value = (True, "OCO-40", "Success")
+        self.mock_broker.get_forever_orders.return_value = [dict(
+            orderId="OCO-40", securityId="11536", orderStatus="PENDING",
+            transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+            quantity=40, quantity1=40, triggerPrice=2910.0, price1=3150.0,
+        )]
 
         changed = watcher.check_once()
         self.assertTrue(changed)
@@ -109,6 +114,11 @@ class TestProtectionWatcher(unittest.TestCase):
             "averageTradedPrice": 3010.0,
         }
         self.mock_broker.place_forever_oco.return_value = (True, "OCO-60", "Success")
+        self.mock_broker.get_forever_orders.return_value = [dict(
+            orderId="OCO-60", securityId="11536", orderStatus="PENDING",
+            transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+            quantity=60, quantity1=60, triggerPrice=2926.15, price1=3167.5,
+        )]
 
         changed2 = watcher.check_once()
         self.assertTrue(changed2)

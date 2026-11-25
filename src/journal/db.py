@@ -34,6 +34,29 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+def write_protection_order(conn, *, parent_id, protection_id, symbol, sl_trigger, sl_limit,
+                           target_price, quantity, status, created_at):
+    """A broker group has one durable parent. Concurrent claims must agree."""
+    if not parent_id or not protection_id:
+        raise ValueError("Protection requires both parent and broker group identifiers")
+    written = conn.execute(
+        """INSERT INTO protection_orders
+               (parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit,
+                target_price, quantity, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(forever_order_id) DO UPDATE SET
+               symbol=excluded.symbol,
+               sl_trigger=COALESCE(NULLIF(excluded.sl_trigger, 0), protection_orders.sl_trigger),
+               sl_limit=COALESCE(NULLIF(excluded.sl_limit, 0), protection_orders.sl_limit),
+               target_price=COALESCE(NULLIF(excluded.target_price, 0), protection_orders.target_price),
+               quantity=excluded.quantity, status=excluded.status
+           WHERE protection_orders.parent_order_id=excluded.parent_order_id""",
+        (parent_id, protection_id, symbol, sl_trigger, sl_limit, target_price, quantity, status, created_at),
+    )
+    if written.rowcount == 0:
+        raise ValueError("Protective broker group already belongs to a different or unknown parent")
+
+
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 _CORR_SEQ_LOCK = threading.Lock()
 _CORR_SEQ = 0
@@ -1506,7 +1529,30 @@ class JournalDB:
         verified_flag = (0 if is_synthetic else 1) if is_verified_trade is None else (1 if is_verified_trade else 0)
 
         with self._get_conn() as conn:
+            # Serialize the identity check with placeholder replacement, including
+            # across independent watcher and reconciliation connections.
+            conn.execute("BEGIN IMMEDIATE")
             if verified_flag == 1 and boid:
+                prior = conn.execute(
+                    "SELECT * FROM fills WHERE exchange_trade_id = ?", (etid,)
+                ).fetchone()
+                if prior is not None:
+                    if (prior["broker_order_id"] != boid
+                            or prior["transaction_type"] != side
+                            or prior["traded_quantity"] != int(traded_quantity)
+                            or abs(prior["traded_price"] - float(traded_price)) >= 1e-6
+                            or not prior["is_verified_trade"]
+                            or any(prior[key] and value and str(prior[key]).upper() != str(value).upper()
+                                   for key, value in (("security_id", security_id),
+                                                      ("exchange_segment", exchange_segment),
+                                                      ("product_type", product_type)))):
+                        # A conflicting verified execution is not an idempotent
+                        # replay. Raise for SELL as well as BUY so every caller,
+                        # including startup reconciliation, must fail closed.
+                        # The SQLite transaction rolls back any provisional
+                        # placeholder replacement on this exception.
+                        raise ValueError("Exchange trade ID conflicts with an existing execution")
+
                 # A later genuine trade ID must be reconciled by an explicit
                 # upgrade, never inserted alongside an existing order-level
                 # broker attestation (which would double-count the position).
@@ -1559,6 +1605,13 @@ class JournalDB:
             if cur.rowcount == 1:
                 return True
             target_parent = str(parent_order_id or "").strip()
+            # A verified SELL may be linked to its first named parent only
+            # from a still-unallocated order-level row. A different durable
+            # parent is conflicting evidence, not a harmless duplicate.
+            if verified_flag == 1 and side == "SELL" and boid and target_parent and target_parent != boid:
+                previous_parent = str(prior["parent_order_id"] or "").strip() if prior is not None else ""
+                if previous_parent not in ("", boid, target_parent):
+                    raise ValueError("Exchange trade ID conflicts with an existing SELL parent")
             sec_s = str(security_id or "").strip()
             seg_s = str(exchange_segment or "").strip().upper()
             prod_s = str(product_type or "").strip().upper()
@@ -1783,7 +1836,12 @@ class JournalDB:
                 (account, security, segment, product),
             ).fetchall()]
             if not rows:
-                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0}
+                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0, "triggered_groups": {}}
+            from src.engine.signed_delivery_live_evidence import (
+                recover_closed_watcher_child_ids, closed_triggered_binding,
+            )
+            triggered_groups = {}
+            sell_order_owners = {}
             expected: Dict[Tuple[str, str], Tuple[str, int, float]] = {}
             orders: Dict[str, Tuple[str, int]] = {}
             group_ids: set[str] = set()
@@ -1813,12 +1871,13 @@ class JournalDB:
                 ).fetchall()]
                 if sum(int(x["traded_quantity"] or 0) for x in originals) != bought:
                     raise ValueError("Closed OCO original BUY evidence incomplete")
-                groups = [str(x[0]) for x in conn.execute(
-                    "SELECT forever_order_id FROM protection_orders WHERE parent_order_id=? "
+                group_rows = [dict(x) for x in conn.execute(
+                    "SELECT forever_order_id, status, quantity FROM protection_orders WHERE parent_order_id=? "
                     "AND forever_order_id IS NOT NULL AND forever_order_id!=''",
                     (oid,),
                 ).fetchall()]
-                if not groups or any(g in group_ids for g in groups):
+                groups = [str(x["forever_order_id"]) for x in group_rows]
+                if not groups or len(groups) != len(set(groups)) or any(g in group_ids for g in groups):
                     raise ValueError("Closed OCO group identity missing/overlapping")
                 group_ids.update(groups)
                 records = conn.execute(
@@ -1836,7 +1895,13 @@ class JournalDB:
                            for k in ("sl_order_id", "tp_order_id")}
                 leg_ids.discard("")
                 if not leg_ids:
-                    raise ValueError("Closed OCO child SELL leg not verified")
+                    # Actual Forever OCO watcher records can persist verified child IDs
+                    # and named leg mappings without tp_order_id/sl_order_id fields.
+                    # Only the exact fully closed single-group context is eligible.
+                    if (len(group_rows) != 1 or group_rows[0]["status"] != "POSITION_CLOSED_LOCAL"
+                            or type(group_rows[0]["quantity"]) is not int or group_rows[0]["quantity"] != bought):
+                        raise ValueError("Closed OCO watcher map lacks exact locally closed group binding")
+                    leg_ids = recover_closed_watcher_child_ids(snapshot, row, groups)
                 sell_records = [dict(x) for x in conn.execute(
                     "SELECT * FROM fills WHERE parent_order_id=? AND security_id=? AND "
                     "exchange_segment=? AND product_type=? AND UPPER(transaction_type)='SELL' "
@@ -1852,6 +1917,7 @@ class JournalDB:
                     (oid,),
                 ).fetchall()]
                 seen_sells: set[str] = set()
+                parent_sell_quantities = {}
                 exit_sum = 0
                 for trade in originals + sell_records:
                     eid = str(trade.get("exchange_trade_id") or "").strip()
@@ -1880,6 +1946,10 @@ class JournalDB:
                         raise ValueError("BUY and SELL share a broker order ID")
                     orders[order_id] = (side, (prior[1] if prior else 0) + quantity)
                     if side == "SELL":
+                        prior_owner = sell_order_owners.setdefault(order_id, oid)
+                        if prior_owner != oid:
+                            raise ValueError("Closed OCO child SELL has competing parent owners")
+                        parent_sell_quantities[order_id] = parent_sell_quantities.get(order_id, 0) + quantity
                         seen_sells.add(eid)
                         sell_ids.add(eid)
                         exit_sum += quantity
@@ -1887,11 +1957,14 @@ class JournalDB:
                             today_sell += quantity
                 if exit_sum != sold:
                     raise ValueError("Closed OCO SELL allocation does not cover entire BUY")
+                binding = closed_triggered_binding(snapshot, row, group_rows, parent_sell_quantities)
+                if binding is not None:
+                    triggered_groups[groups[0]] = binding
                 total_sell += exit_sum
         return {"trades": expected, "order_fills": orders,
                 "forever_ids": tuple(sorted(group_ids)),
                 "sell_ids": tuple(sorted(sell_ids)), "sell_qty": total_sell,
-                "today_sell_qty": today_sell}
+                "today_sell_qty": today_sell, "triggered_groups": triggered_groups}
 
     def get_sell_fills_for_parent(self, parent_order_id: str) -> List[Dict[str, Any]]:
         """P0-A & P1-6: Returns canonical verified SELL fills for `parent_order_id`,

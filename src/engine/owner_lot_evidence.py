@@ -5,7 +5,7 @@ import json
 
 from src.broker.dhan_client import DhanClient, MAX_HISTORICAL_TRADE_WINDOW_DAYS
 from src.engine.market import IST
-from src.engine.holding_quantity import observed_open_quantity
+from src.engine.holding_quantity import observed_open_quantity, _quantity
 from src.engine.mixed_cnc_evidence import verify_mixed_cnc_split
 
 # Scoped to the thread and lifetime of one independent full gate pass.
@@ -224,6 +224,24 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             # generic fail-closed contradiction, and historical execution
             # verification must still succeed below before admission.
             split_proof = None
+            if source == "NEGATIVE_CNC_POSITION_REVIEW":
+                # Before rejecting T+0 settled stock, prove a bot-owned
+                # closed sibling's SELL and the exact remaining parent total.
+                # This cannot be inferred from holdings + netQty alone.
+                from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                holdings_account = attest_signed_holdings(
+                    broker, holdings, account, batch.setdefault("signed_holdings_provenance", {}),
+                )
+                quantity = verify_signed_cnc_delivery_quantity(
+                    db=db, positions=positions, holdings=holdings,
+                    trade_book=day_trades, account=account,
+                    security=security, segment=segment, product=product,
+                    expected_open_qty=sum(parents.values()), now=now,
+                    holdings_profile_account=holdings_account,
+                )
+                source = "VERIFIED_SIGNED_CNC_DELIVERY"
+                evidence.update(quantity=quantity, quantity_source=source)
             if source == "CNC_POSITIONS_HOLDINGS_CONTRADICT" and product == "CNC":
                 split_proof = verify_mixed_cnc_split(
                     db=db, positions=positions, holdings=holdings,
@@ -237,7 +255,7 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                     quantity=quantity, quantity_source=source,
                     mixed_split=split_proof.to_audit_dict(),
                 )
-            if source not in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY"):
+            if source not in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY", "VERIFIED_SIGNED_CNC_DELIVERY"):
                 raise ValueError("Settled holding unavailable: " + source)
             holding = next(r for r in holdings if str(r.get("securityId")) == security)
             evidence["holding"] = {k: holding.get(k) for k in ("isin", "totalQty", "dpQty", "t1Qty", "availableQty")}
@@ -252,6 +270,34 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                     open_parent_ids=tuple(sorted(parents)), now=now,
                 )
                 evidence["verified_closed_sibling_orders"] = list(closed["order_fills"])
+            # Rollover is not an arithmetic waiver. All surviving lots must
+            # be acknowledged, all closed sibling SELLs must be from earlier
+            # trading days, and current books must show no same-security
+            # executions or exposure. Full history is independently checked below.
+            rollover = (
+                source == "VERIFIED_SETTLED_HOLDINGS" and product == "CNC"
+                and len(acked) == len(parents) and quantity == sum(parents.values())
+                and bool(closed.get("sell_ids")) and closed.get("today_sell_qty") == 0
+                and isinstance(day_trades, list) and getattr(day_trades, "ok", True) is True
+                and isinstance(positions, list) and getattr(positions, "ok", True) is True
+                and all(isinstance(t, dict) and t.get("securityId")
+                        and str(t["securityId"]) != security
+                        and (not t.get("isin") or t["isin"] != holding.get("isin"))
+                        for t in day_trades)
+            )
+            if rollover:
+                for position in positions:
+                    if str(position.get("securityId") or "") != security:
+                        continue
+                    if (str(position.get("dhanClientId") or "") != account
+                            or _quantity(position.get("netQty"), signed=True) != 0):
+                        raise ValueError("Rollover position account or quantity unverified")
+                    from src.engine.signed_cnc_delivery import validate_signed_position_components
+                    validate_signed_position_components(position, 0, 0, 0)
+                from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                attest_signed_holdings(
+                    broker, holdings, account, batch.setdefault("signed_holdings_provenance", {}),
+                )
             if not isinstance(forever, list):
                 raise ValueError("Forever protection book unavailable")
             related_oco = [{k: r.get(k) for k in ("orderId", "orderStatus", "transactionType")}
@@ -263,6 +309,21 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                 for r in related_oco:
                     status = str(r["orderStatus"] or "").upper()
                     group = str(r.get("orderId") or "")
+                    if status == "TRIGGERED" and rollover:
+                        # Validate after the full historical execution scan.
+                        # A persistent TRIGGERED group cannot be treated as dead.
+                        continue
+                    if status == "TRIGGERED" and source == "VERIFIED_SIGNED_CNC_DELIVERY":
+                        # Dhan may omit the cancelled sibling from the triggered group.
+                        # Require exact closed parent, leg, live SELL and terminal child
+                        # corroboration; do NOT add TRIGGERED to generic terminal states.
+                        from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group
+                        verify_closed_triggered_group(
+                            group=group, closed=closed, forever=forever, orders=orders,
+                            day_trades=day_trades, account=account, security=security,
+                            segment=segment, product=product,
+                        )
+                        continue
                     if status not in (terminal if group in closed["forever_ids"] else terminal[:4]):
                         raise ValueError("Forever order for owner-managed shares requires attribution")
             relevant_orders = [{k: r.get(k) for k in ("orderId", "transactionType", "orderStatus", "filledQty")}
@@ -275,6 +336,47 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                                         if split_proof is not None else ()),
                                  verified_closed_sibling_trades=closed["trades"],
                                  authorized_closed_sell_ids=closed["sell_ids"])
+            if rollover:
+                from src.engine.unified_exit_reconciliation import _exchange_time
+                from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group
+                previous_sells = []
+                seen_sell_keys = set()
+                today = datetime.fromtimestamp(now, IST).date()
+                for trade in evidence["executions"]:
+                    key = (str(trade.get("orderId") or ""), str(trade.get("exchangeTradeId") or ""))
+                    expected = closed["trades"].get(key)
+                    if not expected or expected[0] != "SELL":
+                        continue
+                    at = datetime.fromtimestamp(_exchange_time(trade.get("exchangeTime")), IST).date()
+                    if (key in seen_sell_keys or at >= today
+                            or at != datetime.fromtimestamp(expected[3], IST).date()):
+                        raise ValueError("Rollover historical SELL execution day or identity differs")
+                    seen_sell_keys.add(key)
+                    previous_sells.append(trade)
+                if seen_sell_keys != {k for k, v in closed["trades"].items() if v[0] == "SELL"}:
+                    raise ValueError("Rollover historical SELL evidence incomplete")
+                # A previous-day child may disappear from today's order book.
+                # Require an authoritative read by exact ID, never infer terminal
+                # status from absence. Include every current order in validation.
+                for group in {str(r["orderId"]) for r in related_oco
+                              if str(r["orderStatus"] or "").upper() == "TRIGGERED"}:
+                    binding = closed.get("triggered_groups", {}).get(group)
+                    if not binding:
+                        raise ValueError("Rollover triggered group lacks closed parent binding")
+                    child_orders = list(orders)
+                    for child in binding["children"]:
+                        if any(str(r.get("orderId") or "") == child for r in child_orders):
+                            continue
+                        lookup = getattr(broker, "order_status", None)
+                        row = lookup(child) if callable(lookup) else None
+                        if not isinstance(row, dict) or str(row.get("orderId") or "") != child:
+                            raise ValueError("Rollover closed child order status unavailable")
+                        child_orders.append(row)
+                    verify_closed_triggered_group(
+                        group=group, closed=closed, forever=forever, orders=child_orders,
+                        day_trades=previous_sells, account=account, security=security,
+                        segment=segment, product=product,
+                    )
             for position in evidence["positions"]:
                 if not position["exchangeSegment"] or not position["productType"]:
                     raise ValueError("Position identity incomplete")
@@ -323,6 +425,13 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
         else:
             decision = "Verified original purchases and settled ownership"
             batch["verified"].update({oid: (account, security, parents[oid]) for oid in acked})
+            if rollover:
+                from src.engine.signed_delivery_live_evidence import _holdings_fingerprint
+                batch.setdefault("settled_closed_sibling_verified", {}).update({
+                    oid: (account, security, segment, product, parents[oid],
+                          _holdings_fingerprint(holdings, account))
+                    for oid in acked
+                })
             if split_proof is not None:
                 # The full historical BUY/SELL attestation above has now
                 # succeeded; watcher may consume this fresh pass-specific

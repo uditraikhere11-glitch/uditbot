@@ -258,6 +258,11 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
         }
         mock_broker.trades_avg_price.return_value = 1000.0
         mock_broker.place_forever_oco.return_value = (True, "OCO-R1", "Success")
+        mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-R1", securityId="3045", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=2, quantity1=2, triggerPrice=970, price1=1030)
+        ]
         watcher.check_once()
 
         self.assertIn(oid, watcher.terminal_orders)

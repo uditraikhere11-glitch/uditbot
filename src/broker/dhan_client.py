@@ -2670,6 +2670,40 @@ class DhanClient:
         """Retrieves delivery, T1 and MTF holdings: GET /v2/holdings."""
         return self._read_collection("/holdings", "holdings", bypass_test_mode=bypass_test_mode)
 
+    def get_account_bound_holdings(self):
+        """Narrow read-only signed-delivery proof: pin one token for profile AND holdings.
+
+        No refresh, retry, token exposure, order operation or fabricated row account.
+        A failed/deferred GET remains unverified, never an empty holdings snapshot.
+        """
+        if getattr(self.cfg, "trading_mode", None) != TradingMode.LIVE:
+            return None, None
+        try:
+            headers = dict(self._headers())
+            account = str(headers.get("client-id") or "").strip()
+            if (not account or account != str(self.cfg.dhan_client_id).strip()
+                    or not str(headers.get("access-token") or "").strip()):
+                return None, None
+            profile = self._governed_get(f"{BASE_URL}/profile", headers=headers,
+                                         timeout=5, priority="identity")
+            if profile.status_code != 200:
+                return None, None
+            identity = profile.json()
+            if not isinstance(identity, dict) or str(identity.get("dhanClientId") or "").strip() != account:
+                return None, None
+            response = self._governed_get(f"{BASE_URL}/holdings", headers=headers, timeout=5)
+            if response.status_code != 200:
+                return None, None
+            rows = response.json()
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                return None, None
+            if any("dhanClientId" in row and str(row["dhanClientId"] or "").strip() != account for row in rows):
+                return None, None
+            return account, rows
+        except Exception:
+            # No credentials or response payloads in logs or return values.
+            return None, None
+
     def get_edis_owned_quantity(self, isin: str) -> Optional[int]:
         """Supplementary eDIS total only; authorization quantity is never an execution."""
         if self.cfg.trading_mode == TradingMode.TEST or not re.fullmatch(r"[A-Z0-9]{12}", isin):
@@ -3576,6 +3610,7 @@ class DhanClient:
             return False, [], f"Malformed trades payload: expected dict or list of dicts, got {type(payload).__name__}"
 
         validated: List[Dict[str, Any]] = []
+        explicit_fills: Dict[str, Dict[str, Any]] = {}
         exp_oid = str(expected_order_id or "").strip()
         exp_acct = str(expected_account_id or "").strip()
         exp_sec = str(expected_security_id or "").strip()
@@ -3638,7 +3673,15 @@ class DhanClient:
             norm_item["tradedPrice"] = price
             norm_item["transactionType"] = t_side or exp_side or "BUY"
             norm_item["exchangeTradeId"] = etid or f"{t_oid or exp_oid or 'ORD'}-TRD-{idx + 1}"
+            norm_item["_has_explicit_transaction_type"] = bool(t_side)
             norm_item["_has_explicit_exchange_trade_id"] = bool(etid)
+            if etid:
+                previous = explicit_fills.get(etid)
+                if previous is not None:
+                    if previous != norm_item:
+                        return False, [], f"Conflicting duplicate exchangeTradeId in trade record #{idx}"
+                    continue
+                explicit_fills[etid] = norm_item
             validated.append(norm_item)
 
         return True, validated, "OK"

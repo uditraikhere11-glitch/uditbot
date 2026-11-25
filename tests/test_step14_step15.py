@@ -68,12 +68,17 @@ class TestStep14And15(unittest.TestCase):
             qty=8,
             product_type="CNC",
         )
-        self.mock_broker.place_forever_oco.return_value = (True, "OCO-1", "Success")
+        self.mock_broker.place_forever_oco.side_effect = [(True, group, "Success") for group in ("OCO-1", "OCO-2", "OCO-5")]
 
         # Fill 1: 1 share @ 1600.0
         self.mock_broker.order_status.return_value = {
             "orderStatus": "PART_TRADED", "filledQty": 1, "averageTradedPrice": 1600.0
         }
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-1", securityId="1333", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=1, quantity1=1, triggerPrice=1552, price1=1648)
+        ]
         self.watcher.check_once()
         self.assertEqual(self.watcher.pending[oid]["protected_qty"], 1)
 
@@ -81,6 +86,11 @@ class TestStep14And15(unittest.TestCase):
         self.mock_broker.order_status.return_value = {
             "orderStatus": "PART_TRADED", "filledQty": 3, "averageTradedPrice": 1605.0
         }
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-2", securityId="1333", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=2, quantity1=2, triggerPrice=1559.25, price1=1655.75)
+        ]
         self.watcher.check_once()
         self.assertEqual(self.watcher.pending[oid]["protected_qty"], 3)
 
@@ -88,6 +98,11 @@ class TestStep14And15(unittest.TestCase):
         self.mock_broker.order_status.return_value = {
             "orderStatus": "TRADED", "filledQty": 8, "averageTradedPrice": 1610.0
         }
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-5", securityId="1333", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=5, quantity1=5, triggerPrice=1564.6, price1=1661.4)
+        ]
         self.watcher.check_once()
         # All 8 shares protected -> removed from pending
         self.assertNotIn(oid, self.watcher.pending)

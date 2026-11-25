@@ -99,7 +99,9 @@ def observed_open_quantity(
         return None, "DUPLICATE_POSITION_CONTRACT"
     net = matches[0] if matches else 0
     if str(product).upper() not in ("CNC", "MTF"):
-        return max(0, net), "VERIFIED_POSITIONS" if net >= 0 else "NEGATIVE_NET_POSITION_REVIEW"
+        if net < 0:
+            return None, "NEGATIVE_NET_POSITION_REVIEW"
+        return net, "VERIFIED_POSITIONS"
     if not isinstance(holdings, list):
         return None, "SETTLED_HOLDINGS_READ_UNAVAILABLE"
     try:

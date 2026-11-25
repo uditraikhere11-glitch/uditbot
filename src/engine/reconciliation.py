@@ -481,32 +481,36 @@ class StartupReconciliationGate:
     def _compute_verified_oco_for_order(
         self,
         *,
+        parent_order_id: str,
         security_id: str,
         exchange_segment: str,
         product_type: str,
         expected_account_id: str,
         forever_orders: Optional[List[Dict[str, Any]]] = None,
-    ) -> Tuple[bool, int, str]:
+    ) -> Tuple[bool, int, List[str]]:
         if forever_orders is None:
             if not hasattr(self.broker, "get_forever_orders"):
-                return True, 0, "No get_forever_orders method"
+                return True, 0, []
             ok_fo, fo_list, fo_msg = self._read_required_broker_collection("get_forever_orders", "forever_orders")
             if not ok_fo:
-                return False, 0, fo_msg
+                return False, 0, []
             forever_orders = fo_list
 
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for row in forever_orders:
             if not isinstance(row, dict):
-                return False, 0, "Malformed non-dict record in forever_orders"
+                return False, 0, []
             gid = str(row.get("orderId") or "").strip()
             if not gid:
-                return False, 0, "Malformed Forever OCO record missing orderId"
+                return False, 0, []
             groups.setdefault(gid, []).append(row)
 
         covered = 0
         matched_gids: List[str] = []
+        associated = set(self.db.get_protection_order_ids_for_parent(parent_order_id)) if groups else set()
         for gid, grp_rows in groups.items():
+            if gid not in associated:
+                continue
             row_sec = str(grp_rows[0].get("securityId") or "").strip()
             if row_sec != str(security_id).strip():
                 continue
@@ -521,8 +525,7 @@ class StartupReconciliationGate:
             if ver.is_verified and ver.protected_quantity > 0:
                 covered += int(ver.protected_quantity)
                 matched_gids.append(gid)
-        self._last_matched_oco_ids = matched_gids
-        return True, covered, "OK"
+        return True, covered, matched_gids
 
 
     def _preflight_zero_id_historical_evidence(
@@ -880,8 +883,10 @@ class StartupReconciliationGate:
                     batch_fo_ok = True
                     batch_fo_list = []
 
+            matched_gids = []
             if batch_fo_ok and batch_fo_list is not None:
-                ok_fo, ver_prot_q, _ = self._compute_verified_oco_for_order(
+                ok_fo, ver_prot_q, matched_gids = self._compute_verified_oco_for_order(
+                    parent_order_id=boid,
                     security_id=sec_id,
                     exchange_segment=seg,
                     product_type=prod,
@@ -905,6 +910,10 @@ class StartupReconciliationGate:
             )
             acct_info = self.db.get_position_accounting(boid) if hasattr(self.db, "get_position_accounting") else {}
             closed_q = int(acct_info.get("sell_filled_qty") or 0)
+            if ver_prot_q > max(0, filled_q - closed_q):
+                # Resting exits exceeding the open lot cannot establish safe coverage.
+                ver_prot_q = 0
+                matched_gids = []
 
             if self.watcher and hasattr(self.watcher, "reconcile_historical_order_fills"):
                 self.watcher.reconcile_historical_order_fills(
@@ -919,7 +928,7 @@ class StartupReconciliationGate:
                     avg_fill_price=vwap_p,
                     verified_protected_qty=min(filled_q, ver_prot_q),
                     verified_closed_qty=closed_q,
-                    confirmed_protection_ids=list(getattr(self, "_last_matched_oco_ids", []) or []),
+                    confirmed_protection_ids=matched_gids,
                     manual_risk_acknowledged=is_man_ack,
                     is_amo=bool(int(intent.get("is_amo") or 0)),
                     protection_route=str(intent.get("protection_route") or ""),
@@ -1412,8 +1421,11 @@ class StartupReconciliationGate:
                 continue
 
             covered_q = 0
-            matched_gids: List[str] = []
+            matched_gids = []
+            associated = set(self.db.get_protection_order_ids_for_parent(p_oid)) if forever_groups else set()
             for gid, grp_rows in forever_groups.items():
+                if gid not in associated:
+                    continue
                 if str(grp_rows[0].get("securityId") or "").strip() != sec_id:
                     continue
                 ver = verify_forever_oco_group(
@@ -1423,11 +1435,16 @@ class StartupReconciliationGate:
                 if not ver.is_verified:
                     continue
                 available = int(ver.protected_quantity) - used_forever.get(gid, 0)
-                if available > 0 and covered_q < open_q:
-                    alloc_q = min(open_q - covered_q, available)
-                    covered_q += alloc_q
-                    used_forever[gid] = used_forever.get(gid, 0) + alloc_q
+                if available > 0:
                     matched_gids.append(gid)
+                    covered_q += available
+                    used_forever[gid] = used_forever.get(gid, 0) + available
+
+            if covered_q > open_q:
+                return False, (
+                    f"Excess verified Forever OCO quantity for order {p_oid}: "
+                    f"openQty={open_q}, verified_protected_qty={covered_q}"
+                )
 
             if covered_q >= open_q:
                 if self.watcher and hasattr(self.watcher, "reconcile_historical_order_fills"):
@@ -1443,6 +1460,7 @@ class StartupReconciliationGate:
                         requested_qty=int(row.get("entry_qty") or open_q),
                         filled_qty=int(row.get("buy_filled_qty") or open_q),
                         avg_fill_price=float(row.get("buy_vwap") or 0.0),
+                        confirmed_protection_ids=matched_gids,
                         verified_protected_qty=min(open_q, covered_q),
                         verified_closed_qty=int(row.get("sell_filled_qty") or 0),
                     )
@@ -1705,7 +1723,7 @@ class StartupReconciliationGate:
                         t_price = float(trade.get("tradedPrice") or 0.0)
                         if t_qty <= 0 or not math.isfinite(t_price) or t_price <= 0.0:
                             raise ValueError(f"invalid quantity/price ({t_qty}, {t_price})")
-                        self.db.record_fill(
+                        recorded = self.db.record_fill(
                             broker_order_id=str(trade["orderId"]),
                             exchange_trade_id=etid_str,
                             symbol=str(trade.get("tradingSymbol") or trade.get("customSymbol") or ""),
@@ -1718,6 +1736,28 @@ class StartupReconciliationGate:
                             product_type=str(trade.get("productType") or ""),
                             is_verified_trade=True,
                         )
+                        if recorded is False:
+                            # False can mean a harmless identical replay OR a
+                            # refused persistence. Read back the exact row;
+                            # never infer success from the boolean alone.
+                            lookup = getattr(self.db, "get_fill_by_exchange_trade_id", None)
+                            persisted = lookup(etid_str) if callable(lookup) else None
+                            if not isinstance(persisted, dict):
+                                raise ValueError("Verified exchange fill not persisted")
+                            if (str(persisted.get("broker_order_id") or "").strip() != str(trade["orderId"]).strip()
+                                    or str(persisted.get("transaction_type") or "").strip().upper() != side
+                                    or persisted.get("is_verified_trade") not in (True, 1)
+                                    or int(persisted.get("traded_quantity") or 0) != t_qty
+                                    or not math.isfinite(float(persisted.get("traded_price") or 0))
+                                    or abs(float(persisted.get("traded_price") or 0) - t_price) >= 1e-6
+                                    or any(
+                                        str(persisted.get(k) or "").strip().upper() != str(trade.get(bk) or "").strip().upper()
+                                        for k, bk in (("security_id", "securityId"),
+                                                      ("exchange_segment", "exchangeSegment"),
+                                                      ("product_type", "productType"))
+                                        if str(persisted.get(k) or "").strip() and str(trade.get(bk) or "").strip()
+                                    )):
+                                raise ValueError("Replayed exchange fill conflicts with persisted broker evidence")
                     except Exception as fill_exc:
                         # P1: Never silently swallow fill persistence failures!
                         self.state = ReconciliationState.BLOCKED
@@ -1887,9 +1927,46 @@ class StartupReconciliationGate:
                         return self._fail_reconciliation_locked(reason, starting_halt_generation)
                     self._active_pass_holdings = rows
                 try:
-                    flat = verified_flat_delivery_day(position, positions, self._active_pass_holdings,
-                                                      trade_book, self.db, books["account"],
-                                                      self._read_required_broker_collection)
+                    contract = (str(position.get("securityId") or "").strip(),
+                                str(position.get("exchangeSegment") or "").strip().upper(),
+                                str(position.get("productType") or "").strip().upper())
+                    open_rows = [
+                        row for row in self.db.get_open_positions_lifecycle()
+                        if (str(row.get("security_id") or "").strip(),
+                            str(row.get("exchange_segment") or "").strip().upper(),
+                            str(row.get("product_type") or "").strip().upper()) == contract
+                    ]
+                    # Existing single-parent signed delivery checks remain
+                    # unchanged. For two acknowledged surviving old lots after
+                    # a different sibling's OCO exit, also require the strict
+                    # shared journal/closed-child proof.
+                    owner_survivors = [
+                        row for row in open_rows
+                        if str(row.get("position_state") or "").upper() in (
+                            "UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED"
+                        ) and int(row.get("protected_qty") or 0) == 0
+                    ]
+                    if owner_survivors:
+                        from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                        from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                        holdings_account = attest_signed_holdings(
+                            self.broker, self._active_pass_holdings, books["account"],
+                            books.setdefault("signed_holdings_provenance", {}),
+                        )
+                        expected = sum(int(row.get("confirmed_open_qty") or 0) for row in open_rows)
+                        verify_signed_cnc_delivery_quantity(
+                            db=self.db, positions=positions,
+                            holdings=self._active_pass_holdings, trade_book=trade_book,
+                            account=books["account"], security=contract[0],
+                            segment=contract[1], product=contract[2],
+                            expected_open_qty=expected, now=time.time(),
+                            holdings_profile_account=holdings_account,
+                        )
+                    flat = verified_flat_delivery_day(
+                        position, positions, self._active_pass_holdings,
+                        trade_book, self.db, books["account"],
+                        self._read_required_broker_collection,
+                    )
                 except (ValueError, TypeError, KeyError, sqlite3.Error):
                     flat = False
                 if flat:

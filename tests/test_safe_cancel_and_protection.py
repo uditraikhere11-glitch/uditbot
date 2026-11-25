@@ -81,6 +81,11 @@ class TestSafeCancelAndProtection(unittest.TestCase):
             "averageTradedPrice": 800.0,
         }
         self.mock_broker.place_forever_oco.return_value = (True, "OCO-SBIN-40", "Success")
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-SBIN-40", securityId="3045", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=40, quantity1=40, triggerPrice=776, price1=824)
+        ]
 
         self.watcher.check_once()
 
@@ -404,6 +409,11 @@ class TestSafeCancelAndProtection(unittest.TestCase):
             "averageTradedPrice": 3500.0,
         }
         self.mock_broker.place_forever_oco.return_value = (True, "OCO-TRADED-1", "Success")
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-TRADED-1", securityId="11536", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=50, quantity1=50, triggerPrice=3395, price1=3605)
+        ]
 
         self.watcher.check_once()
         self.mock_broker.place_forever_oco.assert_called_once()
@@ -413,7 +423,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
             row = cur.fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(row["quantity"], 50)
-            self.assertEqual(row["status"], "ACTIVE")
+            self.assertEqual(row["status"], "ACTIVE_CONFIRMED")
 
     def test_c03_11_202_followed_by_part_traded_preserves_partial_fill(self):
         """C03-11: 202 followed by PART_TRADED preserves partial fill and continues reconciliation."""
@@ -426,6 +436,11 @@ class TestSafeCancelAndProtection(unittest.TestCase):
             "averageTradedPrice": 800.0,
         }
         self.mock_broker.place_forever_oco.return_value = (True, "OCO-PART-1", "Success")
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-PART-1", securityId="3045", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=40, quantity1=40, triggerPrice=776, price1=824)
+        ]
 
         self.watcher.check_once()
         self.mock_broker.place_forever_oco.assert_called_once()
@@ -572,6 +587,11 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         # Late fill arrives from exchange (25 shares filled before cancel processed)
         late_status = {"orderStatus": "CANCELLED", "filledQty": 25, "averageTradedPrice": 1600.0}
         self.mock_broker.place_forever_oco.return_value = (True, "OCO-LATE-25", "Success")
+        self.mock_broker.get_forever_orders.return_value = [
+            dict(orderId="OCO-LATE-25", securityId="1333", orderStatus="PENDING",
+                 transactionType="SELL", exchangeSegment="NSE_EQ", productType="CNC",
+                 quantity=25, quantity1=25, triggerPrice=1552, price1=1648)
+        ]
 
         handled = self.watcher.reconcile_terminal_order(oid, st=late_status)
         self.assertTrue(handled)
