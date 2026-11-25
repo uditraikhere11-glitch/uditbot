@@ -3713,7 +3713,8 @@ class ProtectionWatcher:
         # after a same-day restart. Recover ONLY verified SELL child ownership
         # from the durable, exact original BUY/closed OCO/SELL journal evidence.
         # Never register an arbitrary same-security order by symbol or quantity.
-        if (snapshot_complete and self.journal_db is not None
+        if (snapshot_complete and isinstance(positions_book, list)
+                and self.journal_db is not None
                 and hasattr(self.journal_db, "get_closed_forever_sibling_evidence")):
             contract_keys = {
                 (str(x.get("security_id") or "").strip(),
@@ -3726,6 +3727,17 @@ class ProtectionWatcher:
             for c_sec, c_seg, c_prod in contract_keys:
                 if not account_for_closed or not c_sec:
                     continue
+                # Closed-child restoration is only needed where the broker's
+                # current signed CNC delivery position is negative.
+                if not any(
+                    isinstance(p, dict)
+                    and str(p.get("securityId") or "").strip() == c_sec
+                    and str(p.get("exchangeSegment") or "").strip().upper() == c_seg
+                    and str(p.get("productType") or "").strip().upper() == c_prod
+                    and str(p.get("netQty") or "").strip().startswith("-")
+                    for p in positions_book
+                ):
+                    continue
                 open_parents = tuple(
                     str(x.get("order_id") or "").strip()
                     for x in open_recs
@@ -3735,6 +3747,7 @@ class ProtectionWatcher:
                     == (c_sec, c_seg, c_prod)
                 )
                 try:
+                    pending_children: Dict[str, str] = {}
                     closed = self.journal_db.get_closed_forever_sibling_evidence(
                         account_for_closed, c_sec, c_seg, c_prod,
                         open_parent_ids=open_parents, now=now_ts,
@@ -3758,8 +3771,16 @@ class ProtectionWatcher:
                                 or str((persisted or {}).get("transaction_type") or "").upper() != "SELL"
                                 or int((persisted or {}).get("traded_quantity") or 0) != proof[1]
                                 or abs(float((persisted or {}).get("traded_price") or 0) - proof[2]) >= 1e-6
-                                or not _register_owner(all_bot_leg_owners, child_id, parent_oid)):
+                                or (child_id in pending_children
+                                    and pending_children[child_id] != parent_oid)
+                                or (child_id in all_bot_leg_owners
+                                    and all_bot_leg_owners[child_id] != parent_oid)):
                             raise ValueError("Closed OCO child has conflicting journal ownership")
+                        pending_children[child_id] = parent_oid
+                    # Register only after every candidate is verified. Never
+                    # retain a partial map from an invalid closed OCO group.
+                    for child_id, parent_oid in pending_children.items():
+                        _register_owner(all_bot_leg_owners, child_id, parent_oid)
                 except (ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
                     # Never grant an owner mapping on incomplete evidence.
                     # Later signed-delivery verification will keep entries
