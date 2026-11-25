@@ -1836,7 +1836,7 @@ class JournalDB:
                 (account, security, segment, product),
             ).fetchall()]
             if not rows:
-                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0, "triggered_groups": {}}
+                return {"order_rollups": {}, "trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0, "triggered_groups": {}}
             from src.engine.signed_delivery_live_evidence import (
                 recover_closed_watcher_child_ids, closed_triggered_binding,
             )
@@ -1961,7 +1961,11 @@ class JournalDB:
                 if binding is not None:
                     triggered_groups[groups[0]] = binding
                 total_sell += exit_sum
-        return {"trades": expected, "order_fills": orders,
+        # Rollups describe only the immutable fills already verified above.
+        # They are not new fills and never supply fabricated execution IDs.
+        from src.engine.signed_delivery_live_evidence import closed_order_rollups
+        return {"order_rollups": closed_order_rollups(expected),
+                "trades": expected, "order_fills": orders,
                 "forever_ids": tuple(sorted(group_ids)),
                 "sell_ids": tuple(sorted(sell_ids)), "sell_qty": total_sell,
                 "today_sell_qty": today_sell, "triggered_groups": triggered_groups}
