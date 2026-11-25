@@ -346,7 +346,7 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
                          ("TARGET_LEG", self.THIRD))
         self.assertTrue(self.watcher._save())
 
-    def test_live_shape_with_legacy_attested_buys_and_split_closed_buy(self):
+    def _live_schema_with_legacy_attested_buys_and_split_closed_buy(self):
         self._live_schema()
         import hashlib
         # The actual retained BUYs have no exchange execution IDs; their
@@ -383,6 +383,9 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             is_verified_trade=True,
         ))
         self.history.append(extra)
+
+    def test_live_shape_with_legacy_attested_buys_and_split_closed_buy(self):
+        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
         batch = self._full_watcher_pass()
         self.assertEqual(set(batch["verified"]), {self.FIRST, self.SECOND}, batch)
         self.assert_retained()
@@ -423,6 +426,28 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         for oid in (self.FIRST, self.SECOND):
             self.assertEqual(self.watcher.terminal_orders[oid]["position_state"], "UNPROTECTED_MANUAL_RISK")
         self.broker.reconciliation_gate.halt_new_entries.assert_not_called()
+        self.assert_retained()
+
+    def test_combined_release_live_shape_stale_flags_legacy_buys_full_restart(self):
+        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
+        for oid in (self.FIRST, self.SECOND):
+            rec = self.watcher.terminal_orders[oid]
+            rec.update(external_unlinked_sell_observed=True,
+                       unreadable_broker_response=True,
+                       reconciliation_required=True,
+                       position_state="RECONCILIATION_REQUIRED")
+        self.assertTrue(self.watcher._save())
+        self.test_real_startup_restart_open_only_after_independent_validation()
+        reopened = JournalDB(str(self.root / "isolated-test-journal.db"),
+                             account_id=self.ACCOUNT)
+        _, terminal = reopened.load_watcher_state()
+        for oid in (self.FIRST, self.SECOND):
+            rec = terminal[oid]
+            self.assertFalse(rec.get("external_unlinked_sell_observed"), rec)
+            self.assertFalse(rec.get("reconciliation_required"), rec)
+            self.assertEqual(rec["position_state"], "UNPROTECTED_MANUAL_RISK", rec)
+            self.assertEqual(reopened.get_position_lifecycle(oid)["position_state"],
+                             "UNPROTECTED_MANUAL_RISK")
         self.assert_retained()
 
     def test_live_shape_full_startup_and_restart(self):
