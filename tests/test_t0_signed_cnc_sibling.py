@@ -333,7 +333,9 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         for oid in (self.FIRST, self.SECOND):
             rec = self.watcher.terminal_orders[oid]
             self.assertEqual(rec["broker_quantity_evidence"], "VERIFIED_SIGNED_CNC_DELIVERY")
-            self.assertEqual(rec["position_state"], "UNPROTECTED_MANUAL_RISK")
+            self.assertEqual(rec["position_state"], "UNPROTECTED_MANUAL_RISK",
+                             {"rec": rec, "gate_halts": self.broker.reconciliation_gate.halt_new_entries.call_args_list,
+                              "batch": batch})
             self.assertEqual(rec["confirmed_position_open_qty"], 1)
             self.assertEqual(rec["exit_filled_qty"], 0)
         self.broker.reconciliation_gate.halt_new_entries.assert_not_called()
@@ -346,7 +348,10 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         )
         self.broker.reconciliation_gate = gate
         success, reason = gate.run_startup_reconciliation()
-        self.assertTrue(success, reason)
+        self.assertTrue(success, {"reason": reason,
+                                  "gate": gate.last_error,
+                                  "first": self.watcher.terminal_orders.get(self.FIRST),
+                                  "second": self.watcher.terminal_orders.get(self.SECOND)})
         self.assertEqual(gate.state, ReconciliationState.HEALTHY)
         self.assertTrue(gate.is_accepting_entries)
         self.assert_retained()
