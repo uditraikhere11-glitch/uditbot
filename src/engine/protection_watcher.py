@@ -4523,6 +4523,145 @@ class ProtectionWatcher:
                 except (ValueError, TypeError, KeyError, AttributeError):
                     # Never substitute generic arithmetic or a previous snapshot.
                     mixed_proof = None
+            # Preserve the previously audited *same-parent* executed-SELL
+            # verification exactly. The new read-only shared proof below
+            # handles the separate CLOSED-sibling T+0 case (sell_qty == 0).
+            if (
+                quantity_evidence == "NEGATIVE_CNC_POSITION_REVIEW"
+                and prod in ("CNC", "MTF")
+                and seg in ("NSE_EQ", "BSE_EQ")
+                and isinstance(positions_book, list)
+                and isinstance(holdings_book, list)
+                and isinstance(trade_book, list)
+                and not journal_persistence_failed
+                and sell_qty > 0
+            ):
+                # Reconcile signed T+0 CNC delivery sale (netQty < 0 alongside settled holdings)
+                # strictly when an explicit holdings row exists AND all same-day SELL fills are
+                # verified bot-owned exits matching net_day and settled + net_day == aggregate open.
+                try:
+                    pos_nets = []
+                    pos_ok = True
+                    for prow in positions_book:
+                        if not isinstance(prow, dict):
+                            pos_ok = False
+                            break
+                        if str(prow.get("securityId") or "").strip() != sec_id:
+                            continue
+                        if (
+                            str(prow.get("exchangeSegment") or "").strip().upper() != seg
+                            or str(prow.get("productType") or "").strip().upper() != prod
+                        ):
+                            continue
+                        p_acct = str(prow.get("dhanClientId") or "").strip()
+                        if expected_client_id and p_acct and p_acct != expected_client_id:
+                            pos_ok = False
+                            break
+                        raw_net = prow.get("netQty")
+                        if isinstance(raw_net, bool) or raw_net is None:
+                            pos_ok = False
+                            break
+                        pos_nets.append(int(raw_net))
+                    holdings_map = aggregate_holdings(holdings_book, account_id=expected_client_id)
+                    if pos_ok and len(pos_nets) == 1 and pos_nets[0] < 0 and sec_id in holdings_map:
+                        net_day = pos_nets[0]
+                        settled_qty = holdings_map[sec_id]
+                        today_buys = 0
+                        today_sells = 0
+                        seen_waiver_etids: Set[str] = set()
+                        jdb_ref = getattr(self, "journal_db", None)
+                        trades_ok = bool(jdb_ref and hasattr(jdb_ref, "get_fill_by_exchange_trade_id"))
+                        for trow in (trade_book if trades_ok else ()):
+                            if not isinstance(trow, dict):
+                                trades_ok = False
+                                break
+                            if str(trow.get("securityId") or "").strip() != sec_id:
+                                continue
+                            # C4: Never silently skip same-security trades on another exchange or productType
+                            if (
+                                str(trow.get("exchangeSegment") or "").strip().upper() != seg
+                                or str(trow.get("productType") or "").strip().upper() != prod
+                            ):
+                                trades_ok = False
+                                break
+                            t_acct = str(trow.get("dhanClientId") or trow.get("clientId") or "").strip()
+                            if expected_client_id and t_acct != expected_client_id:
+                                trades_ok = False
+                                break
+                            t_side = str(trow.get("transactionType") or "").strip().upper()
+                            t_oid_c = str(trow.get("orderId") or "").strip()
+                            t_etid_c = str(trow.get("exchangeTradeId") or "").strip()
+                            raw_tq = trow.get("tradedQuantity")
+                            raw_tp = trow.get("tradedPrice")
+                            if (
+                                not t_oid_c
+                                or not t_etid_c
+                                or t_etid_c.upper() in ("0", "NONE", "NULL")
+                                or t_etid_c in seen_waiver_etids
+                                or isinstance(raw_tq, bool)
+                                or isinstance(raw_tq, float)
+                                or raw_tq is None
+                                or isinstance(raw_tp, bool)
+                                or raw_tp is None
+                            ):
+                                trades_ok = False
+                                break
+                            tq = int(raw_tq)
+                            tp = float(raw_tp)
+                            if tq <= 0 or tp <= 0.0 or not (tp == tp and tp != float("inf") and tp != float("-inf")):
+                                trades_ok = False
+                                break
+                            seen_waiver_etids.add(t_etid_c)
+                            # C2, C3, C4: Both BUY and SELL same-security rows must be durably journaled
+                            # with matching contract, quantity, finite price, and exact single-parent ownership
+                            # (MULTI_LOT_ALLOCATED is conservatively deferred to unified_exit_reconciliation).
+                            expected_owner = all_bot_leg_owners.get(t_oid_c)
+                            if not expected_owner or t_side not in ("BUY", "SELL"):
+                                trades_ok = False
+                                break
+                            j_fill = jdb_ref.get_fill_by_exchange_trade_id(t_etid_c)
+                            if not isinstance(j_fill, dict):
+                                trades_ok = False
+                                break
+                            j_raw_p = j_fill.get("traded_price")
+                            if isinstance(j_raw_p, bool) or j_raw_p is None:
+                                trades_ok = False
+                                break
+                            j_prc = float(j_raw_p)
+                            j_parent = str(j_fill.get("parent_order_id") or "").strip()
+                            if (
+                                not bool(j_fill.get("is_verified_trade"))
+                                or str(j_fill.get("transaction_type") or "").strip().upper() != t_side
+                                or str(j_fill.get("broker_order_id") or "").strip() != t_oid_c
+                                or str(j_fill.get("security_id") or "").strip() != sec_id
+                                or str(j_fill.get("exchange_segment") or "").strip().upper() != seg
+                                or str(j_fill.get("product_type") or "").strip().upper() != prod
+                                or int(j_fill.get("traded_quantity") or 0) != tq
+                                or not (j_prc > 0.0 and j_prc == j_prc and j_prc != float("inf"))
+                                or abs(j_prc - tp) >= 1e-6
+                                or not j_parent
+                                or j_parent == "MULTI_LOT_ALLOCATED"
+                                or j_parent != expected_owner
+                            ):
+                                trades_ok = False
+                                break
+                            if t_side == "BUY":
+                                today_buys += tq
+                            else:
+                                today_sells += tq
+                        if (
+                            trades_ok
+                            and today_sells > 0
+                            and (today_buys - today_sells) == net_day
+                            and settled_qty >= -net_day
+                            and (settled_qty + net_day) == aggregate_contract_open_qty
+                        ):
+                            broker_net_qty = settled_qty + net_day
+                            quantity_evidence = "VERIFIED_SIGNED_CNC_DELIVERY"
+                            rec["broker_quantity_unverified"] = False
+                            rec["broker_quantity_evidence"] = quantity_evidence
+                except Exception:
+                    pass
             if (
                 quantity_evidence == "NEGATIVE_CNC_POSITION_REVIEW"
                 and snapshot_complete and parent_reads_complete
