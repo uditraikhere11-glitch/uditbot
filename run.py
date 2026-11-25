@@ -113,6 +113,7 @@ session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else ses
 async def main():
     outbox_worker = None
     runtime_evidence_task = None
+    token_recovery_task = None
     client = None
     try:
         # Construct Telethon inside asyncio.run's *running* event loop.
@@ -130,6 +131,30 @@ async def main():
         await client.start()
         me = await client.get_me()
         print(f"✅ Connected to Telegram as: {me.first_name} (@{me.username or 'No username'})")
+
+        # Install the reporting-only callback before startup broker reads.
+        # This captures on-demand auth recovery even during startup.
+        token_confirmation = None
+        broker = getattr(pipeline, "broker", None)
+        from src.broker.dhan_client import DhanClient
+        if isinstance(broker, DhanClient):
+            from src.engine.token_recovery_notification import TokenRecoveryConfirmation
+
+            def _master_verified():
+                resolver = pipeline.resolver
+                return bool(
+                    (resolver._equities or resolver._options_list)
+                    and resolver._is_cache_fresh(
+                        os.path.join(cfg.data_dir, "scrip_master.csv"),
+                        cfg.scrip_master_max_age_sec,
+                    )
+                )
+
+            token_confirmation = TokenRecoveryConfirmation(
+                cfg, broker, pipeline.db, pipeline.reconciliation_gate.stop_manager,
+                pipeline.reconciliation_gate, _master_verified,
+            )
+            broker._token_recovery_confirmation = token_confirmation.auth_recovered
 
         # STEP 15: Run startup reconciliation gate before accepting entries
         rec_ok, rec_msg = await asyncio.to_thread(pipeline.reconciliation_gate.run_startup_reconciliation)
@@ -223,6 +248,14 @@ async def main():
         )
         asyncio.create_task(outbox_worker.run())
         print("📬 Durable Outbox Worker activated (non-blocking notification pipeline)")
+
+        if token_confirmation is not None:
+            async def _poll_token_recovery():
+                while True:
+                    await asyncio.to_thread(token_confirmation.poll)
+                    await asyncio.sleep(30)
+
+            token_recovery_task = asyncio.create_task(_poll_token_recovery())
 
         # Enqueue startup readiness card via durable outbox (H14: separate listener, entry gate, reconciliation & protection)
         if cfg.log_group_id:
@@ -329,6 +362,8 @@ async def main():
         await client.run_until_disconnected()
     finally:
         try:
+            if token_recovery_task is not None:
+                token_recovery_task.cancel()
             if runtime_evidence_task is not None:
                 runtime_evidence_task.cancel()
             if outbox_worker:
