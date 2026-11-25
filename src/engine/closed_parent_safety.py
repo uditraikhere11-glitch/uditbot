@@ -8,6 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import math
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,117 @@ class _ReadOnlyJournal(JournalDB):
             yield conn
         finally:
             conn.close()
+
+    def record_system_event(self, *args, **kwargs):
+        # The shared owner proof also emits audit events in the runtime gate.
+        # This service-control verifier is strictly read-only; its pass-local
+        # errors and verified identities are consumed below instead.
+        return None
+
+
+def _verify_retained_owner_siblings(db, broker, *, parent_id, group_id, account,
+                                    security, segment, product, siblings,
+                                    positions, holdings, trades, orders, forever,
+                                    super_orders):
+    """Narrow exception for closed CNC parents with independently proven owner lots."""
+    from src.engine.owner_lot_evidence import prepare_owner_lots
+    from src.engine.holding_quantity import observed_open_quantity, _quantity
+    from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+
+    if product != "CNC" or not siblings:
+        return False
+    if any(not isinstance(r, dict) or not r.get("securityId")
+           for book in (positions, holdings, trades, orders, forever, super_orders) for r in book):
+        return False
+    if any(str(r["securityId"]) == security for r in super_orders):
+        return False
+    parents = {}
+    for row in siblings:
+        oid = str(row.get("parent_order_id") or "")
+        qty = row.get("confirmed_open_qty")
+        if (not oid or oid == parent_id or oid in parents or type(qty) is not int or qty <= 0
+                or row.get("account_id") != account or row.get("exchange_segment") != segment
+                or row.get("product_type") != product
+                or row.get("position_state") not in ("RECONCILIATION_REQUIRED", "UNPROTECTED_MANUAL_RISK")
+                or row.get("entry_qty") != qty or row.get("buy_filled_qty") != qty
+                or row.get("sell_filled_qty") != 0 or row.get("protected_qty") != 0
+                or row.get("orphaned_legs_detected")
+                or not db.is_manual_risk_acknowledged(
+                    oid, oid, expected_account_id=account,
+                    expected_security_id=security, required_qty=qty)):
+            return False
+        ack = db.get_manual_risk_acknowledgement(oid, oid)
+        if not ack or ack.get("quantity") != qty or db.owner_lot_review_reason(account, oid):
+            return False
+        with db._get_conn() as conn:
+            intents = conn.execute(
+                "SELECT correlation_id,state FROM order_intents WHERE broker_order_id=? AND account_id=? "
+                "AND security_id=? AND exchange_segment=? AND product_type=?",
+                (oid, account, security, segment, product),
+            ).fetchall()
+            records = conn.execute(
+                "SELECT is_terminal,record_json FROM watcher_orders WHERE order_id=?", (oid,)
+            ).fetchall()
+        if (len(intents) != 1 or intents[0]["state"] != "TRADED"
+                or ack.get("correlation_id") != intents[0]["correlation_id"]
+                or len(records) != 1 or records[0]["is_terminal"] != 1):
+            return False
+        import json
+        w = json.loads(records[0]["record_json"])
+        if (not isinstance(w, dict) or w.get("order_id") != oid
+                or w.get("security_id") != security or w.get("segment") != segment
+                or w.get("product_type") != product or w.get("state") != "TRADED"
+                or w.get("filled_qty") != qty or w.get("confirmed_position_open_qty") != qty
+                or w.get("protected_qty") != 0
+                or any(w.get(k) for k in (
+                    "pending_oco", "retry_reserved", "retry_eligible", "cancel_uncertain",
+                    "persistence_uncertain", "orphaned_legs_detected",
+                    "orphaned_legs_manual_intervention_required", "uncommitted_broker_sell_trades",
+                ))):
+            return False
+        parents[oid] = qty
+    now = time.time()
+    closed = db.get_closed_forever_sibling_evidence(
+        account, security, segment, product, open_parent_ids=tuple(sorted(parents)), now=now
+    )
+    if (group_id not in closed["forever_ids"] or closed["order_fills"].get(parent_id) is None
+            or closed["order_fills"][parent_id][0] != "BUY"):
+        return False
+    if broker.get_authenticated_profile_id(allow_refresh=False) != account:
+        return False
+    attest_signed_holdings(broker, holdings, account, {})
+    qty, source = observed_open_quantity(
+        positions, holdings, security_id=security, segment=segment, product=product, account_id=account
+    )
+    if source == "VERIFIED_SETTLED_HOLDINGS":
+        # A settled rollover must contain no current executions for the
+        # security, no nonzero day position and no current closed sibling SELL.
+        if (qty != sum(parents.values()) or closed["today_sell_qty"] != 0
+                or any(str(t["securityId"]) == security for t in trades)
+                or any(str(p["securityId"]) == security and
+                       _quantity(p.get("netQty"), signed=True) != 0 for p in positions)):
+            return False
+    elif source != "NEGATIVE_CNC_POSITION_REVIEW":
+        return False
+
+    # The runtime's existing proof independently checks the exact signed
+    # delivery arithmetic, all original BUYs (including PR142 rollups),
+    # full SELL attribution, triggered children and next-day settlement.
+    # It never receives a writable journal or broker mutation interface.
+    batch = {"account": account, "verified": {}, "errors": {}, "share": False}
+    prepare_owner_lots(broker, db, batch, positions, trades, now, holdings, forever)
+    if batch["errors"] or any(
+        batch["verified"].get(oid) != (account, security, qty) for oid, qty in parents.items()
+    ):
+        return False
+    if source == "VERIFIED_SETTLED_HOLDINGS" and any(
+        oid not in batch.get("settled_closed_sibling_verified", {}) for oid in parents
+    ):
+        return False
+    # Never credit the closed parent's exit as active protection, and never
+    # change the retained lots or their owner acknowledgements.
+    return True
+
 
 def verified_closed_delivery_parent(
     *, db_path: str, account: str, parent_id: str, required_qty: int,
@@ -110,9 +222,8 @@ def verified_closed_delivery_parent(
         group_id = str(protected[0]["forever_order_id"] or "")
         if not group_id:
             return False
-        if any(str(p.get("security_id") or "") == security_id
-               for p in db.get_open_positions_lifecycle()):
-            return False
+        siblings = [p for p in db.get_open_positions_lifecycle()
+                    if str(p.get("security_id") or "") == security_id]
 
         positions = broker.get_positions()
         holdings = broker.get_holdings()
@@ -141,6 +252,13 @@ def verified_closed_delivery_parent(
                     or str(row.get("orderStatus") or "").upper() not in
                     ("TRIGGERED", "TRADED", "CLOSED", "CANCELLED", "CANCELED")):
                 return False
+        if siblings:
+            return _verify_retained_owner_siblings(
+                db, broker, parent_id=parent_id, group_id=group_id, account=account,
+                security=security_id, segment=segment, product=product, siblings=siblings,
+                positions=positions, holdings=holdings, trades=trades, orders=orders,
+                forever=forever, super_orders=super_orders,
+            )
         negative = [p for p in positions if str(p.get("securityId") or "") == security_id
                     and type(p.get("netQty")) is int and p["netQty"] < 0]
         if negative:
@@ -177,5 +295,5 @@ def verified_closed_delivery_parent(
                 return False
         return True
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError,
-            ArithmeticError, ReconciliationEvidenceError):
+            ArithmeticError, ReconciliationEvidenceError, AttributeError, RuntimeError, StopIteration):
         return False
