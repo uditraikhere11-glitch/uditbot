@@ -258,7 +258,8 @@ class ReadGovernor:
 
         return self._run_with_busy_retry(_op)
 
-    def seconds_until_capacity(self, *, required=1, priority='routine', category='NON_TRADING'):
+    def seconds_until_capacity(self, *, required=1, priority='routine', category='NON_TRADING',
+                               pacing_detail=False):
         """Read-only, migration-aware hint. Never reserves capacity or sleeps.
 
         A planned batch greater than the one-second ceiling is naturally spread
@@ -273,7 +274,7 @@ class ReadGovernor:
         if need < 1 or need > 40:
             raise ValueError('Invalid required read capacity')
         if not self.path.is_file():
-            return 0.0
+            return (0.0, False) if pacing_detail else 0.0
         now = float(self.clock())
         with closing(sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',
                                      uri=True, timeout=.10)) as conn:
@@ -288,6 +289,7 @@ class ReadGovernor:
                 row = conn.execute('SELECT until FROM category_cooldown WHERE category=?',(cat,)).fetchone()
                 if row and row[0]:
                     delay = max(delay, float(row[0])-now)
+            short_only = delay == 0
             for window, limit in self._limits(cat):
                 ceiling = self._ceiling(limit, prio)
                 wave = min(need, ceiling) if window == 1 else need
@@ -310,7 +312,10 @@ class ReadGovernor:
                     if row is None:
                         raise sqlite3.DatabaseError('Inconsistent governor read window')
                     delay = max(delay, float(row[0])+window-now+.01)
-            return max(0.,delay)
+                    if window != 1:
+                        short_only = False
+            delay = max(0., delay)
+            return (delay, short_only and delay > 0) if pacing_detail else delay
 
     def throttled(self, retry_after=None, *, category='NON_TRADING'):
         cat = self._category(category)
