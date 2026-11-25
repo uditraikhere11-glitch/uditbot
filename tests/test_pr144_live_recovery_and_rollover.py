@@ -194,6 +194,125 @@ class LiveRecoveryAndRollover(unittest.TestCase):
         self.move(26, 8, 30)
         self.blocked()
 
+    def test_settled_runtime_changed_child_blocks_without_history_pagination(self):
+        self.startup()
+        self.settle()
+        self.startup("VERIFIED_SETTLED_HOLDINGS")
+        self.f.broker.get_historical_trades.reset_mock()
+        self.poll("VERIFIED_SETTLED_HOLDINGS")
+        self.f.broker.get_historical_trades.assert_not_called()
+        self.f.broker.order_status.side_effect = None
+        self.f.broker.order_status.return_value = None
+        self.blocked()
+        self.f.broker.get_historical_trades.assert_not_called()
+
+    def test_settled_runtime_new_pending_sibling_blocks(self):
+        self.startup()
+        self.settle()
+        self.startup("VERIFIED_SETTLED_HOLDINGS")
+        self.f.forever.append(dict(self.f.forever[0],
+                                   legName="STOP_LOSS_LEG", orderStatus="PENDING"))
+        self.blocked()
+
+    def test_recovery_persistence_failure_keeps_gate_closed(self):
+        with patch.object(self.f.watcher, "_sync_position_lifecycle", return_value=False):
+            self.blocked(startup=True)
+        for oid in (self.f.FIRST, self.f.SECOND):
+            rec = self.f.watcher.terminal_orders[oid]
+            self.assertEqual(rec["position_state"], "RECONCILIATION_REQUIRED")
+            self.assertTrue(rec["reconciliation_required"])
+        self.f.assert_retained()
+
+    def concurrent_recovery(self, *, conflicting_trade=False):
+        # Real background worker, real pass lock and real SQLite WAL. Pause the
+        # historical read before the full gate acquires the watcher pass lock,
+        # then let a routine pass observe the same or newly changed live books.
+        import threading
+        self.startup()
+        self.gate.halt_new_entries("Offline recovery replay")
+        entered, release, done = threading.Event(), threading.Event(), threading.Event()
+        original = self.f.broker.get_historical_trades.side_effect
+        fallback = self.f.broker.get_historical_trades.return_value
+        results = []
+        errors = []
+        real_recheck = self.gate.recheck_and_recover_if_verified
+
+        def history(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("Offline history barrier timed out")
+            return original(*args, **kwargs) if callable(original) else fallback
+
+        def recheck():
+            try:
+                result = real_recheck()
+                results.append(result)
+                return result
+            except Exception as exc:
+                errors.append(exc)
+                raise
+            finally:
+                done.set()
+
+        self.f.broker.get_historical_trades.side_effect = history
+        self.gate.recheck_and_recover_if_verified = Mock(side_effect=recheck)
+        self.gate._historical_background_retry_after = 0
+        threads = []
+        real_thread = threading.Thread
+
+        def capture_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            threads.append(worker)
+            return worker
+
+        with patch("src.engine.reconciliation.threading.Thread", side_effect=capture_thread):
+            try:
+                self.gate._schedule_historical_background_recheck()
+                self.assertTrue(entered.wait(5), "Background history read not reached")
+                self.assertEqual(self.gate.state, ReconciliationState.RECONCILING)
+                self.assertFalse(self.gate.is_accepting_entries)
+                self.gate._schedule_historical_background_recheck()
+                self.assertIsNone(GATE_BOOKS.get())
+                if conflicting_trade:
+                    self.f.broker.get_trade_book.return_value = [
+                        *self.f.broker.get_trade_book.return_value,
+                        dict(self.f.sell, orderId="OFFLINE-RACE-SELL",
+                             exchangeTradeId="OFFLINE-RACE-EID", tradedQuantity=1)]
+                self.gate.halt_new_entries.reset_mock()
+                self.f.watcher.check_once()
+                if conflicting_trade:
+                    self.gate.halt_new_entries.assert_called()
+                    self.assertEqual(self.gate.state, ReconciliationState.BLOCKED)
+                else:
+                    self.gate.halt_new_entries.assert_not_called()
+                    self.assertFalse(self.gate.is_accepting_entries)
+            finally:
+                release.set()
+                for worker in threads:
+                    worker.join(8)
+                    self.assertFalse(worker.is_alive(), "Background worker did not finish")
+        self.assertTrue(done.is_set())
+        self.assertEqual(len(threads), 1)
+        self.gate.recheck_and_recover_if_verified.assert_called_once()
+        self.assertFalse(errors, errors)
+        self.assertFalse(self.gate._historical_background_lock.locked())
+        self.assertEqual(len(results), 1)
+        if conflicting_trade:
+            self.assertFalse(results[0][0], results)
+            self.assertFalse(self.gate.is_accepting_entries)
+            self.assertEqual(self.gate.state, ReconciliationState.BLOCKED)
+        else:
+            self.assertTrue(results[0][0], results)
+            self.healthy()
+            self.poll()
+        self.f.assert_retained()
+
+    def test_concurrent_background_and_routine_reconciliation(self):
+        self.concurrent_recovery()
+
+    def test_concurrent_new_sell_cannot_be_overridden_by_old_gate_snapshot(self):
+        self.concurrent_recovery(conflicting_trade=True)
+
     def governor_cycle(self, *, cooldown=False, final_short_cooldown=False, refill=False):
         self.startup()
         governor = ReadGovernor(self.f.root / "offline-governor", self.f.ACCOUNT,
