@@ -1003,6 +1003,7 @@ def reconcile_verified_exits(
     if prior_day_keys and callable(getattr(broker, "get_historical_trades", None)):
         if cached_holdings is None:
             cached_holdings = _read(read_required, "get_holdings", "holdings")
+        signed_holdings_cache = {}
         for k, earliest_ts in sorted(prior_day_keys.items()):
             lots_for_k = [r for r in live if _identity(r, journal=True) == k]
             expected_open = sum(int(r.get("confirmed_open_qty") or 0) for r in lots_for_k)
@@ -1026,13 +1027,22 @@ def reconcile_verified_exits(
                 # existing closed-OCO verifier binds exact BUY/SELL executions
                 # to an immutable closed parent, original intent and child leg.
                 from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
-                verify_signed_cnc_delivery_quantity(
-                    db=db, positions=positions, holdings=cached_holdings,
-                    trade_book=trade_book, account=account,
-                    security=k[0], segment=k[1], product=k[2],
-                    expected_open_qty=expected_open,
-                    now=time.time(),
-                )
+                from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                try:
+                    holdings_account = attest_signed_holdings(
+                        broker, cached_holdings, account, signed_holdings_cache,
+                    )
+                    verify_signed_cnc_delivery_quantity(
+                        db=db, positions=positions, holdings=cached_holdings,
+                        trade_book=trade_book, account=account,
+                        security=k[0], segment=k[1], product=k[2],
+                        expected_open_qty=expected_open,
+                        now=time.time(), holdings_profile_account=holdings_account,
+                    )
+                except (ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+                    raise ReconciliationEvidenceError(
+                        "Signed delivery holdings or closed sibling proof unavailable"
+                    ) from exc
                 closed = db.get_closed_forever_sibling_evidence(
                     account, k[0], k[1], k[2],
                     open_parent_ids=tuple(str(r["parent_order_id"]) for r in lots_for_k),
