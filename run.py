@@ -113,6 +113,7 @@ session = StringSession(cfg.tg_session_string) if cfg.tg_session_string else ses
 async def main():
     outbox_worker = None
     runtime_evidence_task = None
+    token_recovery_task = None
     client = None
     try:
         # Construct Telethon inside asyncio.run's *running* event loop.
@@ -158,6 +159,16 @@ async def main():
         broker = getattr(pipeline, "broker", None)
         if broker is not None:
             install_token_rotation_fast_recovery(broker, pipeline.reconciliation_gate)
+            from src.engine.dhan_token_recovery_notice import RuntimeTokenRecoveryNotice
+            recovery_notice = RuntimeTokenRecoveryNotice(cfg, broker, pipeline.db, pipeline.reconciliation_gate)
+            broker._runtime_token_recovery_observer = recovery_notice.observe_auth_recovery
+
+            async def _poll_token_recovery_notice():
+                while True:
+                    await asyncio.to_thread(recovery_notice.poll)
+                    await asyncio.sleep(30)
+
+            token_recovery_task = asyncio.create_task(_poll_token_recovery_notice())
 
         # STEP 14 & V12-06: Start persistent Protection Watcher background task using is_lifecycle_open
         asyncio.create_task(pipeline.watcher.run(is_lifecycle_open))
@@ -331,6 +342,8 @@ async def main():
         try:
             if runtime_evidence_task is not None:
                 runtime_evidence_task.cancel()
+            if token_recovery_task is not None:
+                token_recovery_task.cancel()
             if outbox_worker:
                 outbox_worker.stop()
         finally:
