@@ -302,6 +302,10 @@ class ArchivedClosedBuyMatcher:
         if not valid or not normalized or not normalized.get("_broker_attested_no_execution_id"):
             raise ValueError("Archived BUY lacks valid exchange order identity or time")
         qty, vwap, first_at, last_at = summary
+        if (type(qty) is not int or qty <= 0 or not isfinite(vwap) or vwap <= 0
+                or not isfinite(first_at) or not isfinite(last_at)
+                or not 0 < first_at <= last_at):
+            raise ValueError("Malformed archived BUY journal rollup")
         zone = ZoneInfo("Asia/Kolkata")
         day = datetime.fromtimestamp(_exchange_time(row.get("exchangeTime")), zone).date()
         if (day >= today or day != datetime.fromtimestamp(first_at, zone).date()
@@ -311,7 +315,11 @@ class ArchivedClosedBuyMatcher:
         if _quantity(raw_qty) != qty or abs(normalized["tradedPrice"] - vwap) >= 1e-4:
             raise ValueError("Archived BUY rollup quantity or VWAP differs")
         keys = {key for key in self.trades if key[0] == oid}
-        if not keys:
-            raise ValueError("Archived BUY original executions unavailable")
+        if (not keys or any(
+                not isinstance(eid, str) or eid != eid.strip()
+                or eid.upper() in ("", "0", "NONE", "NULL")
+                or any(marker in eid.upper() for marker in ("-TRD-", "-FILL-", "-RECON-"))
+                for _, eid in keys)):
+            raise ValueError("Archived BUY lacks original non-placeholder execution IDs")
         self.aggregated.add(oid)
         return keys
