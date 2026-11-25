@@ -783,7 +783,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     print("=======================================================")
 
     from src.engine.token_recovery_notification import (
-        begin_scheduled_check, fingerprint, scheduled_recovery_state,
+        begin_scheduled_check, end_scheduled_check, fingerprint, scheduled_recovery_state,
     )
     from src.broker.dhan_token import read_token
     prior_digest = ""
@@ -946,7 +946,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         or "Expires before next session open" in report
         or "Expires during next session" in report
     )
-    def _record_recovery_state():
+    def _record_recovery_state(*, keep_lease=False):
         try:
             scheduled_recovery_state(
                 cfg, renewed=renewed, ready=next_session_ready,
@@ -954,20 +954,30 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
                 active_token_fingerprint=fingerprint(client_token),
                 prior_token_expiration_ist=prior_expiry or (
                     token_expiration_str if not renewed else ""),
-                now=report_now, check_id=check_id,
+                now=report_now, check_id=check_id, keep_lease=keep_lease,
             )
         except Exception as exc:
             print(f"[!] Recovery notification marker unavailable ({type(exc).__name__})")
 
-    # Clear before the green report; create a pending marker only after
-    # the failed daily notice is sent or durably queued, preserving order.
-    if renewed and next_session_ready:
-        _record_recovery_state()
-    notify_status = dispatch_morning_health_report_once(
-        cfg, db, report, now_ts=report_now
-    )
-    if not (renewed and next_session_ready):
-        _record_recovery_state()
+    # Persist failed-token evidence before external delivery. The existing
+    # lease suppresses the runtime card until the scheduled dispatch finishes;
+    # if the process dies, the durable marker survives lease expiry.
+    green = renewed and next_session_ready
+    if not green:
+        _record_recovery_state(keep_lease=True)
+    try:
+        notify_status = dispatch_morning_health_report_once(
+            cfg, db, report, now_ts=report_now
+        )
+        if green and (notify_status in (
+            "DELIVERED VIA TELEGRAM BOT API", "QUEUED FOR TELEGRAM RETRY",
+        ) or not getattr(cfg, "log_group_id", 0)):
+            _record_recovery_state()
+    finally:
+        try:
+            end_scheduled_check(cfg, check_id=check_id)
+        except Exception as exc:
+            print(f"[!] Recovery notification lease release unavailable ({type(exc).__name__})")
     auth_check_label = "PASS" if auth_check_ok else "FAIL"
     readiness_label = "VERIFIED_CHECKS" if next_session_ready else "REVIEW_REQUIRED"
     holiday_no_action = (
