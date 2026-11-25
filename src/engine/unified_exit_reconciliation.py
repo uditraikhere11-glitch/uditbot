@@ -666,13 +666,21 @@ def _signed_cnc_delivery_sell_reconciles(
     """
     if key[2] not in ("CNC", "MTF"):
         return False
+    from src.engine.holding_quantity import _quantity
+    from src.engine.signed_cnc_delivery import validate_signed_position_components
     matches = []
+    matching_position = None
     for row in positions:
         if not isinstance(row, dict):
             return False
         if str(row.get("securityId") or "").strip().upper() != key[0]:
             continue
         if _identity(row) != key:
+            try:
+                if _quantity(row.get("netQty"), signed=True) != 0:
+                    return False
+            except ValueError:
+                return False
             continue
         if account and row.get("dhanClientId") and str(row["dhanClientId"]).strip() != account:
             return False
@@ -683,6 +691,7 @@ def _signed_cnc_delivery_sell_reconciles(
             if not re.fullmatch(r"-?[0-9]+", str(raw_net)):
                 return False
             matches.append(int(raw_net))
+            matching_position = row
         except (TypeError, ValueError):
             return False
     if len(matches) != 1 or matches[0] >= 0:
@@ -696,6 +705,7 @@ def _signed_cnc_delivery_sell_reconciles(
     if today_buys - today_sells != net_day:
         return False
     try:
+        validate_signed_position_components(matching_position, net_day, today_buys, today_sells)
         holdings_map = aggregate_holdings(holdings, account_id=account)
     except Exception:
         return False
