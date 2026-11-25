@@ -543,6 +543,29 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
                     account=self.ACCOUNT, security=self.SECURITY, segment="NSE_EQ", product="CNC",
                 ), expected)
 
+    def test_archived_rollup_rejects_placeholder_journal_execution_ids(self):
+        self._archived_rollup_schema()
+        from src.engine.signed_delivery_live_evidence import ArchivedClosedBuyMatcher
+        from zoneinfo import ZoneInfo
+        closed = self.db.get_closed_forever_sibling_evidence(
+            self.ACCOUNT, self.SECURITY, "NSE_EQ", "CNC",
+            open_parent_ids=(self.FIRST, self.SECOND), now=self.now,
+        )
+        buys = {k: v for k, v in closed["trades"].items() if v[0] == "BUY"}
+        original_key = (self.THIRD, "609978137")
+        for placeholder in ("NONE", "NULL", "0", "LOCAL-FILL-1", "LOCAL-RECON-1", "LOCAL-TRD-1"):
+            with self.subTest(placeholder=placeholder):
+                invalid = dict(buys)
+                invalid[(self.THIRD, placeholder)] = invalid.pop(original_key)
+                matcher = ArchivedClosedBuyMatcher(invalid, closed["order_rollups"])
+                with self.assertRaises(ValueError):
+                    matcher.match(
+                        self.archived_buy, historical=True,
+                        today=datetime.fromtimestamp(self.now, ZoneInfo("Asia/Kolkata")).date(),
+                        account=self.ACCOUNT, security=self.SECURITY,
+                        segment="NSE_EQ", product="CNC",
+                    )
+
     def test_archived_rollup_next_day_restart_with_exact_archived_sell(self):
         self._archived_rollup_schema()
         at = self.now - 86400
