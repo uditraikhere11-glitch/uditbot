@@ -269,6 +269,8 @@ class ClosedHistoricalBuyMatcher:
         from zoneinfo import ZoneInfo
         from src.engine.unified_exit_reconciliation import _exchange_time, _integer, _price
         oid = _text(row, "orderId")
+        if isinstance(row.get("exchangeTradeId"), bool):
+            raise ValueError("Boolean historical exchange execution ID")
         eid = _text(row, "exchangeTradeId")
         key = (oid, "BUY")
         if key not in self.rollups:
@@ -285,7 +287,8 @@ class ClosedHistoricalBuyMatcher:
         if eid.upper() in ("", "0", "NONE", "NULL"):
             total, vwap, first, last = self.rollups[key]
             if (key in self.orders or day >= self.today
-                    or not _text(row, "exchangeOrderId")
+                    or isinstance(row.get("exchangeOrderId"), bool)
+                    or _text(row, "exchangeOrderId").upper() in ("", "0", "NONE", "NULL")
                     or qty != total or abs(price - vwap) >= 1e-4
                     or day != datetime.fromtimestamp(first, zone).date()
                     or day != datetime.fromtimestamp(last, zone).date()):
