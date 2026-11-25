@@ -12,7 +12,7 @@ from math import isfinite
 import re
 from typing import Any
 
-from src.engine.holding_quantity import aggregate_holdings, observed_open_quantity
+from src.engine.holding_quantity import aggregate_holdings, observed_open_quantity, _quantity
 
 try:
     from zoneinfo import ZoneInfo
@@ -44,6 +44,28 @@ def _price(value: Any) -> float:
     if not isfinite(result) or result <= 0:
         raise SignedCNCDeliveryUnverified("Nonpositive/nonfinite execution price")
     return result
+
+
+def validate_signed_position_components(position, net_day, today_buy=None, today_sell=None,
+                                        *, require_day_totals=False):
+    """Validate reported components without treating a missing value as zero.
+
+    Legacy callers may lack both day fields; a partial pair is never accepted.
+    The closed-sibling recovery requires the complete pair.
+    """
+    for key in ("carryForwardBuyQty", "carryForwardSellQty"):
+        if key in position and _quantity(position[key]) != 0:
+            raise SignedCNCDeliveryUnverified("Carry-forward quantity overlaps holdings")
+    for buy_key, sell_key, required in (
+        ("dayBuyQty", "daySellQty", require_day_totals),
+        ("buyQty", "sellQty", False),
+    ):
+        if required or buy_key in position or sell_key in position:
+            buy, sell = _quantity(position.get(buy_key)), _quantity(position.get(sell_key))
+            if buy - sell != net_day:
+                raise SignedCNCDeliveryUnverified("Reported BUY/SELL quantities conflict")
+            if today_buy is not None and (buy != today_buy or sell != today_sell):
+                raise SignedCNCDeliveryUnverified("Reported BUY/SELL totals differ from verified tradebook")
 
 
 def verify_signed_cnc_delivery_quantity(
@@ -87,7 +109,11 @@ def verify_signed_cnc_delivery_quantity(
         pos_contract = (str(position.get("exchangeSegment") or "").strip().upper(),
                         str(position.get("productType") or "").strip().upper())
         if pos_contract != (segment, product):
-            if str(position.get("netQty") or "0").strip() not in ("0", "+0", "-0"):
+            try:
+                sibling_net = _quantity(position.get("netQty"), signed=True)
+            except ValueError as exc:
+                raise SignedCNCDeliveryUnverified("Other same-security quantity unverified") from exc
+            if sibling_net != 0:
                 raise SignedCNCDeliveryUnverified("Other same-security position requires attribution")
             continue
         matching.append(position)
@@ -97,22 +123,10 @@ def verify_signed_cnc_delivery_quantity(
     if isinstance(raw_net, (bool, float)) or not re.fullmatch(r"-[1-9][0-9]*", str(raw_net)):
         raise SignedCNCDeliveryUnverified("Signed CNC netQty malformed")
     net_day = int(raw_net)
-    # A prior-day delivered holding cannot be counted twice as a day position.
-    for key in ("carryForwardBuyQty", "carryForwardSellQty"):
-        if key in matching[0] and matching[0][key] is not None:
-            if str(matching[0][key]) != "0":
-                raise SignedCNCDeliveryUnverified("Nonzero carry-forward quantity overlaps holdings")
-    if ("dayBuyQty" in matching[0] and "daySellQty" in matching[0]
-            and matching[0]["dayBuyQty"] is not None and matching[0]["daySellQty"] is not None):
-        raw_day_buy = matching[0]["dayBuyQty"]
-        raw_day_sell = matching[0]["daySellQty"]
-        if (isinstance(raw_day_buy, (bool, float))
-                or isinstance(raw_day_sell, (bool, float))
-                or not re.fullmatch(r"[+]?[0-9]+", str(raw_day_buy))
-                or not re.fullmatch(r"[+]?[0-9]+", str(raw_day_sell))):
-            raise SignedCNCDeliveryUnverified("Reported day quantities malformed")
-        if int(raw_day_buy) - int(raw_day_sell) != net_day:
-            raise SignedCNCDeliveryUnverified("Reported day BUY/SELL quantities conflict")
+    try:
+        validate_signed_position_components(matching[0], net_day, require_day_totals=True)
+    except ValueError as exc:
+        raise SignedCNCDeliveryUnverified("Reported day or carry-forward quantities invalid") from exc
     rows = [r for r in holdings if str(r.get("securityId") or "").strip() == security]
     if len(rows) != 1 or not str(rows[0].get("isin") or "").strip():
         raise SignedCNCDeliveryUnverified("Settled holding identity/ISIN unavailable")
@@ -253,4 +267,9 @@ def verify_signed_cnc_delivery_quantity(
                 today_sell += qty
     if not seen or today_sell <= 0 or today_buy - today_sell != net_day:
         raise SignedCNCDeliveryUnverified("Day BUY minus SELL does not match signed CNC netQty")
+    try:
+        validate_signed_position_components(matching[0], net_day, today_buy, today_sell,
+                                            require_day_totals=True)
+    except ValueError as exc:
+        raise SignedCNCDeliveryUnverified("Reported day totals do not match verified executions") from exc
     return expected_open_qty
