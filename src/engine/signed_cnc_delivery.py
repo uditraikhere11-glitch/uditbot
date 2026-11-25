@@ -50,6 +50,7 @@ def verify_signed_cnc_delivery_quantity(
     *, db: Any, positions: Any, holdings: Any, trade_book: Any,
     account: str, security: str, segment: str, product: str,
     expected_open_qty: int, now: float,
+    holdings_profile_account: str | None = None,
 ) -> int:
     """Return remaining quantity only for fully proven account-bound T+0 sales.
 
@@ -113,9 +114,14 @@ def verify_signed_cnc_delivery_quantity(
         if int(raw_day_buy) - int(raw_day_sell) != net_day:
             raise SignedCNCDeliveryUnverified("Reported day BUY/SELL quantities conflict")
     rows = [r for r in holdings if str(r.get("securityId") or "").strip() == security]
-    if (len(rows) != 1 or str(rows[0].get("dhanClientId") or "").strip() != account
-            or not str(rows[0].get("isin") or "").strip()):
+    if len(rows) != 1 or not str(rows[0].get("isin") or "").strip():
         raise SignedCNCDeliveryUnverified("Settled holding identity/ISIN unavailable")
+    if (holdings_profile_account is not None and holdings_profile_account != account
+            or any("dhanClientId" in row and str(row["dhanClientId"] or "").strip() != account
+                   for row in holdings)
+            or (any("dhanClientId" not in row for row in holdings)
+                and holdings_profile_account != account)):
+        raise SignedCNCDeliveryUnverified("Settled holdings account provenance unavailable or mismatched")
     try:
         settled = aggregate_holdings(holdings, account_id=account)[security]
     except (ValueError, KeyError) as exc:
