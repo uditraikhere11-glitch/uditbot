@@ -442,6 +442,65 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         self.assertFalse(gate.is_accepting_entries)
         self.assert_retained()
 
+    def _closed_parent_stop_proof(self):
+        from src.engine.closed_parent_safety import verified_closed_delivery_parent
+        from src.engine.config_manager import ReadOnlyDhanBrokerAdapter
+        broker = ReadOnlyDhanBrokerAdapter(self.broker)
+        return verified_closed_delivery_parent(
+            db_path=self.db.db_path, account=self.ACCOUNT,
+            parent_id=self.THIRD, required_qty=28, security_id=self.SECURITY,
+            broker=broker, orders=broker.get_order_book(),
+            forever=broker.get_forever_orders(), super_orders=broker.get_super_orders(),
+        )
+
+    def test_owner_stop_closed_parent_with_retained_siblings_t0(self):
+        self._archived_rollup_schema()
+        before = self._states()
+        self.assertTrue(self._closed_parent_stop_proof())
+        self.assertEqual(self._states(), before)
+        self.assert_retained()
+
+    def test_owner_stop_closed_parent_with_retained_siblings_rollover(self):
+        self._settled_rollover_schema()
+        self._replace_split_buy_with_archive()
+        before = self._states()
+        self.assertTrue(self._closed_parent_stop_proof())
+        self.assertEqual(self._states(), before)
+        self.assert_retained()
+
+    def test_owner_stop_retained_sibling_missing_ack_blocks(self):
+        self._archived_rollup_schema()
+        with self.db._get_conn() as conn:
+            conn.execute("DELETE FROM manual_risk_acknowledgements WHERE parent_order_id=?", (self.FIRST,))
+        self.assertFalse(self._closed_parent_stop_proof())
+        self._assert_no_mutation()
+
+    def test_owner_stop_retained_sibling_active_leg_blocks(self):
+        self._archived_rollup_schema()
+        self.forever.append(dict(self.forever[0], legName="STOP_LOSS_LEG", orderStatus="PENDING"))
+        self.assertFalse(self._closed_parent_stop_proof())
+        self.assert_retained()
+
+    def test_owner_stop_retained_sibling_bad_archive_blocks(self):
+        row, _ = self._archived_rollup_schema()
+        row["tradedQuantity"] = 27
+        self.assertFalse(self._closed_parent_stop_proof())
+        self.assert_retained()
+
+    def test_owner_stop_retained_sibling_wrong_pinned_account_blocks(self):
+        self._archived_rollup_schema()
+        self.broker.get_account_bound_holdings.side_effect = None
+        self.broker.get_account_bound_holdings.return_value = ("OTHER", self.broker.get_holdings.return_value)
+        self.assertFalse(self._closed_parent_stop_proof())
+        self.assert_retained()
+
+    def test_owner_stop_retained_sibling_rollover_missing_child_blocks(self):
+        self._settled_rollover_schema()
+        self.broker.order_status.side_effect = None
+        self.broker.order_status.return_value = None
+        self.assertFalse(self._closed_parent_stop_proof())
+        self.assert_retained()
+
     def test_archived_rollup_full_startup_restart_and_durable_recovery(self):
         self._archived_rollup_schema()
         self.test_real_startup_restart_open_only_after_independent_validation()
