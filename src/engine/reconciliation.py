@@ -1608,6 +1608,10 @@ class StartupReconciliationGate:
                 if (result[0] and self.watcher is not None
                         and getattr(self.watcher, "_supervision_read_complete", False) is True):
                     try:
+                        # Cache only real historical SELL rows after the entire
+                        # gate and durable watcher readback succeeded. Never
+                        # persist them as a reusable authorization across restarts.
+                        self.watcher._settled_owner_session = books.get("settled_session_history", {})
                         self.watcher.mark_completed_startup_supervision()
                     except (AttributeError, TypeError, ValueError):
                         pass  # Scheduling optimization only; never changes gate
