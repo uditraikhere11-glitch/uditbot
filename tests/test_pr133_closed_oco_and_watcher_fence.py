@@ -64,7 +64,8 @@ class ClosedExitFixture(unittest.TestCase):
                 security_id TEXT, exchange_segment TEXT, product_type TEXT, transaction_type TEXT,
                 is_verified_trade INTEGER, traded_quantity INTEGER, traded_price REAL, traded_at REAL);
             CREATE TABLE exit_allocations (parent_order_id TEXT, exchange_trade_id TEXT, allocated_qty INTEGER);
-            CREATE TABLE protection_orders (parent_order_id TEXT, forever_order_id TEXT);
+            CREATE TABLE protection_orders (parent_order_id TEXT, forever_order_id TEXT,
+                status TEXT, quantity INTEGER);
             CREATE TABLE watcher_orders (order_id TEXT, record_json TEXT);
             CREATE TABLE broker_attested_historical_fills (broker_order_id TEXT, account_id TEXT, evidence_json TEXT);
         ''')
@@ -92,7 +93,8 @@ class ClosedExitFixture(unittest.TestCase):
                 (oid,'SYNTHETIC','11915','NSE_EQ','CNC',at))
         self.conn.execute('INSERT INTO positions_lifecycle VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
             ('NEW28','SYNTHETIC','11915','NSE_EQ','CNC','POSITION_CLOSED','FOREVER_OCO',0,28,28,28,0,0))
-        self.conn.execute('INSERT INTO protection_orders VALUES (?,?)',('NEW28','FOREVER28'))
+        self.conn.execute('INSERT INTO protection_orders VALUES (?,?,?,?)',
+            ('NEW28','FOREVER28','POSITION_CLOSED_LOCAL',28))
         self.conn.execute('INSERT INTO watcher_orders VALUES (?,?)',('NEW28',json.dumps({
             'security_id':'11915','tp_order_id':'EXIT28'})))
         self.positions=[dict(securityId='11915',exchangeSegment='NSE_EQ',productType='CNC',
