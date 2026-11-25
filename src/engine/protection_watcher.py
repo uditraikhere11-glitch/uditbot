@@ -3758,6 +3758,16 @@ class ProtectionWatcher:
                         persisted = self.journal_db.get_fill_by_exchange_trade_id(eid)
                         parent_oid = str((persisted or {}).get("parent_order_id") or "").strip()
                         parent = self.journal_db.get_position_lifecycle(parent_oid)
+                        # An existing active owner claim on a CLOSED OCO
+                        # child's SELL ID is contradictory evidence. Record
+                        # the collision for the existing per-parent gate fence;
+                        # do not silently swallow it in the readback fallback.
+                        prior_claim = all_bot_leg_owners.get(child_id)
+                        if prior_claim is not None and prior_claim != parent_oid:
+                            owner_id_collisions.setdefault(
+                                child_id, {prior_claim}
+                            ).add(parent_oid)
+                            raise ValueError("Closed OCO child owner collision")
                         if (not parent_oid or parent_oid in open_parents
                                 or not isinstance(parent, dict)
                                 or parent.get("position_state") != "POSITION_CLOSED"
