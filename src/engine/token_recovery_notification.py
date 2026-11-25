@@ -71,15 +71,19 @@ def _scheduled_active(state, now):
 
 def scheduled_recovery_state(cfg, *, renewed, ready, token_problem,
                              prior_token_fingerprint, active_token_fingerprint,
-                             prior_token_expiration_ist, now, check_id=None):
+                             prior_token_expiration_ist, now, check_id=None,
+                             keep_lease=False):
     """Scheduled health result; never write credentials to the marker."""
     path = str(_path(cfg))
     with locked_token_file(path, timeout_sec=2):
         state = _load(cfg)
         if check_id is not None and state.get("scheduled_check_id") != check_id:
             return
-        state.pop("scheduled_check_id", None)
-        state.pop("scheduled_started_at", None)
+        if check_id is None and _scheduled_active(state, now):
+            return
+        if not keep_lease:
+            state.pop("scheduled_check_id", None)
+            state.pop("scheduled_started_at", None)
         if renewed and ready:
             # A normal green report resolves any pending recovery and
             # suppresses a concurrent runtime alert for this same token.
@@ -90,6 +94,19 @@ def scheduled_recovery_state(cfg, *, renewed, ready, token_problem,
                          prior_token_expiration_ist=str(prior_token_expiration_ist or ""),
                          instance_name=str(cfg.instance_name),
                          prior_token_fingerprint=prior_token_fingerprint)
+        _save(cfg, state)
+
+
+def end_scheduled_check(cfg, *, check_id):
+    """Release only our own lease; retain any durable pending recovery."""
+    if check_id is None:
+        return
+    with locked_token_file(str(_path(cfg)), timeout_sec=2):
+        state = _load(cfg)
+        if state.get("scheduled_check_id") != check_id:
+            return
+        state.pop("scheduled_check_id", None)
+        state.pop("scheduled_started_at", None)
         _save(cfg, state)
 
 
@@ -124,16 +141,20 @@ class TokenRecoveryConfirmation:
                 return state
             with self._hint_lock:
                 hint = self._hint
-                self._hint = None
-            if (hint and hint[1] == active_digest
-                    and state.get("last_notified_token_fingerprint") != active_digest
-                    and not state.get("pending")):
-                state.update(pending=True, failed_at=now,
-                             prior_token_fingerprint=hint[0],
-                             prior_token_expiration_ist="",
-                             instance_name=str(self.cfg.instance_name))
-                _save(self.cfg, state)
-                state = _load(self.cfg)
+            if hint and hint[1] == active_digest:
+                if (state.get("last_notified_token_fingerprint") != active_digest
+                        and not state.get("pending")):
+                    state.update(pending=True, failed_at=now,
+                                 prior_token_fingerprint=hint[0],
+                                 prior_token_expiration_ist="",
+                                 instance_name=str(self.cfg.instance_name))
+                    _save(self.cfg, state)
+                    state = _load(self.cfg)
+                # Keep the hint if persistence raised; never discard a newer
+                # callback, or hold the callback lock during filesystem I/O.
+                with self._hint_lock:
+                    if self._hint == hint:
+                        self._hint = None
             return state
 
     def poll(self, *, now=None, monotonic=None):
@@ -192,7 +213,8 @@ class TokenRecoveryConfirmation:
             return False
         if "dhanClientId" in funds and str(funds["dhanClientId"]) != str(self.cfg.dhan_client_id):
             return False
-        balance = next((funds[k] for k in ("availabelBalance", "availableBalance", "sodLimit")
+        # Start-of-day limit is not evidence of currently available funds.
+        balance = next((funds[k] for k in ("availabelBalance", "availableBalance")
                         if k in funds and funds[k] is not None), None)
         if balance is None or isinstance(balance, bool):
             return False
