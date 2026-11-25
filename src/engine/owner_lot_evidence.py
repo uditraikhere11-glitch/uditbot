@@ -25,7 +25,7 @@ class DematReview(ValueError):
 def verify_owner_history(broker, db, account, security, segment, product, parents,
                          holding, day_trades, now, evidence, *, current_day_live_keys=(),
                          verified_closed_sibling_trades=None, authorized_closed_sell_ids=(),
-                         closed_order_rollups=None):
+                         closed_order_rollups=None, session_date=None):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -67,6 +67,7 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     )
     seen_closed_history = set()
     seen_closed_today = set()
+    live_date = last if session_date is None else session_date
 
     def inspect(rows, historical):
         for row in rows:
@@ -112,7 +113,10 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                     if key in seen_closed_history:
                         raise ValueError("Duplicate closed sibling historical execution")
                     seen_closed_history.add(key)
-                elif datetime.fromtimestamp(expected_at, IST).date() == last:
+                elif datetime.fromtimestamp(expected_at, IST).date() == live_date:
+                    from src.engine.unified_exit_reconciliation import _exchange_time
+                    if datetime.fromtimestamp(_exchange_time(row.get("exchangeTime")), IST).date() != live_date:
+                        raise ExecutionConflict("Closed sibling live execution date differs")
                     if key in seen_closed_today:
                         raise ExecutionConflict("Duplicate closed sibling live execution")
                     seen_closed_today.add(key)
@@ -155,7 +159,7 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     if not live_keys.issubset(expected.keys()) or (seen | live_keys) != expected.keys():
         raise ValueError("Complete history does not contain every original BUY")
     current_closed = {k for k, row in allowed_closed.items()
-                      if datetime.fromtimestamp(row[3], IST).date() == last}
+                      if datetime.fromtimestamp(row[3], IST).date() == live_date}
     if (seen_closed_history | (seen_closed_today & current_closed)) != set(allowed_closed):
         raise ValueError("Closed sibling complete broker execution history unavailable")
 
@@ -237,11 +241,16 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             # generic fail-closed contradiction, and historical execution
             # verification must still succeed below before admission.
             split_proof = None
+            session_date = None
             if source == "NEGATIVE_CNC_POSITION_REVIEW":
                 # Before rejecting T+0 settled stock, prove a bot-owned
                 # closed sibling's SELL and the exact remaining parent total.
                 # This cannot be inferred from holdings + netQty alone.
-                from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity, signed_delivery_session_date
+                session_date = signed_delivery_session_date(
+                    trade_book=day_trades, account=account, security=security,
+                    segment=segment, product=product, now=now,
+                )
                 from src.engine.signed_delivery_live_evidence import attest_signed_holdings
                 holdings_account = attest_signed_holdings(
                     broker, holdings, account, batch.setdefault("signed_holdings_provenance", {}),
@@ -280,7 +289,7 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             if product == "CNC" and callable(getattr(db, "get_closed_forever_sibling_evidence", None)):
                 closed = db.get_closed_forever_sibling_evidence(
                     account, security, segment, product,
-                    open_parent_ids=tuple(sorted(parents)), now=now,
+                    open_parent_ids=tuple(sorted(parents)), now=now, session_date=session_date,
                 )
                 evidence["verified_closed_sibling_orders"] = list(closed["order_fills"])
             # Rollover is not an arithmetic waiver. All surviving lots must
@@ -349,7 +358,8 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                                         if split_proof is not None else ()),
                                  verified_closed_sibling_trades=closed["trades"],
                                  authorized_closed_sell_ids=closed["sell_ids"],
-                                 closed_order_rollups=closed.get("order_rollups", {}))
+                                 closed_order_rollups=closed.get("order_rollups", {}),
+                                 session_date=session_date)
             if rollover:
                 from src.engine.unified_exit_reconciliation import _exchange_time
                 from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group
@@ -446,6 +456,10 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                           _holdings_fingerprint(holdings, account))
                     for oid in acked
                 })
+            if session_date is not None:
+                batch.setdefault("signed_owner_verified", {})[(security, segment, product)] = (
+                    account, tuple(sorted(parents.items())), session_date,
+                )
             if split_proof is not None:
                 # The full historical BUY/SELL attestation above has now
                 # succeeded; watcher may consume this fresh pass-specific
