@@ -63,6 +63,30 @@ def _verify_retained_owner_siblings(db, broker, *, parent_id, group_id, account,
         return False
     if any(str(r["securityId"]) == security for r in super_orders):
         return False
+    for book in (positions, trades, orders, forever):
+        for row in book:
+            if str(row["securityId"]) == security and str(row.get("dhanClientId") or "") != account:
+                return False
+    # The selected closed parent must itself have a terminal, mutation-free
+    # watcher record, even in older journals with explicit child leg IDs.
+    import json
+    with db._get_conn() as conn:
+        target = conn.execute(
+            "SELECT is_terminal,record_json FROM watcher_orders WHERE order_id=?", (parent_id,)
+        ).fetchall()
+    if len(target) != 1 or target[0]["is_terminal"] != 1:
+        return False
+    target_rec = json.loads(target[0]["record_json"])
+    if (not isinstance(target_rec, dict)
+            or target_rec.get("order_id") != parent_id
+            or target_rec.get("position_state") != "POSITION_CLOSED"
+            or target_rec.get("confirmed_position_open_qty") != 0
+            or any(target_rec.get(k) for k in (
+                "pending_oco", "retry_reserved", "retry_eligible", "cancel_uncertain",
+                "persistence_uncertain", "orphaned_legs_detected",
+                "orphaned_legs_manual_intervention_required", "uncommitted_broker_sell_trades",
+            ))):
+        return False
     parents = {}
     for row in siblings:
         oid = str(row.get("parent_order_id") or "")
@@ -90,11 +114,13 @@ def _verify_retained_owner_siblings(db, broker, *, parent_id, group_id, account,
             records = conn.execute(
                 "SELECT is_terminal,record_json FROM watcher_orders WHERE order_id=?", (oid,)
             ).fetchall()
-        if (len(intents) != 1 or intents[0]["state"] != "TRADED"
+            protections = conn.execute(
+                "SELECT 1 FROM protection_orders WHERE parent_order_id=?", (oid,)
+            ).fetchall()
+        if (protections or len(intents) != 1 or intents[0]["state"] != "TRADED"
                 or ack.get("correlation_id") != intents[0]["correlation_id"]
                 or len(records) != 1 or records[0]["is_terminal"] != 1):
             return False
-        import json
         w = json.loads(records[0]["record_json"])
         if (not isinstance(w, dict) or w.get("order_id") != oid
                 or w.get("security_id") != security or w.get("segment") != segment
