@@ -146,6 +146,7 @@ def _query_historical_sells(
     parents: Set[str],
     known_sell_ids=(),
     allowed_closed_buys=None,
+    allowed_closed_rollups=None,
 ) -> Dict[str, dict]:
     """Paginate bounded Dhan historical-trade windows from BUY date through today."""
     from src.broker.dhan_client import MAX_HISTORICAL_TRADE_WINDOW_DAYS
@@ -165,6 +166,8 @@ def _query_historical_sells(
 
     span = max(1, int(MAX_HISTORICAL_TRADE_WINDOW_DAYS))
     verified: Dict[str, dict] = {}
+    from src.engine.signed_delivery_live_evidence import ArchivedClosedBuyMatcher
+    archived_buys = ArchivedClosedBuyMatcher(allowed_closed_buys, allowed_closed_rollups)
     current = first
     while current <= last:
         end = min(current + timedelta(days=span - 1), last)
@@ -174,6 +177,15 @@ def _query_historical_sells(
         for row in rows:
             if not isinstance(row, dict):
                 raise ReconciliationEvidenceError("Malformed historical broker execution")
+            try:
+                matched_rollup = archived_buys.match(
+                    row, historical=True, today=last, account=account,
+                    security=contract[0], segment=contract[1], product=contract[2],
+                )
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                raise ReconciliationEvidenceError(str(exc)) from exc
+            if matched_rollup is not None:
+                continue
             row_sec = str(row.get("securityId") or "").strip().upper()
             if row_sec != contract[0]:
                 continue
@@ -204,6 +216,7 @@ def _query_historical_sells(
                                 or datetime.fromtimestamp(when, IST).date()
                                 != datetime.fromtimestamp(expected[2], IST).date()):
                             raise ReconciliationEvidenceError("Closed sibling historical BUY conflicts with journal")
+                        archived_buys.note_exact((str(row.get("orderId") or ""), eid))
                     except (TypeError, ValueError) as exc:
                         raise ReconciliationEvidenceError("Closed sibling historical BUY proof invalid") from exc
                     continue
@@ -1033,6 +1046,7 @@ def reconcile_verified_exits(
                     ).fetchall()
                 }
             closed_buy_allowlist = {}
+            closed_rollups = {}
             if _obs_src == "NEGATIVE_CNC_POSITION_REVIEW":
                 # Never use an unrelated historical BUY as FIFO evidence. The
                 # existing closed-OCO verifier binds exact BUY/SELL executions
@@ -1059,6 +1073,7 @@ def reconcile_verified_exits(
                     open_parent_ids=tuple(str(r["parent_order_id"]) for r in lots_for_k),
                     now=time.time(),
                 )
+                closed_rollups = closed.get("order_rollups", {})
                 closed_buy_allowlist = {
                     key: (value[1], value[2], value[3])
                     for key, value in closed["trades"].items()
@@ -1069,6 +1084,7 @@ def reconcile_verified_exits(
                 required_eids=None, today_date=today_ist,
                 parents={r["parent_order_id"] for r in lots_for_k},
                 allowed_closed_buys=closed_buy_allowlist,
+                allowed_closed_rollups=closed_rollups,
             )
             new_sells = {eid: item for eid, item in hist_found.items() if eid not in known_eids}
             if new_sells:
