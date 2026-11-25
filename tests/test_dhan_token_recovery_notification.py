@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from src.broker.dhan_token import write_token_atomic
 from src.cli import cmd_daily_health_check
 from src.engine.token_recovery_notification import (
-    MARKER, TokenRecoveryConfirmation, fingerprint, scheduled_recovery_state,
+    MARKER, TokenRecoveryConfirmation, begin_scheduled_check, fingerprint, scheduled_recovery_state,
 )
 from src.journal.db import JournalDB
 
@@ -96,8 +96,21 @@ class TokenRecoveryNoticeTests(unittest.TestCase):
         self.assertTrue(self.state()["pending"])
         self.assertFalse(self.poll())
         self.broker.verify_profile_and_token_expiry.assert_not_called()
-        write_token_atomic(self.new, self.cfg.dhan_token_file)
-        self.worker.auth_recovered(self.old, self.new)
+        # Exercise real runtime coordination/publish and callback (only
+        # the verified HTTP login response and subsequent GETs are mocked).
+        from src.broker.dhan_client import DhanClient
+        runtime = object.__new__(DhanClient)
+        runtime.cfg = NS(dhan_client_id=self.cfg.dhan_client_id,
+                         dhan_pin="synthetic-pin", dhan_totp_secret="synthetic-secret",
+                         dhan_token_file=self.cfg.dhan_token_file)
+        runtime.token = self.old
+        runtime._perform_totp_http_login = Mock(return_value=(True, self.new, "verified"))
+        runtime._token_recovery_confirmation = self.worker.auth_recovered
+        ok, token, _ = runtime.generate_token_with_totp(force=False, rejected_token=self.old)
+        self.assertTrue(ok)
+        self.assertEqual(token, self.new)
+        self.assertEqual(Path(self.cfg.dhan_token_file).read_text(), self.new)
+        runtime._perform_totp_http_login.assert_called_once()
         self.assertTrue(self.poll())
         self.assertFalse(self.state()["pending"])
         self.assertEqual(self.state()["last_notified_token_fingerprint"], fingerprint(self.new))
@@ -129,6 +142,26 @@ class TokenRecoveryNoticeTests(unittest.TestCase):
         self.assertFalse(self.poll())
         self.assertFalse(self.state()["pending"])
         self.assertEqual(self.cards(), [])
+
+    def test_scheduled_lease_prevents_duplicate_during_green_check(self):
+        self.pending()
+        lease = begin_scheduled_check(self.cfg, now=self.now - 10)
+        self.worker.auth_recovered(self.old, self.new)
+        self.assertFalse(self.poll())
+        self.broker.verify_profile_and_token_expiry.assert_not_called()
+        scheduled_recovery_state(
+            self.cfg, renewed=True, ready=True, token_problem=False,
+            prior_token_fingerprint=fingerprint(self.old),
+            active_token_fingerprint=fingerprint(self.new),
+            prior_token_expiration_ist="", now=self.now, check_id=lease)
+        self.assertFalse(self.poll(mono=200))
+        self.assertEqual(self.cards(), [])
+
+    def test_expired_scheduled_lease_does_not_strand_recovery(self):
+        self.pending()
+        begin_scheduled_check(self.cfg, now=self.now - 301)
+        self.assertTrue(self.poll())
+        self.assertEqual(len(self.cards()), 1)
 
     def test_runtime_auth_failure_recovery_without_daily_marker(self):
         write_token_atomic(self.new, self.cfg.dhan_token_file)
