@@ -10,7 +10,7 @@ import hashlib
 import json
 import logging
 import math
-import os
+import uuid
 from pathlib import Path
 import threading
 import time
@@ -49,13 +49,37 @@ def _save(cfg, state):
     write_token_atomic(json.dumps(state, sort_keys=True), str(_path(cfg)))
 
 
+def begin_scheduled_check(cfg, *, now):
+    """Suppress runtime confirmations during a scheduled renewal attempt.
+
+    A bounded lease permits recovery after a killed scheduled process.
+    No lock is held during HTTP or Telegram operations.
+    """
+    check_id = uuid.uuid4().hex
+    with locked_token_file(str(_path(cfg)), timeout_sec=2):
+        state = _load(cfg)
+        state.update(scheduled_check_id=check_id, scheduled_started_at=float(now))
+        _save(cfg, state)
+    return check_id
+
+
+def _scheduled_active(state, now):
+    started = state.get("scheduled_started_at")
+    return (isinstance(started, (float, int)) and not isinstance(started, bool)
+            and 0 <= now - started < 300 and bool(state.get("scheduled_check_id")))
+
+
 def scheduled_recovery_state(cfg, *, renewed, ready, token_problem,
                              prior_token_fingerprint, active_token_fingerprint,
-                             prior_token_expiration_ist, now):
+                             prior_token_expiration_ist, now, check_id=None):
     """Scheduled health result; never write credentials to the marker."""
     path = str(_path(cfg))
     with locked_token_file(path, timeout_sec=2):
         state = _load(cfg)
+        if check_id is not None and state.get("scheduled_check_id") != check_id:
+            return
+        state.pop("scheduled_check_id", None)
+        state.pop("scheduled_started_at", None)
         if renewed and ready:
             # A normal green report resolves any pending recovery and
             # suppresses a concurrent runtime alert for this same token.
@@ -66,8 +90,6 @@ def scheduled_recovery_state(cfg, *, renewed, ready, token_problem,
                          prior_token_expiration_ist=str(prior_token_expiration_ist or ""),
                          instance_name=str(cfg.instance_name),
                          prior_token_fingerprint=prior_token_fingerprint)
-        else:
-            return
         _save(cfg, state)
 
 
@@ -98,6 +120,8 @@ class TokenRecoveryConfirmation:
     def _snapshot(self, active_digest, now):
         with locked_token_file(str(_path(self.cfg)), timeout_sec=0):
             state = _load(self.cfg)
+            if _scheduled_active(state, now):
+                return state
             with self._hint_lock:
                 hint = self._hint
                 self._hint = None
@@ -138,7 +162,7 @@ class TokenRecoveryConfirmation:
         if not digest:
             return False
         state = self._snapshot(digest, now)
-        if (state.get("pending") is not True
+        if (_scheduled_active(state, now) or state.get("pending") is not True
                 or digest == state.get("prior_token_fingerprint")
                 or digest == state.get("last_notified_token_fingerprint")
                 or monotonic < self._next_attempt):
