@@ -132,6 +132,13 @@ async def main():
         me = await client.get_me()
         print(f"✅ Connected to Telegram as: {me.first_name} (@{me.username or 'No username'})")
 
+        # Observe auth recovery during startup too; polling starts after startup.
+        broker = getattr(pipeline, "broker", None)
+        if broker is not None:
+            from src.engine.dhan_token_recovery_notice import RuntimeTokenRecoveryNotice
+            recovery_notice = RuntimeTokenRecoveryNotice(cfg, broker, pipeline.db, pipeline.reconciliation_gate)
+            broker._runtime_token_recovery_observer = recovery_notice.observe_auth_recovery
+
         # STEP 15: Run startup reconciliation gate before accepting entries
         rec_ok, rec_msg = await asyncio.to_thread(pipeline.reconciliation_gate.run_startup_reconciliation)
         if rec_ok:
@@ -156,12 +163,8 @@ async def main():
         from src.engine.token_rotation_recovery import install_token_rotation_fast_recovery
         # The offline runner tests use a minimal pipeline without a broker.
         # The real TradingBotPipeline always supplies the Dhan broker.
-        broker = getattr(pipeline, "broker", None)
         if broker is not None:
             install_token_rotation_fast_recovery(broker, pipeline.reconciliation_gate)
-            from src.engine.dhan_token_recovery_notice import RuntimeTokenRecoveryNotice
-            recovery_notice = RuntimeTokenRecoveryNotice(cfg, broker, pipeline.db, pipeline.reconciliation_gate)
-            broker._runtime_token_recovery_observer = recovery_notice.observe_auth_recovery
 
             async def _poll_token_recovery_notice():
                 while True:
