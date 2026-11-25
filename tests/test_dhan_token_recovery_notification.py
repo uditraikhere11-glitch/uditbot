@@ -84,10 +84,16 @@ class TokenRecoveryNoticeTests(unittest.TestCase):
         daily_client.last_funds_is_fallback = False
         daily_client.get_fund_limits.return_value = (True, 949.20, "verified")
         daily_client.verify_profile_and_token_expiry.return_value = self.profile(old_expiry)
+
+        def check_pending_before_dispatch(*args, **kwargs):
+            self.assertTrue(self.state()["pending"])
+            self.assertTrue(self.state()["scheduled_check_id"])
+            return "QUEUED FOR TELEGRAM RETRY"
+
         with patch("src.cli.cmd_refresh_token", return_value=False), \
              patch("src.broker.dhan_client.DhanClient", return_value=daily_client) as factory, \
              patch("src.instruments.resolver.InstrumentResolver") as resolver, \
-             patch("src.cli.dispatch_morning_health_report_once", return_value="QUEUED") as dispatch, \
+             patch("src.cli.dispatch_morning_health_report_once", side_effect=check_pending_before_dispatch) as dispatch, \
              patch("src.cli.time.time", return_value=self.now - 120):
             factory.extract_token_expiration.return_value = (old_expiry, "2026-11-25 18:02:31 IST")
             resolver.return_value.load_dhan_master.return_value = True
@@ -169,6 +175,15 @@ class TokenRecoveryNoticeTests(unittest.TestCase):
         self.assertTrue(self.poll())
         self.assertEqual(len(self.cards()), 1)
 
+    def test_runtime_hint_survives_marker_write_failure(self):
+        write_token_atomic(self.new, self.cfg.dhan_token_file)
+        self.worker.auth_recovered(self.old, self.new)
+        with patch("src.engine.token_recovery_notification._save", side_effect=OSError("disk error")):
+            self.assertFalse(self.poll())
+        self.assertEqual(self.cards(), [])
+        self.assertTrue(self.poll(mono=200))
+        self.assertEqual(len(self.cards()), 1)
+
     def test_expiration_before_next_open_keeps_pending(self):
         self.pending()
         self.broker.verify_profile_and_token_expiry.return_value = self.profile(self.now + 3600)
@@ -207,6 +222,7 @@ class TokenRecoveryNoticeTests(unittest.TestCase):
     def test_funds_missing_or_wrong_account_blocks(self):
         self.pending()
         for index, funds in enumerate(({}, {"availableBalance": True},
+                                       {"sodLimit": 949.20},
                                        {"availableBalance": 900, "dhanClientId": "OTHER"},
                                        {"availableBalance": float("nan")})):
             with self.subTest(funds=funds):
