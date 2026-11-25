@@ -3568,25 +3568,25 @@ class ProtectionWatcher:
         ):
             return changed
 
-        # A routine pass has no startup ContextVar. Re-attest only the narrow
-        # signed CNC owner-managed scenario, using its actual current books.
-        # This does not acquire the gate lock, open entries, or waive other
-        # parent/exit checks. A failure leaves the normal fail-closed path.
+        # No historical pagination under the watcher pass lock. Revalidate
+        # the same-session clean owner records against current exact books.
+        # This is NOT a gate attestation and cannot recover a blocked record.
+        routine_books = None
         if (gate_books is None and snapshot_complete and not self.pending
                 and self.journal_db is not None
                 and all(r.get("product_type") == "CNC" and
-                        r.get("position_state") in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
+                        r.get("position_state") == "UNPROTECTED_MANUAL_RISK"
                         and r.get("manual_risk_acknowledged") is True for r in open_recs)
                 and any(str(p.get("netQty") or "").startswith("-") for p in positions_book)):
             try:
                 from src.engine.owner_lot_evidence import prepare_owner_lots
                 local_books = {"verified": {}, "errors": {}, "share": False}
                 prepare_owner_lots(self.broker, self.journal_db, local_books,
-                                   positions_book, trade_book, now_ts, holdings_book, forever_book)
+                                   positions_book, trade_book, now_ts, holdings_book, forever_book,
+                                   routine_records={str(r["order_id"]): dict(r) for r in open_recs})
                 if local_books.get("signed_owner_verified") and not local_books["errors"]:
-                    local_books.update(get_positions=positions_book, get_trade_book=trade_book)
-                    gate_books = local_books
-                    signed_holdings_cache = gate_books.setdefault("signed_holdings_provenance", {})
+                    routine_books = local_books
+                    signed_holdings_cache = local_books.setdefault("signed_holdings_provenance", {})
             except Exception as exc:
                 logger.warning("[Protection] Routine signed owner proof unavailable: %s", type(exc).__name__)
 
@@ -4356,8 +4356,10 @@ class ProtectionWatcher:
             # original BUY endpoint when the complete current owner-lot proof
             # and exact closed-sibling executions are independently established.
             signed_owner_buy_proof = False
+            signed_session = None
+            signed_books = gate_books if gate_books is not None else routine_books
             if (not self.pending and snapshot_complete and prod == "CNC"
-                    and gate_books is not None and leg_order_ids == {oid}
+                    and signed_books is not None and leg_order_ids == {oid}
                     and not any(str(r.get("securityId") or "") == sec_id for r in super_book)):
                 try:
                     from src.engine.signed_cnc_delivery import (
@@ -4366,17 +4368,18 @@ class ProtectionWatcher:
                     )
                     from src.engine.signed_delivery_live_evidence import attest_signed_holdings
                     from src.engine.settled_owner_read_policy import _UNSAFE
-                    proof = gate_books.get("signed_owner_verified", {}).get((sec_id, seg, prod))
+                    proof = signed_books.get("signed_owner_verified", {}).get((sec_id, seg, prod))
+                    signed_verified = signed_books.get("verified") if gate_books is not None else signed_books.get("routine_verified", {})
                     if (proof and proof[0] == expected_client_id
-                            and not gate_books.get("errors")
-                            and gate_books.get("verified", {}).get(oid) == (expected_client_id, sec_id, buy_filled)
+                            and not signed_books.get("errors")
+                            and signed_verified.get(oid) == (expected_client_id, sec_id, buy_filled)
                             and prev_pos_state in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
                             and prev_sell_qty == 0
                             and not any(rec.get(k) for k in _UNSAFE if k != "external_unlinked_sell_observed")
-                            and positions_book == gate_books.get("get_positions")
-                            and trade_book == gate_books.get("get_trade_book")
-                            and holdings_book == gate_books.get("get_holdings")
-                            and forever_book == gate_books.get("get_forever_orders")):
+                            and positions_book == signed_books.get("get_positions")
+                            and trade_book == signed_books.get("get_trade_book")
+                            and holdings_book == signed_books.get("get_holdings")
+                            and forever_book == signed_books.get("get_forever_orders")):
                         parents = dict(proof[1])
                         session = signed_delivery_session_date(
                             trade_book=trade_book, account=expected_client_id, security=sec_id,
@@ -4388,7 +4391,7 @@ class ProtectionWatcher:
                         )
                         signed_owner_buy_proof = (
                             session == proof[2] and parents.get(oid) == buy_filled
-                            and all(gate_books["verified"].get(p) == (expected_client_id, sec_id, q)
+                            and all(signed_verified.get(p) == (expected_client_id, sec_id, q)
                                     for p, q in parents.items())
                             and closed_sibling_live_rows_match(
                                 closed=closed, trade_book=trade_book, account=expected_client_id,
@@ -4402,6 +4405,8 @@ class ProtectionWatcher:
                                     self.broker, holdings_book, expected_client_id, signed_holdings_cache),
                             ) == sum(parents.values())
                         )
+                        if signed_owner_buy_proof:
+                            signed_session = session
                 except (ValueError, TypeError, KeyError, AttributeError, OSError, sqlite3.Error):
                     signed_owner_buy_proof = False
             omit_old_buy_read = omit_old_buy_read or signed_owner_buy_proof
@@ -4910,7 +4915,7 @@ class ProtectionWatcher:
             stale_manual_record = (
                 prev_pos_state == "RECONCILIATION_REQUIRED"
                 or (prev_pos_state == "UNPROTECTED_MANUAL_RISK" and any(
-                    rec.get(k) for k in ("manual_exit_detected", "reconciliation_required", "unreadable_broker_response")
+                    rec.get(k) for k in ("manual_exit_detected", "reconciliation_required", "unreadable_broker_response", "external_unlinked_sell_observed")
                 ))
             )
             manual_risk_candidate = (
@@ -5011,7 +5016,8 @@ class ProtectionWatcher:
                                              and order_book == gate_books.get("get_order_book"))
                 except (ValueError, TypeError, KeyError, AttributeError):
                     rollover_verified = False
-            if ((quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY" or rollover_verified)
+            stale_external_resolved = bool(
+                    (quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY" or rollover_verified)
                     and rec.get("external_unlinked_sell_observed")
                     and gate_books is not None
                     and gate_books.get("verified", {}).get(oid) == (
@@ -5023,20 +5029,21 @@ class ProtectionWatcher:
                     and self.journal_db is not None
                     and not self.journal_db.owner_lot_review_reason(
                         expected_client_id, oid)
-                    and (rollover_verified or signed_owner_buy_proof)):
-                rec["external_unlinked_sell_observed"] = False
-                changed = True
-            no_protection_conflicts = not any(rec.get(key) for key in (
+                    and (rollover_verified or signed_owner_buy_proof))
+            # Keep stale flags intact until durable recovery succeeds.
+            no_protection_conflicts = (
+                (not rec.get("external_unlinked_sell_observed") or stale_external_resolved)
+                and not any(rec.get(key) for key in (
                 "sl_order_id", "tp_order_id", "exit_order_id",
                 "confirmed_protection_ids", "verified_leg_order_ids",
                 "verified_leg_map", "pending_oco", "orphaned_legs_detected",
                 "orphaned_legs_manual_intervention_required",
                 "uncommitted_broker_sell_trades", "broker_exit_already_executed",
-                "external_unlinked_sell_observed", "unverified_trade_detected",
+                "unverified_trade_detected",
                 "persistence_uncertain", "cancel_uncertain", "cancel_requested",
                 "orphaned_leg_cancel_states", "retry_reserved", "entry_timeout_elapsed",
                 "protected_qty",
-            ))
+            )))
             history_ok = bool(
                 gate_books is not None and gate_books["verified"].get(oid) == (
                     expected_client_id, sec_id, effective_parent_open_qty)
@@ -5061,14 +5068,17 @@ class ProtectionWatcher:
                     manual_risk_quantity_unverified = True
                 # Any fresh execution on this instrument needs attribution to the
                 # original lots before a previous day's proof can be reused.
-                market_date = datetime.fromtimestamp(now_ts, IST).date().isoformat()
-                if history_ok and rec.get("owner_history_day") != market_date:
+                market_date = (signed_session or datetime.fromtimestamp(now_ts, IST).date()).isoformat()
+                if history_ok and not manual_risk_quantity_unverified and rec.get("owner_history_day") != market_date:
                     rec["owner_history_day"] = market_date
                     changed = True
                 if not history_ok and rec.get("owner_history_day") != market_date:
                     manual_risk_quantity_unverified = True
                 if not history_ok and any(
-                    str(t.get("securityId")) == sec_id or not t.get("securityId")
+                    (str(t.get("securityId")) == sec_id and not (
+                        signed_owner_buy_proof and signed_session is not None
+                        and quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY"))
+                    or not t.get("securityId")
                     or (t.get("exchangeSegment") in ("NSE_EQ", "BSE_EQ")
                         and t.get("exchangeSegment") != seg and (not t.get("isin") or any(
                             h.get("isin") == t["isin"] for h in holdings_book or []
@@ -5091,8 +5101,17 @@ class ProtectionWatcher:
                                         "previous_reason": rec.get("manual_exit_evidence_reason")}))
                     rec["owner_evidence_error"] = reason
                     changed = True
+            # A full recovery must never consume an unexplained current SELL.
+            # For signed siblings the exact matcher ran against the same books.
+            # Other owner recovery paths must not have same-security SELLs.
+            current_sells_attributed = isinstance(trade_book, list) and all(
+                isinstance(t, dict) and t.get("securityId") and (
+                    str(t["securityId"]) != sec_id or t.get("transactionType") == "BUY"
+                    or (t.get("transactionType") == "SELL" and signed_owner_buy_proof))
+                for t in trade_book
+            )
             recovery_candidate = bool(
-                stale_manual_record and history_ok
+                stale_manual_record and history_ok and current_sells_attributed
                 and (rec.get("unreadable_broker_response") or legacy_quantity_warning)
                 and (legacy_quantity_warning or (not rec.get("manual_exit_evidence_verified")
                                                 and not rec.get("manual_exit_evidence_reason")))
@@ -5764,6 +5783,7 @@ class ProtectionWatcher:
                             if not isinstance(governor, ReadGovernor):
                                 governor = None
                             wait = 0.0
+                            local_short_pacing = False
                             blocked_reason = None
                             if governor is not None:
                                 try:
@@ -5771,7 +5791,8 @@ class ProtectionWatcher:
                                     check_binding = getattr(self.broker, "_get_active_read_governor", None)
                                     if callable(check_binding):
                                         governor = check_binding()
-                                    wait = governor.seconds_until_capacity(
+                                    wait, local_short_pacing = governor.seconds_until_capacity(
+                                        pacing_detail=True,
                                         required=supervision_read_requirement(len(pending)),
                                         # Every collection GET inside
                                         # check_once() uses NORMAL admission.
@@ -5782,11 +5803,30 @@ class ProtectionWatcher:
                                             pending, open_records
                                         ),
                                     )
+                                    if not math.isfinite(wait) or wait < 0:
+                                        raise ValueError("Invalid governor wait")
                                 except Exception as exc:
                                     wait = 60.0
                                     blocked_reason = "Local broker read-budget verification unavailable"
                                     if now >= last_notice:
                                         logger.error("[Protection] Broker governor preflight failed: %s", type(exc).__name__)
+                            if wait > 0 and wait <= 1.5 and local_short_pacing and not blocked_reason:
+                                # A single bounded local burst wait. No retry
+                                # on broker cooldown, no admission bypass.
+                                await asyncio.sleep(wait + 0.05)
+                                try:
+                                    if callable(check_binding):
+                                        governor = check_binding()
+                                    wait = governor.seconds_until_capacity(
+                                        required=supervision_read_requirement(len(pending)),
+                                        priority=supervision_preflight_priority(pending, open_records),
+                                    )
+                                    if not math.isfinite(wait) or wait < 0:
+                                        raise ValueError("Invalid governor wait")
+                                except Exception:
+                                    wait = 60.0
+                                    blocked_reason = "Local broker read-budget verification unavailable"
+                                now = time.monotonic()
                             if wait > 0:
                                 # The previous completed read cannot certify the
                                 # current deferred supervision cycle.
