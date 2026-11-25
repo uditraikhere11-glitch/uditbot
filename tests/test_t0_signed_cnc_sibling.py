@@ -576,6 +576,43 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             self.assertEqual(reopened.get_position_lifecycle(oid)["position_state"],
                              "UNPROTECTED_MANUAL_RISK")
 
+    def test_archived_rollup_routine_watcher_with_unavailable_old_buy(self):
+        from src.models import BrokerReadFailure, BrokerReadStatus
+        self._archived_rollup_schema()
+        original = self.broker.get_trades_for_order.side_effect
+        self.broker.get_trades_for_order.side_effect = lambda oid: (
+            BrokerReadFailure(status=BrokerReadStatus.FAILED.value, error="offline obsolete BUY", status_code=404)
+            if oid in (self.FIRST, self.SECOND) else original(oid)
+        )
+        gate = StartupReconciliationGate(self.broker, self.db, self.watcher, NS(is_stopped=lambda: False))
+        self.broker.reconciliation_gate = gate
+        ok, detail = gate.run_startup_reconciliation()
+        self.assertTrue(ok, detail)
+        self.assertIsNone(GATE_BOOKS.get())
+        for _ in range(120):
+            self.watcher.check_once()
+            self.assertTrue(gate.is_accepting_entries, gate.last_error)
+            self.assert_retained()
+        for oid in (self.FIRST, self.SECOND):
+            self.assertEqual(self.db.get_position_lifecycle(oid)["position_state"], "UNPROTECTED_MANUAL_RISK")
+
+    def test_signed_session_previous_day_bounded(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+        from src.engine.market import IST
+        from src.engine.signed_cnc_delivery import signed_delivery_session_date
+        now = datetime(2026, 11, 26, 0, 1, tzinfo=IST)
+        row = dict(self.sell, exchangeTime="2026-11-25 09:16:04")
+        kw = dict(trade_book=[row], account=self.ACCOUNT, security=self.SECURITY,
+                  segment="NSE_EQ", product="CNC")
+        with patch("src.engine.market.load_holidays_verified", return_value=(True, set(), "OK")):
+            self.assertEqual(signed_delivery_session_date(**kw, now=now.timestamp()),
+                             (now-timedelta(days=1)).date())
+            with self.assertRaises(SignedCNCDeliveryUnverified):
+                signed_delivery_session_date(**kw, now=now.replace(hour=8, minute=30).timestamp())
+            with self.assertRaises(SignedCNCDeliveryUnverified):
+                signed_delivery_session_date(**dict(kw, trade_book=[row, dict(row, exchangeTime="2026-11-24 09:16:04")]), now=now.timestamp())
+
     def test_archived_rollup_settled_next_day_and_restart(self):
         self._settled_rollover_schema()
         self._replace_split_buy_with_archive()
