@@ -3577,14 +3577,16 @@ class ProtectionWatcher:
                 and all(r.get("product_type") == "CNC" and
                         r.get("position_state") == "UNPROTECTED_MANUAL_RISK"
                         and r.get("manual_risk_acknowledged") is True for r in open_recs)
-                and any(str(p.get("netQty") or "").startswith("-") for p in positions_book)):
+                and (any(str(p.get("netQty") or "").startswith("-") for p in positions_book)
+                     or getattr(self, "_settled_owner_session", {}))):
             try:
                 from src.engine.owner_lot_evidence import prepare_owner_lots
                 local_books = {"verified": {}, "errors": {}, "share": False}
                 prepare_owner_lots(self.broker, self.journal_db, local_books,
                                    positions_book, trade_book, now_ts, holdings_book, forever_book,
-                                   routine_records={str(r["order_id"]): dict(r) for r in open_recs})
-                if local_books.get("signed_owner_verified") and not local_books["errors"]:
+                                   routine_records={str(r["order_id"]): dict(r) for r in open_recs},
+                                   settled_session_history=getattr(self, "_settled_owner_session", {}))
+                if (local_books.get("signed_owner_verified") or local_books.get("settled_closed_sibling_verified")) and not local_books["errors"]:
                     routine_books = local_books
                     signed_holdings_cache = local_books.setdefault("signed_holdings_provenance", {})
             except Exception as exc:
@@ -4409,7 +4411,30 @@ class ProtectionWatcher:
                             signed_session = session
                 except (ValueError, TypeError, KeyError, AttributeError, OSError, sqlite3.Error):
                     signed_owner_buy_proof = False
-            omit_old_buy_read = omit_old_buy_read or signed_owner_buy_proof
+            settled_owner_buy_proof = False
+            if (not self.pending and snapshot_complete and prod == "CNC"
+                    and signed_books is not None and leg_order_ids == {oid}
+                    and not any(str(r.get("securityId") or "") == sec_id for r in super_book)):
+                try:
+                    from src.engine.signed_delivery_live_evidence import _holdings_fingerprint
+                    from src.engine.settled_owner_read_policy import _UNSAFE
+                    marker = signed_books.get("settled_closed_sibling_verified", {}).get(oid)
+                    verified = signed_books.get("verified", {}) if gate_books is not None else signed_books.get("routine_verified", {})
+                    settled_owner_buy_proof = bool(
+                        marker and marker == (expected_client_id, sec_id, seg, prod, buy_filled,
+                                               _holdings_fingerprint(holdings_book, expected_client_id))
+                        and verified.get(oid) == (expected_client_id, sec_id, buy_filled)
+                        and not signed_books.get("errors")
+                        and prev_sell_qty == 0
+                        and prev_pos_state in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
+                        and not any(rec.get(k) for k in _UNSAFE if k != "external_unlinked_sell_observed")
+                        and positions_book == signed_books.get("get_positions")
+                        and trade_book == signed_books.get("get_trade_book")
+                        and holdings_book == signed_books.get("get_holdings")
+                        and forever_book == signed_books.get("get_forever_orders"))
+                except (ValueError, TypeError, KeyError, AttributeError, OSError, sqlite3.Error):
+                    settled_owner_buy_proof = False
+            omit_old_buy_read = omit_old_buy_read or signed_owner_buy_proof or settled_owner_buy_proof
             # Only the ORIGINAL prior-day BUY is exempt. Live/triggered OCO
             # legs remain subject to their normal order-specific trade reads.
             prior_protected_proof = getattr(self, "_protected_buy_history_session", {})
@@ -5065,6 +5090,15 @@ class ProtectionWatcher:
                         except Exception:
                             profile_account = None
                 if not expected_client_id or profile_account != expected_client_id:
+                    manual_risk_quantity_unverified = True
+                # A prior independently attested closed sibling must not
+                # fall back to ordinary holdings arithmetic if its current
+                # terminal child/holdings proof changes.
+                if (quantity_evidence == "VERIFIED_SETTLED_HOLDINGS"
+                        and gate_books is None and prod == "CNC"
+                        and any(key[:4] == (expected_client_id, sec_id, seg, prod)
+                                for key in getattr(self, "_settled_owner_session", {}))
+                        and not settled_owner_buy_proof):
                     manual_risk_quantity_unverified = True
                 # Any fresh execution on this instrument needs attribution to the
                 # original lots before a previous day's proof can be reused.
