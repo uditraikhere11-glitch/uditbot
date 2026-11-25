@@ -278,6 +278,9 @@ class ArchivedClosedBuyMatcher:
                 or _text(row, "productType") != product):
             raise ValueError("Closed sibling historical BUY identity differs")
         if not self.missing_id(row):
+            # Track exact-form rows before callers' date/security filters, so
+            # an earlier conflicting row cannot hide behind an aggregate.
+            self.note_exact((oid, _text(row, "exchangeTradeId")))
             return None
         if not historical:
             raise ValueError("Archived rollup forbidden for current tradebook")
@@ -286,6 +289,10 @@ class ArchivedClosedBuyMatcher:
         summary = self.rollups.get((oid, "BUY"))
         if not summary:
             raise ValueError("Closed sibling order rollup unavailable")
+        exchange_order_id = row.get("exchangeOrderId")
+        if (isinstance(exchange_order_id, bool)
+                or str(exchange_order_id or "").strip().upper() in ("", "0", "NONE", "NULL")):
+            raise ValueError("Archived BUY exchange order identity missing")
         valid, normalized, _ = DhanClient.validate_historical_trade_record(
             row, expected_account_id=account, expected_order_id=oid,
             expected_security_id=security, expected_exchange_segment=segment,
