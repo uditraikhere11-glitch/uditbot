@@ -1908,6 +1908,11 @@ class StartupReconciliationGate:
                     ]
                     if owner_survivors:
                         from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                        from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                        holdings_account = attest_signed_holdings(
+                            self.broker, self._active_pass_holdings, books["account"],
+                            books.setdefault("signed_holdings_provenance", {}),
+                        )
                         expected = sum(int(row.get("confirmed_open_qty") or 0) for row in open_rows)
                         verify_signed_cnc_delivery_quantity(
                             db=self.db, positions=positions,
@@ -1915,6 +1920,7 @@ class StartupReconciliationGate:
                             account=books["account"], security=contract[0],
                             segment=contract[1], product=contract[2],
                             expected_open_qty=expected, now=time.time(),
+                            holdings_profile_account=holdings_account,
                         )
                     flat = verified_flat_delivery_day(
                         position, positions, self._active_pass_holdings,
