@@ -465,6 +465,25 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             self.proof()
         self.assert_retained()
 
+    def test_invalid_negative_or_boolean_day_component_rejected(self):
+        self.broker.get_positions.return_value[0]["dayBuyQty"] = -1
+        self.broker.get_positions.return_value[0]["daySellQty"] = 27
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        self.broker.get_positions.return_value[0]["dayBuyQty"] = True
+        self.broker.get_positions.return_value[0]["daySellQty"] = 29
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        self.assert_retained()
+
+    def test_broker_exchange_time_from_prior_day_not_current_sell(self):
+        self.broker.get_trade_book.return_value[0]["exchangeTime"] = datetime.fromtimestamp(
+            self.prior, __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        self.assert_retained()
+
     def test_trade_book_unreadable_rejected(self):
         self.broker.get_trade_book.return_value = None
         with self.assertRaises(SignedCNCDeliveryUnverified):
