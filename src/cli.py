@@ -782,7 +782,9 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     print("     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          ")
     print("=======================================================")
 
-    from src.engine.token_recovery_notification import fingerprint, scheduled_recovery_state
+    from src.engine.token_recovery_notification import (
+        begin_scheduled_check, fingerprint, scheduled_recovery_state,
+    )
     from src.broker.dhan_token import read_token
     prior_digest = ""
     prior_expiry = ""
@@ -795,6 +797,11 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         # The scheduled health check remains authoritative; an unavailable
         # prior expiry is descriptive only, not a fabricated verification.
         pass
+    check_id = None
+    try:
+        check_id = begin_scheduled_check(cfg, now=time.time())
+    except Exception as exc:
+        print(f"[!] Recovery notification lease unavailable ({type(exc).__name__})")
     renewal_evidence = {}
     tok_ok = cmd_refresh_token(cfg, stop_mgr, verification_sink=renewal_evidence)
     # Candidate identity was already verified BEFORE the new token was
@@ -947,7 +954,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
                 active_token_fingerprint=fingerprint(client_token),
                 prior_token_expiration_ist=prior_expiry or (
                     token_expiration_str if not renewed else ""),
-                now=report_now,
+                now=report_now, check_id=check_id,
             )
         except Exception as exc:
             print(f"[!] Recovery notification marker unavailable ({type(exc).__name__})")
