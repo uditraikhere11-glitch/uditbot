@@ -4848,6 +4848,26 @@ class ProtectionWatcher:
                         f"Open holding {oid}: owner manual-risk ACK not independently verified"
                     )
                 changed = True
+            # A completed fresh signed-CNC proof plus the serialized full
+            # owner-history attestation can resolve a legacy false positive:
+            # a now-CLOSED sibling OCO child was previously mislabelled an
+            # external unlinked SELL on each surviving one-share parent.
+            # Never clear a flag on arithmetic alone, and never discard a
+            # durable owner conflict or any unverified current trade.
+            if (quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY"
+                    and rec.get("external_unlinked_sell_observed")
+                    and gate_books is not None
+                    and gate_books.get("verified", {}).get(oid) == (
+                        expected_client_id, sec_id, effective_parent_open_qty)
+                    and snapshot_complete and parent_reads_complete
+                    and not journal_persistence_failed
+                    and not rec.get("unverified_trade_detected")
+                    and not rec.get("uncommitted_broker_sell_trades")
+                    and self.journal_db is not None
+                    and not self.journal_db.owner_lot_review_reason(
+                        expected_client_id, oid)):
+                rec["external_unlinked_sell_observed"] = False
+                changed = True
             no_protection_conflicts = not any(rec.get(key) for key in (
                 "sl_order_id", "tp_order_id", "exit_order_id",
                 "confirmed_protection_ids", "verified_leg_order_ids",
