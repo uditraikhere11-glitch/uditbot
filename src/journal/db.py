@@ -1836,7 +1836,12 @@ class JournalDB:
                 (account, security, segment, product),
             ).fetchall()]
             if not rows:
-                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0}
+                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0, "triggered_groups": {}}
+            from src.engine.signed_delivery_live_evidence import (
+                recover_closed_watcher_child_ids, closed_triggered_binding,
+            )
+            triggered_groups = {}
+            sell_order_owners = {}
             expected: Dict[Tuple[str, str], Tuple[str, int, float]] = {}
             orders: Dict[str, Tuple[str, int]] = {}
             group_ids: set[str] = set()
@@ -1866,12 +1871,13 @@ class JournalDB:
                 ).fetchall()]
                 if sum(int(x["traded_quantity"] or 0) for x in originals) != bought:
                     raise ValueError("Closed OCO original BUY evidence incomplete")
-                groups = [str(x[0]) for x in conn.execute(
-                    "SELECT forever_order_id FROM protection_orders WHERE parent_order_id=? "
+                group_rows = [dict(x) for x in conn.execute(
+                    "SELECT forever_order_id, status, quantity FROM protection_orders WHERE parent_order_id=? "
                     "AND forever_order_id IS NOT NULL AND forever_order_id!=''",
                     (oid,),
                 ).fetchall()]
-                if not groups or any(g in group_ids for g in groups):
+                groups = [str(x["forever_order_id"]) for x in group_rows]
+                if not groups or len(groups) != len(set(groups)) or any(g in group_ids for g in groups):
                     raise ValueError("Closed OCO group identity missing/overlapping")
                 group_ids.update(groups)
                 records = conn.execute(
@@ -1889,7 +1895,13 @@ class JournalDB:
                            for k in ("sl_order_id", "tp_order_id")}
                 leg_ids.discard("")
                 if not leg_ids:
-                    raise ValueError("Closed OCO child SELL leg not verified")
+                    # Actual Forever OCO watcher records can persist verified child IDs
+                    # and named leg mappings without tp_order_id/sl_order_id fields.
+                    # Only the exact fully closed single-group context is eligible.
+                    if (len(group_rows) != 1 or group_rows[0]["status"] != "POSITION_CLOSED_LOCAL"
+                            or type(group_rows[0]["quantity"]) is not int or group_rows[0]["quantity"] != bought):
+                        raise ValueError("Closed OCO watcher map lacks exact locally closed group binding")
+                    leg_ids = recover_closed_watcher_child_ids(snapshot, row, groups)
                 sell_records = [dict(x) for x in conn.execute(
                     "SELECT * FROM fills WHERE parent_order_id=? AND security_id=? AND "
                     "exchange_segment=? AND product_type=? AND UPPER(transaction_type)='SELL' "
@@ -1905,6 +1917,7 @@ class JournalDB:
                     (oid,),
                 ).fetchall()]
                 seen_sells: set[str] = set()
+                parent_sell_quantities = {}
                 exit_sum = 0
                 for trade in originals + sell_records:
                     eid = str(trade.get("exchange_trade_id") or "").strip()
@@ -1933,6 +1946,10 @@ class JournalDB:
                         raise ValueError("BUY and SELL share a broker order ID")
                     orders[order_id] = (side, (prior[1] if prior else 0) + quantity)
                     if side == "SELL":
+                        prior_owner = sell_order_owners.setdefault(order_id, oid)
+                        if prior_owner != oid:
+                            raise ValueError("Closed OCO child SELL has competing parent owners")
+                        parent_sell_quantities[order_id] = parent_sell_quantities.get(order_id, 0) + quantity
                         seen_sells.add(eid)
                         sell_ids.add(eid)
                         exit_sum += quantity
@@ -1940,11 +1957,14 @@ class JournalDB:
                             today_sell += quantity
                 if exit_sum != sold:
                     raise ValueError("Closed OCO SELL allocation does not cover entire BUY")
+                binding = closed_triggered_binding(snapshot, row, group_rows, parent_sell_quantities)
+                if binding is not None:
+                    triggered_groups[groups[0]] = binding
                 total_sell += exit_sum
         return {"trades": expected, "order_fills": orders,
                 "forever_ids": tuple(sorted(group_ids)),
                 "sell_ids": tuple(sorted(sell_ids)), "sell_qty": total_sell,
-                "today_sell_qty": today_sell}
+                "today_sell_qty": today_sell, "triggered_groups": triggered_groups}
 
     def get_sell_fills_for_parent(self, parent_order_id: str) -> List[Dict[str, Any]]:
         """P0-A & P1-6: Returns canonical verified SELL fills for `parent_order_id`,
