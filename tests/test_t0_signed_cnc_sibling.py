@@ -429,6 +429,22 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         self._live_schema()
         self.test_real_startup_restart_open_only_after_independent_validation()
 
+    def test_live_shape_startup_wrong_pinned_profile_blocks(self):
+        self._live_schema()
+        self.broker.get_account_bound_holdings.side_effect = None
+        self.broker.get_account_bound_holdings.return_value = (
+            "OTHER", self.broker.get_holdings.return_value,
+        )
+        gate = StartupReconciliationGate(
+            self.broker, self.db, self.watcher, NS(is_stopped=lambda: False),
+        )
+        self.broker.reconciliation_gate = gate
+        ok, detail = gate.run_startup_reconciliation()
+        self.assertFalse(ok, detail)
+        self.assertFalse(gate.is_accepting_entries)
+        self.assertIn("Signed delivery holdings or closed sibling proof unavailable", detail)
+        self.assert_retained()
+
     def test_live_shape_owner_stop_blocks(self):
         self._live_schema()
         self.test_unchanged_owner_stop_fences_healthy_signed_delivery()
