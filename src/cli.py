@@ -812,12 +812,12 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
     report_now = time.time()
     bound_profile = renewal_evidence.get("profile")
-    fingerprint = str(renewal_evidence.get("token_sha256") or "")
+    candidate_digest = str(renewal_evidence.get("token_sha256") or "")
     client_token = str(getattr(client, "token", "") or "")
     proof_matches = bool(
-        fingerprint and isinstance(bound_profile, dict) and client_token
+        candidate_digest and isinstance(bound_profile, dict) and client_token
         and hmac.compare_digest(
-            fingerprint, hashlib.sha256(client_token.encode("utf-8")).hexdigest()
+            candidate_digest, hashlib.sha256(client_token.encode("utf-8")).hexdigest()
         )
         and str(bound_profile.get("profile_client_id") or "") == str(cfg.dhan_client_id)
         and bound_profile.get("identity_verified") is True
