@@ -563,6 +563,20 @@ class ReadOnlyDhanBrokerAdapter:
             raise RuntimeError("Broker order trades read unavailable")
         return self._broker.get_trades_for_order(order_id)
 
+    def get_authenticated_profile_id(self, *, allow_refresh=False):
+        if allow_refresh:
+            raise RuntimeError("Service-control profile verification must not request renewal")
+        return self._broker.get_authenticated_profile_id(allow_refresh=False)
+
+    def get_account_bound_holdings(self):
+        return self._broker.get_account_bound_holdings()
+
+    def get_historical_trades(self, *args, **kwargs):
+        return self._broker.get_historical_trades(*args, **kwargs)
+
+    def get_edis_owned_quantity(self, isin):
+        return self._broker.get_edis_owned_quantity(isin)
+
     def evaluate_forever_oco_protection(self, *args, **kwargs) -> Any:
         if hasattr(self._broker, "evaluate_forever_oco_protection"):
             return self._broker.evaluate_forever_oco_protection(*args, **kwargs)
