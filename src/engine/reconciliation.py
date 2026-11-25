@@ -1927,9 +1927,46 @@ class StartupReconciliationGate:
                         return self._fail_reconciliation_locked(reason, starting_halt_generation)
                     self._active_pass_holdings = rows
                 try:
-                    flat = verified_flat_delivery_day(position, positions, self._active_pass_holdings,
-                                                      trade_book, self.db, books["account"],
-                                                      self._read_required_broker_collection)
+                    contract = (str(position.get("securityId") or "").strip(),
+                                str(position.get("exchangeSegment") or "").strip().upper(),
+                                str(position.get("productType") or "").strip().upper())
+                    open_rows = [
+                        row for row in self.db.get_open_positions_lifecycle()
+                        if (str(row.get("security_id") or "").strip(),
+                            str(row.get("exchange_segment") or "").strip().upper(),
+                            str(row.get("product_type") or "").strip().upper()) == contract
+                    ]
+                    # Existing single-parent signed delivery checks remain
+                    # unchanged. For two acknowledged surviving old lots after
+                    # a different sibling's OCO exit, also require the strict
+                    # shared journal/closed-child proof.
+                    owner_survivors = [
+                        row for row in open_rows
+                        if str(row.get("position_state") or "").upper() in (
+                            "UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED"
+                        ) and int(row.get("protected_qty") or 0) == 0
+                    ]
+                    if owner_survivors:
+                        from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                        from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                        holdings_account = attest_signed_holdings(
+                            self.broker, self._active_pass_holdings, books["account"],
+                            books.setdefault("signed_holdings_provenance", {}),
+                        )
+                        expected = sum(int(row.get("confirmed_open_qty") or 0) for row in open_rows)
+                        verify_signed_cnc_delivery_quantity(
+                            db=self.db, positions=positions,
+                            holdings=self._active_pass_holdings, trade_book=trade_book,
+                            account=books["account"], security=contract[0],
+                            segment=contract[1], product=contract[2],
+                            expected_open_qty=expected, now=time.time(),
+                            holdings_profile_account=holdings_account,
+                        )
+                    flat = verified_flat_delivery_day(
+                        position, positions, self._active_pass_holdings,
+                        trade_book, self.db, books["account"],
+                        self._read_required_broker_collection,
+                    )
                 except (ValueError, TypeError, KeyError, sqlite3.Error):
                     flat = False
                 if flat:
