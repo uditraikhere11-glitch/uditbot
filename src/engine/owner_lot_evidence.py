@@ -457,6 +457,10 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                     for oid in acked
                 })
             if session_date is not None:
+                # Preserve the actual proof books even when sharing is not
+                # authorized. The watcher compares them to its own reads.
+                batch["get_positions"] = positions
+                batch["get_trade_book"] = day_trades
                 batch.setdefault("signed_owner_verified", {})[(security, segment, product)] = (
                     account, tuple(sorted(parents.items())), session_date,
                 )
