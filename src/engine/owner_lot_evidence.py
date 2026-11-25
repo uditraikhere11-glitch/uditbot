@@ -229,11 +229,16 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                 # closed sibling's SELL and the exact remaining parent total.
                 # This cannot be inferred from holdings + netQty alone.
                 from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                holdings_account = attest_signed_holdings(
+                    broker, holdings, account, batch.setdefault("signed_holdings_provenance", {}),
+                )
                 quantity = verify_signed_cnc_delivery_quantity(
                     db=db, positions=positions, holdings=holdings,
                     trade_book=day_trades, account=account,
                     security=security, segment=segment, product=product,
                     expected_open_qty=sum(parents.values()), now=now,
+                    holdings_profile_account=holdings_account,
                 )
                 source = "VERIFIED_SIGNED_CNC_DELIVERY"
                 evidence.update(quantity=quantity, quantity_source=source)
@@ -276,6 +281,17 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                 for r in related_oco:
                     status = str(r["orderStatus"] or "").upper()
                     group = str(r.get("orderId") or "")
+                    if status == "TRIGGERED" and source == "VERIFIED_SIGNED_CNC_DELIVERY":
+                        # Dhan may omit the cancelled sibling from the triggered group.
+                        # Require exact closed parent, leg, live SELL and terminal child
+                        # corroboration; do NOT add TRIGGERED to generic terminal states.
+                        from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group
+                        verify_closed_triggered_group(
+                            group=group, closed=closed, forever=forever, orders=orders,
+                            day_trades=day_trades, account=account, security=security,
+                            segment=segment, product=product,
+                        )
+                        continue
                     if status not in (terminal if group in closed["forever_ids"] else terminal[:4]):
                         raise ValueError("Forever order for owner-managed shares requires attribution")
             relevant_orders = [{k: r.get(k) for k in ("orderId", "transactionType", "orderStatus", "filledQty")}
