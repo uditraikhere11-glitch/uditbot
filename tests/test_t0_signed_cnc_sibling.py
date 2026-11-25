@@ -363,6 +363,24 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         self.broker.reconciliation_gate.halt_new_entries.assert_not_called()
         self.assert_retained()
 
+    def test_closed_child_id_claimed_by_other_parent_blocks_recovery(self):
+        # C8: A forged/stale active owner claim for the closed sibling's
+        # child SELL order ID cannot be excused by otherwise valid 30-28 math.
+        first = self.watcher.terminal_orders[self.FIRST]
+        first["verified_leg_order_ids"] = [self.TARGET_CHILD]
+        self.assertTrue(self.watcher._save())
+        self._full_watcher_pass()
+        reasons = [
+            str(call.args[0]) for call in
+            self.broker.reconciliation_gate.halt_new_entries.call_args_list
+        ]
+        self.assertTrue(any("conflicting bot owner claim" in x for x in reasons), reasons)
+        self.assertEqual(
+            self.watcher.terminal_orders[self.FIRST]["position_state"],
+            "RECONCILIATION_REQUIRED",
+        )
+        self.assert_retained()
+
     def test_real_startup_restart_open_only_after_independent_validation(self):
         self.broker.reconciliation_gate = NS(halt_new_entries=Mock())
         gate = StartupReconciliationGate(
