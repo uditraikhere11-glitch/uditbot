@@ -919,6 +919,7 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     )
     auth_check_label = "PASS" if auth_check_ok else "FAIL"
     readiness_label = "VERIFIED_CHECKS" if next_session_ready else "REVIEW_REQUIRED"
+    notify_status = dispatch_morning_health_report_once(cfg, db, report, now_ts=report_now)
     update_scheduled_recovery(
         cfg, renewed=bool(renewal_evidence.get("token_generated", tok_ok)),
         ready=bool(auth_check_ok and next_session_ready),
@@ -928,7 +929,6 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         prior_fingerprint=prior_digest, prior_expiration=prior_expiry,
         current_token=client_token, now=report_now,
     )
-    notify_status = dispatch_morning_health_report_once(cfg, db, report, now_ts=report_now)
     holiday_no_action = (
         "Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED" in report
     )
