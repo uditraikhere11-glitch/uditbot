@@ -394,13 +394,34 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
                 self.assertIsNone(conn.execute("SELECT exchange_trade_id FROM fills WHERE broker_order_id=?",
                                                (parent,)).fetchone()[0])
 
-    def _archived_rollup_schema(self):
-        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
-        third = [r for r in self.history if r["orderId"] == self.THIRD]
-        self.assertEqual(len(third), 2)
+    def _replace_split_buy_with_archive(self):
+        third = sorted((r for r in self.history if r["orderId"] == self.THIRD),
+                       key=lambda r: r["tradedQuantity"], reverse=True)
+        self.assertEqual([r["tradedQuantity"] for r in third], [16, 12])
+        # Exact observed execution IDs, quantity, price and exchange order ID.
+        # Account, other identifiers and clock remain offline fixture values.
+        with self.db._get_conn() as conn:
+            for row, eid in zip(third, ("609978137", "609978138")):
+                conn.execute("UPDATE fills SET exchange_trade_id=?, traded_price=? "
+                             "WHERE parent_order_id=? AND exchange_trade_id=?",
+                             (eid, 17.72, self.THIRD, row["exchangeTradeId"]))
+                row.update(exchangeTradeId=eid, tradedPrice=17.72,
+                           exchangeOrderId="1300000097782851")
+            conn.execute("UPDATE positions_lifecycle SET buy_vwap=? WHERE parent_order_id=?",
+                         (17.72, self.THIRD))
+        self.watcher.terminal_orders[self.THIRD]["buy_vwap"] = 17.72
         self.history[:] = [r for r in self.history if r["orderId"] != self.THIRD]
         aggregate = dict(third[0], exchangeTradeId="", tradedQuantity=28)
         self.history.append(aggregate)
+        self.assertTrue(self.watcher._save())
+        return aggregate, third
+
+    def _archived_rollup_schema(self):
+        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
+        aggregate, third = self._replace_split_buy_with_archive()
+        # Dhan's historical response contained the original BUYs only.
+        # The current-day SELL remains independently verified in tradebook.
+        self.history[:] = [r for r in self.history if r["orderId"] != self.TARGET_CHILD]
         for oid in (self.FIRST, self.SECOND):
             self.watcher.terminal_orders[oid].update(
                 external_unlinked_sell_observed=True,
@@ -437,8 +458,45 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
                 "SELECT exchange_trade_id, traded_quantity FROM fills WHERE parent_order_id=? "
                 "AND transaction_type='BUY' ORDER BY traded_quantity", (self.THIRD,)
             ).fetchall()
-            self.assertEqual([r[1] for r in fills], [12, 16])
-            self.assertTrue(all(r[0] for r in fills))
+            self.assertEqual([(r[0], r[1]) for r in fills],
+                             [("609978138", 12), ("609978137", 16)])
+        for oid in (self.FIRST, self.SECOND):
+            self.assertEqual(reopened.get_position_lifecycle(oid)["position_state"],
+                             "UNPROTECTED_MANUAL_RISK")
+
+    def test_archived_rollup_settled_next_day_and_restart(self):
+        self._settled_rollover_schema()
+        self._replace_split_buy_with_archive()
+        self._assert_rollover_recovered()
+
+    def test_archived_rollup_normalizer_missing_sentinels_and_no_dedup(self):
+        from src.broker.dhan_client import DhanClient
+        row, _ = self._archived_rollup_schema()
+        for sentinel in ("", None, "0", "NONE", "NULL"):
+            with self.subTest(sentinel=sentinel):
+                raw = dict(row, exchangeTradeId=sentinel)
+                ok, normalized, reason = DhanClient.validate_historical_trade_record(
+                    raw, expected_account_id=self.ACCOUNT,
+                    allow_missing_exchange_trade_id=True,
+                )
+                self.assertTrue(ok, reason)
+                self.assertIsNone(normalized["exchangeTradeId"])
+                self.assertTrue(normalized["_broker_attested_no_execution_id"])
+                valid, _, _ = DhanClient.validate_historical_trade_record(
+                    raw, expected_account_id=self.ACCOUNT,
+                    allow_missing_exchange_trade_id=False,
+                )
+                self.assertFalse(valid)
+        # Real pagination must preserve duplicate ID-less rows so the
+        # shared matcher, rather than pagination dedup, can reject them.
+        client = object.__new__(DhanClient)
+        client.cfg = NS(trading_mode="LIVE")
+        client.get_historical_trades_page = Mock(side_effect=[
+            [dict(normalized), dict(normalized)], [],
+        ])
+        day = datetime.fromtimestamp(self.prior, timezone.utc).date().isoformat()
+        result = client.get_historical_trades(day, day, page_delay_sec=0)
+        self.assertEqual(len(result), 2)
 
     def test_archived_rollup_wrong_quantity_low(self):
         row, _ = self._archived_rollup_schema()
