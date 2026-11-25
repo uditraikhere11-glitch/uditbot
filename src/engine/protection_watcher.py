@@ -3465,7 +3465,8 @@ class ProtectionWatcher:
         gate_books = GATE_BOOKS.get()
         profile_checked = False
         profile_account = None
-
+        signed_holdings_cache = (gate_books.setdefault("signed_holdings_provenance", {})
+                                 if gate_books is not None else {})
 
         def _safe_list_call(attr_name: str) -> Optional[List[Dict[str, Any]]]:
             if gate_books is not None and gate_books["share"] and attr_name in gate_books:
@@ -3707,6 +3708,94 @@ class ProtectionWatcher:
                         if db_fid and not db_fid.startswith("SUPER-"):
                             _register_owner(all_bot_forever_owners, db_fid, k_oid)
                 except Exception:
+                    pass
+
+        # Closed OCO children may disappear from the active watcher owner map
+        # after a same-day restart. Recover ONLY verified SELL child ownership
+        # from the durable, exact original BUY/closed OCO/SELL journal evidence.
+        # Never register an arbitrary same-security order by symbol or quantity.
+        if (snapshot_complete and isinstance(positions_book, list)
+                and self.journal_db is not None
+                and hasattr(self.journal_db, "get_closed_forever_sibling_evidence")):
+            contract_keys = {
+                (str(x.get("security_id") or "").strip(),
+                 str(x.get("segment") or "NSE_EQ").strip().upper(),
+                 str(x.get("product_type") or "CNC").strip().upper())
+                for x in open_recs
+                if str(x.get("product_type") or "").strip().upper() in ("CNC", "MTF")
+            }
+            account_for_closed = str(getattr(self.journal_db, "account_id", "") or "").strip()
+            for c_sec, c_seg, c_prod in contract_keys:
+                if not account_for_closed or not c_sec:
+                    continue
+                # Closed-child restoration is only needed where the broker's
+                # current signed CNC delivery position is negative.
+                if not any(
+                    isinstance(p, dict)
+                    and str(p.get("securityId") or "").strip() == c_sec
+                    and str(p.get("exchangeSegment") or "").strip().upper() == c_seg
+                    and str(p.get("productType") or "").strip().upper() == c_prod
+                    and str(p.get("netQty") or "").strip().startswith("-")
+                    for p in positions_book
+                ):
+                    continue
+                open_parents = tuple(
+                    str(x.get("order_id") or "").strip()
+                    for x in open_recs
+                    if (str(x.get("security_id") or "").strip(),
+                        str(x.get("segment") or "NSE_EQ").strip().upper(),
+                        str(x.get("product_type") or "CNC").strip().upper())
+                    == (c_sec, c_seg, c_prod)
+                )
+                try:
+                    pending_children: Dict[str, str] = {}
+                    closed = self.journal_db.get_closed_forever_sibling_evidence(
+                        account_for_closed, c_sec, c_seg, c_prod,
+                        open_parent_ids=open_parents, now=now_ts,
+                    )
+                    for (child_id, eid), proof in (closed.get("trades") or {}).items():
+                        if proof[0] != "SELL":
+                            continue
+                        persisted = self.journal_db.get_fill_by_exchange_trade_id(eid)
+                        parent_oid = str((persisted or {}).get("parent_order_id") or "").strip()
+                        parent = self.journal_db.get_position_lifecycle(parent_oid)
+                        # An existing active owner claim on a CLOSED OCO
+                        # child's SELL ID is contradictory evidence. Record
+                        # the collision for the existing per-parent gate fence;
+                        # do not silently swallow it in the readback fallback.
+                        prior_claim = all_bot_leg_owners.get(child_id)
+                        if prior_claim is not None and prior_claim != parent_oid:
+                            owner_id_collisions.setdefault(
+                                child_id, {prior_claim}
+                            ).add(parent_oid)
+                            raise ValueError("Closed OCO child owner collision")
+                        if (not parent_oid or parent_oid in open_parents
+                                or not isinstance(parent, dict)
+                                or parent.get("position_state") != "POSITION_CLOSED"
+                                or int(parent.get("confirmed_open_qty") or 0) != 0
+                                or str(parent.get("account_id") or "") != account_for_closed
+                                or str(parent.get("security_id") or "") != c_sec
+                                or str(parent.get("exchange_segment") or "").upper() != c_seg
+                                or str(parent.get("product_type") or "").upper() != c_prod
+                                or (persisted or {}).get("is_verified_trade") not in (1, True)
+                                or str((persisted or {}).get("broker_order_id") or "") != child_id
+                                or str((persisted or {}).get("transaction_type") or "").upper() != "SELL"
+                                or int((persisted or {}).get("traded_quantity") or 0) != proof[1]
+                                or abs(float((persisted or {}).get("traded_price") or 0) - proof[2]) >= 1e-6
+                                or (child_id in pending_children
+                                    and pending_children[child_id] != parent_oid)
+                                or (child_id in all_bot_leg_owners
+                                    and all_bot_leg_owners[child_id] != parent_oid)):
+                            raise ValueError("Closed OCO child has conflicting journal ownership")
+                        pending_children[child_id] = parent_oid
+                    # Register only after every candidate is verified. Never
+                    # retain a partial map from an invalid closed OCO group.
+                    for child_id, parent_oid in pending_children.items():
+                        _register_owner(all_bot_leg_owners, child_id, parent_oid)
+                except (ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+                    # Never grant an owner mapping on incomplete evidence.
+                    # Later signed-delivery verification will keep entries
+                    # blocked if this closed sibling's SELL is required.
                     pass
 
         for rec in open_recs:
@@ -4523,6 +4612,9 @@ class ProtectionWatcher:
                 except (ValueError, TypeError, KeyError, AttributeError):
                     # Never substitute generic arithmetic or a previous snapshot.
                     mixed_proof = None
+            # Preserve the previously audited *same-parent* executed-SELL
+            # verification exactly. The new read-only shared proof below
+            # handles the separate CLOSED-sibling T+0 case (sell_qty == 0).
             if (
                 quantity_evidence == "NEGATIVE_CNC_POSITION_REVIEW"
                 and prod in ("CNC", "MTF")
@@ -4659,6 +4751,37 @@ class ProtectionWatcher:
                             rec["broker_quantity_evidence"] = quantity_evidence
                 except Exception:
                     pass
+            if (
+                quantity_evidence == "NEGATIVE_CNC_POSITION_REVIEW"
+                and snapshot_complete and parent_reads_complete
+                and not journal_persistence_failed and self.journal_db is not None
+            ):
+                # netQty is per contract, not per open parent. A closed
+                # sibling's journal-verified SELL can explain the negative
+                # day figure while both owner-managed lots remain untouched.
+                try:
+                    from src.engine.signed_cnc_delivery import (
+                        verify_signed_cnc_delivery_quantity,
+                        SignedCNCDeliveryUnverified,
+                    )
+                    from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                    holdings_account = attest_signed_holdings(
+                        self.broker, holdings_book, expected_client_id, signed_holdings_cache,
+                    )
+                    broker_net_qty = verify_signed_cnc_delivery_quantity(
+                        db=self.journal_db, positions=positions_book,
+                        holdings=holdings_book, trade_book=trade_book,
+                        account=expected_client_id, security=sec_id,
+                        segment=seg, product=prod,
+                        expected_open_qty=aggregate_contract_open_qty,
+                        now=now_ts, holdings_profile_account=holdings_account,
+                    )
+                    quantity_evidence = "VERIFIED_SIGNED_CNC_DELIVERY"
+                    rec["broker_quantity_unverified"] = False
+                    rec["broker_quantity_evidence"] = quantity_evidence
+                except (SignedCNCDeliveryUnverified, ValueError, TypeError,
+                        KeyError, AttributeError, OSError, sqlite3.Error):
+                    broker_net_qty = None
             if quantity_evidence not in ("VERIFIED_POSITIONS", "VERIFIED_SETTLED_HOLDINGS", "VERIFIED_SIGNED_CNC_DELIVERY", "VERIFIED_MIXED_CNC_DELIVERY"):
                 broker_net_qty = None
                 rec["broker_quantity_unverified"] = True
@@ -4693,7 +4816,7 @@ class ProtectionWatcher:
             )
             manual_risk_quantity_unverified = (
                 manual_risk_candidate and confirmed_open_qty > 0 and (
-                    quantity_evidence not in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY")
+                    quantity_evidence not in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY", "VERIFIED_SIGNED_CNC_DELIVERY")
                     or (quantity_evidence == "VERIFIED_MIXED_CNC_DELIVERY" and (
                         mixed_proof is None or oid not in mixed_proof.settled_parent_ids))
                     or broker_net_qty != aggregate_contract_open_qty or not snapshot_complete)
@@ -4739,6 +4862,26 @@ class ProtectionWatcher:
                     gate.halt_new_entries(
                         f"Open holding {oid}: owner manual-risk ACK not independently verified"
                     )
+                changed = True
+            # A completed fresh signed-CNC proof plus the serialized full
+            # owner-history attestation can resolve a legacy false positive:
+            # a now-CLOSED sibling OCO child was previously mislabelled an
+            # external unlinked SELL on each surviving one-share parent.
+            # Never clear a flag on arithmetic alone, and never discard a
+            # durable owner conflict or any unverified current trade.
+            if (quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY"
+                    and rec.get("external_unlinked_sell_observed")
+                    and gate_books is not None
+                    and gate_books.get("verified", {}).get(oid) == (
+                        expected_client_id, sec_id, effective_parent_open_qty)
+                    and snapshot_complete and parent_reads_complete
+                    and not journal_persistence_failed
+                    and not rec.get("unverified_trade_detected")
+                    and not rec.get("uncommitted_broker_sell_trades")
+                    and self.journal_db is not None
+                    and not self.journal_db.owner_lot_review_reason(
+                        expected_client_id, oid)):
+                rec["external_unlinked_sell_observed"] = False
                 changed = True
             no_protection_conflicts = not any(rec.get(key) for key in (
                 "sl_order_id", "tp_order_id", "exit_order_id",
@@ -4825,7 +4968,7 @@ class ProtectionWatcher:
                 and broker_net_qty == aggregate_contract_open_qty
                 # Historical settled positions cannot be 'recovered' merely
                 # from fresh current-day CNC BUYs when Demat quantity is zero.
-                and quantity_evidence in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY")
+                and quantity_evidence in ("VERIFIED_SETTLED_HOLDINGS", "VERIFIED_MIXED_CNC_DELIVERY", "VERIFIED_SIGNED_CNC_DELIVERY")
                 and snapshot_complete
             )
 
