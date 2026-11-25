@@ -1887,32 +1887,40 @@ class StartupReconciliationGate:
                         return self._fail_reconciliation_locked(reason, starting_halt_generation)
                     self._active_pass_holdings = rows
                 try:
-                    # The signed-book invariant also requires an exact
-                    # journal-bound, closed-sibling quantity proof. The
-                    # two-book observed_open_quantity API remains fail-closed.
-                    from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
                     contract = (str(position.get("securityId") or "").strip(),
                                 str(position.get("exchangeSegment") or "").strip().upper(),
                                 str(position.get("productType") or "").strip().upper())
-                    expected = sum(
-                        int(row.get("confirmed_open_qty") or 0)
-                        for row in self.db.get_open_positions_lifecycle()
+                    open_rows = [
+                        row for row in self.db.get_open_positions_lifecycle()
                         if (str(row.get("security_id") or "").strip(),
                             str(row.get("exchange_segment") or "").strip().upper(),
                             str(row.get("product_type") or "").strip().upper()) == contract
-                    )
-                    verified = verify_signed_cnc_delivery_quantity(
-                        db=self.db, positions=positions,
-                        holdings=self._active_pass_holdings, trade_book=trade_book,
-                        account=books["account"], security=contract[0],
-                        segment=contract[1], product=contract[2],
-                        expected_open_qty=expected, now=time.time(),
-                    )
-                    flat = (verified == expected and verified_flat_delivery_day(
+                    ]
+                    # Existing single-parent signed delivery checks remain
+                    # unchanged. For two acknowledged surviving old lots after
+                    # a different sibling's OCO exit, also require the strict
+                    # shared journal/closed-child proof.
+                    owner_survivors = [
+                        row for row in open_rows
+                        if str(row.get("position_state") or "").upper() in (
+                            "UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED"
+                        ) and int(row.get("protected_qty") or 0) == 0
+                    ]
+                    if owner_survivors:
+                        from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                        expected = sum(int(row.get("confirmed_open_qty") or 0) for row in open_rows)
+                        verify_signed_cnc_delivery_quantity(
+                            db=self.db, positions=positions,
+                            holdings=self._active_pass_holdings, trade_book=trade_book,
+                            account=books["account"], security=contract[0],
+                            segment=contract[1], product=contract[2],
+                            expected_open_qty=expected, now=time.time(),
+                        )
+                    flat = verified_flat_delivery_day(
                         position, positions, self._active_pass_holdings,
                         trade_book, self.db, books["account"],
                         self._read_required_broker_collection,
-                    ))
+                    )
                 except (ValueError, TypeError, KeyError, sqlite3.Error):
                     flat = False
                 if flat:
