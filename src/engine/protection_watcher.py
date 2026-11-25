@@ -3465,7 +3465,8 @@ class ProtectionWatcher:
         gate_books = GATE_BOOKS.get()
         profile_checked = False
         profile_account = None
-
+        signed_holdings_cache = (gate_books.setdefault("signed_holdings_provenance", {})
+                                 if gate_books is not None else {})
 
         def _safe_list_call(attr_name: str) -> Optional[List[Dict[str, Any]]]:
             if gate_books is not None and gate_books["share"] and attr_name in gate_books:
@@ -4763,19 +4764,23 @@ class ProtectionWatcher:
                         verify_signed_cnc_delivery_quantity,
                         SignedCNCDeliveryUnverified,
                     )
+                    from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                    holdings_account = attest_signed_holdings(
+                        self.broker, holdings_book, expected_client_id, signed_holdings_cache,
+                    )
                     broker_net_qty = verify_signed_cnc_delivery_quantity(
                         db=self.journal_db, positions=positions_book,
                         holdings=holdings_book, trade_book=trade_book,
                         account=expected_client_id, security=sec_id,
                         segment=seg, product=prod,
                         expected_open_qty=aggregate_contract_open_qty,
-                        now=now_ts,
+                        now=now_ts, holdings_profile_account=holdings_account,
                     )
                     quantity_evidence = "VERIFIED_SIGNED_CNC_DELIVERY"
                     rec["broker_quantity_unverified"] = False
                     rec["broker_quantity_evidence"] = quantity_evidence
                 except (SignedCNCDeliveryUnverified, ValueError, TypeError,
-                        KeyError, AttributeError, OSError):
+                        KeyError, AttributeError, OSError, sqlite3.Error):
                     broker_net_qty = None
             if quantity_evidence not in ("VERIFIED_POSITIONS", "VERIFIED_SETTLED_HOLDINGS", "VERIFIED_SIGNED_CNC_DELIVERY", "VERIFIED_MIXED_CNC_DELIVERY"):
                 broker_net_qty = None
