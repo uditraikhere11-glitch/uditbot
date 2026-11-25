@@ -3568,6 +3568,28 @@ class ProtectionWatcher:
         ):
             return changed
 
+        # A routine pass has no startup ContextVar. Re-attest only the narrow
+        # signed CNC owner-managed scenario, using its actual current books.
+        # This does not acquire the gate lock, open entries, or waive other
+        # parent/exit checks. A failure leaves the normal fail-closed path.
+        if (gate_books is None and snapshot_complete and not self.pending
+                and self.journal_db is not None
+                and all(r.get("product_type") == "CNC" and
+                        r.get("position_state") in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
+                        and r.get("manual_risk_acknowledged") is True for r in open_recs)
+                and any(str(p.get("netQty") or "").startswith("-") for p in positions_book)):
+            try:
+                from src.engine.owner_lot_evidence import prepare_owner_lots
+                local_books = {"verified": {}, "errors": {}, "share": False}
+                prepare_owner_lots(self.broker, self.journal_db, local_books,
+                                   positions_book, trade_book, now_ts, holdings_book, forever_book)
+                if local_books.get("signed_owner_verified") and not local_books["errors"]:
+                    local_books.update(get_positions=positions_book, get_trade_book=trade_book)
+                    gate_books = local_books
+                    signed_holdings_cache = gate_books.setdefault("signed_holdings_provenance", {})
+            except Exception as exc:
+                logger.warning("[Protection] Routine signed owner proof unavailable: %s", type(exc).__name__)
+
         active_states = {"PENDING", "TRANSIT", "OPEN", "ACTIVE", "CONFIRM", "CONFIRMED"}
         terminal_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "CLOSED", "TRADED"}
         dead_leg_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
@@ -4330,6 +4352,59 @@ class ProtectionWatcher:
                 current_holdings=holdings_book, account_id=expected_client_id,
                 now=now_ts,
             )
+            # A current same-security SELL is not grounds to query an obsolete
+            # original BUY endpoint when the complete current owner-lot proof
+            # and exact closed-sibling executions are independently established.
+            signed_owner_buy_proof = False
+            if (not self.pending and snapshot_complete and prod == "CNC"
+                    and gate_books is not None and leg_order_ids == {oid}
+                    and not any(str(r.get("securityId") or "") == sec_id for r in super_book)):
+                try:
+                    from src.engine.signed_cnc_delivery import (
+                        verify_signed_cnc_delivery_quantity, closed_sibling_live_rows_match,
+                        signed_delivery_session_date,
+                    )
+                    from src.engine.signed_delivery_live_evidence import attest_signed_holdings
+                    from src.engine.settled_owner_read_policy import _UNSAFE
+                    proof = gate_books.get("signed_owner_verified", {}).get((sec_id, seg, prod))
+                    if (proof and proof[0] == expected_client_id
+                            and not gate_books.get("errors")
+                            and gate_books.get("verified", {}).get(oid) == (expected_client_id, sec_id, buy_filled)
+                            and prev_pos_state in ("UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED")
+                            and prev_sell_qty == 0
+                            and not any(rec.get(k) for k in _UNSAFE if k != "external_unlinked_sell_observed")
+                            and positions_book == gate_books.get("get_positions")
+                            and trade_book == gate_books.get("get_trade_book")
+                            and holdings_book == gate_books.get("get_holdings")
+                            and forever_book == gate_books.get("get_forever_orders")):
+                        parents = dict(proof[1])
+                        session = signed_delivery_session_date(
+                            trade_book=trade_book, account=expected_client_id, security=sec_id,
+                            segment=seg, product=prod, now=now_ts,
+                        )
+                        closed = self.journal_db.get_closed_forever_sibling_evidence(
+                            expected_client_id, sec_id, seg, prod,
+                            open_parent_ids=tuple(sorted(parents)), now=now_ts, session_date=session,
+                        )
+                        signed_owner_buy_proof = (
+                            session == proof[2] and parents.get(oid) == buy_filled
+                            and all(gate_books["verified"].get(p) == (expected_client_id, sec_id, q)
+                                    for p, q in parents.items())
+                            and closed_sibling_live_rows_match(
+                                closed=closed, trade_book=trade_book, account=expected_client_id,
+                                security=sec_id, segment=seg, product=prod,
+                            )
+                            and verify_signed_cnc_delivery_quantity(
+                                db=self.journal_db, positions=positions_book, holdings=holdings_book,
+                                trade_book=trade_book, account=expected_client_id, security=sec_id,
+                                segment=seg, product=prod, expected_open_qty=sum(parents.values()),
+                                now=now_ts, holdings_profile_account=attest_signed_holdings(
+                                    self.broker, holdings_book, expected_client_id, signed_holdings_cache),
+                            ) == sum(parents.values())
+                        )
+                except (ValueError, TypeError, KeyError, AttributeError, OSError, sqlite3.Error):
+                    signed_owner_buy_proof = False
+            omit_old_buy_read = omit_old_buy_read or signed_owner_buy_proof
             # Only the ORIGINAL prior-day BUY is exempt. Live/triggered OCO
             # legs remain subject to their normal order-specific trade reads.
             prior_protected_proof = getattr(self, "_protected_buy_history_session", {})
@@ -4947,7 +5022,8 @@ class ProtectionWatcher:
                     and not rec.get("uncommitted_broker_sell_trades")
                     and self.journal_db is not None
                     and not self.journal_db.owner_lot_review_reason(
-                        expected_client_id, oid)):
+                        expected_client_id, oid)
+                    and (rollover_verified or signed_owner_buy_proof)):
                 rec["external_unlinked_sell_observed"] = False
                 changed = True
             no_protection_conflicts = not any(rec.get(key) for key in (
@@ -5042,8 +5118,8 @@ class ProtectionWatcher:
             if not parent_reads_complete and (manual_risk_candidate or stale_manual_record):
                 all_parent_reads_ok = False
             if manual_risk_candidate and confirmed_open_qty > 0 and (
-                (stale_manual_record and not recovery_candidate)
-                or rec.get("external_unlinked_sell_observed")
+                ((stale_manual_record or rec.get("external_unlinked_sell_observed"))
+                 and not recovery_candidate)
                 or not parent_reads_complete
             ):
                 rec["position_state"] = PositionLifecycleState.RECONCILIATION_REQUIRED.value
@@ -5372,7 +5448,8 @@ class ProtectionWatcher:
                     json.dumps({"order_id": oid, "account": expected_client_id, "open_qty": effective_parent_open_qty,
                                 "previous_state": prev_pos_state, "previous_manual_exit": rec.get("manual_exit_detected"),
                                 "previous_reason": rec.get("manual_exit_evidence_reason"), "observed_at": now_ts}))
-                rec.pop("owner_evidence_error", None)
+                rec["external_unlinked_sell_observed"] = False
+                rec["owner_evidence_error"] = ""
                 rec.pop("owner_readback_failed", None)
                 rec.pop("manual_risk_ack_unverified", None)
                 rec.pop("manual_exit_evidence_reason", None)
