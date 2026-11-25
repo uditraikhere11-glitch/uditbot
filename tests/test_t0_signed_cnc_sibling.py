@@ -450,6 +450,131 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
                              "UNPROTECTED_MANUAL_RISK")
         self.assert_retained()
 
+    def _settled_rollover_schema(self, *, triggered=True):
+        """Simulate deployment after settlement with original stale flags."""
+        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
+        old_sell_at = self.now - 86400
+        old_sell_time = datetime.fromtimestamp(
+            old_sell_at, __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        for trade in self.history:
+            if trade["exchangeTradeId"] == self.SELL_TRADE:
+                trade["exchangeTime"] = old_sell_time
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE fills SET traded_at=? WHERE exchange_trade_id=?",
+                         (old_sell_at, self.SELL_TRADE))
+        self.broker.get_positions.return_value = []
+        self.broker.get_trade_book.return_value = []
+        self.broker.get_holdings.return_value[0].update(
+            totalQty=2, dpQty=2, t1Qty=0, availableQty=2,
+        )
+        child = dict(self.broker.get_order_book.return_value[0])
+        self.broker.get_order_book.return_value = []
+        self.broker.order_status = Mock(side_effect=lambda oid: (
+            dict(child) if oid == self.TARGET_CHILD else None
+        ))
+        if not triggered:
+            self.forever[:] = []
+        for oid in (self.FIRST, self.SECOND):
+            self.watcher.terminal_orders[oid].update(
+                external_unlinked_sell_observed=True,
+                unreadable_broker_response=True,
+                reconciliation_required=True,
+                position_state="RECONCILIATION_REQUIRED",
+            )
+        self.assertTrue(self.watcher._save())
+
+    def _assert_rollover_recovered(self):
+        self.test_real_startup_restart_open_only_after_independent_validation()
+        reopened = JournalDB(str(self.root / "isolated-test-journal.db"),
+                             account_id=self.ACCOUNT)
+        _, terminal = reopened.load_watcher_state()
+        for oid in (self.FIRST, self.SECOND):
+            self.assertFalse(terminal[oid].get("external_unlinked_sell_observed"))
+            self.assertFalse(terminal[oid].get("reconciliation_required"))
+            self.assertEqual(terminal[oid]["position_state"], "UNPROTECTED_MANUAL_RISK")
+            self.assertEqual(reopened.get_position_lifecycle(oid)["position_state"],
+                             "UNPROTECTED_MANUAL_RISK")
+        self.assert_retained()
+
+    def test_rollover_persistent_triggered_child_readback_and_restart(self):
+        self._settled_rollover_schema()
+        self._assert_rollover_recovered()
+        self.broker.order_status.assert_any_call(self.TARGET_CHILD)
+
+    def test_rollover_retired_group_and_restart(self):
+        self._settled_rollover_schema(triggered=False)
+        self._assert_rollover_recovered()
+
+    def test_rollover_missing_child_status_remains_blocked(self):
+        self._settled_rollover_schema()
+        self.broker.order_status.side_effect = None
+        self.broker.order_status.return_value = None
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assertTrue(self.watcher.terminal_orders[self.FIRST]["external_unlinked_sell_observed"])
+        self.assert_retained()
+
+    def test_rollover_pending_sibling_remains_blocked(self):
+        self._settled_rollover_schema()
+        self.forever.append(dict(self.forever[0], legName="STOP_LOSS_LEG", orderStatus="PENDING"))
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_rollover_fresh_unknown_sell_remains_blocked(self):
+        self._settled_rollover_schema(triggered=False)
+        unknown = dict(self.sell, orderId="UNKNOWN-SELL", exchangeTradeId="UNKNOWN-EXEC",
+                       tradedQuantity=1)
+        self.broker.get_trade_book.return_value = [unknown]
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assertTrue(self.watcher.terminal_orders[self.FIRST]["external_unlinked_sell_observed"])
+        self.assert_retained()
+
+    def test_rollover_history_missing_closed_sell_remains_blocked(self):
+        self._settled_rollover_schema(triggered=False)
+        self.history[:] = [t for t in self.history if t["exchangeTradeId"] != self.SELL_TRADE]
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_rollover_unverified_holding_account_remains_blocked(self):
+        self._settled_rollover_schema(triggered=False)
+        self.broker.get_account_bound_holdings.side_effect = None
+        self.broker.get_account_bound_holdings.return_value = ("OTHER", self.broker.get_holdings.return_value)
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_signed_position_rejects_offsetting_omitted_executions(self):
+        self.broker.get_positions.return_value[0].update(dayBuyQty=5, daySellQty=33)
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        self.assert_retained()
+
+    def test_signed_position_rejects_partial_day_totals(self):
+        row = self.broker.get_positions.return_value[0]
+        row.pop("daySellQty")
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        row.pop("dayBuyQty")
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        self.assert_retained()
+
+    def test_signed_position_rejects_malformed_other_contract(self):
+        original = dict(self.broker.get_positions.return_value[0])
+        for value in (None, False, 0.0, "", "bad"):
+            with self.subTest(netQty=value):
+                self.broker.get_positions.return_value = [
+                    dict(original), dict(original, productType="MTF", netQty=value)
+                ]
+                with self.assertRaises(SignedCNCDeliveryUnverified):
+                    self.proof()
+        self.assert_retained()
+
+    def test_signed_position_rejects_null_carry_forward(self):
+        self.broker.get_positions.return_value[0]["carryForwardSellQty"] = None
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()
+        self.assert_retained()
+
     def test_live_shape_full_startup_and_restart(self):
         self._live_schema()
         self.test_real_startup_restart_open_only_after_independent_validation()
