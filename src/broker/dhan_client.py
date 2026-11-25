@@ -3813,7 +3813,7 @@ class DhanClient:
         if isinstance(raw_etid, bool):
             return False, None, "Historical trade record has boolean exchangeTradeId"
         etid = str(raw_etid or "").strip()
-        missing_exchange_trade_id = not etid or etid in ("0", "None", "null")
+        missing_exchange_trade_id = etid.upper() in ("", "0", "NONE", "NULL")
         if not missing_exchange_trade_id and any(
             marker in etid for marker in ("-TRD-", "-FILL-", "-RECON-")
         ):
@@ -3827,7 +3827,7 @@ class DhanClient:
         exchange_order_id = str(item.get("exchangeOrderId") or "").strip()
         exchange_time = str(item.get("exchangeTime") or "").strip()
         if missing_exchange_trade_id:
-            if exchange_order_id in ("", "0", "None", "null"):
+            if exchange_order_id.upper() in ("", "0", "NONE", "NULL"):
                 return False, None, "Historical trade missing usable exchangeOrderId for zero-ID fallback"
             try:
                 exchange_dt = datetime.fromisoformat(
