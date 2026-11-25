@@ -24,7 +24,8 @@ class DematReview(ValueError):
 
 def verify_owner_history(broker, db, account, security, segment, product, parents,
                          holding, day_trades, now, evidence, *, current_day_live_keys=(),
-                         verified_closed_sibling_trades=None, authorized_closed_sell_ids=()):
+                         verified_closed_sibling_trades=None, authorized_closed_sell_ids=(),
+                         verified_closed_sibling_rollups=None):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -59,11 +60,22 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     evidence.update(from_date=first.isoformat(), to_date=last.isoformat(), windows=[], executions=[])
     seen = set()
     allowed_closed = verified_closed_sibling_trades or {}
+    from src.engine.signed_delivery_live_evidence import ArchivedClosedBuyMatcher
+    archived_buys = ArchivedClosedBuyMatcher(
+        {key: value for key, value in allowed_closed.items() if value[0] == "BUY"},
+        verified_closed_sibling_rollups,
+    )
     seen_closed_history = set()
     seen_closed_today = set()
 
     def inspect(rows, historical):
         for row in rows:
+            # A known closed BUY with a wrong contract must not disappear
+            # through the unrelated-security filter.
+            matched_rollup = archived_buys.match(
+                row, historical=historical, today=last, account=account,
+                security=security, segment=segment, product=product,
+            )
             sid = str(row.get("securityId") or "")
             row_isin = str(row.get("isin") or "").strip().upper()
             if not sid or not row.get("exchangeSegment"):
@@ -87,6 +99,13 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                 allow_missing_exchange_trade_id=historical)
             if not valid or normalized is None:
                 raise ValueError("Execution identity or quantity incomplete")
+            if matched_rollup is not None:
+                if row_isin and row_isin != isin:
+                    raise ValueError("Archived BUY rollup ISIN differs")
+                if seen_closed_history.intersection(matched_rollup):
+                    raise ValueError("Overlapping closed sibling historical execution")
+                seen_closed_history.update(matched_rollup)
+                continue
             if key in allowed_closed:
                 expected_side, expected_qty, expected_price, expected_at = allowed_closed[key]
                 if (side != expected_side
@@ -95,6 +114,8 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                         or int(row["tradedQuantity"]) != expected_qty
                         or abs(float(row["tradedPrice"]) - expected_price) > 1e-6):
                     raise ExecutionConflict("Closed sibling execution differs from journal allocation")
+                if side == "BUY":
+                    archived_buys.note_exact(key)
                 if historical:
                     if key in seen_closed_history:
                         raise ValueError("Duplicate closed sibling historical execution")
@@ -335,7 +356,8 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                  current_day_live_keys=(split_proof.intraday_trade_keys
                                                         if split_proof is not None else ()),
                                  verified_closed_sibling_trades=closed["trades"],
-                                 authorized_closed_sell_ids=closed["sell_ids"])
+                                 authorized_closed_sell_ids=closed["sell_ids"],
+                                 verified_closed_sibling_rollups=closed.get("order_rollups"))
             if rollover:
                 from src.engine.unified_exit_reconciliation import _exchange_time
                 from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group

@@ -199,9 +199,10 @@ from src.engine.unified_exit_reconciliation import ReconciliationEvidenceError
 
 
 class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
-    TARGET_CHILD = "SYNTHETIC-TARGET-CHILD-28"
+    GROUP = "23132611231775"
+    TARGET_CHILD = "22126112566908"
     STOP_CHILD = "SYNTHETIC-STOP-CHILD-28"
-    SELL_TRADE = "SYNTHETIC-EXIT-TRADE-28"
+    SELL_TRADE = "600252830"
 
     def setUp(self):
         super().setUp()
@@ -383,6 +384,210 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             is_verified_trade=True,
         ))
         self.history.append(extra)
+
+    def _archived_rollup_schema(self, *, missing_id=""):
+        """Production execution identity/quantity/price, with relative dates and fake account."""
+        for parent, price in ((self.FIRST, 15.52), (self.SECOND, 15.51), (self.THIRD, 17.72)):
+            trade = next(r for r in self.history if r["orderId"] == parent)
+            trade["tradedPrice"] = price
+            if parent == self.THIRD:
+                trade["exchangeOrderId"] = "1300000097782851"
+            with self.db._get_conn() as conn:
+                conn.execute("UPDATE fills SET traded_price=? WHERE broker_order_id=? AND transaction_type='BUY'",
+                             (price, parent))
+                conn.execute("UPDATE positions_lifecycle SET buy_vwap=? WHERE parent_order_id=?",
+                             (price, parent))
+            self.watcher.terminal_orders[parent]["buy_vwap"] = price
+        self._live_schema_with_legacy_attested_buys_and_split_closed_buy()
+        split = [r for r in self.history if r["orderId"] == self.THIRD]
+        self.assertEqual([r["tradedQuantity"] for r in split], [16, 12])
+        for row, eid in zip(split, ("609978137", "609978138")):
+            with self.db._get_conn() as conn:
+                conn.execute("UPDATE fills SET exchange_trade_id=? WHERE exchange_trade_id=?",
+                             (eid, row["exchangeTradeId"]))
+            row["exchangeTradeId"] = eid
+        self.split_closed_buys = [dict(r) for r in split]
+        self.archived_buy = dict(split[0], exchangeTradeId=missing_id, tradedQuantity=28)
+        # The historical endpoint in production omitted today's SELL; the
+        # authenticated live tradebook supplies the exact immutable SELL instead.
+        self.history[:] = [r for r in self.history if r["orderId"] in (self.FIRST, self.SECOND)]
+        self.history.append(self.archived_buy)
+        for oid in (self.FIRST, self.SECOND):
+            self.watcher.terminal_orders[oid].update(
+                external_unlinked_sell_observed=True, unreadable_broker_response=True,
+                reconciliation_required=True, position_state="RECONCILIATION_REQUIRED",
+            )
+        self.assertTrue(self.watcher._save())
+
+    def _assert_rollup_blocked(self):
+        # Both independent entry points must refuse the bad evidence.
+        batch = self._full_watcher_pass()
+        self.assertFalse(batch["verified"], batch)
+        self.assertTrue(self.watcher.terminal_orders[self.FIRST]["external_unlinked_sell_observed"])
+        gate = StartupReconciliationGate(
+            self.broker, self.db, self.watcher, NS(is_stopped=lambda: False),
+        )
+        self.broker.reconciliation_gate = gate
+        ok, reason = gate.run_startup_reconciliation()
+        self.assertFalse(ok, reason)
+        self.assertFalse(gate.is_accepting_entries)
+        self.assert_retained()
+
+    def _assert_original_split_unchanged(self):
+        with self.db._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT exchange_trade_id, traded_quantity, traded_price FROM fills "
+                "WHERE parent_order_id=? AND transaction_type='BUY' ORDER BY exchange_trade_id",
+                (self.THIRD,),
+            ).fetchall()
+        self.assertEqual([tuple(r) for r in rows], [
+            ("609978137", 16, 17.72), ("609978138", 12, 17.72),
+        ])
+
+    def test_archived_rollup_exact_production_replay_and_restart(self):
+        self._archived_rollup_schema()
+        self.test_real_startup_restart_open_only_after_independent_validation()
+        reopened = JournalDB(str(self.root / "isolated-test-journal.db"), account_id=self.ACCOUNT)
+        _, terminal = reopened.load_watcher_state()
+        for oid in (self.FIRST, self.SECOND):
+            self.assertEqual(terminal[oid]["position_state"], "UNPROTECTED_MANUAL_RISK")
+            for flag in ("external_unlinked_sell_observed", "reconciliation_required",
+                         "broker_quantity_unverified"):
+                self.assertIs(terminal[oid].get(flag), False, terminal[oid])
+            self.assertEqual(reopened.get_position_lifecycle(oid)["position_state"],
+                             "UNPROTECTED_MANUAL_RISK")
+        self._assert_original_split_unchanged()
+        self.assert_retained()
+
+    def test_archived_rollup_wrong_quantity_blocks(self):
+        self._archived_rollup_schema()
+        for qty in (27, 29):
+            with self.subTest(qty=qty):
+                self.archived_buy["tradedQuantity"] = qty
+                self._assert_rollup_blocked()
+
+    def test_archived_rollup_wrong_price_blocks(self):
+        self._archived_rollup_schema()
+        self.archived_buy["tradedPrice"] = 17.75
+        self._assert_rollup_blocked()
+
+    def test_archived_rollup_duplicate_blocks(self):
+        self._archived_rollup_schema()
+        self.history.append(dict(self.archived_buy))
+        self._assert_rollup_blocked()
+
+    def test_archived_rollup_individual_overlap_blocks_both_orders(self):
+        self._archived_rollup_schema()
+        retained_history = [r for r in self.history if r["orderId"] != self.THIRD]
+        for rows in ([self.archived_buy, self.split_closed_buys[0]],
+                     [self.split_closed_buys[0], self.archived_buy]):
+            with self.subTest(first=rows[0]["exchangeTradeId"]):
+                self.history[:] = retained_history + rows
+                self._assert_rollup_blocked()
+
+    def test_archived_rollup_unknown_order_blocks(self):
+        self._archived_rollup_schema()
+        self.archived_buy["orderId"] = "UNRELATED-BUY"
+        self._assert_rollup_blocked()
+
+    def test_archived_rollup_wrong_contract_blocks(self):
+        self._archived_rollup_schema()
+        for key, value in (("exchangeSegment", "BSE_EQ"), ("productType", "INTRADAY"),
+                           ("dhanClientId", "OTHER"), ("securityId", "OTHER")):
+            with self.subTest(key=key):
+                before = self.archived_buy[key]
+                self.archived_buy[key] = value
+                self._assert_rollup_blocked()
+                self.archived_buy[key] = before
+
+    def test_archived_rollup_missing_exchange_order_blocks(self):
+        self._archived_rollup_schema()
+        self.archived_buy["exchangeOrderId"] = ""
+        self._assert_rollup_blocked()
+
+    def test_archived_rollup_wrong_or_current_date_blocks(self):
+        self._archived_rollup_schema()
+        for at in (self.prior - 86400, self.now):
+            with self.subTest(at=at):
+                self.archived_buy["exchangeTime"] = datetime.fromtimestamp(
+                    at, __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
+                ).isoformat()
+                self._assert_rollup_blocked()
+
+    def test_archived_rollup_never_accepts_blank_live_sell_id(self):
+        self._archived_rollup_schema()
+        self.broker.get_trade_book.return_value[0]["exchangeTradeId"] = ""
+        self._assert_rollup_blocked()
+
+    def test_archived_rollup_never_accepts_live_buy_rollup(self):
+        self._archived_rollup_schema()
+        self.broker.get_trade_book.return_value.append(dict(self.archived_buy))
+        self._assert_rollup_blocked()
+
+    def test_archived_rollup_missing_id_sentinels(self):
+        self._archived_rollup_schema()
+        from src.engine.signed_delivery_live_evidence import ArchivedClosedBuyMatcher
+        from zoneinfo import ZoneInfo
+        closed = self.db.get_closed_forever_sibling_evidence(
+            self.ACCOUNT, self.SECURITY, "NSE_EQ", "CNC",
+            open_parent_ids=(self.FIRST, self.SECOND), now=self.now,
+        )
+        expected = {(self.THIRD, "609978137"), (self.THIRD, "609978138")}
+        buys = {k: v for k, v in closed["trades"].items() if v[0] == "BUY"}
+        for sentinel in ("", None, "0", "NONE", "NULL"):
+            with self.subTest(sentinel=sentinel):
+                matcher = ArchivedClosedBuyMatcher(buys, closed["order_rollups"])
+                self.assertEqual(matcher.match(
+                    dict(self.archived_buy, exchangeTradeId=sentinel), historical=True,
+                    today=datetime.fromtimestamp(self.now, ZoneInfo("Asia/Kolkata")).date(),
+                    account=self.ACCOUNT, security=self.SECURITY, segment="NSE_EQ", product="CNC",
+                ), expected)
+
+    def test_archived_rollup_rejects_placeholder_journal_execution_ids(self):
+        self._archived_rollup_schema()
+        from src.engine.signed_delivery_live_evidence import ArchivedClosedBuyMatcher
+        from zoneinfo import ZoneInfo
+        closed = self.db.get_closed_forever_sibling_evidence(
+            self.ACCOUNT, self.SECURITY, "NSE_EQ", "CNC",
+            open_parent_ids=(self.FIRST, self.SECOND), now=self.now,
+        )
+        buys = {k: v for k, v in closed["trades"].items() if v[0] == "BUY"}
+        original_key = (self.THIRD, "609978137")
+        for placeholder in ("NONE", "NULL", "0", "LOCAL-FILL-1", "LOCAL-RECON-1", "LOCAL-TRD-1"):
+            with self.subTest(placeholder=placeholder):
+                invalid = dict(buys)
+                invalid[(self.THIRD, placeholder)] = invalid.pop(original_key)
+                matcher = ArchivedClosedBuyMatcher(invalid, closed["order_rollups"])
+                with self.assertRaises(ValueError):
+                    matcher.match(
+                        self.archived_buy, historical=True,
+                        today=datetime.fromtimestamp(self.now, ZoneInfo("Asia/Kolkata")).date(),
+                        account=self.ACCOUNT, security=self.SECURITY,
+                        segment="NSE_EQ", product="CNC",
+                    )
+
+    def test_archived_rollup_next_day_restart_with_exact_archived_sell(self):
+        self._archived_rollup_schema()
+        at = self.now - 86400
+        old_sell = dict(self.sell, exchangeTime=datetime.fromtimestamp(
+            at, __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
+        ).isoformat())
+        self.history.append(old_sell)
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE fills SET traded_at=? WHERE exchange_trade_id=?",
+                         (at, self.SELL_TRADE))
+        self.broker.get_positions.return_value = []
+        self.broker.get_trade_book.return_value = []
+        self.broker.get_holdings.return_value[0].update(
+            totalQty=2, dpQty=2, t1Qty=0, availableQty=2,
+        )
+        child = dict(self.broker.get_order_book.return_value[0])
+        self.broker.get_order_book.return_value = []
+        self.broker.order_status = Mock(side_effect=lambda oid: (
+            dict(child) if oid == self.TARGET_CHILD else None
+        ))
+        self._assert_rollover_recovered()
+        self._assert_original_split_unchanged()
 
     def test_live_shape_with_legacy_attested_buys_and_split_closed_buy(self):
         self._live_schema_with_legacy_attested_buys_and_split_closed_buy()

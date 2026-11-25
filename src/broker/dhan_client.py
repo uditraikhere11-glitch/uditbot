@@ -3813,7 +3813,7 @@ class DhanClient:
         if isinstance(raw_etid, bool):
             return False, None, "Historical trade record has boolean exchangeTradeId"
         etid = str(raw_etid or "").strip()
-        missing_exchange_trade_id = not etid or etid in ("0", "None", "null")
+        missing_exchange_trade_id = not etid or etid.upper() in ("0", "NONE", "NULL")
         if not missing_exchange_trade_id and any(
             marker in etid for marker in ("-TRD-", "-FILL-", "-RECON-")
         ):
