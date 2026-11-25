@@ -129,8 +129,9 @@ def _verified_card(cfg, broker, db, gate, token, now):
         reconciliation_ok=gate.is_accepting_entries is True,
         unresolved_intents_count=len(intents), unprotected_positions_count=len(unprotected),
         canonical=True)
-    if ("Next trading session readiness: ✅ VERIFIED CHECKS" not in report
-            or "Overall result: ✅ SUCCESS" not in report):
+    lines = report.splitlines()
+    if ("🚦 Next trading session readiness: ✅ VERIFIED CHECKS" not in lines
+            or "📊 <b>Overall result: ✅ SUCCESS</b>" not in lines):
         return None
     return (report.replace("🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
                            "✅ <b>AUDITBOT — DHAN TOKEN RECOVERY VERIFIED</b>", 1)
