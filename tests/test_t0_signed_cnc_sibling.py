@@ -314,6 +314,177 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         )
         self._assert_no_mutation()
 
+    def _live_schema(self):
+        """Production shape with synthetic identifiers and no live API access."""
+        self.broker.get_holdings.return_value = [dict(
+            exchange="ALL", tradingSymbol="YESBANK", securityId=self.SECURITY,
+            isin="SYNTHETIC-YESBANK-ISIN", totalQty=30, dpQty=0, t1Qty=2,
+            availableQty=2, mtf_qty=0, mtf_t1_qty=0, collateralQty=0,
+        )]
+        self.broker.get_account_bound_holdings = Mock(side_effect=lambda: (
+            self.ACCOUNT, [dict(r) for r in self.broker.get_holdings.return_value],
+        ))
+        self.broker.get_positions.return_value[0].update(
+            positionType="SHORT", buyQty=0, sellQty=28,
+        )
+        self.forever[:] = [dict(
+            orderId=self.GROUP, orderStatus="TRIGGERED", orderType="OCO",
+            legName="TARGET_LEG", securityId=self.SECURITY, dhanClientId=self.ACCOUNT,
+            exchangeSegment="NSE_EQ", productType="CNC", transactionType="SELL",
+            quantity=28, price=17.9, triggerPrice=0.0,
+        )]
+        self.broker.get_order_book.return_value[0].update(legName="NA", orderType="LIMIT")
+        self.broker.get_trade_book.return_value[0].pop("isin", None)
+        rec = self.watcher.terminal_orders[self.THIRD]
+        rec.pop("tp_order_id", None)
+        rec.pop("sl_order_id", None)
+        rec.update(triggered_leg="TARGET_LEG", protected_qty=28,
+                   verified_leg_order_ids=[self.TARGET_CHILD],
+                   verified_leg_map={self.GROUP: "TARGET_LEG", self.TARGET_CHILD: "TARGET_LEG"})
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE positions_lifecycle SET triggered_leg=?, protected_qty=28 WHERE parent_order_id=?",
+                         ("TARGET_LEG", self.THIRD))
+        self.assertTrue(self.watcher._save())
+
+    def test_live_shape_with_legacy_attested_buys_and_split_closed_buy(self):
+        self._live_schema()
+        import hashlib
+        # The actual retained BUYs have no exchange execution IDs; their
+        # independent original broker attestations must survive recovery.
+        for parent in (self.FIRST, self.SECOND):
+            trade = next(r for r in self.history if r["orderId"] == parent)
+            trade["exchangeTradeId"] = None
+            evidence = {k: trade[k] for k in (
+                "dhanClientId", "orderId", "exchangeOrderId", "exchangeTradeId",
+                "securityId", "exchangeSegment", "productType", "transactionType",
+                "isin", "exchangeTime", "tradedQuantity", "tradedPrice",
+            )}
+            evidence["source"] = "BROKER_HISTORICAL_NO_EXECUTION_ID"
+            canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+            with self.db._get_conn() as conn:
+                conn.execute("UPDATE fills SET exchange_trade_id=NULL, evidence_source=? WHERE broker_order_id=?",
+                             (evidence["source"], parent))
+                conn.execute("INSERT INTO broker_attested_historical_fills "
+                             "(account_id, broker_order_id, correlation_id, exchange_order_id, "
+                             "evidence_fingerprint, evidence_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                             (self.ACCOUNT, parent, parent, trade["exchangeOrderId"],
+                              hashlib.sha256(canonical.encode()).hexdigest(), canonical, self.prior))
+        third = next(r for r in self.history if r["orderId"] == self.THIRD)
+        third["tradedQuantity"] = 16
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE fills SET traded_quantity=16 WHERE exchange_trade_id=?",
+                         (third["exchangeTradeId"],))
+        extra = dict(third, exchangeTradeId="SYNTHETIC-SPLIT-12", tradedQuantity=12)
+        self.assertTrue(self.db.record_fill(
+            broker_order_id=self.THIRD, exchange_trade_id=extra["exchangeTradeId"],
+            symbol="YESBANK-EQ", traded_price=extra["tradedPrice"], traded_quantity=12,
+            traded_at=self.prior, transaction_type="BUY", security_id=self.SECURITY,
+            exchange_segment="NSE_EQ", product_type="CNC", parent_order_id=self.THIRD,
+            is_verified_trade=True,
+        ))
+        self.history.append(extra)
+        batch = self._full_watcher_pass()
+        self.assertEqual(set(batch["verified"]), {self.FIRST, self.SECOND}, batch)
+        self.assert_retained()
+        for parent in (self.FIRST, self.SECOND):
+            with self.db._get_conn() as conn:
+                self.assertIsNone(conn.execute("SELECT exchange_trade_id FROM fills WHERE broker_order_id=?",
+                                               (parent,)).fetchone()[0])
+
+    def test_pinned_broker_method_uses_one_credential_snapshot(self):
+        from src.broker.dhan_client import DhanClient, TradingMode
+        client = object.__new__(DhanClient)
+        client.cfg = NS(dhan_client_id=self.ACCOUNT, trading_mode=TradingMode.LIVE)
+        headers = {"client-id": self.ACCOUNT, "access-token": "synthetic-no-live-token"}
+        client._headers = Mock(return_value=headers)
+        profile = NS(status_code=200, json=lambda: {"dhanClientId": self.ACCOUNT})
+        holdings = NS(status_code=200, json=lambda: [{"securityId": self.SECURITY}])
+        client._governed_get = Mock(side_effect=[profile, holdings])
+        self.assertEqual(client.get_account_bound_holdings(), (self.ACCOUNT, [{"securityId": self.SECURITY}]))
+        client._headers.assert_called_once()
+        calls = client._governed_get.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0].args[0].endswith("/profile"))
+        self.assertTrue(calls[1].args[0].endswith("/holdings"))
+        self.assertIs(calls[0].kwargs["headers"], calls[1].kwargs["headers"])
+        self.assertEqual(calls[0].kwargs["headers"], headers)
+        client._governed_get.reset_mock()
+        client._governed_get.side_effect = [NS(status_code=200, json=lambda: {"dhanClientId": "OTHER"})]
+        self.assertEqual(client.get_account_bound_holdings(), (None, None))
+        client._governed_get.assert_called_once()
+
+    def test_live_shape_requires_pinned_account_and_recovers_watcher(self):
+        self._live_schema()
+        with self.assertRaises(SignedCNCDeliveryUnverified):
+            self.proof()  # Missing row account is never accepted from raw data alone.
+        batch = self._full_watcher_pass()
+        self.assertEqual(set(batch["verified"]), {self.FIRST, self.SECOND}, batch)
+        self.broker.get_account_bound_holdings.assert_called_once()
+        for oid in (self.FIRST, self.SECOND):
+            self.assertEqual(self.watcher.terminal_orders[oid]["position_state"], "UNPROTECTED_MANUAL_RISK")
+        self.broker.reconciliation_gate.halt_new_entries.assert_not_called()
+        self.assert_retained()
+
+    def test_live_shape_full_startup_and_restart(self):
+        self._live_schema()
+        self.test_real_startup_restart_open_only_after_independent_validation()
+
+    def test_live_shape_owner_stop_blocks(self):
+        self._live_schema()
+        self.test_unchanged_owner_stop_fences_healthy_signed_delivery()
+
+    def test_live_shape_wrong_pinned_profile_blocks(self):
+        self._live_schema()
+        self.broker.get_account_bound_holdings.side_effect = None
+        self.broker.get_account_bound_holdings.return_value = ("OTHER", self.broker.get_holdings.return_value)
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_changed_pinned_holdings_blocks(self):
+        self._live_schema()
+        self.broker.get_account_bound_holdings.side_effect = None
+        changed = [dict(self.broker.get_holdings.return_value[0], totalQty=31)]
+        self.broker.get_account_bound_holdings.return_value = (self.ACCOUNT, changed)
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_explicit_holdings_account_mismatch_blocks(self):
+        self._live_schema()
+        self.broker.get_holdings.return_value[0]["dhanClientId"] = "OTHER"
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_triggered_with_pending_sibling_blocks(self):
+        self._live_schema()
+        self.forever.append(dict(self.forever[0], legName="STOP_LOSS_LEG", orderStatus="PENDING"))
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_triggered_with_wrong_child_algo_blocks(self):
+        self._live_schema()
+        self.broker.get_order_book.return_value[0]["algoId"] = "OTHER-GROUP"
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_triggered_with_unfilled_child_blocks(self):
+        self._live_schema()
+        self.broker.get_order_book.return_value[0]["remainingQuantity"] = 1
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_triggered_with_conflicting_leg_map_blocks(self):
+        self._live_schema()
+        self.watcher.terminal_orders[self.THIRD]["verified_leg_map"][self.TARGET_CHILD] = "STOP_LOSS_LEG"
+        self.assertTrue(self.watcher._save())
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
+    def test_live_shape_triggered_with_unknown_group_blocks(self):
+        self._live_schema()
+        self.forever[0]["orderId"] = "UNBOUND-GROUP"
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
     def test_signed_delivery_proof_and_generic_two_book_fail_closed(self):
         observed, status = observed_open_quantity(
             self.broker.get_positions(), self.broker.get_holdings(),
