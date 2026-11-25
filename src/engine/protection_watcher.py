@@ -3709,6 +3709,63 @@ class ProtectionWatcher:
                 except Exception:
                     pass
 
+        # Closed OCO children may disappear from the active watcher owner map
+        # after a same-day restart. Recover ONLY verified SELL child ownership
+        # from the durable, exact original BUY/closed OCO/SELL journal evidence.
+        # Never register an arbitrary same-security order by symbol or quantity.
+        if (snapshot_complete and self.journal_db is not None
+                and hasattr(self.journal_db, "get_closed_forever_sibling_evidence")):
+            contract_keys = {
+                (str(x.get("security_id") or "").strip(),
+                 str(x.get("segment") or "NSE_EQ").strip().upper(),
+                 str(x.get("product_type") or "CNC").strip().upper())
+                for x in open_recs
+                if str(x.get("product_type") or "").strip().upper() in ("CNC", "MTF")
+            }
+            account_for_closed = str(getattr(self.journal_db, "account_id", "") or "").strip()
+            for c_sec, c_seg, c_prod in contract_keys:
+                if not account_for_closed or not c_sec:
+                    continue
+                open_parents = tuple(
+                    str(x.get("order_id") or "").strip()
+                    for x in open_recs
+                    if (str(x.get("security_id") or "").strip(),
+                        str(x.get("segment") or "NSE_EQ").strip().upper(),
+                        str(x.get("product_type") or "CNC").strip().upper())
+                    == (c_sec, c_seg, c_prod)
+                )
+                try:
+                    closed = self.journal_db.get_closed_forever_sibling_evidence(
+                        account_for_closed, c_sec, c_seg, c_prod,
+                        open_parent_ids=open_parents, now=now_ts,
+                    )
+                    for (child_id, eid), proof in (closed.get("trades") or {}).items():
+                        if proof[0] != "SELL":
+                            continue
+                        persisted = self.journal_db.get_fill_by_exchange_trade_id(eid)
+                        parent_oid = str((persisted or {}).get("parent_order_id") or "").strip()
+                        parent = self.journal_db.get_position_lifecycle(parent_oid)
+                        if (not parent_oid or parent_oid in open_parents
+                                or not isinstance(parent, dict)
+                                or parent.get("position_state") != "POSITION_CLOSED"
+                                or int(parent.get("confirmed_open_qty") or 0) != 0
+                                or str(parent.get("account_id") or "") != account_for_closed
+                                or str(parent.get("security_id") or "") != c_sec
+                                or str(parent.get("exchange_segment") or "").upper() != c_seg
+                                or str(parent.get("product_type") or "").upper() != c_prod
+                                or (persisted or {}).get("is_verified_trade") not in (1, True)
+                                or str((persisted or {}).get("broker_order_id") or "") != child_id
+                                or str((persisted or {}).get("transaction_type") or "").upper() != "SELL"
+                                or int((persisted or {}).get("traded_quantity") or 0) != proof[1]
+                                or abs(float((persisted or {}).get("traded_price") or 0) - proof[2]) >= 1e-6
+                                or not _register_owner(all_bot_leg_owners, child_id, parent_oid)):
+                            raise ValueError("Closed OCO child has conflicting journal ownership")
+                except (ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+                    # Never grant an owner mapping on incomplete evidence.
+                    # Later signed-delivery verification will keep entries
+                    # blocked if this closed sibling's SELL is required.
+                    pass
+
         for rec in open_recs:
             oid = str(rec.get("order_id") or "").strip()
             sec_id = str(rec.get("security_id") or "").strip()
