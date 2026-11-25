@@ -231,3 +231,80 @@ def closed_triggered_binding(snapshot, lifecycle, group_rows, sell_quantities):
         except ValueError:
             return None
     return {"leg": leg, "quantity": lifecycle["sell_filled_qty"], "children": dict(sell_quantities)}
+
+
+class ArchivedClosedBuyMatcher:
+    """Pass-local historical corroboration; never generates or allocates fills.
+
+    Only a closed parent's archived BUY can use an aggregate. SELL identity
+    remains exact. A rollup and individual executions must never overlap.
+    """
+
+    def __init__(self, trades, rollups):
+        self.trades = trades or {}
+        self.rollups = rollups or {}
+        self.buy_orders = {oid for oid, _ in self.trades}
+        self.individual = set()
+        self.aggregated = set()
+
+    @staticmethod
+    def missing_id(row):
+        raw = row.get("exchangeTradeId")
+        return not isinstance(raw, bool) and str(raw if raw is not None else "").strip().upper() in (
+            "", "0", "NONE", "NULL",
+        )
+
+    def note_exact(self, key):
+        oid = key[0]
+        if oid in self.aggregated:
+            raise ValueError("Historical BUY overlaps an archived rollup")
+        self.individual.add(oid)
+
+    def match(self, row, *, historical, today, account, security, segment, product):
+        """Return the original keys corroborated by one prior-day BUY row."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from src.broker.dhan_client import DhanClient
+        from src.engine.unified_exit_reconciliation import _exchange_time
+        from src.engine.holding_quantity import _quantity
+
+        oid = _text(row, "orderId")
+        if oid not in self.buy_orders:
+            return None
+        if (_text(row, "transactionType") != "BUY"
+                or _text(row, "dhanClientId") != account
+                or _text(row, "securityId") != security
+                or _text(row, "exchangeSegment") != segment
+                or _text(row, "productType") != product):
+            raise ValueError("Closed sibling historical BUY identity differs")
+        if not self.missing_id(row):
+            return None
+        if not historical:
+            raise ValueError("Archived rollup forbidden for current tradebook")
+        if oid in self.individual or oid in self.aggregated:
+            raise ValueError("Duplicate or overlapping archived BUY rollup")
+        summary = self.rollups.get((oid, "BUY"))
+        if not summary:
+            raise ValueError("Closed sibling order rollup unavailable")
+        valid, normalized, _ = DhanClient.validate_historical_trade_record(
+            row, expected_account_id=account, expected_order_id=oid,
+            expected_security_id=security, expected_exchange_segment=segment,
+            expected_product_type=product, expected_transaction_type="BUY",
+            allow_missing_exchange_trade_id=True,
+        )
+        if not valid or not normalized or not normalized.get("_broker_attested_no_execution_id"):
+            raise ValueError("Archived BUY lacks valid exchange order identity or time")
+        qty, vwap, first_at, last_at = summary
+        zone = ZoneInfo("Asia/Kolkata")
+        day = datetime.fromtimestamp(_exchange_time(row.get("exchangeTime")), zone).date()
+        if (day >= today or day != datetime.fromtimestamp(first_at, zone).date()
+                or day != datetime.fromtimestamp(last_at, zone).date()):
+            raise ValueError("Archived BUY rollup execution date differs")
+        raw_qty = row.get("tradedQuantity")
+        if _quantity(raw_qty) != qty or abs(normalized["tradedPrice"] - vwap) >= 1e-4:
+            raise ValueError("Archived BUY rollup quantity or VWAP differs")
+        keys = {key for key in self.trades if key[0] == oid}
+        if not keys:
+            raise ValueError("Archived BUY original executions unavailable")
+        self.aggregated.add(oid)
+        return keys
