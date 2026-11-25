@@ -4654,7 +4654,10 @@ class ProtectionWatcher:
                 # strictly when an explicit holdings row exists AND all same-day SELL fills are
                 # verified bot-owned exits matching net_day and settled + net_day == aggregate open.
                 try:
+                    from src.engine.holding_quantity import _quantity
+                    from src.engine.signed_cnc_delivery import validate_signed_position_components
                     pos_nets = []
+                    matching_position = None
                     pos_ok = True
                     for prow in positions_book:
                         if not isinstance(prow, dict):
@@ -4666,6 +4669,9 @@ class ProtectionWatcher:
                             str(prow.get("exchangeSegment") or "").strip().upper() != seg
                             or str(prow.get("productType") or "").strip().upper() != prod
                         ):
+                            if _quantity(prow.get("netQty"), signed=True) != 0:
+                                pos_ok = False
+                                break
                             continue
                         p_acct = str(prow.get("dhanClientId") or "").strip()
                         if expected_client_id and p_acct and p_acct != expected_client_id:
@@ -4675,7 +4681,8 @@ class ProtectionWatcher:
                         if isinstance(raw_net, bool) or raw_net is None:
                             pos_ok = False
                             break
-                        pos_nets.append(int(raw_net))
+                        pos_nets.append(_quantity(raw_net, signed=True))
+                        matching_position = prow
                     holdings_map = aggregate_holdings(holdings_book, account_id=expected_client_id)
                     if pos_ok and len(pos_nets) == 1 and pos_nets[0] < 0 and sec_id in holdings_map:
                         net_day = pos_nets[0]
@@ -4770,6 +4777,9 @@ class ProtectionWatcher:
                             and settled_qty >= -net_day
                             and (settled_qty + net_day) == aggregate_contract_open_qty
                         ):
+                            validate_signed_position_components(
+                                matching_position, net_day, today_buys, today_sells,
+                            )
                             broker_net_qty = settled_qty + net_day
                             quantity_evidence = "VERIFIED_SIGNED_CNC_DELIVERY"
                             rec["broker_quantity_unverified"] = False
@@ -4894,7 +4904,39 @@ class ProtectionWatcher:
             # external unlinked SELL on each surviving one-share parent.
             # Never clear a flag on arithmetic alone, and never discard a
             # durable owner conflict or any unverified current trade.
-            if (quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY"
+            rollover_verified = False
+            if (quantity_evidence == "VERIFIED_SETTLED_HOLDINGS"
+                    and rec.get("external_unlinked_sell_observed")
+                    and gate_books is not None
+                    and gate_books.get("settled_closed_sibling_verified", {}).get(oid)
+                    and snapshot_complete and parent_reads_complete):
+                try:
+                    from src.engine.signed_delivery_live_evidence import _holdings_fingerprint
+                    # Consume only the same serialized, account-bound book
+                    # evidence. A new execution or changed protection book
+                    # invalidates the rollover recovery even within this pass.
+                    rollover_verified = (
+                        gate_books["settled_closed_sibling_verified"][oid] == (
+                            expected_client_id, sec_id, seg, prod, effective_parent_open_qty,
+                            _holdings_fingerprint(holdings_book, expected_client_id))
+                        and broker_net_qty == aggregate_contract_open_qty
+                        and forever_book == gate_books.get("get_forever_orders")
+                        and isinstance(trade_book, list)
+                        and all(str(t.get("securityId") or "") != sec_id for t in trade_book)
+                        and not any(str(r.get("securityId") or "") == sec_id
+                                    for r in super_book or [])
+                    )
+                    # Full gate passes share the exact owner-lot order book.
+                    # If it was not shared, read it independently before clearing.
+                    if rollover_verified:
+                        if not order_book_loaded:
+                            order_book = _safe_list_call("get_order_book")
+                            order_book_loaded = True
+                        rollover_verified = (isinstance(order_book, list)
+                                             and order_book == gate_books.get("get_order_book"))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    rollover_verified = False
+            if ((quantity_evidence == "VERIFIED_SIGNED_CNC_DELIVERY" or rollover_verified)
                     and rec.get("external_unlinked_sell_observed")
                     and gate_books is not None
                     and gate_books.get("verified", {}).get(oid) == (
