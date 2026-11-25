@@ -1085,10 +1085,22 @@ class DhanClient:
                 except Exception:
                     pass
                 logger.info(f"✅ Active Dhan access token coordinated via {token_path}")
+                if not force and rejected_for_cooldown:
+                    self._signal_token_recovery(rejected_for_cooldown, new_token)
                 return True, new_token, "Token generated successfully"
             return False, "", last_err[0]
         except Exception as e:
             return False, "", f"Exception generating token via TOTP: {e}"
+
+    def _signal_token_recovery(self, rejected, active):
+        # Installed only by the runtime listener. A notification callback
+        # must not change the broker result or delay the trading caller.
+        callback = getattr(self, "_token_recovery_confirmation", None)
+        if callable(callback) and rejected and active and rejected != active:
+            try:
+                callback(rejected, active)
+            except Exception:
+                logger.warning("Token recovery notification hint unavailable")
 
     @staticmethod
     def _token_stat_signature(stat_result):
@@ -2518,6 +2530,7 @@ class DhanClient:
         self._sync_shared_token_from_disk()
         if self.token and self.token != rejected:
             logger.warning("Dhan read auth rejected; adopting updated shared token.")
+            self._signal_token_recovery(rejected, self.token)
         elif self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
             coord_lock, inflight_map = globals().setdefault(
                 "_ASYNC_AUTH_COORD_STATE", (_threading.Lock(), {})
