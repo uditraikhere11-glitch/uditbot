@@ -1836,7 +1836,7 @@ class JournalDB:
                 (account, security, segment, product),
             ).fetchall()]
             if not rows:
-                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0, "triggered_groups": {}}
+                return {"trades": {}, "order_fills": {}, "forever_ids": (), "sell_ids": (), "sell_qty": 0, "today_sell_qty": 0, "triggered_groups": {}, "order_rollups": {}}
             from src.engine.signed_delivery_live_evidence import (
                 recover_closed_watcher_child_ids, closed_triggered_binding,
             )
@@ -1961,7 +1961,18 @@ class JournalDB:
                 if binding is not None:
                     triggered_groups[groups[0]] = binding
                 total_sell += exit_sum
-        return {"trades": expected, "order_fills": orders,
+        # Derived only after every closed parent's allocation has been checked.
+        # Keep the original immutable execution IDs; the rollup is evidence only.
+        from math import fsum
+        grouped = {}
+        for (order_id, eid), (side, qty, price, at) in expected.items():
+            grouped.setdefault((order_id, side), []).append((qty, price, at))
+        rollups = {}
+        for key, fills in grouped.items():
+            total = sum(qty for qty, _, _ in fills)
+            rollups[key] = (total, fsum(qty * price for qty, price, _ in fills) / total,
+                            min(at for _, _, at in fills), max(at for _, _, at in fills))
+        return {"trades": expected, "order_fills": orders, "order_rollups": rollups,
                 "forever_ids": tuple(sorted(group_ids)),
                 "sell_ids": tuple(sorted(sell_ids)), "sell_qty": total_sell,
                 "today_sell_qty": today_sell, "triggered_groups": triggered_groups}
