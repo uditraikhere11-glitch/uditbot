@@ -596,6 +596,40 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         for oid in (self.FIRST, self.SECOND):
             self.assertEqual(self.db.get_position_lifecycle(oid)["position_state"], "UNPROTECTED_MANUAL_RISK")
 
+    def test_overnight_signed_owner_proof_with_unpublished_sell_history(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+        from src.engine.market import IST
+        self._archived_rollup_schema()
+        sell_day = datetime.fromtimestamp(self.now, IST).date()
+        next_morning = datetime.combine(sell_day + timedelta(days=1),
+                                         datetime.min.time(), tzinfo=IST).replace(minute=1)
+        self.now = next_morning.timestamp()
+        # The broker retains the previous session's exact positions, holdings,
+        # and child trade. Its historical endpoint still omits the recent SELL.
+        # The synthetic fixture's original sell day is the certified trading day.
+        with patch("src.engine.market.load_holidays_verified", return_value=(True, set(), "OK")):
+            if sell_day.weekday() >= 5:
+                # Fix the test clock to a real prior weekday, not a weekend
+                # synthetic trade. All existing BUYs precede this sell date.
+                previous = sell_day
+                while previous.weekday() >= 5:
+                    previous -= timedelta(days=1)
+                at = datetime.combine(previous, datetime.min.time(), tzinfo=IST).replace(hour=12)
+                with self.db._get_conn() as conn:
+                    conn.execute("UPDATE fills SET traded_at=? WHERE exchange_trade_id=?",
+                                 (at.timestamp(), self.SELL_TRADE))
+                self.broker.get_trade_book.return_value[0]["exchangeTime"] = at.strftime("%Y-%m-%d %H:%M:%S")
+                self.now = (at + timedelta(days=1)).replace(hour=0, minute=1).timestamp()
+            batch = self._full_watcher_pass()
+            self.assertFalse(batch["errors"], batch["errors"])
+            self.assertEqual(set(batch["verified"]), {self.FIRST, self.SECOND})
+            self.assert_retained()
+            self.now = datetime.fromtimestamp(self.now, IST).replace(hour=8, minute=30).timestamp()
+            batch = self._full_watcher_pass()
+            self.assertFalse(batch["verified"])
+            self.assert_retained()
+
     def test_signed_session_previous_day_bounded(self):
         from datetime import timedelta
         from unittest.mock import patch
