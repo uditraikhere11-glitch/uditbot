@@ -24,7 +24,8 @@ class DematReview(ValueError):
 
 def verify_owner_history(broker, db, account, security, segment, product, parents,
                          holding, day_trades, now, evidence, *, current_day_live_keys=(),
-                         verified_closed_sibling_trades=None, authorized_closed_sell_ids=()):
+                         verified_closed_sibling_trades=None, authorized_closed_sell_ids=(),
+                         closed_order_rollups=None):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -59,6 +60,11 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     evidence.update(from_date=first.isoformat(), to_date=last.isoformat(), windows=[], executions=[])
     seen = set()
     allowed_closed = verified_closed_sibling_trades or {}
+    from src.engine.signed_delivery_live_evidence import ClosedHistoricalBuyMatcher
+    matcher = ClosedHistoricalBuyMatcher(
+        allowed_closed, closed_order_rollups or {},
+        account=account, contract=(security, segment, product), today=last,
+    )
     seen_closed_history = set()
     seen_closed_today = set()
 
@@ -87,6 +93,13 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                 allow_missing_exchange_trade_id=historical)
             if not valid or normalized is None:
                 raise ValueError("Execution identity or quantity incomplete")
+            if historical and side == "BUY":
+                matched = matcher.match(row)
+                if matched is not None:
+                    if matched & seen_closed_history:
+                        raise ValueError("Duplicate closed sibling historical execution")
+                    seen_closed_history.update(matched)
+                    continue
             if key in allowed_closed:
                 expected_side, expected_qty, expected_price, expected_at = allowed_closed[key]
                 if (side != expected_side
@@ -335,7 +348,8 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                  current_day_live_keys=(split_proof.intraday_trade_keys
                                                         if split_proof is not None else ()),
                                  verified_closed_sibling_trades=closed["trades"],
-                                 authorized_closed_sell_ids=closed["sell_ids"])
+                                 authorized_closed_sell_ids=closed["sell_ids"],
+                                 closed_order_rollups=closed.get("order_rollups", {}))
             if rollover:
                 from src.engine.unified_exit_reconciliation import _exchange_time
                 from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group

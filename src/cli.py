@@ -300,7 +300,8 @@ def format_morning_health_report(
     unresolved_intents_count: int = 0,
     unprotected_positions_count: int = 0,
     reconciliation_summary: str = "",
-) -> str:
+    recovery_confirmation: bool = False,
+) -> str | None:
     """
     Builds the scheduled 05:00 PM IST after-market Dhan health report (`AUDITBOT — 05:00 PM DHAN HEALTH CHECK`).
     - C3 (P0): Strictly distinguishes current authentication (`Dhan authentication: ✅ VERIFIED`) from
@@ -530,6 +531,20 @@ def format_morning_health_report(
         lines = lines[:-2] + (
             "🧾 Reconciliation: ⚠️ NEW ENTRIES BLOCKED — " + html.escape(detail),
         ) + lines[-2:]
+    if recovery_confirmation:
+        # A recovery card is never an alternative route to a green result.
+        # In particular the next-day-market-closed exception is NOT READY.
+        if not ready or token_renewed is not True:
+            return None
+        return "\n".join(lines).replace(
+            "🕔 <b>AUDITBOT — 05:00 PM DHAN HEALTH CHECK</b>",
+            "✅ <b>AUDITBOT — DHAN TOKEN RECOVERY VERIFIED</b>", 1
+        ).replace("Token renewal: ✅ SUCCESS", "Token renewal: ✅ AUTO-RECOVERED", 1
+        ).replace("Next trading session readiness: ✅ VERIFIED CHECKS",
+                  "Next trading session readiness: ✅ READY", 1
+        ).replace("Overall result: ✅ SUCCESS",
+                  "Overall result: ✅ RECOVERED — NO ACTION REQUIRED", 1)
+
     # The full authoritative status block is kept immutable in custom cards.
     # In particular, the designer cannot hide an expired token, STOP or failed renewal.
     from src.notifier.message_designer import render as render_designed_message
@@ -767,6 +782,26 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     print("     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          ")
     print("=======================================================")
 
+    from src.engine.token_recovery_notification import (
+        begin_scheduled_check, end_scheduled_check, fingerprint, scheduled_recovery_state,
+    )
+    from src.broker.dhan_token import read_token
+    prior_digest = ""
+    prior_expiry = ""
+    try:
+        prior_token = read_token(cfg.dhan_token_file)
+        prior_digest = fingerprint(prior_token)
+        _, prior_expiry = DhanClient.extract_token_expiration(prior_token)
+        del prior_token
+    except Exception:
+        # The scheduled health check remains authoritative; an unavailable
+        # prior expiry is descriptive only, not a fabricated verification.
+        pass
+    check_id = None
+    try:
+        check_id = begin_scheduled_check(cfg, now=time.time())
+    except Exception as exc:
+        print(f"[!] Recovery notification lease unavailable ({type(exc).__name__})")
     renewal_evidence = {}
     tok_ok = cmd_refresh_token(cfg, stop_mgr, verification_sink=renewal_evidence)
     # Candidate identity was already verified BEFORE the new token was
@@ -777,12 +812,12 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     client = DhanClient(cfg, stop_manager=stop_mgr, auto_generate_token=False)
     report_now = time.time()
     bound_profile = renewal_evidence.get("profile")
-    fingerprint = str(renewal_evidence.get("token_sha256") or "")
+    candidate_digest = str(renewal_evidence.get("token_sha256") or "")
     client_token = str(getattr(client, "token", "") or "")
     proof_matches = bool(
-        fingerprint and isinstance(bound_profile, dict) and client_token
+        candidate_digest and isinstance(bound_profile, dict) and client_token
         and hmac.compare_digest(
-            fingerprint, hashlib.sha256(client_token.encode("utf-8")).hexdigest()
+            candidate_digest, hashlib.sha256(client_token.encode("utf-8")).hexdigest()
         )
         and str(bound_profile.get("profile_client_id") or "") == str(cfg.dhan_client_id)
         and bound_profile.get("identity_verified") is True
@@ -900,14 +935,49 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         unprotected_positions_count=unprot_pos_cnt,
         reconciliation_summary=("Local journal health check unavailable" if not local_reconciliation_verified else ""),
     )
-    notify_status = dispatch_morning_health_report_once(
-        cfg, db, report, now_ts=report_now
-    )
     auth_check_ok = bool(auth_verified and funds_verified)
     next_session_ready = (
         "Next trading session readiness: ✅ VERIFIED CHECKS" in report
         and "Overall result: ✅ SUCCESS" in report
     )
+    renewed = bool(renewal_evidence.get("token_generated", tok_ok))
+    token_problem = bool(
+        not auth_check_ok or token_expired or not token_expiration_ts
+        or "Expires before next session open" in report
+        or "Expires during next session" in report
+    )
+    def _record_recovery_state(*, keep_lease=False):
+        try:
+            scheduled_recovery_state(
+                cfg, renewed=renewed, ready=next_session_ready,
+                token_problem=token_problem, prior_token_fingerprint=prior_digest,
+                active_token_fingerprint=fingerprint(client_token),
+                prior_token_expiration_ist=prior_expiry or (
+                    token_expiration_str if not renewed else ""),
+                now=report_now, check_id=check_id, keep_lease=keep_lease,
+            )
+        except Exception as exc:
+            print(f"[!] Recovery notification marker unavailable ({type(exc).__name__})")
+
+    # Persist failed-token evidence before external delivery. The existing
+    # lease suppresses the runtime card until the scheduled dispatch finishes;
+    # if the process dies, the durable marker survives lease expiry.
+    green = renewed and next_session_ready
+    if not green:
+        _record_recovery_state(keep_lease=True)
+    try:
+        notify_status = dispatch_morning_health_report_once(
+            cfg, db, report, now_ts=report_now
+        )
+        if green and (notify_status in (
+            "DELIVERED VIA TELEGRAM BOT API", "QUEUED FOR TELEGRAM RETRY",
+        ) or not getattr(cfg, "log_group_id", 0)):
+            _record_recovery_state()
+    finally:
+        try:
+            end_scheduled_check(cfg, check_id=check_id)
+        except Exception as exc:
+            print(f"[!] Recovery notification lease release unavailable ({type(exc).__name__})")
     auth_check_label = "PASS" if auth_check_ok else "FAIL"
     readiness_label = "VERIFIED_CHECKS" if next_session_ready else "REVIEW_REQUIRED"
     holiday_no_action = (

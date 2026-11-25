@@ -54,6 +54,15 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         self.stop.provision_initial_clean_state("Operator", "1113731536")
         self.pending_path = os.path.join(self.tmp.name, "pending_protection.json")
 
+    def _wait_for_historical_background(self, gate):
+        # The real watcher can schedule a daemon reconciliation pass. Its
+        # lock is held from scheduling until the worker has finished SQLite
+        # and filesystem work. Drain it before TemporaryDirectory cleanup.
+        lock = gate._historical_background_lock
+        self.assertTrue(lock.acquire(timeout=30.0),
+                        "Historical reconciliation worker did not finish")
+        lock.release()
+
     def _make_watcher(self, broker, clock_fn=None, **kwargs):
         broker.get_authenticated_profile_id = Mock(return_value=self.cfg.dhan_client_id)
         if isinstance(broker, DhanClient) and "get" not in getattr(broker.session, "__dict__", {}):
@@ -935,6 +944,7 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
+        self.addCleanup(self._wait_for_historical_background, gate)
         gate._accepting_entries = True
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
@@ -1064,6 +1074,7 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
+        self.addCleanup(self._wait_for_historical_background, gate)
         gate._accepting_entries = True
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate

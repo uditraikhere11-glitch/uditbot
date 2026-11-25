@@ -87,7 +87,8 @@ class ClosedExitFixture(unittest.TestCase):
                 (oid, 'NEW28' if oid=='EXIT28' else oid,tid,'11915','NSE_EQ','CNC',side,1,qty,price,at))
             self.history.append(dict(dhanClientId='SYNTHETIC',securityId='11915',isin='TESTISIN',
                 exchangeSegment='NSE_EQ',productType='CNC',orderId=oid,exchangeTradeId=tid,
-                transactionType=side,tradedQuantity=qty,tradedPrice=price))
+                transactionType=side,tradedQuantity=qty,tradedPrice=price,
+                exchangeTime=datetime.datetime.fromtimestamp(at,IST).isoformat()))
         for oid,at in [('OLD1',OLD),('OLD2',OLD+86400),('NEW28',NOW-150)]:
             self.conn.execute('INSERT INTO order_intents VALUES (?,?,?,?,?,?)',
                 (oid,'SYNTHETIC','11915','NSE_EQ','CNC',at))
