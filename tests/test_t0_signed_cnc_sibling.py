@@ -18,7 +18,7 @@ from unittest.mock import Mock
 from src.engine.owner_lot_evidence import GATE_BOOKS, prepare_owner_lots
 from src.engine.protection_watcher import ProtectionWatcher
 from src.engine.reconciliation import StartupReconciliationGate
-from src.journal.db import JournalDB, write_protection_order
+from src.journal.db import JournalDB
 
 
 class _ThreeParentFixture:
@@ -103,11 +103,12 @@ class _ThreeParentFixture:
                 tradedQuantity=qty, tradedPrice=15.0,
             ))
         with self.db._get_conn() as con:
-            write_protection_order(
-                con, parent_id=self.THIRD, protection_id=self.GROUP,
-                symbol="YESBANK-EQ", sl_trigger=14.0, sl_limit=13.95,
-                target_price=16.0, quantity=28, status="ACTIVE_CONFIRMED",
-                created_at=self.prior,
+            con.execute(
+                "INSERT INTO protection_orders "
+                "(parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit, "
+                "target_price, quantity, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (self.THIRD, self.GROUP, "YESBANK-EQ", 14.0, 13.95, 16.0,
+                 28, "ACTIVE_CONFIRMED", self.prior),
             )
         self.forever = [dict(
             orderId=self.GROUP, orderStatus="PENDING", securityId=self.SECURITY,
@@ -226,10 +227,17 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             exchangeSegment="NSE_EQ", productType="CNC",
             orderId=self.TARGET_CHILD, exchangeTradeId=self.SELL_TRADE,
             exchangeOrderId="SYNTHETIC-EXCHANGE-SELL",
-            exchangeTime=datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            exchangeTime=datetime.fromtimestamp(self.now, __import__("zoneinfo").ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
             transactionType="SELL", tradedQuantity=28, tradedPrice=17.93,
         )
         self.broker.get_trade_book.return_value = [dict(self.sell)]
+        for buy in self.history:
+            # A separate historical BUY cannot be exempted without its exact
+            # broker date and exchange execution identity.
+            buy["exchangeTime"] = datetime.fromtimestamp(
+                self.prior, __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            buy["exchangeOrderId"] = "SYNTHETIC-EXCHANGE-" + buy["orderId"]
         self.history.append(dict(self.sell))
         self.broker.get_order_book.return_value = [dict(
             orderId=self.TARGET_CHILD, algoId=self.GROUP,
