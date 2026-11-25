@@ -146,6 +146,7 @@ def _query_historical_sells(
     parents: Set[str],
     known_sell_ids=(),
     allowed_closed_buys=None,
+    closed_order_rollups=None,
 ) -> Dict[str, dict]:
     """Paginate bounded Dhan historical-trade windows from BUY date through today."""
     from src.broker.dhan_client import MAX_HISTORICAL_TRADE_WINDOW_DAYS
@@ -164,6 +165,11 @@ def _query_historical_sells(
         )
 
     span = max(1, int(MAX_HISTORICAL_TRADE_WINDOW_DAYS))
+    from src.engine.signed_delivery_live_evidence import ClosedHistoricalBuyMatcher
+    matcher = ClosedHistoricalBuyMatcher(
+        {k: ("BUY", *v) for k, v in (allowed_closed_buys or {}).items()},
+        closed_order_rollups or {}, account=account, contract=contract, today=last,
+    )
     verified: Dict[str, dict] = {}
     current = first
     while current <= last:
@@ -179,6 +185,8 @@ def _query_historical_sells(
                 continue
             eid = str(row.get("exchangeTradeId") or "").strip()
             if _identity(row) != contract:
+                if (str(row.get("orderId") or ""), "BUY") in matcher.rollups:
+                    raise ReconciliationEvidenceError("Closed historical BUY contract mismatch")
                 continue
             if row.get("dhanClientId") != account:
                 raise ReconciliationEvidenceError("Historical execution account differs")
@@ -186,6 +194,12 @@ def _query_historical_sells(
             if side not in {"BUY", "SELL"}:
                 raise ReconciliationEvidenceError("Historical execution side unverified")
             if side == "BUY" and str(row.get("orderId")) not in parents:
+                try:
+                    matched = matcher.match(row)
+                except ValueError as exc:
+                    raise ReconciliationEvidenceError(str(exc)) from exc
+                if matched is not None:
+                    continue
                 if _exchange_time(row.get("exchangeTime")) >= created_at:
                     # A *fully closed, independently audited* sibling OCO
                     # BUY is not a competing candidate for the open 1+1 lots.
@@ -1033,6 +1047,7 @@ def reconcile_verified_exits(
                     ).fetchall()
                 }
             closed_buy_allowlist = {}
+            closed_rollups = {}
             if _obs_src == "NEGATIVE_CNC_POSITION_REVIEW":
                 # Never use an unrelated historical BUY as FIFO evidence. The
                 # existing closed-OCO verifier binds exact BUY/SELL executions
@@ -1059,6 +1074,7 @@ def reconcile_verified_exits(
                     open_parent_ids=tuple(str(r["parent_order_id"]) for r in lots_for_k),
                     now=time.time(),
                 )
+                closed_rollups = closed.get("order_rollups", {})
                 closed_buy_allowlist = {
                     key: (value[1], value[2], value[3])
                     for key, value in closed["trades"].items()
@@ -1069,6 +1085,7 @@ def reconcile_verified_exits(
                 required_eids=None, today_date=today_ist,
                 parents={r["parent_order_id"] for r in lots_for_k},
                 allowed_closed_buys=closed_buy_allowlist,
+                closed_order_rollups=closed_rollups,
             )
             new_sells = {eid: item for eid, item in hist_found.items() if eid not in known_eids}
             if new_sells:
