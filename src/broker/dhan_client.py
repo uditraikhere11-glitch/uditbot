@@ -1085,6 +1085,12 @@ class DhanClient:
                 except Exception:
                     pass
                 logger.info(f"✅ Active Dhan access token coordinated via {token_path}")
+                callback = getattr(self, "_runtime_token_recovery_observer", None)
+                if not force and callable(callback):
+                    try:
+                        callback(rejected_for_cooldown, new_token)
+                    except Exception:
+                        logger.warning("Token recovery notice observer unavailable")
                 return True, new_token, "Token generated successfully"
             return False, "", last_err[0]
         except Exception as e:
@@ -2518,6 +2524,12 @@ class DhanClient:
         self._sync_shared_token_from_disk()
         if self.token and self.token != rejected:
             logger.warning("Dhan read auth rejected; adopting updated shared token.")
+            callback = getattr(self, "_runtime_token_recovery_observer", None)
+            if callable(callback):
+                try:
+                    callback(rejected, self.token)
+                except Exception:
+                    logger.warning("Token recovery notice observer unavailable")
         elif self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
             coord_lock, inflight_map = globals().setdefault(
                 "_ASYNC_AUTH_COORD_STATE", (_threading.Lock(), {})
