@@ -341,6 +341,28 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         self.broker.reconciliation_gate.halt_new_entries.assert_not_called()
         self.assert_retained()
 
+    def test_durable_stale_external_sell_flag_recovered_only_after_exact_proof(self):
+        # Recreate the production halt's sticky watcher state: the closed
+        # sibling child was previously labelled an external/unlinked SELL.
+        # Recovery cannot merely accept the signed quantity while retaining
+        # this stale flag: otherwise every later pass remains BLOCKED.
+        for oid in (self.FIRST, self.SECOND):
+            rec = self.watcher.terminal_orders[oid]
+            rec["external_unlinked_sell_observed"] = True
+            rec["unreadable_broker_response"] = True
+            rec["reconciliation_required"] = True
+            rec["position_state"] = "RECONCILIATION_REQUIRED"
+        self.assertTrue(self.watcher._save())
+        batch = self._full_watcher_pass()
+        self.assertEqual(set(batch["verified"]), {self.FIRST, self.SECOND}, batch)
+        for oid in (self.FIRST, self.SECOND):
+            rec = self.watcher.terminal_orders[oid]
+            self.assertFalse(rec.get("external_unlinked_sell_observed"), rec)
+            self.assertEqual(rec["position_state"], "UNPROTECTED_MANUAL_RISK", rec)
+            self.assertFalse(rec.get("reconciliation_required"), rec)
+        self.broker.reconciliation_gate.halt_new_entries.assert_not_called()
+        self.assert_retained()
+
     def test_real_startup_restart_open_only_after_independent_validation(self):
         self.broker.reconciliation_gate = NS(halt_new_entries=Mock())
         gate = StartupReconciliationGate(
