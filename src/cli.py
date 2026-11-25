@@ -300,6 +300,7 @@ def format_morning_health_report(
     unresolved_intents_count: int = 0,
     unprotected_positions_count: int = 0,
     reconciliation_summary: str = "",
+    canonical: bool = False,
 ) -> str:
     """
     Builds the scheduled 05:00 PM IST after-market Dhan health report (`AUDITBOT — 05:00 PM DHAN HEALTH CHECK`).
@@ -532,6 +533,8 @@ def format_morning_health_report(
         ) + lines[-2:]
     # The full authoritative status block is kept immutable in custom cards.
     # In particular, the designer cannot hide an expired token, STOP or failed renewal.
+    if canonical:
+        return "\n".join(lines)
     from src.notifier.message_designer import render as render_designed_message
     custom = render_designed_message(
         "dhan_health",
@@ -767,6 +770,15 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     print("     AUDIT BOT 05:00 PM IST DHAN HEALTH CHECK          ")
     print("=======================================================")
 
+    from src.engine.dhan_token_recovery_notice import fingerprint, update_scheduled_recovery
+    from src.broker.dhan_token import read_token
+    prior_token = read_token(cfg.dhan_token_file) if getattr(cfg, "dhan_token_file", None) else ""
+    prior_digest = fingerprint(prior_token)
+    prior_expiry = ""
+    try:
+        _, prior_expiry = DhanClient.extract_token_expiration(prior_token)
+    except (TypeError, AttributeError, ValueError):
+        pass
     renewal_evidence = {}
     tok_ok = cmd_refresh_token(cfg, stop_mgr, verification_sink=renewal_evidence)
     # Candidate identity was already verified BEFORE the new token was
@@ -900,9 +912,6 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
         unprotected_positions_count=unprot_pos_cnt,
         reconciliation_summary=("Local journal health check unavailable" if not local_reconciliation_verified else ""),
     )
-    notify_status = dispatch_morning_health_report_once(
-        cfg, db, report, now_ts=report_now
-    )
     auth_check_ok = bool(auth_verified and funds_verified)
     next_session_ready = (
         "Next trading session readiness: ✅ VERIFIED CHECKS" in report
@@ -910,6 +919,16 @@ def cmd_daily_health_check(cfg: AppConfig, db: JournalDB, stop_mgr: EmergencySto
     )
     auth_check_label = "PASS" if auth_check_ok else "FAIL"
     readiness_label = "VERIFIED_CHECKS" if next_session_ready else "REVIEW_REQUIRED"
+    update_scheduled_recovery(
+        cfg, renewed=bool(renewal_evidence.get("token_generated", tok_ok)),
+        ready=bool(auth_check_ok and next_session_ready),
+        token_problem=not auth_verified or not funds_verified or (
+            not next_session_ready and ("Expires before next session open" in report
+            or "Expires during next session" in report or "Token expiration: ⚠️ UNVERIFIED" in report)),
+        prior_fingerprint=prior_digest, prior_expiration=prior_expiry,
+        current_token=client_token, now=report_now,
+    )
+    notify_status = dispatch_morning_health_report_once(cfg, db, report, now_ts=report_now)
     holiday_no_action = (
         "Overall result: ✅ ACTION NOT REQUIRED — NEXT DAY MARKET CLOSED" in report
     )
