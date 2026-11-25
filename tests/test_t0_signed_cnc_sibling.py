@@ -453,6 +453,59 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             forever=broker.get_forever_orders(), super_orders=broker.get_super_orders(),
         )
 
+    def _run_deferred_owner_stop(self, *, expect_safe):
+        from src.engine.config_manager import ConfigChangeTracker
+        from src.engine.emergency_stop import EmergencyStopManager
+        env_path = self.root / ".env"
+        env_path.write_text(
+            f"TRADING_MODE=LIVE\nDHAN_CLIENT_ID={self.ACCOUNT}\n"
+            f"DATA_DIR={self.root}\nJOURNAL_DB_PATH={self.db.db_path}\n"
+        )
+        stop_path = self.root / "emergency_stop.json"
+        EmergencyStopManager(str(stop_path), expected_account_id=self.ACCOUNT).provision_initial_clean_state(
+            "offline operator", self.ACCOUNT
+        )
+        tracker = ConfigChangeTracker(data_dir=str(self.root))
+        tracker.set_transition_gate(True, change_id="OWNER-STOP-PENDING", target_mode="STOPPED",
+                                    reason="offline deferred STOP")
+        tracker.record_service_control_intent(
+            desired_service_state="STOPPED", last_action="OWNER_STOP",
+            reason="offline deferred STOP", requested_mode="LIVE",
+            observed_state="RUNNING", deferred_stop_pending=True,
+        )
+        tracker.start_coordinator_daemon = Mock()
+        state = ["active"]
+        calls = []
+        def systemctl(action, service):
+            calls.append((action, service))
+            state[0] = "inactive"
+            return True
+        result = tracker.control_service(
+            "stop", reason="offline approved maintenance",
+            env_path=str(env_path), db_path=self.db.db_path, stop_state_path=str(stop_path),
+            broker=self.broker, systemctl_fn=systemctl, check_service_fn=lambda: state[0],
+        )
+        if expect_safe:
+            self.assertTrue(result.get("stop_verified"), result)
+            self.assertEqual(calls, [("stop", "trading_bot.service")])
+            self.assertEqual(tracker.get_service_control_record()["desired_service_state"], "STOPPED")
+            self.assertFalse(tracker.get_service_control_record()["deferred_stop_pending"])
+        else:
+            self.assertFalse(result.get("ok"), result)
+            self.assertTrue(result.get("deferred"), result)
+            self.assertEqual(calls, [])
+            self.assertTrue(tracker.inspect_transition_gate_status()["active"])
+        self.assert_retained()
+
+    def test_owner_stop_real_control_path_t0(self):
+        self._archived_rollup_schema()
+        self._run_deferred_owner_stop(expect_safe=True)
+
+    def test_owner_stop_real_control_path_rejects_active_sibling(self):
+        self._archived_rollup_schema()
+        self.forever.append(dict(self.forever[0], legName="STOP_LOSS_LEG", orderStatus="PENDING"))
+        self._run_deferred_owner_stop(expect_safe=False)
+
     def test_owner_stop_closed_parent_with_retained_siblings_t0(self):
         self._archived_rollup_schema()
         before = self._states()
