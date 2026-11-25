@@ -103,14 +103,15 @@ def verify_signed_cnc_delivery_quantity(
                 raise SignedCNCDeliveryUnverified("Nonzero carry-forward quantity overlaps holdings")
     if ("dayBuyQty" in matching[0] and "daySellQty" in matching[0]
             and matching[0]["dayBuyQty"] is not None and matching[0]["daySellQty"] is not None):
-        try:
-            reported_delta = int(str(matching[0]["dayBuyQty"])) - int(str(matching[0]["daySellQty"]))
-            if (isinstance(matching[0]["dayBuyQty"], (float, bool))
-                    or isinstance(matching[0]["daySellQty"], (float, bool))
-                    or reported_delta != net_day):
-                raise SignedCNCDeliveryUnverified("Reported day BUY/SELL quantities conflict")
-        except (TypeError, ValueError) as exc:
-            raise SignedCNCDeliveryUnverified("Reported day quantities malformed") from exc
+        raw_day_buy = matching[0]["dayBuyQty"]
+        raw_day_sell = matching[0]["daySellQty"]
+        if (isinstance(raw_day_buy, (bool, float))
+                or isinstance(raw_day_sell, (bool, float))
+                or not re.fullmatch(r"[+]?[0-9]+", str(raw_day_buy))
+                or not re.fullmatch(r"[+]?[0-9]+", str(raw_day_sell))):
+            raise SignedCNCDeliveryUnverified("Reported day quantities malformed")
+        if int(raw_day_buy) - int(raw_day_sell) != net_day:
+            raise SignedCNCDeliveryUnverified("Reported day BUY/SELL quantities conflict")
     rows = [r for r in holdings if str(r.get("securityId") or "").strip() == security]
     if (len(rows) != 1 or str(rows[0].get("dhanClientId") or "").strip() != account
             or not str(rows[0].get("isin") or "").strip()):
@@ -175,7 +176,8 @@ def verify_signed_cnc_delivery_quantity(
             order_id = str(trade.get("orderId") or "").strip()
             eid = str(trade.get("exchangeTradeId") or "").strip()
             if (side not in ("BUY", "SELL") or not order_id or not eid or eid in seen
-                    or eid in ("0", "None", "null") or "-FILL-" in eid or "-RECON-" in eid):
+                    or eid.upper() in ("0", "NONE", "NULL")
+                    or "-FILL-" in eid.upper() or "-RECON-" in eid.upper()):
                 raise SignedCNCDeliveryUnverified("Duplicate/missing exchange trade ID")
             seen.add(eid)
             qty = _positive_int(trade.get("tradedQuantity"))
@@ -193,8 +195,19 @@ def verify_signed_cnc_delivery_quantity(
                     or not str(fill.get("parent_order_id") or "").strip()
                     or fill.get("parent_order_id") == "MULTI_LOT_ALLOCATED"):
                 raise SignedCNCDeliveryUnverified("Broker execution lacks exact verified journal identity")
-            if datetime.fromtimestamp(float(fill.get("traded_at") or 0), _IST).date() != today:
-                raise SignedCNCDeliveryUnverified("Execution is not from this trading day")
+            # A trade-book row is not automatically a current-day execution
+            # just because its journal insertion happened today. Verify the
+            # broker exchangeTime independently of the stored fill timestamp.
+            try:
+                from src.engine.unified_exit_reconciliation import _exchange_time
+                broker_at = _exchange_time(trade.get("exchangeTime"))
+                journal_at = float(fill.get("traded_at") or 0)
+                if (not isfinite(journal_at)
+                        or datetime.fromtimestamp(broker_at, _IST).date() != today
+                        or datetime.fromtimestamp(journal_at, _IST).date() != today):
+                    raise SignedCNCDeliveryUnverified("Execution is not from this trading day")
+            except (OverflowError, OSError, TypeError, ValueError) as exc:
+                raise SignedCNCDeliveryUnverified("Broker/journal execution day invalid") from exc
             parent = str(fill["parent_order_id"])
             lot = db.get_position_lifecycle(parent)
             if (not isinstance(lot, dict)
