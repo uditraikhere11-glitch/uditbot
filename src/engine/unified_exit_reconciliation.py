@@ -668,6 +668,7 @@ def _signed_cnc_delivery_sell_reconciles(
     account: str,
     projected: int,
     broker_evidence: Dict[str, dict],
+    session_date=None,
 ) -> bool:
     """P0-3 & UREC-007: Reconcile signed day `netQty < 0` on CNC/MTF delivery sales.
 
@@ -711,7 +712,8 @@ def _signed_cnc_delivery_sell_reconciles(
     if len(matches) != 1 or matches[0] >= 0:
         return False
     net_day = matches[0]
-    if any(datetime.fromtimestamp(v["when"], IST).date() != datetime.now(IST).date()
+    effective_date = session_date if session_date is not None else datetime.now(IST).date()
+    if any(datetime.fromtimestamp(v["when"], IST).date() != effective_date
            for v in broker_evidence.values() if v.get("from_today")):
         return False
     today_buys = sum(v["qty"] for v in broker_evidence.values() if v.get("side") == "BUY" and v.get("from_today"))
@@ -730,7 +732,7 @@ def _signed_cnc_delivery_sell_reconciles(
     return settled >= -net_day and settled + net_day == projected
 
 
-def verified_flat_delivery_day(broker_position, positions, holdings, trades, db, account, read_required):
+def verified_flat_delivery_day(broker_position, positions, holdings, trades, db, account, read_required, *, session_date=None):
     """A negative day balance may represent delivery stock sold from a prior day."""
     key = _identity(broker_position)
     if key[1] not in ("NSE_EQ", "BSE_EQ"):
@@ -748,7 +750,7 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
         if side not in ("BUY", "SELL"):
             return False
         fill = _broker_trade(row, account, key, side)
-        if datetime.fromtimestamp(fill["when"], IST).date() != datetime.now(IST).date() or fill["eid"] in evidence:
+        if datetime.fromtimestamp(fill["when"], IST).date() != (session_date or datetime.now(IST).date()) or fill["eid"] in evidence:
             return False
         evidence[fill["eid"]] = dict(fill, side=side, from_today=True)
         if side == "SELL":
@@ -796,7 +798,8 @@ def verified_flat_delivery_day(broker_position, positions, holdings, trades, db,
         super_orders=_read(read_required, "get_super_orders", "Super orders"),
         key=key, account=account, broker_evidence=evidence, orders=orders)
     return _signed_cnc_delivery_sell_reconciles(
-        positions=positions, holdings=holdings, key=key, account=account, projected=open_qty, broker_evidence=evidence)
+        positions=positions, holdings=holdings, key=key, account=account, projected=open_qty, broker_evidence=evidence,
+        session_date=session_date)
 
 
 def _verify_fill_level_chronology(

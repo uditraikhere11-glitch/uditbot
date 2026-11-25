@@ -25,7 +25,7 @@ class DematReview(ValueError):
 def verify_owner_history(broker, db, account, security, segment, product, parents,
                          holding, day_trades, now, evidence, *, current_day_live_keys=(),
                          verified_closed_sibling_trades=None, authorized_closed_sell_ids=(),
-                         closed_order_rollups=None):
+                         closed_order_rollups=None, session_date=None):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -67,6 +67,7 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     )
     seen_closed_history = set()
     seen_closed_today = set()
+    live_date = last if session_date is None else session_date
 
     def inspect(rows, historical):
         for row in rows:
@@ -112,7 +113,10 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                     if key in seen_closed_history:
                         raise ValueError("Duplicate closed sibling historical execution")
                     seen_closed_history.add(key)
-                elif datetime.fromtimestamp(expected_at, IST).date() == last:
+                elif datetime.fromtimestamp(expected_at, IST).date() == live_date:
+                    from src.engine.unified_exit_reconciliation import _exchange_time
+                    if datetime.fromtimestamp(_exchange_time(row.get("exchangeTime")), IST).date() != live_date:
+                        raise ExecutionConflict("Closed sibling live execution date differs")
                     if key in seen_closed_today:
                         raise ExecutionConflict("Duplicate closed sibling live execution")
                     seen_closed_today.add(key)
@@ -155,7 +159,7 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     if not live_keys.issubset(expected.keys()) or (seen | live_keys) != expected.keys():
         raise ValueError("Complete history does not contain every original BUY")
     current_closed = {k for k, row in allowed_closed.items()
-                      if datetime.fromtimestamp(row[3], IST).date() == last}
+                      if datetime.fromtimestamp(row[3], IST).date() == live_date}
     if (seen_closed_history | (seen_closed_today & current_closed)) != set(allowed_closed):
         raise ValueError("Closed sibling complete broker execution history unavailable")
 
@@ -182,8 +186,15 @@ def corroborated_external_sells(trades, account, security, segment, product, own
     return sum(qty for _, qty in executions.values())
 
 
-def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=None, forever=None):
-    """Run only in the serialized gate worker, before it takes the watcher pass lock."""
+def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=None, forever=None,
+                       *, routine_records=None, settled_session_history=None):
+    """Full history belongs to the serialized gate worker.
+
+    The optional routine path only revalidates current signed closed-sibling
+    books for already healthy parents with same-session history. It cannot
+    authorize recovery, does not query historical trades, and returns a
+    separate proof namespace rather than marking full history verified.
+    """
     rows = db.get_open_positions_lifecycle() if hasattr(db, "get_open_positions_lifecycle") else []
     if not isinstance(rows, list):
         return  # The gate's required lifecycle check rejects invalid storage.
@@ -226,6 +237,11 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                         parents=parents, acknowledged=acked, observed_at=now, quantity=quantity,
                         quantity_source=source, profile_matches=True)
         try:
+            if routine_records is not None and (
+                    product != "CNC" or source not in (
+                        "NEGATIVE_CNC_POSITION_REVIEW", "VERIFIED_SETTLED_HOLDINGS")
+                    or set(acked) != set(parents)):
+                raise ValueError("Routine signed owner proof requires all owner acknowledgements")
             for oid in acked:
                 review = db.owner_lot_review_reason(account, oid)
                 if review:
@@ -237,11 +253,16 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             # generic fail-closed contradiction, and historical execution
             # verification must still succeed below before admission.
             split_proof = None
+            session_date = None
             if source == "NEGATIVE_CNC_POSITION_REVIEW":
                 # Before rejecting T+0 settled stock, prove a bot-owned
                 # closed sibling's SELL and the exact remaining parent total.
                 # This cannot be inferred from holdings + netQty alone.
-                from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity, signed_delivery_session_date
+                session_date = signed_delivery_session_date(
+                    trade_book=day_trades, account=account, security=security,
+                    segment=segment, product=product, now=now,
+                )
                 from src.engine.signed_delivery_live_evidence import attest_signed_holdings
                 holdings_account = attest_signed_holdings(
                     broker, holdings, account, batch.setdefault("signed_holdings_provenance", {}),
@@ -280,7 +301,7 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             if product == "CNC" and callable(getattr(db, "get_closed_forever_sibling_evidence", None)):
                 closed = db.get_closed_forever_sibling_evidence(
                     account, security, segment, product,
-                    open_parent_ids=tuple(sorted(parents)), now=now,
+                    open_parent_ids=tuple(sorted(parents)), now=now, session_date=session_date,
                 )
                 evidence["verified_closed_sibling_orders"] = list(closed["order_fills"])
             # Rollover is not an arithmetic waiver. All surviving lots must
@@ -343,13 +364,62 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                for r in orders if str(r.get("securityId")) == security
                                or (holding.get("isin") and r.get("isin") == holding["isin"])]
             evidence["orders"] = relevant_orders
-            verify_owner_history(broker, db, account, security, segment, product, parents,
-                                 holding, day_trades, now, evidence,
-                                 current_day_live_keys=(split_proof.intraday_trade_keys
-                                                        if split_proof is not None else ()),
-                                 verified_closed_sibling_trades=closed["trades"],
-                                 authorized_closed_sell_ids=closed["sell_ids"],
-                                 closed_order_rollups=closed.get("order_rollups", {}))
+            if routine_records is None:
+                verify_owner_history(broker, db, account, security, segment, product, parents,
+                                     holding, day_trades, now, evidence,
+                                     current_day_live_keys=(split_proof.intraday_trade_keys
+                                                            if split_proof is not None else ()),
+                                     verified_closed_sibling_trades=closed["trades"],
+                                     authorized_closed_sell_ids=closed["sell_ids"],
+                                     closed_order_rollups=closed.get("order_rollups", {}),
+                                     session_date=session_date)
+            else:
+                from src.engine.signed_cnc_delivery import closed_sibling_live_rows_match
+                from src.engine.settled_owner_read_policy import _UNSAFE
+                if session_date is None:
+                    if not rollover:
+                        raise ValueError("Routine settled sibling proof unavailable")
+                    session_key = (account, security, segment, product, tuple(sorted(parents.items())),
+                                   datetime.fromtimestamp(now, IST).date().isoformat())
+                    prior = (settled_session_history or {}).get(session_key)
+                    if not isinstance(prior, list) or not prior:
+                        raise ValueError("Full settled history must first be verified this session")
+                    # These are actual broker historical rows from the last
+                    # successful full gate, never synthesized from journal data.
+                    evidence["executions"] = [dict(r) for r in prior]
+                    proof_day = datetime.fromtimestamp(now, IST).date()
+                else:
+                    if not closed_sibling_live_rows_match(
+                            closed=closed, trade_book=day_trades, account=account, security=security,
+                            segment=segment, product=product):
+                        raise ValueError("Routine tradebook is not exclusively verified closed siblings")
+                    proof_day = session_date
+                isin = str(holding.get("isin") or "").strip().upper()
+                if not isin or any(not r.get("securityId") or (
+                        str(r["securityId"]) != security and (
+                            str(r.get("isin") or "").strip().upper() == isin
+                            or (r.get("exchangeSegment") in ("NSE_EQ", "BSE_EQ")
+                                and r["exchangeSegment"] != segment and not r.get("isin"))))
+                        for r in day_trades):
+                    raise ValueError("Routine owner execution identity ambiguous")
+                for oid, qty in parents.items():
+                    rec = routine_records.get(oid, {})
+                    if (rec.get("position_state") != "UNPROTECTED_MANUAL_RISK"
+                            or rec.get("owner_history_day") != proof_day.isoformat()
+                            or rec.get("filled_qty") != qty or rec.get("confirmed_position_open_qty") != qty
+                            or rec.get("exit_filled_qty") != 0 or any(rec.get(k) for k in _UNSAFE + (
+                                "manual_exit_detected", "reconciliation_required",
+                                "unreadable_broker_response", "owner_readback_failed", "owner_evidence_error",
+                                "broker_quantity_unverified", "manual_risk_ack_unverified",
+                            ))):
+                        raise ValueError("Routine owner history is absent or no longer clean")
+                    created, fills = db.owner_lot_basis(
+                        account, security, segment, product, oid,
+                        authorized_closed_sell_ids=closed["sell_ids"],
+                    )
+                    if (datetime.fromtimestamp(created, IST).date() >= proof_day
+                            or sum(f["traded_quantity"] for f in fills) != qty):
+                        raise ValueError("Routine original BUY basis differs")
             if rollover:
                 from src.engine.unified_exit_reconciliation import _exchange_time
                 from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group
@@ -363,7 +433,17 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                         continue
                     at = datetime.fromtimestamp(_exchange_time(trade.get("exchangeTime")), IST).date()
                     if (key in seen_sell_keys or at >= today
-                            or at != datetime.fromtimestamp(expected[3], IST).date()):
+                            or at != datetime.fromtimestamp(expected[3], IST).date()
+                            or trade.get("dhanClientId") != account
+                            or str(trade.get("securityId")) != security
+                            or trade.get("exchangeSegment") != segment
+                            or trade.get("productType") != product
+                            or trade.get("transactionType") != "SELL"
+                            or type(trade.get("tradedQuantity")) not in (int, str)
+                            or str(trade["tradedQuantity"]) != str(expected[1])
+                            or isinstance(trade.get("tradedPrice"), bool)
+                            or not __import__("math").isfinite(float(trade["tradedPrice"]))
+                            or abs(float(trade["tradedPrice"]) - expected[2]) >= 1e-6):
                         raise ValueError("Rollover historical SELL execution day or identity differs")
                     seen_sell_keys.add(key)
                     previous_sells.append(trade)
@@ -438,20 +518,36 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
             batch["errors"].update(dict.fromkeys(acked, decision))
         else:
             decision = "Verified original purchases and settled ownership"
-            batch["verified"].update({oid: (account, security, parents[oid]) for oid in acked})
+            proof_key = "verified" if routine_records is None else "routine_verified"
+            batch.setdefault(proof_key, {}).update({oid: (account, security, parents[oid]) for oid in acked})
             if rollover:
                 from src.engine.signed_delivery_live_evidence import _holdings_fingerprint
+                batch["get_positions"] = positions
+                batch["get_trade_book"] = day_trades
+                if routine_records is None:
+                    session_key = (account, security, segment, product, tuple(sorted(parents.items())),
+                                   datetime.fromtimestamp(now, IST).date().isoformat())
+                    batch.setdefault("settled_session_history", {})[session_key] = [dict(r) for r in previous_sells]
                 batch.setdefault("settled_closed_sibling_verified", {}).update({
                     oid: (account, security, segment, product, parents[oid],
                           _holdings_fingerprint(holdings, account))
                     for oid in acked
                 })
+            if session_date is not None:
+                # Preserve the actual proof books even when sharing is not
+                # authorized. The watcher compares them to its own reads.
+                batch["get_positions"] = positions
+                batch["get_trade_book"] = day_trades
+                batch.setdefault("signed_owner_verified", {})[(security, segment, product)] = (
+                    account, tuple(sorted(parents.items())), session_date,
+                )
             if split_proof is not None:
                 # The full historical BUY/SELL attestation above has now
                 # succeeded; watcher may consume this fresh pass-specific
                 # proof, never a generic addition of broker quantities.
                 batch.setdefault("mixed_verified", {})[(security, segment, product)] = split_proof
-        db.record_system_event("OWNER_LOT_EVIDENCE", decision, json.dumps(evidence))
+        if routine_records is None:
+            db.record_system_event("OWNER_LOT_EVIDENCE", decision, json.dumps(evidence))
     if isinstance(orders, list):
         batch["get_order_book"] = orders
     if isinstance(holdings, list):

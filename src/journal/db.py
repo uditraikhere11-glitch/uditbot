@@ -1816,7 +1816,7 @@ class JournalDB:
 
     def get_closed_forever_sibling_evidence(
         self, account: str, security: str, segment: str, product: str,
-        *, open_parent_ids: Tuple[str, ...], now: float,
+        *, open_parent_ids: Tuple[str, ...], now: float, session_date=None,
     ) -> Dict[str, Any]:
         """Read-only closed-OCO sibling allowance; no unexplained same-security SELL is exempt.
 
@@ -1828,6 +1828,12 @@ class JournalDB:
                 or not segment or product != "CNC" or not open_parent_ids):
             raise ValueError("Closed sibling identity not verified")
         ids = tuple(str(x) for x in open_parent_ids)
+        # The caller must establish a valid broker session independently.
+        # Keep the actual observation clock for chronology/future checks.
+        actual_date = datetime.datetime.fromtimestamp(now, IST).date()
+        effective_date = actual_date if session_date is None else session_date
+        if type(effective_date) is not datetime.date or effective_date > actual_date:
+            raise ValueError("Closed sibling session date invalid")
         with self._get_conn() as conn:
             rows = [dict(r) for r in conn.execute(
                 "SELECT * FROM positions_lifecycle WHERE account_id=? AND security_id=? "
@@ -1953,7 +1959,7 @@ class JournalDB:
                         seen_sells.add(eid)
                         sell_ids.add(eid)
                         exit_sum += quantity
-                        if datetime.datetime.fromtimestamp(float(at), IST).date() == datetime.datetime.fromtimestamp(now, IST).date():
+                        if datetime.datetime.fromtimestamp(float(at), IST).date() == effective_date:
                             today_sell += quantity
                 if exit_sum != sold:
                     raise ValueError("Closed OCO SELL allocation does not cover entire BUY")

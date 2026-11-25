@@ -1608,6 +1608,10 @@ class StartupReconciliationGate:
                 if (result[0] and self.watcher is not None
                         and getattr(self.watcher, "_supervision_read_complete", False) is True):
                     try:
+                        # Cache only real historical SELL rows after the entire
+                        # gate and durable watcher readback succeeded. Never
+                        # persist them as a reusable authorization across restarts.
+                        self.watcher._settled_owner_session = books.get("settled_session_history", {})
                         self.watcher.mark_completed_startup_supervision()
                     except (AttributeError, TypeError, ValueError):
                         pass  # Scheduling optimization only; never changes gate
@@ -1946,8 +1950,9 @@ class StartupReconciliationGate:
                             "UNPROTECTED_MANUAL_RISK", "RECONCILIATION_REQUIRED"
                         ) and int(row.get("protected_qty") or 0) == 0
                     ]
+                    signed_session = None
                     if owner_survivors:
-                        from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity
+                        from src.engine.signed_cnc_delivery import verify_signed_cnc_delivery_quantity, signed_delivery_session_date
                         from src.engine.signed_delivery_live_evidence import attest_signed_holdings
                         holdings_account = attest_signed_holdings(
                             self.broker, self._active_pass_holdings, books["account"],
@@ -1962,10 +1967,14 @@ class StartupReconciliationGate:
                             expected_open_qty=expected, now=time.time(),
                             holdings_profile_account=holdings_account,
                         )
+                        signed_session = signed_delivery_session_date(
+                            trade_book=trade_book, account=books["account"], security=contract[0],
+                            segment=contract[1], product=contract[2], now=time.time(),
+                        )
                     flat = verified_flat_delivery_day(
                         position, positions, self._active_pass_holdings,
                         trade_book, self.db, books["account"],
-                        self._read_required_broker_collection,
+                        self._read_required_broker_collection, session_date=signed_session,
                     )
                 except (ValueError, TypeError, KeyError, sqlite3.Error):
                     flat = False

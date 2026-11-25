@@ -7,7 +7,7 @@ child-leg evidence; the active broker exit books remain separate admission gates
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time as clock_time, timedelta
 from math import isfinite
 import re
 from typing import Any
@@ -66,6 +66,81 @@ def validate_signed_position_components(position, net_day, today_buy=None, today
                 raise SignedCNCDeliveryUnverified("Reported BUY/SELL quantities conflict")
             if today_buy is not None and (buy != today_buy or sell != today_sell):
                 raise SignedCNCDeliveryUnverified("Reported BUY/SELL totals differ from verified tradebook")
+
+
+def signed_delivery_session_date(*, trade_book, account, security, segment, product, now):
+    """Select an execution date, never manufacture or extend a broker snapshot.
+
+    Prior-session books are eligible only before 08:30 IST, for CNC, with
+    complete calendar coverage and one exact preceding trading date. All
+    quantity, execution and protection proofs remain mandatory downstream.
+    """
+    from src.engine.unified_exit_reconciliation import _exchange_time
+    from src.engine.market import load_holidays_verified
+    current = datetime.fromtimestamp(now, _IST)
+    dates = set()
+    if not isinstance(trade_book, list) or getattr(trade_book, "ok", True) is not True:
+        raise SignedCNCDeliveryUnverified("Signed session tradebook unavailable")
+    for row in trade_book:
+        if not isinstance(row, dict) or not str(row.get("securityId") or "").strip():
+            raise SignedCNCDeliveryUnverified("Signed session trade identity unavailable")
+        if str(row["securityId"]).strip() != security:
+            continue
+        if (str(row.get("dhanClientId") or "").strip() != account
+                or row.get("exchangeSegment") != segment or row.get("productType") != product):
+            raise SignedCNCDeliveryUnverified("Signed session account or contract differs")
+        try:
+            at = _exchange_time(row.get("exchangeTime"))
+            if at > now:
+                raise ValueError("Future execution")
+            dates.add(datetime.fromtimestamp(at, _IST).date())
+        except (ValueError, TypeError, OverflowError, OSError) as exc:
+            raise SignedCNCDeliveryUnverified("Signed session execution date unavailable") from exc
+    if dates == {current.date()}:
+        return current.date()
+    if (product != "CNC" or current.time() >= clock_time(8, 30) or len(dates) != 1):
+        raise SignedCNCDeliveryUnverified("Signed session date is stale or ambiguous")
+    day = current.date() - timedelta(days=1)
+    for _ in range(14):
+        ok, holidays, _ = load_holidays_verified(required_year=day.year)
+        if not ok:
+            raise SignedCNCDeliveryUnverified("Previous trading session calendar unverified")
+        if day.weekday() < 5 and day not in holidays:
+            if dates == {day}:
+                return day
+            break
+        day -= timedelta(days=1)
+    raise SignedCNCDeliveryUnverified("Not the immediately preceding trading session")
+
+
+def closed_sibling_live_rows_match(*, closed, trade_book, account, security, segment, product, sells_only=False):
+    """Exact candidate allowlist match, including exchange execution day."""
+    from src.engine.unified_exit_reconciliation import _exchange_time
+    seen = set()
+    try:
+        if not isinstance(trade_book, list):
+            return False
+        for row in trade_book:
+            if not isinstance(row, dict) or not str(row.get("securityId") or "").strip():
+                return False
+            if str(row["securityId"]).strip() != security:
+                continue
+            if sells_only and row.get("transactionType") == "BUY":
+                continue
+            key = (str(row.get("orderId") or "").strip(), str(row.get("exchangeTradeId") or "").strip())
+            proof = closed["trades"].get(key)
+            if (not proof or key in seen or row.get("dhanClientId") != account
+                    or row.get("exchangeSegment") != segment or row.get("productType") != product
+                    or row.get("transactionType") != proof[0]
+                    or _positive_int(row.get("tradedQuantity")) != proof[1]
+                    or abs(_price(row.get("tradedPrice")) - proof[2]) >= 1e-6
+                    or datetime.fromtimestamp(_exchange_time(row.get("exchangeTime")), _IST).date()
+                    != datetime.fromtimestamp(proof[3], _IST).date()):
+                return False
+            seen.add(key)
+        return True
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, OSError):
+        return False
 
 
 def verify_signed_cnc_delivery_quantity(
@@ -168,19 +243,23 @@ def verify_signed_cnc_delivery_quantity(
             ):
                 raise SignedCNCDeliveryUnverified("Owner acknowledgement missing")
 
+    session_date = signed_delivery_session_date(
+        trade_book=trade_book, account=account, security=security,
+        segment=segment, product=product, now=now,
+    )
     # This strict journal routine verifies closed parent lifecycle, original
     # BUY intent/fills, OCO group, exact child leg IDs and full SELL allocations.
     try:
         closed = db.get_closed_forever_sibling_evidence(
             account, security, segment, product,
-            open_parent_ids=open_ids, now=now,
+            open_parent_ids=open_ids, now=now, session_date=session_date,
         )
     except (AttributeError, ValueError, TypeError, KeyError) as exc:
         raise SignedCNCDeliveryUnverified("Closed sibling ownership unavailable") from exc
     closed_trades = closed.get("trades") or {}
     seen: set[str] = set()
     today_buy = today_sell = 0
-    today = datetime.fromtimestamp(now, _IST).date()
+    today = session_date
     with db._get_conn() as conn:
         for trade in trade_book:
             sid = str(trade.get("securityId") or "").strip()
@@ -265,6 +344,14 @@ def verify_signed_cnc_delivery_quantity(
                 ).fetchone():
                     raise SignedCNCDeliveryUnverified("Shared multi-lot SELL allocation requires review")
                 today_sell += qty
+    if session_date != datetime.fromtimestamp(now, _IST).date():
+        # Overnight exception is closed-sibling-only, not a replay of a
+        # previous day's partial exit or an unallocated/current BUY.
+        if not closed_sibling_live_rows_match(
+            closed=closed, trade_book=trade_book, account=account,
+            security=security, segment=segment, product=product,
+        ):
+            raise SignedCNCDeliveryUnverified("Overnight execution is not a verified closed sibling")
     if not seen or today_sell <= 0 or today_buy - today_sell != net_day:
         raise SignedCNCDeliveryUnverified("Day BUY minus SELL does not match signed CNC netQty")
     try:

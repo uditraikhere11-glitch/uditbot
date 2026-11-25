@@ -140,16 +140,16 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_uncertainty_previews_normal_transport_allowance(self):
         from src.broker.read_governor import ReadGovernor
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
-        governor.seconds_until_capacity = Mock(return_value=0)
+        governor.seconds_until_capacity = Mock(return_value=(0.0, False))
         self.w.broker._read_governor = governor
         self.w.terminal_orders['O1']['cancel_uncertain'] = True
         await self.drive(4)
-        governor.seconds_until_capacity.assert_called_once_with(required=8, priority='normal')
+        governor.seconds_until_capacity.assert_called_once_with(pacing_detail=True, required=8, priority='normal')
 
     async def test_throttled_closed_session_is_not_consumed(self):
         from src.broker.read_governor import ReadGovernor
         governor = ReadGovernor(self.tmp.name, 'ACCOUNT')
-        governor.seconds_until_capacity = Mock(side_effect=[30, 0])
+        governor.seconds_until_capacity = Mock(side_effect=[(30.0, False), (0.0, False)])
         self.w.broker._read_governor = governor
         await self.drive(400)
         self.assertEqual(self.calls, [1030])
