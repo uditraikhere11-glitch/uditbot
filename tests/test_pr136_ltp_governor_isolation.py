@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import os
 import sqlite3
@@ -82,7 +83,7 @@ class OneStrikePerCooldownTests(unittest.TestCase):
         )
 
     def _state(self):
-        with sqlite3.connect(self.governor.path) as conn:
+        with closing(sqlite3.connect(self.governor.path)) as conn:
             return conn.execute(
                 "SELECT until, strikes FROM category_cooldown WHERE category=?",
                 ("NON_TRADING",),
@@ -110,16 +111,19 @@ class OneStrikePerCooldownTests(unittest.TestCase):
         self.governor.throttled("15")
         self.assertEqual(self._state(), (10185.0, 1))
 
-    def test_expired_window_escalates_and_success_resets(self):
+    def test_expired_window_escalates_and_single_success_does_not_reset(self):
         self.governor.throttled(None)
         self.now[0] = 10060.0  # exact expiry must count as a new window
         self.governor.throttled(None)
         self.assertEqual(self._state(), (10180.0, 2))
         self.now[0] = 10180.0
-        self.governor.record_success()
-        self.assertEqual(self._state(), (10180.0, 0))
+        receipt = self.governor.admit()
+        self.assertTrue(self.governor.record_success(receipt=receipt))
+        self.assertEqual(self._state(), (10180.0, 2))
+        self.now[0] += 0.5
+        self.governor.admit()
         self.governor.throttled(None)
-        self.assertEqual(self._state(), (10240.0, 1))
+        self.assertEqual(self._state(), (10420.5, 3))
 
     def test_repeat_429_never_shortens_server_cooldown(self):
         self.governor.throttled("240")

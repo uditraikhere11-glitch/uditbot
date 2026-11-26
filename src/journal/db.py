@@ -121,8 +121,12 @@ class JournalDB:
         try:
             with conn:
                 yield conn
+            committed_changes=conn.total_changes
         finally:
             conn.close()
+        if committed_changes and self.account_id:
+            from src.broker.evidence_events import note_event
+            note_event(os.path.dirname(os.path.abspath(self.db_path)),self.account_id,'JOURNAL_DURABLE_COMMIT')
 
     def _init_db(self):
         with self._get_conn() as conn:

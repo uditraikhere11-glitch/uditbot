@@ -30,6 +30,8 @@ import sqlite3
 import time
 from urllib.parse import urlsplit
 
+from src.broker import read_recovery
+
 
 RECONCILIATION_PACING = ContextVar("reconciliation_pacing", default=False)
 
@@ -37,6 +39,7 @@ RECONCILIATION_PACING = ContextVar("reconciliation_pacing", default=False)
 class ReadDeferred(RuntimeError):
     def __init__(self, seconds, reason, *, short_window=False):
         self.short_window = short_window
+        self.wait_seconds = max(0.0, float(seconds))
         self.seconds = max(1, math.ceil(seconds))
         super().__init__(f'Dhan API deferred locally for {self.seconds}s: {reason}')
 
@@ -55,7 +58,7 @@ class ReadGovernor:
     PRIORITY_FRACTIONS = {'routine': .80, 'low': .90, 'normal': 1.0,
                           'identity': 1.0, 'urgent': 1.0}
 
-    def __init__(self, directory, account_id, clock=time.time):
+    def __init__(self, directory, account_id, clock=time.time, *, monotonic_clock=None, boot_id=None):
         self.directory = Path(directory)
         self.account_id = str(account_id if account_id is not None else '').strip()
         key = hashlib.sha256(self.account_id.encode('utf-8')).hexdigest()[:24]
@@ -63,6 +66,10 @@ class ReadGovernor:
         # history are not silently abandoned during the migration.
         self.path = self.directory / f'dhan-reads-{key}.sqlite3'
         self.clock = clock
+        self.monotonic_clock = monotonic_clock or (time.monotonic if clock is time.time else clock)
+        self.boot_id = boot_id or Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if not self.boot_id:
+            raise ValueError("Missing broker recovery boot identity")
 
     @classmethod
     def classify(cls, method, url):
@@ -185,6 +192,7 @@ class ReadGovernor:
                          '(category TEXT PRIMARY KEY, until REAL, strikes INTEGER)')
             conn.execute('CREATE TABLE IF NOT EXISTS order_modifications '
                          '(order_id TEXT PRIMARY KEY, used INTEGER NOT NULL)')
+            read_recovery.initialize(conn)
             conn.commit()
             return conn
         except Exception:
@@ -222,15 +230,26 @@ class ReadGovernor:
         return max(1, int(limit * frac))
 
     def admit(self, *, category='NON_TRADING', historical=False, priority='normal',
-              modification_order_id=None):
+              modification_order_id=None, transport_timeout=5.0):
         cat = self._category(category)
         prio = str(priority or 'normal').strip().lower()
         if prio not in self.PRIORITY_FRACTIONS:
             raise ValueError('Unsupported Dhan request admission priority')
-        now = float(self.clock())
-
+        if (type(transport_timeout) not in (int, float) or not math.isfinite(transport_timeout)
+                or transport_timeout <= 0):
+            raise ValueError('Invalid recovery transport timeout')
         def _op(conn):
             conn.execute('BEGIN IMMEDIATE')
+            # Sample admission clocks under the serialized write transaction.
+            # Concurrent processes may acquire the lock out of arrival order.
+            now = float(self.clock())
+            utc, mono = int(now * read_recovery.NS), int(self.monotonic_clock() * read_recovery.NS)
+            try:
+                recovery_state, recovery_clock = read_recovery.check_admission(
+                    conn, cat, utc, mono, self.boot_id)
+            except read_recovery.RecoveryDeferred as exc:
+                conn.commit()  # only recovery metadata, not a network admission
+                raise ReadDeferred(exc.seconds, exc.reason, short_window=exc.short_window) from None
             until = self._cooldown_until(conn, cat, now)
             if until > now:
                 raise ReadDeferred(until - now, 'broker rate-limit cooldown')
@@ -255,6 +274,7 @@ class ReadGovernor:
                              'ON CONFLICT(order_id) DO UPDATE SET used=used+1',
                              (str(modification_order_id),))
             conn.execute('INSERT INTO reads(at,category) VALUES (?,?)', (now, cat))
+            return read_recovery.admit(conn, cat, recovery_state, recovery_clock, utc, mono, transport_timeout)
 
         return self._run_with_busy_retry(_op)
 
@@ -290,6 +310,28 @@ class ReadGovernor:
                 if row and row[0]:
                     delay = max(delay, float(row[0])-now)
             short_only = delay == 0
+            tables = {x[0] for x in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'category_recovery' in tables:
+                row = conn.execute('SELECT state,strikes,boot_id,cooldown_until_mono_ns,probe_lease_deadline_utc_ns FROM category_recovery WHERE category=?',(cat,)).fetchone()
+                if row and row[1]:
+                    if row[2] != self.boot_id:
+                        # A preview must never manufacture recovery authority after reboot.
+                        delay = max(delay, 60 * 2**(row[1]-1))
+                        short_only = False
+                    else:
+                        mono = int(self.monotonic_clock() * read_recovery.NS)
+                        if row[0] == 'COOLDOWN':
+                            delay = max(delay, ((row[3] or 0)-mono)/read_recovery.NS)
+                            short_only = False if delay > 0 else short_only
+                        if cat == 'NON_TRADING' and row[0] in ('HALF_OPEN','RECOVERY'):
+                            c = conn.execute('SELECT probe_deadline_mono_ns,last_admission_mono_ns FROM recovery_clock WHERE category=?',(cat,)).fetchone()
+                            if c is None:
+                                raise sqlite3.DatabaseError('Recovery clock metadata missing')
+                            if row[0] == 'HALF_OPEN':
+                                delay = max(delay, ((c[0] or 0)-mono)/read_recovery.NS, (row[4] or 0)/read_recovery.NS-now)
+                                short_only = False if delay > 0 else short_only
+                            elif c[1] is not None:
+                                delay = max(delay, (c[1]+read_recovery.NS//2-mono)/read_recovery.NS)
             for window, limit in self._limits(cat):
                 ceiling = self._ceiling(limit, prio)
                 wave = min(need, ceiling) if window == 1 else need
@@ -319,52 +361,55 @@ class ReadGovernor:
 
     def throttled(self, retry_after=None, *, category='NON_TRADING'):
         cat = self._category(category)
-        now = float(self.clock())
-        delay = None
-        if isinstance(retry_after, (int,float)) and not isinstance(retry_after,bool):
-            delay = float(retry_after)
-        elif isinstance(retry_after,str):
-            try:
-                delay = float(retry_after.strip())
-            except ValueError:
-                try:
-                    dt = parsedate_to_datetime(retry_after.strip())
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    delay = dt.timestamp()-now
-                except (ValueError,TypeError,OverflowError):
-                    pass
-        if delay is not None and (not math.isfinite(delay) or delay<=0):
-            delay = None
-
         def _op(conn):
             conn.execute('BEGIN IMMEDIATE')
-            row = conn.execute('SELECT until,strikes FROM category_cooldown WHERE category=?',(cat,)).fetchone()
-            previous_strikes = int(row[1]) if row and row[1] is not None else 0
-            existing = float(row[0]) if row and row[0] is not None else 0.
-            if existing > now:
-                # Concurrent 429 responses belong to the same cooldown window.
-                # Respect a longer Retry-After without escalating strikes again.
-                strikes = previous_strikes
-                until = max(existing, now + (delay or 0))
-            else:
-                strikes = min(previous_strikes + 1, 7)
-                until = max(existing, now + max(60 * 2**(strikes - 1), delay or 0))
-            conn.execute('INSERT OR REPLACE INTO category_cooldown(category,until,strikes) VALUES (?,?,?)',
-                         (cat,until,strikes))
-            return until-now
+            now = float(self.clock())
+            delay = None
+            if isinstance(retry_after, (int,float)) and not isinstance(retry_after,bool):
+                delay = float(retry_after)
+            elif isinstance(retry_after,str):
+                try:
+                    delay = float(retry_after.strip())
+                except ValueError:
+                    try:
+                        dt = parsedate_to_datetime(retry_after.strip())
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        delay = dt.timestamp()-now
+                    except (ValueError,TypeError,OverflowError):
+                        pass
+            if delay is not None and (not math.isfinite(delay) or delay<=0):
+                delay = None
 
+            utc, mono = int(now * read_recovery.NS), int(self.monotonic_clock() * read_recovery.NS)
+            return read_recovery.throttle(conn, cat, delay, utc, mono, self.boot_id)
         return self._run_with_busy_retry(_op)
 
-    def record_success(self, *, category='NON_TRADING'):
+    def record_success(self, *, category='NON_TRADING', receipt=None):
+        """Count only caller-validated, once-consumable, actual GET admissions."""
         cat = self._category(category)
-        now = float(self.clock())
+        if receipt is None or cat != 'NON_TRADING':
+            return False
         def _op(conn):
             conn.execute('BEGIN IMMEDIATE')
-            row = conn.execute('SELECT until,strikes FROM category_cooldown WHERE category=?',(cat,)).fetchone()
-            if row and row[1] and (row[0] is None or float(row[0])<=now):
-                conn.execute('UPDATE category_cooldown SET strikes=0 WHERE category=?',(cat,))
-        try:
-            self._run_with_busy_retry(_op)
-        except (OSError,sqlite3.Error):
-            pass
+            utc, mono = int(self.clock()*read_recovery.NS), int(self.monotonic_clock()*read_recovery.NS)
+            return read_recovery.success(conn,cat,receipt,utc,mono,self.boot_id)
+        return self._run_with_busy_retry(_op)
+
+    def record_coherent_snapshot(self, snapshot, generation):
+        """A cache hit is not an additional coherent snapshot or clean GET."""
+        from src.broker.broker_snapshot import (BrokerSnapshot, EvidenceRequest, LIVE_BOOKS,
+                                                Purpose, account_key)
+        if not isinstance(snapshot, BrokerSnapshot) or snapshot.account_id != self.account_id:
+            return False
+        if generation.account_key != account_key(self.account_id) or generation.boot_id != self.boot_id:
+            return False
+        def _op(conn):
+            conn.execute('BEGIN IMMEDIATE')
+            utc, mono = int(self.clock()*read_recovery.NS), int(self.monotonic_clock()*read_recovery.NS)
+            req = EvidenceRequest(self.account_id,Purpose.WATCHER,LIVE_BOOKS,deadline_mono_ns=mono)
+            if snapshot.validation_reasons(req,generation,mono):
+                return False
+            return read_recovery.snapshot_success(conn,snapshot.snapshot_id,utc,mono,self.boot_id,
+                                                  snapshot.capture_started_utc_ns,snapshot.capture_started_mono_ns)
+        return self._run_with_busy_retry(_op)

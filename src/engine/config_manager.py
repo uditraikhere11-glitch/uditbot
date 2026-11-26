@@ -258,6 +258,9 @@ def write_json_atomic(file_path: str, data: Dict[str, Any], mode: int = 0o600) -
         os.replace(tmp_path, file_path)
         os.chmod(file_path, mode)
         _fsync_directory(parent_dir)
+        if os.path.basename(file_path) in ('service_control_state.json','mode_transition_gate.json'):
+            from src.broker.evidence_events import note_owner_event
+            note_owner_event(parent_dir,'OWNER_CONTROL_STATE_CHANGED')
     except Exception:
         if os.path.exists(tmp_path):
             try:
@@ -1472,7 +1475,7 @@ class ConfigChangeTracker:
                 cfg = AppConfig.from_env(env=parsed_env, env_file="") if os.path.exists(env_path) else AppConfig()
                 cfg.trading_mode = TradingMode.LIVE
                 cfg.data_dir = self.data_dir
-                client = DhanClient(cfg)
+                client = DhanClient(cfg, auto_generate_token=False, allow_read_auth_recovery=False)
                 return ReadOnlyDhanBrokerAdapter(client)
         except Exception as e:
             logger.warning(f"Could not construct ReadOnlyDhanBrokerAdapter: {e}")

@@ -137,7 +137,8 @@ class AdmissionRecoveryTests(unittest.TestCase):
                            side_effect=lambda seconds: clock.__setitem__(0, clock[0]+seconds)) as wait:
                     response = broker._governed_get("https://api.dhan.co/v2/fundlimit", headers={}, timeout=1)
                     self.assertEqual(response.status_code, 200)
-                    wait.assert_called_once_with(1)
+                    # Locked Phase 2B pacing includes a 50ms safety margin.
+                    wait.assert_called_once_with(1.05)
                     broker.session.get.assert_called_once()
                     g.throttled(120)
                     response = broker._governed_get("https://api.dhan.co/v2/fundlimit", headers={}, timeout=1)

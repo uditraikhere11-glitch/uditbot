@@ -323,7 +323,7 @@ def main() -> int:
 
     cfg = AppConfig.from_env()
     report = clean_orphaned_forever_orders(
-        DhanClient(cfg), cfg.journal_db_path, execute=args.execute
+        DhanClient(cfg, auto_generate_token=False, allow_read_auth_recovery=False), cfg.journal_db_path, execute=args.execute
     )
     print(json.dumps(report, indent=2))
     return 1 if report["error"] or report["failed"] else 0

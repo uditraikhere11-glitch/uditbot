@@ -138,10 +138,15 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         # Block a required broker read using the real persisted Dhan read governor.
         clock = [1000.0]
         self.gov.clock = lambda: clock[0]
+        self.gov.monotonic_clock = lambda: clock[0]
         self.gov.throttled(30)
         holdings = broker.get_holdings.return_value
         def read_holdings():
-            self.gov.admit()
+            # Synthetic transport emits an actual validated admission receipt,
+            # and the independent captures are spaced by the locked recovery rate.
+            receipt = self.gov.admit()
+            self.gov.record_success(receipt=receipt)
+            clock[0] += 0.5
             return holdings
         broker.get_holdings.side_effect = read_holdings
         self.assertFalse(gate.run_startup_reconciliation()[0])

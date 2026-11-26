@@ -3,6 +3,8 @@ Unit tests for Dhan automated TOTP authentication and /fundlimit integration.
 """
 
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from src.config import AppConfig
@@ -58,7 +60,10 @@ class TestDhanAuthAndFunds(unittest.TestCase):
         cfg.dhan_client_id = "1113731536"
         cfg.dhan_pin = "123456"
         cfg.dhan_totp_secret = "JBSWY3DPEHPK3PXP"
-        cfg.dhan_token_file = "/tmp/test_dhan_token.txt"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg.data_dir = tmp.name
+        cfg.dhan_token_file = str(Path(tmp.name) / "token.txt")
 
         client = DhanClient(cfg)
         # The authentication reply alone must not authorize publication of a
