@@ -151,7 +151,7 @@ class AdditionalMergeGate(unittest.TestCase):
             ]
             case.broker.get_trade_book.return_value = [{
                 'orderId': 'ORDER-A-TGT',
-                'exchangeTradeId': 'PART-FILL-1',
+                'exchangeTradeId': 'PART-EXEC-1',
                 'transactionType': 'SELL',
                 'securityId': '55001',
                 'exchangeSegment': 'NSE_FNO',
@@ -171,10 +171,10 @@ class AdditionalMergeGate(unittest.TestCase):
             self.assertEqual(rec.get('position_state'), PositionLifecycleState.EXIT_PART_FILLED.value)
             self.assertEqual(rec.get('exit_filled_qty'), 4)
 
-            # Second fill arrives (6 shares), but record_fill fails on PART-FILL-2
+            # Second fill arrives (6 shares), but record_fill fails on PART-EXEC-2
             real_record_fill = case.db.record_fill
             def fail_on_second_fill(*args, **kwargs):
-                if kwargs.get('exchange_trade_id') == 'PART-FILL-2':
+                if kwargs.get('exchange_trade_id') == 'PART-EXEC-2':
                     raise OSError('disk full on second fill')
                 return real_record_fill(*args, **kwargs)
 
@@ -184,7 +184,7 @@ class AdditionalMergeGate(unittest.TestCase):
             ]
             case.broker.get_trade_book.return_value.append({
                 'orderId': 'ORDER-A-TGT',
-                'exchangeTradeId': 'PART-FILL-2',
+                'exchangeTradeId': 'PART-EXEC-2',
                 'transactionType': 'SELL',
                 'securityId': '55001',
                 'exchangeSegment': 'NSE_FNO',
@@ -552,7 +552,7 @@ class AdditionalMergeGate(unittest.TestCase):
             # Recording a verified exchange tradebook fill for ORD-HIST-1 replaces the legacy synthetic -FILL-10 row without double counting!
             inserted = db.record_fill(
                 broker_order_id="ORD-HIST-1",
-                exchange_trade_id="REAL-EXCH-TRD-1",
+                exchange_trade_id="REAL-EXCH-EXEC-1",
                 symbol="YESBANK",
                 traded_price=15.55,
                 traded_quantity=10,

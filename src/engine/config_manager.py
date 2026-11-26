@@ -3553,26 +3553,10 @@ class ConfigChangeTracker:
                                 odict["status"] = resolved_st
                                 odict["filled_quantity"] = int(filled_q)
 
-                        # F03-01 Requirement 4: Record partial/full fill idempotently in `fills` and `watcher_orders`
-                        if filled_q > 0:
-                            eff_b_oid = actual_boid or boid or cid
-                            sym_val = str(row["symbol"] or "") if "symbol" in row.keys() else ""
-                            p_val = avg_p if avg_p > 0.0 else (float(row["price"] or 0.0) if "price" in row.keys() else 0.0)
-                            try:
-                                existing_f = cur.execute(
-                                    "SELECT COALESCE(SUM(traded_quantity), 0) FROM fills WHERE broker_order_id = ?",
-                                    (eff_b_oid,),
-                                ).fetchone()[0]
-                                if int(existing_f or 0) < int(filled_q):
-                                    cur.execute(
-                                        """
-                                        INSERT OR IGNORE INTO fills (broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity, traded_at)
-                                        VALUES (?, ?, ?, ?, ?, ?)
-                                        """,
-                                        (eff_b_oid, f"{eff_b_oid}-RECON-FILL-{filled_q}", sym_val, p_val, int(filled_q) - int(existing_f or 0), now_ts),
-                                    )
-                            except sqlite3.OperationalError:
-                                pass
+                        # Broker order summaries establish terminal status and reported
+                        # quantity, not exchange execution identity. Never insert a
+                        # fill here. Only the verified tradebook ingestion boundary
+                        # can record an execution or allocate an exit.
 
                         w_target = watcher_map.get(boid) or watcher_map.get(cid)
                         if w_target is not None:

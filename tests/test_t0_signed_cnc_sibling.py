@@ -652,6 +652,37 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         self._replace_split_buy_with_archive()
         self._assert_rollover_recovered()
 
+    def _replace_split_sell_with_archive(self, *, valid_child=True):
+        self._settled_rollover_schema()
+        self._replace_split_buy_with_archive()
+        row = next(r for r in self.history if r.get("exchangeTradeId") == self.SELL_TRADE)
+        with self.db._get_conn() as conn:
+            at = conn.execute("SELECT traded_at FROM fills WHERE exchange_trade_id=?", (self.SELL_TRADE,)).fetchone()[0]
+            conn.execute("UPDATE fills SET traded_quantity=16 WHERE exchange_trade_id=?", (self.SELL_TRADE,))
+        self.assertTrue(self.db.record_fill(
+            broker_order_id=self.TARGET_CHILD, exchange_trade_id="SYNTHETIC-SELL-SPLIT-12",
+            symbol="YESBANK-EQ", traded_price=17.93, traded_quantity=12, traded_at=at,
+            transaction_type="SELL", security_id=self.SECURITY, exchange_segment="NSE_EQ", product_type="CNC",
+            parent_order_id=self.THIRD, is_verified_trade=True))
+        row.update(exchangeTradeId="", tradedQuantity=28)
+        child = dict(self.broker.order_status(self.TARGET_CHILD))
+        child["exchangeOrderId"] = row["exchangeOrderId"] if valid_child else "WRONG-EXCHANGE-ORDER"
+        self.broker.order_status.side_effect = lambda oid: dict(child) if oid == self.TARGET_CHILD else None
+
+    def test_archived_split_sell_rollup_settled_no_new_fills(self):
+        self._replace_split_sell_with_archive()
+        with self.db._get_conn() as conn:
+            before = conn.execute("SELECT * FROM fills ORDER BY id").fetchall()
+        self._assert_rollover_recovered()
+        with self.db._get_conn() as conn:
+            after = conn.execute("SELECT * FROM fills ORDER BY id").fetchall()
+        self.assertEqual([tuple(r) for r in before], [tuple(r) for r in after])
+
+    def test_archived_split_sell_rollup_wrong_child_binding_blocks(self):
+        self._replace_split_sell_with_archive(valid_child=False)
+        self.assertFalse(self._full_watcher_pass()["verified"])
+        self.assert_retained()
+
     def test_archived_rollup_normalizer_missing_sentinels_and_no_dedup(self):
         from src.broker.dhan_client import DhanClient
         row, _ = self._archived_rollup_schema()

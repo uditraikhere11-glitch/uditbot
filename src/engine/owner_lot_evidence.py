@@ -25,7 +25,7 @@ class DematReview(ValueError):
 def verify_owner_history(broker, db, account, security, segment, product, parents,
                          holding, day_trades, now, evidence, *, current_day_live_keys=(),
                          verified_closed_sibling_trades=None, authorized_closed_sell_ids=(),
-                         closed_order_rollups=None, session_date=None):
+                         closed_order_rollups=None, session_date=None, allow_closed_sell_rollups=False):
     """Match every original execution; a SELL followed by a BUY is still a conflict."""
     isin = str(holding.get("isin") or "").strip().upper()
     if not isin:
@@ -63,7 +63,7 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
     from src.engine.signed_delivery_live_evidence import ClosedHistoricalBuyMatcher
     matcher = ClosedHistoricalBuyMatcher(
         allowed_closed, closed_order_rollups or {},
-        account=account, contract=(security, segment, product), today=last,
+        account=account, contract=(security, segment, product), today=last, now=now,
     )
     seen_closed_history = set()
     seen_closed_today = set()
@@ -94,9 +94,12 @@ def verify_owner_history(broker, db, account, security, segment, product, parent
                 allow_missing_exchange_trade_id=historical)
             if not valid or normalized is None:
                 raise ValueError("Execution identity or quantity incomplete")
-            if historical and side == "BUY":
+            if historical and side in ("BUY", "SELL"):
                 matched = matcher.match(row)
                 if matched is not None:
+                    if (side == "SELL" and matcher.sell_matches[-1].aggregate
+                            and not allow_closed_sell_rollups):
+                        raise ValueError("Historical SELL rollup requires settled closed-child verification")
                     if matched & seen_closed_history:
                         raise ValueError("Duplicate closed sibling historical execution")
                     seen_closed_history.update(matched)
@@ -372,7 +375,7 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                                      verified_closed_sibling_trades=closed["trades"],
                                      authorized_closed_sell_ids=closed["sell_ids"],
                                      closed_order_rollups=closed.get("order_rollups", {}),
-                                     session_date=session_date)
+                                     session_date=session_date, allow_closed_sell_rollups=rollover)
             else:
                 from src.engine.signed_cnc_delivery import closed_sibling_live_rows_match
                 from src.engine.settled_owner_read_policy import _UNSAFE
@@ -421,34 +424,33 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                             or sum(f["traded_quantity"] for f in fills) != qty):
                         raise ValueError("Routine original BUY basis differs")
             if rollover:
-                from src.engine.unified_exit_reconciliation import _exchange_time
-                from src.engine.signed_delivery_live_evidence import verify_closed_triggered_group
+                from src.engine.signed_delivery_live_evidence import (
+                    ClosedHistoricalBuyMatcher, verify_closed_triggered_group,
+                )
                 previous_sells = []
                 seen_sell_keys = set()
                 today = datetime.fromtimestamp(now, IST).date()
+                sell_matcher = ClosedHistoricalBuyMatcher(
+                    closed["trades"], closed.get("order_rollups", {}), account=account,
+                    contract=(security, segment, product), today=today, now=now,
+                )
                 for trade in evidence["executions"]:
-                    key = (str(trade.get("orderId") or ""), str(trade.get("exchangeTradeId") or ""))
-                    expected = closed["trades"].get(key)
-                    if not expected or expected[0] != "SELL":
+                    if trade.get("transactionType") != "SELL":
                         continue
-                    at = datetime.fromtimestamp(_exchange_time(trade.get("exchangeTime")), IST).date()
-                    if (key in seen_sell_keys or at >= today
-                            or at != datetime.fromtimestamp(expected[3], IST).date()
-                            or trade.get("dhanClientId") != account
-                            or str(trade.get("securityId")) != security
-                            or trade.get("exchangeSegment") != segment
-                            or trade.get("productType") != product
-                            or trade.get("transactionType") != "SELL"
-                            or type(trade.get("tradedQuantity")) not in (int, str)
-                            or str(trade["tradedQuantity"]) != str(expected[1])
-                            or isinstance(trade.get("tradedPrice"), bool)
-                            or not __import__("math").isfinite(float(trade["tradedPrice"]))
-                            or abs(float(trade["tradedPrice"]) - expected[2]) >= 1e-6):
-                        raise ValueError("Rollover historical SELL execution day or identity differs")
-                    seen_sell_keys.add(key)
+                    if (trade.get("isin") and str(trade["isin"]).strip().upper()
+                            != str(holding.get("isin") or "").strip().upper()):
+                        raise ValueError("Rollover historical SELL ISIN differs")
+                    keys = sell_matcher.match(trade)
+                    if keys is None or keys & seen_sell_keys:
+                        raise ValueError("Rollover historical SELL identity or overlap differs")
+                    if sell_matcher.sell_matches[-1].day >= today:
+                        raise ValueError("Rollover historical SELL not prior day")
+                    seen_sell_keys.update(keys)
                     previous_sells.append(trade)
                 if seen_sell_keys != {k for k, v in closed["trades"].items() if v[0] == "SELL"}:
                     raise ValueError("Rollover historical SELL evidence incomplete")
+                aggregate_children = {m.order_id for m in sell_matcher.sell_matches if m.aggregate}
+                verified_aggregate_children = set()
                 # A previous-day child may disappear from today's order book.
                 # Require an authoritative read by exact ID, never infer terminal
                 # status from absence. Include every current order in validation.
@@ -468,9 +470,13 @@ def prepare_owner_lots(broker, db, batch, positions, day_trades, now, holdings=N
                         child_orders.append(row)
                     verify_closed_triggered_group(
                         group=group, closed=closed, forever=forever, orders=child_orders,
-                        day_trades=previous_sells, account=account, security=security,
+                        day_trades=[], account=account, security=security,
                         segment=segment, product=product,
+                        historical_sell_matches=sell_matcher.sell_matches,
                     )
+                    verified_aggregate_children.update(binding["children"])
+                if not aggregate_children <= verified_aggregate_children:
+                    raise ValueError("Historical SELL rollup lacks verified closed child binding")
             for position in evidence["positions"]:
                 if not position["exchangeSegment"] or not position["productType"]:
                     raise ValueError("Position identity incomplete")

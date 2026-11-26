@@ -307,6 +307,11 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                 self.assertEqual(int(w_data["qty"]), req_qty)
                 self.assertEqual(int(w_data["filled_qty"]), fill_qty)
 
+        # Broker terminal summaries must not become fabricated exchange fills.
+        with self.db._get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM fills WHERE exchange_trade_id LIKE '%-RECON-FILL-%' AND is_verified_trade=1").fetchone()[0], 0)
+
         # Only the 3 orders with filled_qty > 0 (5 + 4 + 3 = 12 shares @ 100.0 = 1200.0 INR) count toward daily trades & exposure
         self.assertEqual(self.db.get_today_orders_count(), 3)
         risk_st = self.db.get_live_portfolio_risk_state()
