@@ -18,7 +18,7 @@ Covers all 17 scenarios specified in `INDEPENDENT_CODE_AUDIT.md` and `DEVELOPMEN
 - H14: Startup auth verified but reconciliation blocked -> Telegram cards report auth verified & entries BLOCKED.
 - H15: History outside API-supported retention (>31d) or missing broker_order_id -> escalates for manual review.
 - H16: LIVE test order explicitly owner acknowledged -> narrow audited UNPROTECTED_MANUAL_RISK; no global bypass.
-- H17: `bypass_reconciliation.py` disabled and zero automatic order mutations during historical reconciliation.
+- H17: `bypass_reconciliation.py` absent; missing evidence must not bulk-close orders.
 """
 
 import datetime
@@ -1063,18 +1063,70 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             self.assertEqual(pl["confirmed_open_qty"], 1)
 
     # ------------------------------------------------------------------
-    # H17: bypass_reconciliation.py disabled and no bulk-close SQL path exists
+    # H17: the bypass script must not exist; missing evidence cannot bulk-close orders
     # ------------------------------------------------------------------
     def test_h17_bypass_reconciliation_script_disabled_and_no_bulk_close_path_exists(self):
         repo_root = Path(__file__).resolve().parent.parent
         bypass_path = repo_root / "bypass_reconciliation.py"
-        if bypass_path.exists():
-            content = bypass_path.read_text(encoding="utf-8")
-            self.assertNotIn("UPDATE ", content.upper())
-            self.assertNotIn("SET STATE", content.upper())
-            self.assertNotIn("SET STATUS", content.upper())
-            with self.assertRaises(RuntimeError):
-                exec(compile(content, str(bypass_path), "exec"), {})
+        self.assertFalse(bypass_path.exists() or bypass_path.is_symlink(),
+                         "Dangerous reconciliation bypass must be absent")
+
+        for retired in (
+            'nuke_groww.py',
+            'bypass_amo_validator.py',
+            'dhan_client.py',
+            'src/broker/dhan_client.py.bak',
+            'setup_app.py',
+            'patch_brain.py',
+            'patch_safe_brain.py',
+            'rollback_brain.py',
+            'today_bot_logs.txt',
+            'tests/test_webui_budget_flexible.py.backup_20261104_234729',
+            'test_11_step_rework_matrix.py',
+            'test_pipeline_e2e.py',
+            'test_v13_targeted_safety_corrections.py',
+        ):
+            with self.subTest(retired=retired):
+                path = repo_root / retired
+                self.assertFalse(path.exists() or path.is_symlink(),
+                                 "Retired unsafe or duplicate file must stay absent")
+
+        # Exercise the existing fail-closed path with two independent synthetic
+        # lots. A blanket rewrite must not close either ACKED intent/order.
+        for suffix, day in (("1", 2), ("2", 4)):
+            self._seed_acked_intent(
+                correlation_id="EQ-H17-" + suffix,
+                broker_order_id="H17-ORDER-" + suffix,
+                created_ts=datetime.datetime(2026, 11, day, 14, 1, 18,
+                                             tzinfo=IST).timestamp(),
+            )
+
+        def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
+            if url.endswith("/fundlimit"):
+                return _http_resp(200, {"availabelBalance": 5000.0})
+            if url.endswith("/holdings"):
+                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK",
+                                        "totalQty": 2, "dpQty": 2}])
+            return _http_resp(200, [])
+
+        def states():
+            with self.db._get_conn() as conn:
+                intents = [tuple(row) for row in conn.execute(
+                    "SELECT correlation_id, state FROM order_intents ORDER BY correlation_id")]
+                orders = [tuple(row) for row in conn.execute(
+                    "SELECT correlation_id, status FROM orders ORDER BY correlation_id")]
+            return intents, orders
+
+        before = states()
+        self.assertEqual(before, ([("EQ-H17-1", "ACKED"), ("EQ-H17-2", "ACKED")],
+                                  [("EQ-H17-1", "PENDING"), ("EQ-H17-2", "PENDING")]))
+        with patch.object(self.client.session, "get", side_effect=fake_get):
+            ok, msg = self.gate.run_startup_reconciliation()
+        self.assertFalse(ok, msg)
+        self.assertEqual(self.gate.state, ReconciliationState.BLOCKED)
+        self.assertEqual(states(), before)
 
 
     # Additional independent-audit regressions outside Gemini's H01–H17 set.

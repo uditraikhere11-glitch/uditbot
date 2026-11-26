@@ -160,9 +160,10 @@ class ExplicitIsolationOnlyTests(unittest.TestCase):
                 ),
                 path.as_posix(),
             )
-        # The tracked historical .bak was also scrubbed to keep source audits clean.
-        archived = Path("src/broker/dhan_client.py.bak")
-        self.assertNotIn('"unittest" in sys.modules', archived.read_text(encoding="utf-8"))
+        # The obsolete tracked archive must be absent; production checks above remain.
+        archived = Path(__file__).resolve().parent.parent / "src/broker/dhan_client.py.bak"
+        self.assertFalse(archived.exists() or archived.is_symlink(),
+                         "Historical Dhan client backup must be absent")
 
 
 if __name__ == "__main__":
