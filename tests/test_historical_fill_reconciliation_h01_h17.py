@@ -18,7 +18,7 @@ Covers all 17 scenarios specified in `INDEPENDENT_CODE_AUDIT.md` and `DEVELOPMEN
 - H14: Startup auth verified but reconciliation blocked -> Telegram cards report auth verified & entries BLOCKED.
 - H15: History outside API-supported retention (>31d) or missing broker_order_id -> escalates for manual review.
 - H16: LIVE test order explicitly owner acknowledged -> narrow audited UNPROTECTED_MANUAL_RISK; no global bypass.
-- H17: `bypass_reconciliation.py` disabled and zero automatic order mutations during historical reconciliation.
+- H17: `bypass_reconciliation.py` absent; missing evidence must not bulk-close orders.
 """
 
 import datetime
@@ -60,6 +60,8 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 def _http_resp(status: int, payload=None, text: str = "") -> MagicMock:
     r = MagicMock()
     r.status_code = status
+    r.headers = {}
+    r._uditbot_original_status = status
     r.text = text or (json.dumps(payload) if payload is not None and not isinstance(payload, Exception) else "")
     if isinstance(payload, Exception):
         r.json.side_effect = payload
@@ -119,7 +121,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         self.stop_path = os.path.join(self.data_dir, "emergency_stop.json")
         self.watcher_path = os.path.join(self.data_dir, "pending_protection.json")
 
-        write_token_atomic("TEST_ACTIVE_TOKEN", self.tok_path)
+        from tests._phase2d_live_harness import make_synthetic_jwt
+        write_token_atomic(make_synthetic_jwt(FAKE_ACCT, expires_in_sec=86400.0 * 365.0), self.tok_path)
         self.cfg = AppConfig(
             trading_mode=TradingMode.LIVE,
             dhan_client_id=FAKE_ACCT,
@@ -147,6 +150,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             dry_run=False,
             journal_db=self.db,
         )
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(self.client, db_path=self.db.db_path, data_dir=os.path.dirname(self.db.db_path))
         self.gate = StartupReconciliationGate(
             broker=self.client,
             journal_db=self.db,
@@ -228,13 +233,15 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         )
 
         with self.db._get_conn() as conn:
-            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
-                         ("900001102657701", "FO-YES-1"))
+            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         ("900001102657701", "FO-YES-1", "YESBANK-EQ", 1, "ACTIVE", mon_ts))
 
         hist_trade = {
             "dhanClientId": FAKE_ACCT,
             "orderId": "900001102657701",
             "exchangeTradeId": "ETID-20261102-001",
+            "exchangeOrderId": "EXO-20261102-001",
+            "exchangeTime": "2026-11-02 14:01:18",
             "tradingSymbol": "YESBANK-EQ",
             "securityId": "11915",
             "exchangeSegment": "NSE_EQ",
@@ -260,7 +267,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "totalQty": 1, "dpQty": 1}])
+                return _http_resp(200, [{"dhanClientId": FAKE_ACCT, "securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 1, "dpQty": 1, "t1Qty": 0, "availableQty": 1}])
             return _http_resp(200, [])
 
         with patch.object(self.client.session, "get", side_effect=fake_get), \
@@ -293,11 +300,11 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
 
     def _two_independent_lots(self, bind_second, second_group_qty=1):
         with self.db._get_conn() as conn:
-            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
-                         ("900001102657701", "FO-FIRST"))
+            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         ("900001102657701", "FO-FIRST", "YESBANK-EQ", 1, "ACTIVE", time.time() - 86400))
             if bind_second:
-                conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
-                             ("900001104398802", "FO-SECOND"))
+                conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                             ("900001104398802", "FO-SECOND", "YESBANK-EQ", 1, "ACTIVE", time.time() - 86400))
         nov2_ts = datetime.datetime(2026, 11, 2, 14, 1, 18, tzinfo=IST).timestamp()
         nov4_ts = datetime.datetime(2026, 11, 4, 11, 25, 21, tzinfo=IST).timestamp()
         self._seed_acked_intent(
@@ -320,6 +327,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001102657701",
                 "exchangeTradeId": "ETID-NOV2-11915",
+                "exchangeOrderId": "EXO-NOV2-11915",
+                "exchangeTime": "2026-11-02 14:01:18",
                 "tradingSymbol": "YESBANK-EQ",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
@@ -332,6 +341,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001104398802",
                 "exchangeTradeId": "ETID-NOV4-11915",
+                "exchangeOrderId": "EXO-NOV4-11915",
+                "exchangeTime": "2026-11-04 14:05:10",
                 "tradingSymbol": "YESBANK-EQ",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
@@ -358,7 +369,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "totalQty": 2, "dpQty": 2, "avgCostPrice": 15.515}])
+                return _http_resp(200, [{"dhanClientId": FAKE_ACCT, "securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2, "t1Qty": 0, "availableQty": 2, "avgCostPrice": 15.515}])
             return _http_resp(200, [])
 
         with patch.object(self.client.session, "get", side_effect=fake_get):
@@ -986,6 +997,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001102657701",
                 "exchangeTradeId": "ETID-NOV2-1",
+                "exchangeOrderId": "EXO-NOV2-1",
+                "exchangeTime": "2026-11-02 14:01:18",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
                 "productType": "CNC",
@@ -997,6 +1010,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001104398802",
                 "exchangeTradeId": "ETID-NOV4-1",
+                "exchangeOrderId": "EXO-NOV4-1",
+                "exchangeTime": "2026-11-04 14:05:10",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
                 "productType": "CNC",
@@ -1016,7 +1031,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2}])
+                return _http_resp(200, [{"dhanClientId": FAKE_ACCT, "securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2, "t1Qty": 0, "availableQty": 2}])
             if url.endswith("/forever/orders"):
                 return _http_resp(200, [])
             return _http_resp(200, [])
@@ -1063,18 +1078,70 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             self.assertEqual(pl["confirmed_open_qty"], 1)
 
     # ------------------------------------------------------------------
-    # H17: bypass_reconciliation.py disabled and no bulk-close SQL path exists
+    # H17: the bypass script must not exist; missing evidence cannot bulk-close orders
     # ------------------------------------------------------------------
     def test_h17_bypass_reconciliation_script_disabled_and_no_bulk_close_path_exists(self):
         repo_root = Path(__file__).resolve().parent.parent
         bypass_path = repo_root / "bypass_reconciliation.py"
-        if bypass_path.exists():
-            content = bypass_path.read_text(encoding="utf-8")
-            self.assertNotIn("UPDATE ", content.upper())
-            self.assertNotIn("SET STATE", content.upper())
-            self.assertNotIn("SET STATUS", content.upper())
-            with self.assertRaises(RuntimeError):
-                exec(compile(content, str(bypass_path), "exec"), {})
+        self.assertFalse(bypass_path.exists() or bypass_path.is_symlink(),
+                         "Dangerous reconciliation bypass must be absent")
+
+        for retired in (
+            'nuke_groww.py',
+            'bypass_amo_validator.py',
+            'dhan_client.py',
+            'src/broker/dhan_client.py.bak',
+            'setup_app.py',
+            'patch_brain.py',
+            'patch_safe_brain.py',
+            'rollback_brain.py',
+            'today_bot_logs.txt',
+            'tests/test_webui_budget_flexible.py.backup_20261104_234729',
+            'test_11_step_rework_matrix.py',
+            'test_pipeline_e2e.py',
+            'test_v13_targeted_safety_corrections.py',
+        ):
+            with self.subTest(retired=retired):
+                path = repo_root / retired
+                self.assertFalse(path.exists() or path.is_symlink(),
+                                 "Retired unsafe or duplicate file must stay absent")
+
+        # Exercise the existing fail-closed path with two independent synthetic
+        # lots. A blanket rewrite must not close either ACKED intent/order.
+        for suffix, day in (("1", 2), ("2", 4)):
+            self._seed_acked_intent(
+                correlation_id="EQ-H17-" + suffix,
+                broker_order_id="H17-ORDER-" + suffix,
+                created_ts=datetime.datetime(2026, 11, day, 14, 1, 18,
+                                             tzinfo=IST).timestamp(),
+            )
+
+        def fake_get(url, headers=None, timeout=5):
+            if url.endswith("/profile"):
+                return _http_resp(200, {"dhanClientId": FAKE_ACCT})
+            if url.endswith("/fundlimit"):
+                return _http_resp(200, {"availabelBalance": 5000.0})
+            if url.endswith("/holdings"):
+                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK",
+                                        "totalQty": 2, "dpQty": 2}])
+            return _http_resp(200, [])
+
+        def states():
+            with self.db._get_conn() as conn:
+                intents = [tuple(row) for row in conn.execute(
+                    "SELECT correlation_id, state FROM order_intents ORDER BY correlation_id")]
+                orders = [tuple(row) for row in conn.execute(
+                    "SELECT correlation_id, status FROM orders ORDER BY correlation_id")]
+            return intents, orders
+
+        before = states()
+        self.assertEqual(before, ([("EQ-H17-1", "ACKED"), ("EQ-H17-2", "ACKED")],
+                                  [("EQ-H17-1", "PENDING"), ("EQ-H17-2", "PENDING")]))
+        with patch.object(self.client.session, "get", side_effect=fake_get):
+            ok, msg = self.gate.run_startup_reconciliation()
+        self.assertFalse(ok, msg)
+        self.assertEqual(self.gate.state, ReconciliationState.BLOCKED)
+        self.assertEqual(states(), before)
 
 
     # Additional independent-audit regressions outside Gemini's H01–H17 set.

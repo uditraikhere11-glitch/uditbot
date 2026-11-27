@@ -121,8 +121,12 @@ class JournalDB:
         try:
             with conn:
                 yield conn
+            committed_changes=conn.total_changes
         finally:
             conn.close()
+        if committed_changes and self.account_id:
+            from src.broker.evidence_events import note_event
+            note_event(os.path.dirname(os.path.abspath(self.db_path)),self.account_id,'JOURNAL_DURABLE_COMMIT')
 
     def _init_db(self):
         with self._get_conn() as conn:
@@ -1525,8 +1529,11 @@ class JournalDB:
         side = str(transaction_type or "BUY").strip().upper()
         if side not in ("BUY", "SELL"):
             side = "BUY"
-        is_synthetic = ("-FILL-" in etid or "-RECON-FILL-" in etid)
-        verified_flag = (0 if is_synthetic else 1) if is_verified_trade is None else (1 if is_verified_trade else 0)
+        is_synthetic = (not etid or etid.upper() in {"0", "NONE", "NULL"}
+                        or any(marker in etid.upper() for marker in ("-FILL-", "-RECON-", "-TRD-")))
+        # A caller cannot promote a synthetic order-summary ID into execution
+        # evidence, even via an explicit verified=True argument.
+        verified_flag = 0 if is_synthetic else (1 if is_verified_trade is None or is_verified_trade else 0)
 
         with self._get_conn() as conn:
             # Serialize the identity check with placeholder replacement, including

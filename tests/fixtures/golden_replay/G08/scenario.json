@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Multi-contract portfolio: YESBANK retained CNC lots + protected CNC holding (INFY) + MTF holding (SBIN) + F&O Super Order position, verifying independent per-parent accounting, zero cross-credit, and negative shared-protection/fractional/boolean/wrong-product variants.",
+  "primary_provenance": "SYNTHETIC",
+  "scenario_id": "G08",
+  "title": "Mixed retained and protected portfolio"
+}

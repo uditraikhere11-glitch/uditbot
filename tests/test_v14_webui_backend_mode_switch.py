@@ -133,7 +133,7 @@ class TestV14WebUIBackendModeSwitch(unittest.TestCase):
             data_dir=self.data_dir,
         )
         stop_mgr = EmergencyStopManager(self.stop_path, expected_account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         self.tracker.set_transition_gate(
             active=True,
@@ -279,6 +279,7 @@ class TestV14WebUIBackendModeSwitch(unittest.TestCase):
     def test_16_owner_manually_stops_service(self):
         with open(self.env_path, "w", encoding="utf-8") as f:
             f.write("TRADING_MODE=TEST\nEQUITY_BUDGET_INR=500.0\nDHAN_CLIENT_ID=1113731536\n")
+        self.tracker.record_active_running_version("test-mode-v1", trading_mode="TEST")
         svc_state = {"state": "active"}
         res_stop = self.tracker.control_service(
             action="stop",
@@ -405,3 +406,10 @@ class TestV14WebUIBackendModeSwitch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

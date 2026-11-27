@@ -1,0 +1,5 @@
+{
+  "post_intent_stop_authorized": true,
+  "pre_intent_snapshot_denied": true,
+  "retained_lots_untouched": true
+}

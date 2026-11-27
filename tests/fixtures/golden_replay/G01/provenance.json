@@ -1,0 +1,24 @@
+{
+  "components": {
+    "captures": {
+      "forever_orders_t0": "OBSERVED_PROJECTION",
+      "holdings_settled": "SYNTHETIC",
+      "holdings_t0": "OBSERVED_PROJECTION",
+      "order_book_t0": "OBSERVED_PROJECTION",
+      "positions_settled": "SYNTHETIC",
+      "positions_t0": "OBSERVED_PROJECTION",
+      "profile": "SYNTHETIC",
+      "super_orders": "SYNTHETIC",
+      "trade_book_t0": "OBSERVED_PROJECTION"
+    },
+    "expected_results": "SYNTHETIC",
+    "governor_seed": "SYNTHETIC",
+    "journal_seed": "OBSERVED_PROJECTION",
+    "mutation_ledger": "SYNTHETIC",
+    "owner_state": "SYNTHETIC"
+  },
+  "contains_real_sanitized_raw": false,
+  "missing_raw_evidence_note": "No raw HTTP wire captures were supplied in the input bundle; observed fields are explicitly labeled OBSERVED_PROJECTION or REPORTED_INCIDENT and remaining envelopes are SYNTHETIC.",
+  "overall_classification": "OBSERVED_PROJECTION",
+  "scenario_id": "G01"
+}

@@ -6,6 +6,10 @@ caller provides a fresh gate/pass-local cache, never a long-lived cache.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from math import isfinite
 
 from src.engine.holding_quantity import aggregate_holdings
@@ -78,8 +82,19 @@ def _text(row, field):
     return str(row.get(field) or "").strip()
 
 
+@dataclass(frozen=True, slots=True)
+class HistoricalSellMatch:
+    """Corroboration only; the keys reference existing durable execution IDs."""
+    order_id: str
+    exchange_order_id: str
+    day: date
+    execution_keys: frozenset[tuple[str, str]]
+    aggregate: bool
+
+
 def verify_closed_triggered_group(*, group, closed, forever, orders, day_trades,
-                                  account, security, segment, product):
+                                  account, security, segment, product,
+                                  historical_sell_matches=()):
     """Read-only proof of a closed sibling's Dhan TRIGGERED OCO group.
 
     A triggered row is NOT terminal on its own. The journal must bind the
@@ -152,6 +167,30 @@ def verify_closed_triggered_group(*, group, closed, forever, orders, day_trades,
             raise ValueError("Triggered child live SELL differs from journal")
         seen_execs.add(eid)
         live_children[oid] = live_children.get(oid, 0) + qty
+    # Archived summaries are never presented as current tradebook executions.
+    for match in historical_sell_matches:
+        if not isinstance(match, HistoricalSellMatch) or not match.execution_keys:
+            raise ValueError("Malformed historical child corroboration")
+        if match.order_id not in expected_children:
+            continue
+        children = [r for r in orders if _text(r, "orderId") == match.order_id]
+        if len(children) != 1:
+            raise ValueError("Historical child status missing or duplicated")
+        child = children[0]
+        if match.aggregate and (_text(child, "exchangeOrderId") != match.exchange_order_id
+                                or not match.exchange_order_id):
+            raise ValueError("Historical SELL rollup exchange order binding unavailable")
+        if (match.exchange_order_id and _text(child, "exchangeOrderId")
+                and _text(child, "exchangeOrderId") != match.exchange_order_id):
+            raise ValueError("Historical SELL exchange order identity differs")
+        for oid, eid in sorted(match.execution_keys):
+            journal = (closed.get("trades") or {}).get((oid, eid))
+            if (oid != match.order_id or eid in seen_execs or not journal
+                    or journal[0] != "SELL"
+                    or datetime.fromtimestamp(journal[3], ZoneInfo("Asia/Kolkata")).date() != match.day):
+                raise ValueError("Historical child SELL overlaps or differs from journal")
+            seen_execs.add(eid)
+            live_children[oid] = live_children.get(oid, 0) + _positive_qty(journal[1])
     if live_children != expected_children:
         raise ValueError("Triggered group lacks all exact current child executions")
     confirmed = validate_forever_oco_child_orders(
@@ -233,78 +272,101 @@ def closed_triggered_binding(snapshot, lifecycle, group_rows, sell_quantities):
     return {"leg": leg, "quantity": lifecycle["sell_filled_qty"], "children": dict(sell_quantities)}
 
 
+def _decimal_price(value):
+    if type(value) not in (int, float, str, Decimal):
+        raise ValueError("Malformed historical price")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("Malformed historical price") from exc
+    if not number.is_finite() or number <= 0:
+        raise ValueError("Nonpositive/nonfinite historical price")
+    return number
+
+
 def closed_order_rollups(trades):
     """Summarize verified fills without changing or replacing their identities."""
-    from math import fsum
     grouped = {}
     for (oid, eid), (side, qty, price, at) in trades.items():
-        grouped.setdefault((oid, side), []).append((eid, qty, price, at))
+        grouped.setdefault((oid, side), []).append((eid, _positive_qty(qty), _decimal_price(price), at))
     return {
         key: (sum(row[1] for row in rows),
-              fsum(row[1] * row[2] for row in rows) / sum(row[1] for row in rows),
+              sum(row[1] * row[2] for row in rows) / sum(row[1] for row in rows),
               min(row[3] for row in rows), max(row[3] for row in rows))
         for key, rows in grouped.items()
     }
 
 
 class ClosedHistoricalBuyMatcher:
-    """Pass-local matcher for archived closed BUYs, never current executions.
+    """Pass-local matcher for archived closed BUYs and SELLs, never executions.
 
     An ID-less historical summary corroborates the existing fill set; it
     does not create an execution or authorize a SELL allocation. Mixing
     exact and aggregate representations of one order is ambiguous.
     """
-    def __init__(self, trades, rollups, *, account, contract, today):
+    def __init__(self, trades, rollups, *, account, contract, today, now=None):
         self.trades = trades
         self.rollups = rollups
         self.account = account
         self.contract = contract
         self.today = today
+        self.now = now
         self.seen = set()
         self.aggregated = set()
         self.orders = set()
+        self.sell_matches = []
 
     def match(self, row):
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        from src.engine.unified_exit_reconciliation import _exchange_time, _integer, _price
+        from src.engine.unified_exit_reconciliation import _exchange_time, _integer
         oid = _text(row, "orderId")
         if isinstance(row.get("exchangeTradeId"), bool):
             raise ValueError("Boolean historical exchange execution ID")
         eid = _text(row, "exchangeTradeId")
-        key = (oid, "BUY")
+        side = _text(row, "transactionType").upper()
+        key = (oid, side)
         if key not in self.rollups:
             return None
-        if (_text(row, "transactionType").upper() != "BUY"
+        if (side not in ("BUY", "SELL")
                 or _text(row, "dhanClientId") != self.account
                 or (_text(row, "securityId"), _text(row, "exchangeSegment").upper(),
                     _text(row, "productType").upper()) != self.contract):
-            raise ValueError("Closed historical BUY account/contract mismatch")
+            raise ValueError("Closed historical execution account/contract mismatch")
         zone = ZoneInfo("Asia/Kolkata")
-        day = datetime.fromtimestamp(_exchange_time(row.get("exchangeTime")), zone).date()
+        at = _exchange_time(row.get("exchangeTime"))
+        day = datetime.fromtimestamp(at, zone).date()
+        if day > self.today or (self.now is not None and at > self.now):
+            raise ValueError("Closed historical execution in future")
         qty = _integer(row.get("tradedQuantity"), positive=True)
-        price = _price(row.get("tradedPrice"))
-        if eid.upper() in ("", "0", "NONE", "NULL"):
+        price = _decimal_price(row.get("tradedPrice"))
+        aggregate = eid.upper() in ("", "0", "NONE", "NULL")
+        exchange_order_id = _text(row, "exchangeOrderId")
+        if aggregate:
             total, vwap, first, last = self.rollups[key]
             if (key in self.orders or day >= self.today
                     or isinstance(row.get("exchangeOrderId"), bool)
-                    or _text(row, "exchangeOrderId").upper() in ("", "0", "NONE", "NULL")
-                    or qty != total or abs(price - vwap) >= 1e-4
+                    or exchange_order_id.upper() in ("", "0", "NONE", "NULL")
+                    or qty != total or abs(price - _decimal_price(vwap)) >= Decimal('0.0001')
                     or day != datetime.fromtimestamp(first, zone).date()
                     or day != datetime.fromtimestamp(last, zone).date()):
-                raise ValueError("Closed historical BUY rollup conflicts with verified fills")
-            keys = {k for k, v in self.trades.items() if k[0] == oid and v[0] == "BUY"}
+                raise ValueError("Closed historical rollup conflicts with verified fills")
+            keys = {k for k, v in self.trades.items() if k[0] == oid and v[0] == side}
             if not keys or keys & self.seen:
-                raise ValueError("Duplicate or overlapping closed historical BUY rollup")
+                raise ValueError("Duplicate or overlapping closed historical rollup")
             self.aggregated.add(key)
         else:
             expected = self.trades.get((oid, eid))
-            if (key in self.aggregated or not expected or expected[0] != "BUY"
-                    or expected[1] != qty or abs(expected[2] - price) >= 1e-6
+            if (key in self.aggregated or not expected or expected[0] != side
+                    or expected[1] != qty or abs(_decimal_price(expected[2]) - price) >= Decimal('0.000001')
                     or day != datetime.fromtimestamp(expected[3], zone).date()
                     or (oid, eid) in self.seen):
-                raise ValueError("Closed historical BUY execution conflicts with verified fills")
+                raise ValueError("Closed historical execution conflicts with verified fills")
             keys = {(oid, eid)}
+        if any(not k[1] or k[1].upper() in ('0', 'NONE', 'NULL')
+               or any(marker in k[1] for marker in ('-TRD-', '-FILL-', '-RECON-')) for k in keys):
+            raise ValueError("Closed historical corroboration requires genuine durable executions")
         self.orders.add(key)
         self.seen.update(keys)
+        if side == "SELL":
+            self.sell_matches.append(HistoricalSellMatch(oid, exchange_order_id, day,
+                                                         frozenset(keys), aggregate))
         return keys

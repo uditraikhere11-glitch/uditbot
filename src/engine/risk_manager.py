@@ -97,6 +97,7 @@ class RiskManager:
         journal_db: Optional[Any] = None,
         broker: Optional[Any] = None,
         watcher: Optional[Any] = None,
+        broker_snapshot: Optional[Any] = None,
     ) -> Tuple[bool, str]:
         """
         V12-08 & V14: Synchronizes portfolio risk counters from durable SQLite journal, active watcher orders,
@@ -137,8 +138,40 @@ class RiskManager:
             except Exception:
                 pass
 
-        if broker is not None or is_live:
-            if broker is None or not hasattr(broker, "get_positions"):
+        if broker_snapshot is not None or broker is not None or is_live:
+            positions: Optional[list] = None
+            if broker_snapshot is not None:
+                from src.broker.broker_snapshot import BrokerSnapshot
+                if not isinstance(broker_snapshot, BrokerSnapshot):
+                    self._broker_positions_verified = False
+                    self._last_positions_sync_ts = 0.0
+                    self._broker_positions_error = (
+                        f"Invalid broker_snapshot type: {type(broker_snapshot).__name__}"
+                    )
+                    return False, self._broker_positions_error
+                finished_utc_sec = float(getattr(broker_snapshot, "capture_finished_utc_ns", 0) or 0) / 1e9
+                snap_age = time.time() - finished_utc_sec
+                if snap_age < -5.0 or snap_age > 10.0:
+                    self._broker_positions_verified = False
+                    self._last_positions_sync_ts = 0.0
+                    self._broker_positions_error = (
+                        f"Coordinated broker_snapshot is stale (age={snap_age:.1f}s > 10.0s)"
+                    )
+                    return False, self._broker_positions_error
+                from src.broker.broker_snapshot import BookStatus
+                if broker_snapshot.positions.status not in (BookStatus.OK_EMPTY, BookStatus.OK_RECORDS) or not broker_snapshot.positions.complete:
+                    self._broker_positions_verified = False
+                    self._last_positions_sync_ts = 0.0
+                    self._broker_positions_error = (
+                        f"Coordinated broker_snapshot positions read failed: {broker_snapshot.positions.status}"
+                    )
+                    return False, self._broker_positions_error
+                from src.broker.broker_snapshot import thaw_json
+                pos_payload = thaw_json(broker_snapshot.positions.payload)
+                positions = list(pos_payload) if isinstance(pos_payload, (list, tuple)) else []
+                self._last_snapshot_id = broker_snapshot.snapshot_id
+                self._last_snapshot_generation = broker_snapshot.generation
+            elif broker is None or not hasattr(broker, "get_positions"):
                 if is_live:
                     self._broker_positions_verified = False
                     self._last_positions_sync_ts = 0.0
@@ -166,6 +199,7 @@ class RiskManager:
                     self._broker_positions_error = f"Broker positions could not be retrieved or verified: {err_detail}"
                     return False, self._broker_positions_error
 
+            if positions is not None:
                 open_pos = 0
                 pos_exposure = 0.0
                 realized_pnl = 0.0

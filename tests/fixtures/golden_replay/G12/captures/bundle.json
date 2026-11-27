@@ -1,0 +1,37 @@
+{
+  "synthetic_sell": {
+    "account_pseudonym": "9000001536",
+    "broker_error_code": null,
+    "caller_identity": "DhanSnapshotSource",
+    "completeness_state": "COMPLETE",
+    "endpoint": "/v2/trades",
+    "exchange_ist_date": "2026-11-25",
+    "http_status": 200,
+    "monotonic_request_start_ns": 10000000000000,
+    "monotonic_response_receipt_ns": 10000005000000,
+    "payload": [
+      {
+        "dhanClientId": "9000001536",
+        "exchangeSegment": "NSE_EQ",
+        "exchangeTime": "2026-11-25T11:00:00",
+        "exchangeTradeId": "G12-EID-SELL-1",
+        "orderId": "G12-SELL-001",
+        "productType": "CNC",
+        "securityId": "13197",
+        "tradedPrice": 420.0,
+        "tradedQuantity": 1,
+        "transactionType": "SELL"
+      }
+    ],
+    "payload_sha256": "953e698f4e8ed81d9f13436e044efed61c1a468cc80dc170f7777129e391ce45",
+    "provenance": "SYNTHETIC",
+    "request_identity": "req-v2-trades",
+    "request_params": {},
+    "retry_after": null,
+    "sanitized_error_body": null,
+    "token_epoch_label": "epoch-1",
+    "transport_sent": true,
+    "utc_request_start": "2026-11-25T05:30:00Z",
+    "utc_response_receipt": "2026-11-25T05:30:00Z"
+  }
+}

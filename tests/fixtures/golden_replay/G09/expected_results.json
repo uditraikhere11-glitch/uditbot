@@ -1,0 +1,6 @@
+{
+  "decay_requires_all_three": true,
+  "max_cooldown_s": 3840,
+  "max_strikes": 7,
+  "single_success_does_not_reset": true
+}

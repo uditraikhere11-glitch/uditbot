@@ -14,3 +14,4 @@ __pycache__/
 *.py[cod]
 venv/
 /FETCH_HEAD
+/today_bot_logs.txt

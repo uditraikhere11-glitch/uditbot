@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Real SQLite WAL + real subprocess os._exit(137) crash injection across all 20 persistence/outbox/resolution boundaries, WAL integrity check, idempotent restart replay, and explicit rejection of legacy -RECON-FILL- synthetic execution IDs.",
+  "primary_provenance": "SYNTHETIC",
+  "scenario_id": "G12",
+  "title": "Crash during reconciliation persistence"
+}

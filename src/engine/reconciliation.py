@@ -190,6 +190,16 @@ class StartupReconciliationGate:
         self._in_startup_reconciliation_pass: bool = False
         self._active_pass_holdings: Optional[List[Dict[str, Any]]] = None
         self._active_pass_forever_orders: Optional[List[Dict[str, Any]]] = None
+        # Phase 2D (C08): Unified account verdict + strict 10-second live TTL ceiling + generation/epoch fencing
+        self._unified_verdict: Any = None
+        self._unified_snapshot: Any = None
+        self._unified_verdict_at: float = 0.0
+        self._unified_verdict_ttl_sec: float = 10.0
+        self._unified_verdict_epoch: Optional[int] = None
+        self._unified_verdict_generation: Optional[int] = None
+        _b_cfg = getattr(broker, "cfg", None)
+        _b_mode = str(getattr(getattr(_b_cfg, "trading_mode", None), "value", getattr(_b_cfg, "trading_mode", "")) or "").upper()
+        self._require_unified_verdict: bool = (_b_mode == "LIVE")
         # Keep protected reconciliation audit rows immutable.
 
     @property
@@ -222,7 +232,391 @@ class StartupReconciliationGate:
         from src.engine.owner_service_admission import owner_entries_permitted
         if not owner_entries_permitted(data_dir):
             return False
+        _uv = getattr(self, "_unified_verdict", None)
+        if getattr(self, "_require_unified_verdict", False) and _uv is None:
+            return False
+        if _uv is not None:
+            _ttl = min(float(getattr(self, "_unified_verdict_ttl_sec", 10.0) or 10.0), 10.0)
+            age = time.monotonic() - float(getattr(self, "_unified_verdict_at", 0.0) or 0.0)
+            if age < 0.0 or age > _ttl:
+                return False
+            if not getattr(_uv, "entry_eligible", False):
+                return False
         return True
+
+    def enable_mandatory_unified_verdict(self) -> None:
+        """C08: Require a fresh (<=10s) unified BrokerLedgerReconciler verdict for LIVE entry admission."""
+        with self._entry_state_lock:
+            self._require_unified_verdict = True
+
+    def revalidate_for_transport_submission(
+        self,
+        *,
+        pending_correlation_id: Optional[str] = None,
+        post_registration: bool = False,
+        expected_order_payload: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """C08 + Req #4: Revalidate entry gate, 10-second unified evidence ceiling, AND final
+        coordinator generation + journal digest immediately before LIVE transport submission.
+        """
+        # C51: Capture halt_generation before external/SQLite reads; final atomic linearization
+        # occurs under self._entry_state_lock right before returning ADMITTED.
+        with self._entry_state_lock:
+            _start_halt_gen = int(getattr(self, "_halt_generation", 0))
+        if not self.is_accepting_entries:
+            _uv = getattr(self, "_unified_verdict", None)
+            if getattr(self, "_require_unified_verdict", False) and _uv is None:
+                return False, "UNIFIED_VERDICT_MISSING: Unified broker ledger verdict required before LIVE submission"
+            if _uv is not None:
+                _ttl = min(float(getattr(self, "_unified_verdict_ttl_sec", 10.0) or 10.0), 10.0)
+                age = time.monotonic() - float(getattr(self, "_unified_verdict_at", 0.0) or 0.0)
+                if age < 0.0 or age > _ttl:
+                    return False, f"UNIFIED_VERDICT_STALE: Unified verdict expired ({age:.2f}s > {_ttl:.1f}s ceiling)"
+            return False, self.last_error or "Startup reconciliation gate is CLOSED"
+
+        _uv = getattr(self, "_unified_verdict", None)
+        _pcid = str(pending_correlation_id or "").strip()
+        if _uv is not None:
+            _db_path = str(getattr(self.db, "db_path", "") or "")
+            _cfg = getattr(self.broker, "cfg", None)
+            _acct = str(getattr(_cfg, "dhan_client_id", "") or "").strip()
+            _uv_gen = getattr(self, "_unified_verdict_generation", None)
+            if _db_path and os.path.isfile(_db_path) and _acct:
+                from src.engine.journal_view import read_journal_view
+                _jv_now = read_journal_view(
+                    _db_path,
+                    account_id=_acct,
+                    journal_epoch=(getattr(_uv_gen, "journal_epoch", 1) if _uv_gen else 1),
+                    read_utc_ns=int(time.time() * 1_000_000_000),
+                )
+                if not _jv_now.read_complete:
+                    return False, "UNIFIED_JOURNAL_DIGEST_DRIFT: Journal read incomplete at final transport interlock"
+                if _jv_now.digest_sha256 != getattr(_uv, "journal_digest", None):
+                    _allowed_pending = False
+                    _base_jv = getattr(self, "_unified_verdict_journal_view", None)
+                    _pcid = str(pending_correlation_id or "").strip()
+                    if _pcid and _base_jv is not None and getattr(_base_jv, "digest_sha256", None) == getattr(_uv, "journal_digest", None):
+                        # C35: Allow ONLY the single newly written PENDING_SUBMIT/SUBMITTING order_intent
+                        # for this exact correlation_id; ANY other table/row change still blocks!
+                        _non_rr_equal = all(
+                            getattr(_jv_now, _t, None) == getattr(_base_jv, _t, None)
+                            for _t in (
+                                "orders", "fills", "exit_allocations", "positions_lifecycle",
+                                "protection_orders", "protection_attempts", "watcher_orders",
+                                "manual_risk_acknowledgements", "historical_fill_attestations",
+                                "relevant_system_events",
+                            )
+                        )
+                        _base_rr = [dict(r) for r in getattr(_base_jv, "retry_reservations", ())]
+                        _now_rr = [dict(r) for r in getattr(_jv_now, "retry_reservations", ())]
+                        _rr_ok = (_now_rr == _base_rr)
+                        if not _rr_ok and _pcid:
+                            _rr_without = [r for r in _now_rr if str(r.get("child_correlation_id") or "").strip() != _pcid]
+                            _rr_match_c = [r for r in _now_rr if str(r.get("child_correlation_id") or "").strip() == _pcid]
+                            if _rr_without == _base_rr and len(_rr_match_c) == 1:
+                                _rr_ok = True
+                        _other_tables_equal = _non_rr_equal and _rr_ok
+                        if _other_tables_equal:
+                            _base_oi = [dict(r) for r in getattr(_base_jv, "order_intents", ())]
+                            _now_oi = [dict(r) for r in getattr(_jv_now, "order_intents", ())]
+                            _now_without = [r for r in _now_oi if str(r.get("correlation_id") or "").strip() != _pcid]
+                            _now_match = [r for r in _now_oi if str(r.get("correlation_id") or "").strip() == _pcid]
+                            if (
+                                _now_without == _base_oi
+                                and len(_now_match) == 1
+                                and str(_now_match[0].get("state") or "").strip().upper()
+                                in ("PENDING_SUBMIT", "SUBMITTING", "CREATED", "RESERVED", "PENDING")
+                            ):
+                                _allowed_pending = True
+                    if not _allowed_pending:
+                        return False, "UNIFIED_JOURNAL_DIGEST_DRIFT: Journal mutated after unified verdict; re-verification required"
+                # C45: Bind exact outgoing canonical order payload to the authorized durable order_intent
+                if isinstance(expected_order_payload, dict) and _pcid:
+                    _intent_rows = [
+                        dict(r) for r in getattr(_jv_now, "order_intents", ())
+                        if str(r.get("correlation_id") or "").strip() == _pcid
+                    ]
+                    if len(_intent_rows) != 1:
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: Expected 1 durable order_intent for {_pcid}, found {len(_intent_rows)}"
+                    _ir = _intent_rows[0]
+                    _exp_acct = str(expected_order_payload.get("account_id") or "").strip()
+                    _ir_acct = str(_ir.get("account_id") or "").strip()
+                    if _exp_acct and _ir_acct and _ir_acct != _exp_acct:
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: account_id mismatch ({_ir_acct} != {_exp_acct})"
+                    if str(_ir.get("security_id") or "").strip() != str(expected_order_payload.get("security_id") or "").strip():
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: security_id mismatch ({_ir.get('security_id')} != {expected_order_payload.get('security_id')})"
+                    if str(_ir.get("exchange_segment") or "").strip().upper() != str(expected_order_payload.get("exchange_segment") or "").strip().upper():
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: exchange_segment mismatch"
+                    if str(_ir.get("product_type") or "").strip().upper() != str(expected_order_payload.get("product_type") or "").strip().upper():
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: product_type mismatch"
+                    if expected_order_payload.get("order_type"):
+                        if str(_ir.get("order_type") or "").strip().upper() != str(expected_order_payload.get("order_type") or "").strip().upper():
+                            return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: order_type mismatch"
+                    # C52: Strict numeric validation (reject bool, float-truncation, NaN, inf, non-positive)
+                    _raw_ir_q = _ir.get("quantity")
+                    _raw_exp_q = expected_order_payload.get("quantity")
+                    if (
+                        type(_raw_ir_q) is not int or type(_raw_exp_q) is not int
+                        or _raw_ir_q <= 0 or _raw_exp_q <= 0 or _raw_ir_q != _raw_exp_q
+                    ):
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: strict quantity mismatch ({_raw_ir_q!r} != {_raw_exp_q!r})"
+                    _raw_ir_p = _ir.get("price")
+                    _raw_exp_p = expected_order_payload.get("price")
+                    if (
+                        isinstance(_raw_ir_p, bool) or isinstance(_raw_exp_p, bool)
+                        or not isinstance(_raw_ir_p, (int, float)) or not isinstance(_raw_exp_p, (int, float))
+                        or not math.isfinite(float(_raw_ir_p)) or not math.isfinite(float(_raw_exp_p))
+                        or float(_raw_ir_p) <= 0.0 or float(_raw_exp_p) <= 0.0
+                        or abs(float(_raw_ir_p) - float(_raw_exp_p)) > 1e-6
+                    ):
+                        return False, f"UNIFIED_INTENT_PAYLOAD_MISMATCH: strict price mismatch ({_raw_ir_p!r} != {_raw_exp_p!r})"
+                    if "is_super_order" in expected_order_payload and _ir.get("is_super_order") is not None:
+                        if bool(int(_ir.get("is_super_order") or 0)) != bool(expected_order_payload.get("is_super_order")):
+                            return False, "UNIFIED_INTENT_PAYLOAD_MISMATCH: is_super_order mismatch"
+                    if "is_amo" in expected_order_payload and _ir.get("is_amo") is not None:
+                        if bool(int(_ir.get("is_amo") or 0)) != bool(expected_order_payload.get("is_amo")):
+                            return False, "UNIFIED_INTENT_PAYLOAD_MISMATCH: is_amo mismatch"
+                    # C52: Super Order authorized protection bounds (stop_loss_price, target_price, trailing_jump)
+                    if expected_order_payload.get("is_super_order"):
+                        _sl_p = expected_order_payload.get("stop_loss_price")
+                        _tg_p = expected_order_payload.get("target_price")
+                        _tj_p = expected_order_payload.get("trailing_jump", 0.0)
+                        _ep = float(_raw_exp_p)
+                        if (
+                            isinstance(_sl_p, bool) or isinstance(_tg_p, bool) or isinstance(_tj_p, bool)
+                            or not isinstance(_sl_p, (int, float)) or not isinstance(_tg_p, (int, float)) or not isinstance(_tj_p, (int, float))
+                            or not (math.isfinite(float(_sl_p)) and math.isfinite(float(_tg_p)) and math.isfinite(float(_tj_p)))
+                            or float(_sl_p) <= 0.0 or float(_sl_p) >= _ep or float(_tg_p) <= _ep or float(_tj_p) < 0.0
+                        ):
+                            return False, "UNIFIED_SUPER_PROTECTION_OUT_OF_BOUNDS: invalid SL/target/trailing values"
+                        _max_sl_pct = float(expected_order_payload.get("max_sl_pct") or 50.0)
+                        _max_tg_pct = float(expected_order_payload.get("max_target_pct") or 100.0)
+                        _sl_pct = ((_ep - float(_sl_p)) / _ep) * 100.0
+                        _tg_pct = ((float(_tg_p) - _ep) / _ep) * 100.0
+                        if _sl_pct > _max_sl_pct + 0.5 or _tg_pct > _max_tg_pct + 0.5:
+                            return False, f"UNIFIED_SUPER_PROTECTION_OUT_OF_BOUNDS: sl_pct={_sl_pct:.2f}% (max {_max_sl_pct:.2f}%), target_pct={_tg_pct:.2f}% (max {_max_tg_pct:.2f}%)"
+                        if float(_tj_p) > 0.0 and float(_tj_p) > (float(_tg_p) - _ep):
+                            return False, f"UNIFIED_SUPER_PROTECTION_OUT_OF_BOUNDS: trailing_jump={_tj_p} exceeds target distance"
+                    # C57: Exact retry reservation child-correlation binding
+                    _exp_retry_parent = str(expected_order_payload.get("retry_parent_id") or "").strip()
+                    _exp_retry_root = str(expected_order_payload.get("retry_root_id") or "").strip()
+                    _is_retry_req = bool(expected_order_payload.get("is_retry")) or bool(_exp_retry_parent) or _pcid.startswith("RTRY-")
+                    if _is_retry_req:
+                        _rr_rows = [
+                            dict(r) for r in getattr(_jv_now, "retry_reservations", ())
+                            if str(r.get("child_correlation_id") or "").strip() == _pcid
+                        ]
+                        if len(_rr_rows) != 1:
+                            return False, f"UNIFIED_RETRY_RESERVATION_CHILD_MISMATCH: expected 1 retry_reservation bound to child_correlation_id={_pcid}, found {len(_rr_rows)}"
+                        if _exp_retry_parent and str(_rr_rows[0].get("parent_order_id") or "").strip() != _exp_retry_parent:
+                            return False, f"UNIFIED_RETRY_RESERVATION_CHILD_MISMATCH: parent_order_id mismatch"
+                        if _exp_retry_root and str(_rr_rows[0].get("root_order_id") or "").strip() != _exp_retry_root:
+                            return False, f"UNIFIED_RETRY_RESERVATION_CHILD_MISMATCH: root_order_id mismatch"
+            _data_dir = str(getattr(_cfg, "data_dir", "") or "") or (os.path.dirname(_db_path) if _db_path else "")
+            if _data_dir and _acct and _uv_gen is not None:
+                from contextlib import closing as _closing
+                from pathlib import Path as _Path
+                from src.broker.broker_snapshot import account_key
+                _ak = account_key(_acct)
+                _sc = _Path(_data_dir) / "broker_evidence" / _ak / "snapshots.sqlite3"
+                if not _sc.is_file():
+                    return False, "UNIFIED_SIDECAR_MISSING: Authority snapshot sidecar missing at final transport interlock"
+                with _closing(sqlite3.connect(f"file:{_sc.resolve()}?mode=ro", uri=True, timeout=2.0)) as _c:
+                    _r = _c.execute(
+                        "SELECT boot_id, token_epoch, mutation_epoch, owner_epoch, journal_epoch, session_epoch FROM account_state WHERE account_key = ? LIMIT 1",
+                        (_ak,),
+                    ).fetchone()
+                    _srow = _c.execute(
+                        "SELECT state, expires_mono_ns FROM snapshots WHERE snapshot_id = ? AND account_key = ? LIMIT 1",
+                        (str(getattr(_uv, "snapshot_id", "")), _ak),
+                    ).fetchone()
+                if _r is None:
+                    return False, "UNIFIED_ACCOUNT_STATE_MISSING: Coordinator account_state missing at final transport interlock"
+                if post_registration and self.stop_manager is not None:
+                    try:
+                        if self.stop_manager.is_stopped() is True:
+                            return False, "EMERGENCY_STOP_ACTIVE: Durable emergency stop active at final transport interlock"
+                    except Exception:
+                        return False, "EMERGENCY_STOP_UNVERIFIED: Could not verify emergency stop state at final transport interlock"
+                _pending_intent_only = locals().get("_allowed_pending", False)
+                if _srow is None or time.monotonic_ns() >= int(_srow[1] or 0):
+                    return False, "UNIFIED_SNAPSHOT_MISSING_OR_EXPIRED: Persisted authority snapshot missing or expired"
+                _st_srow = str(_srow[0])
+                _cur = (str(_r[0]), int(_r[1]), int(_r[2]), int(_r[3]), int(_r[4]), int(_r[5]))
+                _exp = (
+                    str(_uv_gen.boot_id),
+                    int(_uv_gen.token_epoch),
+                    int(_uv_gen.mutation_epoch),
+                    int(_uv_gen.owner_epoch),
+                    int(_uv_gen.journal_epoch),
+                    int(_uv_gen.session_epoch),
+                )
+                # C41: Post-registration interlock immediately before HTTP transport:
+                # allow exact +1 mutation_epoch ONLY if our own pending_correlation_id is registered in-flight.
+                _own_post_reg_mut = False
+                if post_registration and _pcid and _cur[2] == _exp[2] + 1:
+                    _in_flight = set()
+                    if self.stop_manager is not None and hasattr(self.stop_manager, "get_in_flight"):
+                        try:
+                            _in_flight = {str(x) for x in (self.stop_manager.get_in_flight() or ())}
+                        except Exception:
+                            _in_flight = set()
+                    if _pcid in _in_flight:
+                        _own_post_reg_mut = True
+                if _st_srow != "COMPLETE" and not ((_pending_intent_only or _own_post_reg_mut) and _st_srow == "INVALID"):
+                    return False, "UNIFIED_SNAPSHOT_MISSING_OR_EXPIRED: Persisted authority snapshot missing or expired"
+                if _cur != _exp:
+                    _mut_ok = (_cur[2] == _exp[2]) or _own_post_reg_mut
+                    _j_ok = (_cur[4] == _exp[4]) or (_pending_intent_only and _cur[4] >= _exp[4])
+                    _static_ok = (_cur[0], _cur[1], _cur[3], _cur[5]) == (_exp[0], _exp[1], _exp[3], _exp[5])
+                    if not (_static_ok and _mut_ok and _j_ok):
+                        return False, "UNIFIED_GENERATION_DRIFT: Coordinator generation changed since unified verdict"
+        # C51: SINGLE ATOMIC TRANSPORT-ADMISSION LINEARIZATION POINT
+        # Serialized under self._entry_state_lock against halt_new_entries() and state transitions;
+        # lock is released immediately before HTTP transport (never held across network I/O).
+        with self._entry_state_lock:
+            if int(getattr(self, "_halt_generation", 0)) != _start_halt_gen:
+                return False, "UNIFIED_GATE_HALTED_DURING_ADMISSION: Gate halted concurrently during transport admission"
+            if not self._accepting_entries or self.state != ReconciliationState.HEALTHY:
+                return False, self.last_error or "Startup reconciliation gate is CLOSED at atomic transport admission"
+            _uv_now = getattr(self, "_unified_verdict", None)
+            if getattr(self, "_require_unified_verdict", False) and _uv_now is None:
+                return False, "UNIFIED_VERDICT_MISSING: Unified verdict absent at atomic transport admission"
+            if _uv_now is not None:
+                _ttl_now = min(float(getattr(self, "_unified_verdict_ttl_sec", 10.0) or 10.0), 10.0)
+                _age_now = time.monotonic() - float(getattr(self, "_unified_verdict_at", 0.0) or 0.0)
+                if _age_now < 0.0 or _age_now > _ttl_now or not getattr(_uv_now, "entry_eligible", False):
+                    return False, "UNIFIED_VERDICT_STALE: Unified verdict invalid or expired at atomic transport admission"
+            if self.stop_manager is not None:
+                try:
+                    if self.stop_manager.is_stopped() is True:
+                        return False, "EMERGENCY_STOP_ACTIVE: Durable emergency stop active at atomic transport admission"
+                except Exception:
+                    return False, "EMERGENCY_STOP_UNVERIFIED: Could not verify emergency stop at atomic transport admission"
+        return True, "ADMITTED"
+
+    def publish_unified_verdict(
+        self,
+        verdict: Any,
+        *,
+        expected_halt_generation: int,
+        snapshot_generation: Optional[int] = None,
+        journal_epoch: Optional[int] = None,
+        ttl_sec: float = 10.0,
+    ) -> Tuple[bool, str]:
+        """Phase 2D: Atomically publish a unified BrokerLedgerReconciler verdict fenced by halt_generation."""
+        if ttl_sec <= 0.0 or ttl_sec > 10.0:
+            ttl_sec = 10.0
+        with self._entry_state_lock:
+            if self._halt_generation != expected_halt_generation:
+                return (
+                    False,
+                    f"Stale unified verdict rejected (halt_generation changed: {expected_halt_generation} != {self._halt_generation})",
+                )
+            self._unified_verdict = verdict
+            self._unified_verdict_at = time.monotonic()
+            self._unified_verdict_ttl_sec = float(ttl_sec)
+            self._unified_verdict_generation = snapshot_generation
+            self._unified_verdict_epoch = journal_epoch
+            if getattr(verdict, "entry_eligible", False):
+                self._accepting_entries = True
+                self.state = ReconciliationState.HEALTHY
+                self.last_reconciled_at = time.time()
+                self.last_error = ""
+                return True, "Unified reconciliation healthy"
+            self._accepting_entries = False
+            self.state = ReconciliationState.BLOCKED
+            reasons = getattr(verdict, "reason_codes", ()) or ()
+            self.last_error = "; ".join(str(r) for r in reasons) if reasons else "Unified reconciliation blocked"
+            return False, self.last_error
+
+    def run_unified_startup_verification(
+        self,
+        *,
+        data_dir: str = "",
+        broker_snapshot: Optional[Any] = None,
+        calendar: Optional[Any] = None,
+        now: Optional[Any] = None,
+        ttl_sec: float = 10.0,
+    ) -> Tuple[bool, str]:
+        """Phase 2D: Execute unified BrokerLedgerReconciler verification and publish atomically."""
+        with self._entry_state_lock:
+            starting_halt_generation = self._halt_generation
+        cfg = getattr(self.broker, "cfg", None)
+        resolved_data_dir = data_dir or str(getattr(cfg, "data_dir", "") or "")
+        db_path = str(getattr(self.db, "db_path", "") or "")
+        if not resolved_data_dir and db_path:
+            resolved_data_dir = os.path.dirname(db_path)
+        if not db_path and resolved_data_dir:
+            db_path = os.path.join(resolved_data_dir, "trade_journal.db")
+        account_id = str(getattr(cfg, "dhan_client_id", "") or "").strip()
+        from src.engine.unified_account_runtime import UnifiedAccountRuntime
+        from src.engine.broker_ledger_reconciler import Purpose
+        from src.engine.unified_account_runtime import build_policy_context
+        runtime = UnifiedAccountRuntime(
+            data_dir=resolved_data_dir or "data",
+            db_path=db_path,
+            account_id=account_id,
+        )
+        from src.engine.unified_account_runtime import build_verified_policy_context
+        from src.engine.journal_view import read_journal_view
+        jv_for_pol = read_journal_view(
+            db_path,
+            account_id=account_id,
+            journal_epoch=(broker_snapshot.generation.journal_epoch if broker_snapshot is not None else 1),
+            read_utc_ns=int(time.time() * 1_000_000_000),
+        )
+        policy = build_verified_policy_context(
+            mode="LIVE",
+            purpose=Purpose.STARTUP,
+            snapshot=broker_snapshot,
+            journal_view=jv_for_pol,
+            stop_manager=self.stop_manager,
+            watcher=self.watcher,
+            data_dir=resolved_data_dir or "data",
+            risk_funds_verified=True,
+        )
+        if broker_snapshot is not None:
+            res = runtime.evaluate_snapshot(broker_snapshot, policy)
+        else:
+            res = runtime.acquire_and_evaluate(
+                self.broker,
+                policy,
+                policy_builder=lambda snap, jv: build_verified_policy_context(
+                    mode="LIVE",
+                    purpose=Purpose.STARTUP,
+                    snapshot=snap,
+                    journal_view=jv,
+                    stop_manager=self.stop_manager,
+                    watcher=self.watcher,
+                    data_dir=resolved_data_dir or "data",
+                    risk_funds_verified=True,
+                ),
+            )
+        if res.verdict is None:
+            with self._entry_state_lock:
+                self._accepting_entries = False
+                self.state = ReconciliationState.BLOCKED
+                self.last_error = res.detail or res.reason_code or "Unified startup verification failed"
+            return False, self.last_error
+        self._unified_snapshot = res.snapshot
+        self._require_unified_verdict = True
+        if db_path and os.path.isfile(db_path) and account_id:
+            _sg = getattr(res.snapshot, "generation", None)
+            self._unified_verdict_journal_view = read_journal_view(
+                db_path,
+                account_id=account_id,
+                journal_epoch=(getattr(_sg, "journal_epoch", 1) if _sg else 1),
+                read_utc_ns=int(time.time() * 1_000_000_000),
+            )
+        snap_gen = getattr(res.snapshot, "generation", None)
+        return self.publish_unified_verdict(
+            res.verdict,
+            expected_halt_generation=starting_halt_generation,
+            snapshot_generation=snap_gen,
+            journal_epoch=(getattr(snap_gen, "journal_epoch", None) if snap_gen else None),
+            ttl_sec=ttl_sec,
+        )
 
     def halt_new_entries(self, reason: str) -> None:
         """Fail closed first, then durably aggregate identical audit events.
@@ -2014,6 +2408,14 @@ class StartupReconciliationGate:
                 return False, self.last_error
 
         # 8. Invariant check passed -> open the gate
+        # C12: Acquire unified broker evidence OUTSIDE self._entry_state_lock (zero lock-reentry deadlock!)
+        _unified_precheck_ok = True
+        _unified_precheck_msg = ""
+        if getattr(self, "_require_unified_verdict", False) and not (books is not None and books.get("recovered")):
+            _unified_precheck_ok, _unified_precheck_msg = self.run_unified_startup_verification()
+            if not _unified_precheck_ok:
+                return False, f"Unified startup verification blocked entry admission: {_unified_precheck_msg}"
+
         with self._entry_state_lock:
             if self._halt_generation != starting_halt_generation or self.stop_manager.is_stopped():
                 self._accepting_entries = False

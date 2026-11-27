@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Iterator, Optional
 
 from src.engine.runtime_evidence import proc_starttime
+from src.broker.evidence_events import note_event
 
 _LOCAL_LOCK = threading.RLock()
 
@@ -176,6 +177,7 @@ def register_producer(data_dir: str | os.PathLike[str], account: str) -> None:
             "account_id": account, "active": active, "unresolved": unresolved,
             "registered_at": time.time(),
         })
+        note_event(data_dir,account,'MUTATION_PRODUCER_REGISTERED')
 
 
 def _barrier_clear(barrier: Path) -> None:
@@ -204,6 +206,7 @@ def broker_mutation(data_dir: str | os.PathLike[str], account: str, kind: str) -
         entry = {"id": mutation_id, "method": kind, "started_at": time.time()}
         data["active"].append(entry)
         _write(ledger, data)
+        note_event(data_dir,account,'MUTATION_BEFORE_SEND')
 
     outcome = {"known": False}
     def finish(known: bool) -> None:
@@ -221,6 +224,7 @@ def broker_mutation(data_dir: str | os.PathLike[str], account: str, kind: str) -
             if not outcome["known"]:
                 data["unresolved"].append({"id": mutation_id, "method": kind, "at": time.time()})
             _write(ledger, data)
+            note_event(data_dir,account,'MUTATION_COMPLETED' if outcome['known'] else 'MUTATION_UNKNOWN')
 
 
 def guarded_request(
@@ -266,6 +270,7 @@ def acquire_apply_barrier(
             "owner_pid": os.getpid(), "owner_starttime": _identity()[1],
             "account_id": str(account), "created_at": time.time(),
         })
+        note_event(data_dir,account,'OWNER_APPLY_BARRIER_ACQUIRED')
         return True
 
 
@@ -304,6 +309,7 @@ def release_aborted_apply_barrier(
         state["released_at"] = time.time()
         state["release_reason"] = "ABORTED_BEFORE_ENV_COMMIT_SYSTEMD_STOPPED"
         _write(barrier, state)
+        note_event(data_dir,account,'OWNER_APPLY_BARRIER_RELEASED')
         return True
 
 
@@ -328,4 +334,5 @@ def release_apply_barrier(
         state["active"] = False
         state["released_at"] = time.time()
         _write(barrier, state)
+        note_event(data_dir,account,'OWNER_APPLY_BARRIER_RELEASED')
         return True

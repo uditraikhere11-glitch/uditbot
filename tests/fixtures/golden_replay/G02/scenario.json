@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Reproduces PDSL manual exit with verified BUY, failed protection attempt, attributable manual SELL (current-session and archive-only), durable allocation, idempotent restart, and negative ambiguity/missing-EID variants.",
+  "primary_provenance": "REPORTED_INCIDENT",
+  "scenario_id": "G02",
+  "title": "PDSL manual exit"
+}

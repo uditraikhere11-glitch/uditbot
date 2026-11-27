@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "VEDPOWER triggered Forever target leg with child linkage, verified SELL execution, zero remaining executable stop leg, durable closure, single logical notification, and partial/active-stop/wrong-algoId negative variants.",
+  "primary_provenance": "REPORTED_INCIDENT",
+  "scenario_id": "G03",
+  "title": "VEDPOWER triggered Forever target"
+}

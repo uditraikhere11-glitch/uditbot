@@ -1,3 +1,4 @@
+import math
 """
 Domain models for the single-account Telegram-to-Dhan trading system.
 Compatible with Python 3.11/3.12+ and Pydantic v1 / v2.
@@ -6,6 +7,14 @@ Compatible with Python 3.11/3.12+ and Pydantic v1 / v2.
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
+try:
+    from pydantic import field_validator as _pyd_field_validator  # Pydantic v2
+    _PYDANTIC_V2 = hasattr(BaseModel, "model_validate")
+except ImportError:
+    _pyd_field_validator = None
+    _PYDANTIC_V2 = False
+if not _PYDANTIC_V2:
+    from pydantic import validator as _pyd_v1_validator
 
 
 class TradingMode(str, Enum):
@@ -441,6 +450,58 @@ class SizingResult(BaseModel):
     tranches: List[Tuple[int, float]] = Field(default_factory=list)  # [(lots, target_price), ...]
 
 
+# C68: Documented 32-bit signed integer exchange ceiling & safe IEEE-754 decimal price bound
+MAX_SAFE_INT_QTY = 2_147_483_647
+MAX_SAFE_DECIMAL_PRICE = 1e9
+
+
+def _strict_raw_int(v, field_name: str, *, allow_zero: bool = False) -> int:
+    """C58 + C68: Validate raw integer input BEFORE Pydantic/int() coercion with overflow/range check."""
+    if isinstance(v, bool) or type(v) is not int:
+        raise ValueError(f"{field_name} must be a strict int (got {type(v).__name__}: {v!r})")
+    if v > MAX_SAFE_INT_QTY:
+        raise ValueError(f"{field_name} exceeds maximum safe 32-bit integer limit ({v!r} > {MAX_SAFE_INT_QTY})")
+    if allow_zero:
+        if v < 0:
+            raise ValueError(f"{field_name} must be >= 0 (got {v!r})")
+    else:
+        if v <= 0:
+            raise ValueError(f"{field_name} must be > 0 (got {v!r})")
+    return v
+
+
+def _strict_raw_number(v, field_name: str, *, allow_zero: bool = False) -> float:
+    """C58 + C68: Validate raw numeric input BEFORE Pydantic/float() coercion, catching OverflowError."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{field_name} must be a finite int or float (got {type(v).__name__}: {v!r})")
+    try:
+        fv = float(v)
+    except OverflowError as exc:
+        raise ValueError(f"{field_name} numeric overflow ({v!r})") from exc
+    if not math.isfinite(fv) or abs(fv) > MAX_SAFE_DECIMAL_PRICE:
+        raise ValueError(f"{field_name} must be finite and within safe price range (got {v!r})")
+    if allow_zero:
+        if fv < 0.0:
+            raise ValueError(f"{field_name} must be >= 0 (got {v!r})")
+    else:
+        if fv <= 0.0:
+            raise ValueError(f"{field_name} must be > 0 (got {v!r})")
+    return fv
+
+
+def _strict_raw_finite_number(v, field_name: str) -> float:
+    """C58 + C68: Reject bool, non-numeric, OverflowError, NaN/Inf, or out-of-range values."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{field_name} must be a finite int or float (got {type(v).__name__}: {v!r})")
+    try:
+        fv = float(v)
+    except OverflowError as exc:
+        raise ValueError(f"{field_name} numeric overflow ({v!r})") from exc
+    if not math.isfinite(fv) or abs(fv) > MAX_SAFE_DECIMAL_PRICE:
+        raise ValueError(f"{field_name} must be finite and within safe price range (got {v!r})")
+    return fv
+
+
 class OrderRequest(BaseModel):
     correlation_id: str
     symbol: str
@@ -452,9 +513,51 @@ class OrderRequest(BaseModel):
     price: float
     quantity: int
     trigger_price: float = 0.0
+    disclosed_quantity: int = 0
     trading_mode: TradingMode = TradingMode.TEST
     after_market_order: bool = False
     amo_time: str = "OPEN"
+
+    if _PYDANTIC_V2:
+        @_pyd_field_validator("quantity", mode="before")
+        @classmethod
+        def _validate_raw_quantity(cls, v):
+            return _strict_raw_int(v, "quantity", allow_zero=False)
+
+        @_pyd_field_validator("disclosed_quantity", mode="before")
+        @classmethod
+        def _validate_raw_disclosed_quantity(cls, v):
+            return _strict_raw_int(v, "disclosed_quantity", allow_zero=True)
+
+        @_pyd_field_validator("price", mode="before")
+        @classmethod
+        def _validate_raw_price(cls, v, info):
+            ot = (info.data or {}).get("order_type", OrderType.LIMIT)
+            is_mkt = (ot == OrderType.MARKET) or (str(ot).upper() in ("MARKET", "ORDERTYPE.MARKET"))
+            return _strict_raw_number(v, "price", allow_zero=is_mkt)
+
+        @_pyd_field_validator("trigger_price", mode="before")
+        @classmethod
+        def _validate_raw_trigger_price(cls, v):
+            return _strict_raw_number(v, "trigger_price", allow_zero=True)
+    else:
+        @_pyd_v1_validator("quantity", pre=True)
+        def _validate_raw_quantity(cls, v):
+            return _strict_raw_int(v, "quantity", allow_zero=False)
+
+        @_pyd_v1_validator("disclosed_quantity", pre=True)
+        def _validate_raw_disclosed_quantity(cls, v):
+            return _strict_raw_int(v, "disclosed_quantity", allow_zero=True)
+
+        @_pyd_v1_validator("price", pre=True)
+        def _validate_raw_price(cls, v, values):
+            ot = values.get("order_type", OrderType.LIMIT)
+            is_mkt = (ot == OrderType.MARKET) or (str(ot).upper() in ("MARKET", "ORDERTYPE.MARKET"))
+            return _strict_raw_number(v, "price", allow_zero=is_mkt)
+
+        @_pyd_v1_validator("trigger_price", pre=True)
+        def _validate_raw_trigger_price(cls, v):
+            return _strict_raw_number(v, "trigger_price", allow_zero=True)
 
 
 class ProtectionLevels(BaseModel):
@@ -464,3 +567,39 @@ class ProtectionLevels(BaseModel):
     target_price: float
     quantity: int
     target_trigger: Optional[float] = None
+
+    if _PYDANTIC_V2:
+        @_pyd_field_validator("quantity", mode="before")
+        @classmethod
+        def _validate_raw_prot_quantity(cls, v):
+            if isinstance(v, bool) or type(v) is not int or v > MAX_SAFE_INT_QTY:
+                raise ValueError(f"quantity must be a bounded strict int (got {type(v).__name__}: {v!r})")
+            return v
+
+        @_pyd_field_validator("executed_price", "sl_trigger", "sl_limit", "target_price", mode="before")
+        @classmethod
+        def _validate_raw_prot_prices(cls, v, info):
+            return _strict_raw_finite_number(v, getattr(info, "field_name", "price"))
+
+        @_pyd_field_validator("target_trigger", mode="before")
+        @classmethod
+        def _validate_raw_target_trigger(cls, v):
+            if v is None:
+                return None
+            return _strict_raw_finite_number(v, "target_trigger")
+    else:
+        @_pyd_v1_validator("quantity", pre=True)
+        def _validate_raw_prot_quantity(cls, v):
+            if isinstance(v, bool) or type(v) is not int or v > MAX_SAFE_INT_QTY:
+                raise ValueError(f"quantity must be a bounded strict int (got {type(v).__name__}: {v!r})")
+            return v
+
+        @_pyd_v1_validator("executed_price", "sl_trigger", "sl_limit", "target_price", pre=True)
+        def _validate_raw_prot_prices(cls, v):
+            return _strict_raw_finite_number(v, "protection_price")
+
+        @_pyd_v1_validator("target_trigger", pre=True)
+        def _validate_raw_target_trigger(cls, v):
+            if v is None:
+                return None
+            return _strict_raw_finite_number(v, "target_trigger")

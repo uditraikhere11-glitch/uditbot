@@ -69,7 +69,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # Appendix B #1 / V12-04: Forever verification rejects TRADED or incomplete records
     # ------------------------------------------------------------------
     def test_01_v12_04_forever_missing_legs_or_traded_is_rejected(self):
-        c = DhanClient(self.cfg, self.stop)
+        c = DhanClient(self.cfg, self.stop, reconciliation_gate=_c60_admit_gate())
         c.get_forever_orders = Mock(return_value=[{"orderId": "O", "orderStatus": "TRADED"}])
         self.assertFalse(c.verify_forever_leg_active("O", "3045", 10, 97, 103)[0])
 
@@ -284,7 +284,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_12_v12_13_http_500_preserved_as_uncertain(self):
-        c = DhanClient(self.cfg, self.stop)
+        c = DhanClient(self.cfg, self.stop, reconciliation_gate=_c60_admit_gate())
         c.session.post = Mock(return_value=SimpleNamespace(status_code=500, text="Internal Server Error"))
         c.get_order_by_correlation_id = Mock(return_value=None)
         c.get_order_book = Mock(return_value=[])
@@ -324,7 +324,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_14_v12_16_tick_size_forwarded_to_place_forever_oco(self):
-        c = DhanClient(self.cfg, self.stop)
+        c = DhanClient(self.cfg, self.stop, reconciliation_gate=_c60_admit_gate())
         c.order_status = Mock(return_value={"orderStatus": "TRADED", "filledQty": 10, "averageTradedPrice": 10.01})
         c.trades_avg_price = Mock(return_value=10.01)
         c.session.get = Mock(return_value=SimpleNamespace(status_code=200, text="[]", json=lambda: []))
@@ -408,7 +408,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # ------------------------------------------------------------------
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_17_v12_12_super_order_preserves_full_30_char_correlation_id(self):
-        c = DhanClient(self.cfg, self.stop)
+        c = DhanClient(self.cfg, self.stop, reconciliation_gate=_c60_admit_gate())
         captured = {}
 
         def fake_post(url, headers=None, json=None, timeout=5):
@@ -435,7 +435,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
     # V12-15: Yahoo quote freshness requires symbol/exchange metadata & measures post-HTTP time
     # ------------------------------------------------------------------
     def test_18_v12_15_yahoo_quote_rejects_missing_metadata_and_measures_elapsed_time(self):
-        c = DhanClient(self.cfg, self.stop)
+        c = DhanClient(self.cfg, self.stop, reconciliation_gate=_c60_admit_gate())
         # Missing exchangeName/symbol in meta is rejected
         c.session.get = Mock(
             return_value=SimpleNamespace(
@@ -460,7 +460,7 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
             dhan_token_file=tok_path,
             data_dir=self.t.name,
         )
-        c = DhanClient(cfg, self.stop)
+        c = DhanClient(cfg, self.stop, reconciliation_gate=_c60_admit_gate())
         self.assertEqual(c.token, "SHARED_TOKEN_V1")
 
         # External process updates shared token file; _headers() adopts it automatically
@@ -577,3 +577,10 @@ class TestV13IndependentAuditRemediations(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

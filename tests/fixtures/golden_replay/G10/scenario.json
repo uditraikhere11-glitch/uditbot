@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Uninterrupted watcher across evening -> midnight -> 00:08 IST -> prior-session signed carryover -> 08:30 IST transition -> delayed/ambiguous settlement block -> verified settled holdings automatic watcher-only recovery without bot restart.",
+  "primary_provenance": "OBSERVED_PROJECTION",
+  "scenario_id": "G10",
+  "title": "Uninterrupted watcher-only EOD rollover"
+}

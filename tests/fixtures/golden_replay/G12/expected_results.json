@@ -1,0 +1,7 @@
+{
+  "executed_journal_crash_boundaries": 5,
+  "reject_recon_fill_synthetic": true,
+  "total_contract_crash_boundaries": 20,
+  "wal_integrity_ok": true,
+  "zero_duplicate_fills": true
+}

@@ -633,10 +633,12 @@ class TradingBotPipeline:
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.OPTION, symbol=sig.symbol)
 
         if hasattr(self.risk_manager, "sync_from_journal_and_broker"):
+            _coord_snap = getattr(getattr(self, "reconciliation_gate", None), "_unified_snapshot", None) if is_live else None
             self.risk_manager.sync_from_journal_and_broker(
                 journal_db=self.db,
-                broker=self.broker if is_live else None,
+                broker=(self.broker if is_live else None),
                 watcher=self.watcher,
+                broker_snapshot=_coord_snap,
             )
 
         effective_funds = avail_funds if (is_live or avail_funds >= sizing.total_cost) else getattr(self.cfg, "test_mode_paper_funds_inr", 100000.0)
@@ -1239,10 +1241,12 @@ class TradingBotPipeline:
             return ValidationResult(is_valid=False, action=SignalAction.BLOCKED, reason=reason, signal_type=SignalType.EQUITY, symbol=inst.symbol)
 
         if hasattr(self.risk_manager, "sync_from_journal_and_broker"):
+            _coord_snap = getattr(getattr(self, "reconciliation_gate", None), "_unified_snapshot", None) if is_live else None
             self.risk_manager.sync_from_journal_and_broker(
                 journal_db=self.db,
-                broker=self.broker if is_live else None,
+                broker=(self.broker if is_live else None),
                 watcher=self.watcher,
+                broker_snapshot=_coord_snap,
             )
 
         effective_funds = avail_funds if (is_live or avail_funds >= sizing.total_cost) else getattr(self.cfg, "test_mode_paper_funds_inr", 100000.0)

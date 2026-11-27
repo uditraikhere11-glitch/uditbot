@@ -1,0 +1,77 @@
+{
+  "fills": [
+    {
+      "broker_order_id": "G12-BUY-001",
+      "exchange_segment": "NSE_EQ",
+      "exchange_trade_id": "G12-EID-BUY-1",
+      "is_verified_trade": 1,
+      "parent_order_id": "G12-BUY-001",
+      "product_type": "CNC",
+      "security_id": "13197",
+      "symbol": "PDSL-EQ",
+      "traded_at": 1795149000.0,
+      "traded_price": 405.0,
+      "traded_quantity": 1,
+      "transaction_type": "BUY"
+    }
+  ],
+  "order_intents": [
+    {
+      "account_id": "9000001536",
+      "broker_order_id": "G12-BUY-001",
+      "correlation_id": "EQ-PDSL-G12-1",
+      "created_at": 1795149000.0,
+      "exchange_segment": "NSE_EQ",
+      "order_type": "LIMIT",
+      "price": 405.0,
+      "product_type": "CNC",
+      "protection_route": "FOREVER_OCO",
+      "quantity": 1,
+      "security_id": "13197",
+      "state": "TRADED",
+      "symbol": "PDSL-EQ",
+      "trading_symbol": "PDSL-EQ",
+      "updated_at": 1795149000.0
+    }
+  ],
+  "positions_lifecycle": [
+    {
+      "account_id": "9000001536",
+      "buy_filled_qty": 1,
+      "buy_vwap": 405.0,
+      "confirmed_open_qty": 1,
+      "entry_qty": 1,
+      "exchange_segment": "NSE_EQ",
+      "manual_exit_detected": 0,
+      "orphaned_legs_detected": 0,
+      "parent_order_id": "G12-BUY-001",
+      "position_state": "PROTECTED",
+      "product_type": "CNC",
+      "protected_qty": 1,
+      "protection_route": "FOREVER_OCO",
+      "realized_pnl": 0.0,
+      "security_id": "13197",
+      "sell_filled_qty": 0,
+      "sell_vwap": 0.0,
+      "sl_price": 392.0,
+      "symbol": "PDSL-EQ",
+      "target_price": 420.0,
+      "trading_symbol": "PDSL-EQ",
+      "triggered_leg": "",
+      "updated_at": 1795149000.0
+    }
+  ],
+  "protection_orders": [
+    {
+      "created_at": 1795149001.0,
+      "forever_order_id": "FO-G12-001",
+      "parent_order_id": "G12-BUY-001",
+      "quantity": 1,
+      "sl_limit": 391.0,
+      "sl_trigger": 392.0,
+      "status": "ACTIVE_CONFIRMED",
+      "symbol": "PDSL-EQ",
+      "target_price": 420.0
+    }
+  ]
+}

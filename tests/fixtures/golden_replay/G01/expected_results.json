@@ -1,0 +1,12 @@
+{
+  "ambiguous_t1_blocks": true,
+  "closed_parent_id": "221261123606908",
+  "effective_open_qty": 2,
+  "manual_ack_qty": 2,
+  "retained_parents": [
+    "221261102657708",
+    "23126110439808"
+  ],
+  "settled_2_share_verifies": true,
+  "unprotected_qty": 0
+}

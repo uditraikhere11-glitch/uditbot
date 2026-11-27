@@ -1,0 +1,56 @@
+{
+  "auth_fail_1700": {
+    "account_pseudonym": "9000001536",
+    "broker_error_code": "DH-901",
+    "caller_identity": "DhanSnapshotSource",
+    "completeness_state": "COMPLETE",
+    "endpoint": "/v2/profile",
+    "exchange_ist_date": "2026-11-25",
+    "http_status": 401,
+    "monotonic_request_start_ns": 10000000000000,
+    "monotonic_response_receipt_ns": 10000005000000,
+    "payload": {
+      "errorCode": "DH-901",
+      "errorMessage": "Token expired",
+      "errorType": "Invalid_Authentication"
+    },
+    "payload_sha256": "c1241f558a5d2d7a2b382a42703c5ac9e29465d611ca1f86b70a3b24fa9ea103",
+    "provenance": "REPORTED_INCIDENT",
+    "request_identity": "req-v2-profile",
+    "request_params": {},
+    "retry_after": null,
+    "sanitized_error_body": {
+      "errorCode": "DH-901",
+      "errorMessage": "Token expired",
+      "errorType": "Invalid_Authentication"
+    },
+    "token_epoch_label": "epoch-1",
+    "transport_sent": true,
+    "utc_request_start": "2026-11-25T11:30:00Z",
+    "utc_response_receipt": "2026-11-25T11:30:00Z"
+  },
+  "profile_ok_1702": {
+    "account_pseudonym": "9000001536",
+    "broker_error_code": null,
+    "caller_identity": "DhanSnapshotSource",
+    "completeness_state": "COMPLETE",
+    "endpoint": "/v2/profile",
+    "exchange_ist_date": "2026-11-25",
+    "http_status": 200,
+    "monotonic_request_start_ns": 10000000000000,
+    "monotonic_response_receipt_ns": 10000005000000,
+    "payload": {
+      "dhanClientId": "9000001536"
+    },
+    "payload_sha256": "3f3f26925521111f01dcdf8f85aa109d5e14306c4a89d2d893f9e7ac068de585",
+    "provenance": "SYNTHETIC",
+    "request_identity": "req-v2-profile",
+    "request_params": {},
+    "retry_after": null,
+    "sanitized_error_body": null,
+    "token_epoch_label": "epoch-2",
+    "transport_sent": true,
+    "utc_request_start": "2026-11-25T11:32:00Z",
+    "utc_response_receipt": "2026-11-25T11:32:00Z"
+  }
+}

@@ -1,0 +1,54 @@
+name: Unified broker ledger exact-head offline gate
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  exact-offline:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'refactor/unified-broker-ledger'
+    name: Offline suite (${{ matrix.revision }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [baseline, candidate]
+    env:
+      AUDITBOT_TEST_ISOLATION: '1'
+      UDITBOT_OFFLINE_TESTS: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      BASELINE: 0e7241de6880663508ce804ae84e33a476d1e6a2
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REVISION: ${{ matrix.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.revision == 'baseline' && '0e7241de6880663508ce804ae84e33a476d1e6a2' || github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify frozen base and exact checkout
+        run: |
+          set -euo pipefail
+          test "$BASE_SHA" = "$BASELINE"
+          expected="$HEAD_SHA"
+          if [ "$REVISION" = baseline ]; then expected="$BASELINE"; fi
+          test "$(git rev-parse HEAD)" = "$expected"
+          git merge-base --is-ancestor "$BASELINE" HEAD
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+          test ! -e .env
+          test ! -e data/trade_journal.db
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install declared test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Enable existing offline network perimeter
+        run: echo "PYTHONPATH=${GITHUB_WORKSPACE}/tests/ci_offline:${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+      - name: Full offline regression at verified SHA
+        run: |
+          set -euo pipefail
+          AUDITBOT_TEST_ISOLATION=1 UDITBOT_OFFLINE_TESTS=1 python3 -W error::ResourceWarning -m unittest discover -s tests -t . -p 'test_*.py'

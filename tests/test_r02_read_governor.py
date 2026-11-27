@@ -209,25 +209,24 @@ sys.exit(1)
     # Additional Independent Audit Regression Tests (Findings 1–9)
     # ------------------------------------------------------------------
 
-    def test_strike_counter_resets_after_cooldown_recovery_http_200(self):
-        """Finding 1: Strikes reset to 0 after cooldown expires and a genuine HTTP 200 succeeds."""
+    def test_strikes_survive_one_success_and_next_429_escalates(self):
+        """Locked F03: 429 -> 60s -> validated GET -> 429 -> 120s."""
         c = self.client()
-        # 3 consecutive throttles without Retry-After -> strikes=3 (240s cooldown)
         c.session.get.return_value = response(429)
-        c.get_holdings()
-        self.g.throttled(None)
-        self.g.throttled(None)
-        self.now += 241
-        # Genuine HTTP 200 after cooldown -> resets strikes to 0
-        c.session.get.return_value = response(200, '[]')
-        res = c.get_holdings()
-        self.assertEqual(res, [])
-        # Next single 429 without Retry-After starts fresh at strike 1 (60s), not strike 4 (480s)
-        c.session.get.return_value = response(429)
-        c.get_holdings()
-        self.now += 61
+        self.assertIsInstance(c.get_holdings(), BrokerReadFailure)
+        self.now += 60
         c.session.get.return_value = response(200, '[]')
         self.assertEqual(c.get_holdings(), [])
+        self.now += .5
+        c.session.get.return_value = response(429)
+        self.assertIsInstance(c.get_holdings(), BrokerReadFailure)
+        self.now += 61
+        c.session.get.return_value = response(200, '[]')
+        self.assertIsInstance(c.get_holdings(), BrokerReadFailure)
+        self.assertEqual(c.session.get.call_count, 3)
+        self.now += 59
+        self.assertEqual(c.get_holdings(), [])
+        self.assertEqual(c.session.get.call_count, 4)
 
     def test_concurrent_multithread_admission_no_false_sqlite_lock_halt(self):
         """Finding 2: Concurrent WAL admission across threads never triggers false SQLite lock halts."""

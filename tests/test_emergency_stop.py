@@ -79,7 +79,7 @@ class TestEmergencyStop(unittest.TestCase):
         """DhanClient adapter boundary rejects place_order when STOP is active."""
         self.manager.provision_initial_clean_state(operator="Udit", account_id="1113731536")
         cfg = self._make_isolated_config(mode=TradingMode.LIVE)
-        client = DhanClient(cfg, stop_manager=self.manager)
+        client = DhanClient(cfg, stop_manager=self.manager, reconciliation_gate=_c60_admit_gate())
         self.addCleanup(client.session.close)
         client.session.post = MagicMock(side_effect=AssertionError("Live HTTP POST forbidden during Emergency STOP test"))
 
@@ -135,7 +135,7 @@ class TestEmergencyStop(unittest.TestCase):
         """
         self.manager.provision_initial_clean_state(operator="Udit", account_id="1113731536")
         cfg = self._make_isolated_config(mode=TradingMode.TEST)
-        client = DhanClient(cfg, stop_manager=self.manager)
+        client = DhanClient(cfg, stop_manager=self.manager, reconciliation_gate=_c60_admit_gate())
         self.addCleanup(client.session.close)
         client.session.delete = MagicMock(side_effect=AssertionError("Live HTTP DELETE forbidden in TEST mode"))
         client.session.post = MagicMock(side_effect=AssertionError("Live HTTP POST forbidden in TEST mode"))
@@ -166,3 +166,10 @@ class TestEmergencyStop(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

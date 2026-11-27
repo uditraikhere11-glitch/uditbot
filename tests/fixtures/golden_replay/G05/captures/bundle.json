@@ -1,0 +1,32 @@
+{
+  "throttle_429": {
+    "account_pseudonym": "9000001536",
+    "broker_error_code": "DH-904",
+    "caller_identity": "DhanSnapshotSource",
+    "completeness_state": "COMPLETE",
+    "endpoint": "/v2/positions",
+    "exchange_ist_date": "2026-11-26",
+    "http_status": 429,
+    "monotonic_request_start_ns": 10000000000000,
+    "monotonic_response_receipt_ns": 10000005000000,
+    "payload": {
+      "errorCode": "DH-904",
+      "errorMessage": "Too many requests on server from single user breaching rate limits.",
+      "errorType": "Rate_Limit"
+    },
+    "payload_sha256": "b26c431c88c9307b69cc16bd555c142d927d725b8f57c7f05d8668c1f07b8689",
+    "provenance": "OBSERVED_PROJECTION",
+    "request_identity": "req-v2-positions",
+    "request_params": {},
+    "retry_after": null,
+    "sanitized_error_body": {
+      "errorCode": "DH-904",
+      "errorMessage": "Too many requests on server from single user breaching rate limits.",
+      "errorType": "Rate_Limit"
+    },
+    "token_epoch_label": "epoch-1",
+    "transport_sent": true,
+    "utc_request_start": "2026-11-26T03:16:00Z",
+    "utc_response_receipt": "2026-11-26T03:16:00Z"
+  }
+}

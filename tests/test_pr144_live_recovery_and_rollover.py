@@ -1,6 +1,6 @@
 """PR144 production-shape replay. No live broker, account, service, or journal."""
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
@@ -29,7 +29,7 @@ class LiveRecoveryAndRollover(unittest.TestCase):
         patch("src.engine.closed_parent_safety.datetime", ReplayDateTime).start()
         # Deterministic verified calendar, not the machine's mutable calendar.
         patch("src.engine.market.load_holidays_verified",
-              return_value=(True, set(), "offline calendar")).start()
+              return_value=(True, {date(2026, 1, 26), date(2026, 8, 15), date(2026, 10, 2)}, "offline calendar")).start()
         self.f = fixture.SignedCNCT0ClosedSibling(methodName="runTest")
         self.f.TARGET_CHILD = "22126112566908"
         self.f.SELL_TRADE = "600252830"
@@ -94,8 +94,9 @@ class LiveRecoveryAndRollover(unittest.TestCase):
         self.f.history.append(dict(self.f.sell))
         child = dict(self.f.broker.get_order_book.return_value[0])
         self.f.broker.get_order_book.return_value = []
+        _prev_os = getattr(self.f.broker, "order_status", None)
         self.f.broker.order_status = Mock(side_effect=lambda oid: dict(child)
-                                           if oid == self.f.TARGET_CHILD else None)
+                                           if oid == self.f.TARGET_CHILD else (_prev_os(oid) if callable(_prev_os) else None))
         self.f.broker.get_positions.return_value = []
         self.f.broker.get_trade_book.return_value = []
         self.f.broker.get_holdings.return_value[0].update(totalQty=2, dpQty=2, t1Qty=0, availableQty=2)

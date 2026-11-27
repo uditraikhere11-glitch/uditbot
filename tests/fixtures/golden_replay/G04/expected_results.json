@@ -1,0 +1,6 @@
+{
+  "corroboration_only": true,
+  "exact_price_tol": 1e-06,
+  "no_fabricated_fills": true,
+  "rollup_price_tol": 0.0001
+}

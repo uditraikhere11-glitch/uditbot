@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Historical execution corroboration across split BUY summaries, SELL summaries, blank/zero/missing EIDs, multi-page pagination with terminal empty page, price tolerances (<0.0001 rollup, <0.000001 exact row), and negative variants.",
+  "primary_provenance": "SYNTHETIC",
+  "scenario_id": "G04",
+  "title": "Midnight / T+1 BUY and SELL archive rollups"
+}

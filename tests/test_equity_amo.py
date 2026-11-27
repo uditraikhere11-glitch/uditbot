@@ -71,7 +71,7 @@ class TestBrokerAMOPayload(unittest.TestCase):
         )
         self.client.stop_manager = MagicMock()
         self.client.stop_manager.try_begin_mutation.return_value = (True, {})
-        self.client.reconciliation_gate = SimpleNamespace(is_accepting_entries=True)
+        self.client.reconciliation_gate = SimpleNamespace(is_accepting_entries=True, revalidate_for_transport_submission=lambda *, pending_correlation_id=None, post_registration=False, expected_order_payload=None: (True, 'ADMITTED'))
         self.client._headers = lambda: {"access-token": "mock"}
         response = MagicMock(status_code=201, text='{"orderId":"TEST-123"}')
         response.json.return_value = {"orderId": "TEST-123", "orderStatus": "PENDING"}

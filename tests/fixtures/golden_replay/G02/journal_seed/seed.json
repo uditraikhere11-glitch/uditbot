@@ -1,0 +1,89 @@
+{
+  "fills": [
+    {
+      "broker_order_id": "PDSL-BUY-001",
+      "exchange_segment": "NSE_EQ",
+      "exchange_trade_id": "PDSL-EID-BUY-1",
+      "is_verified_trade": 1,
+      "parent_order_id": "PDSL-BUY-001",
+      "product_type": "CNC",
+      "security_id": "13197",
+      "symbol": "PDSL-EQ",
+      "traded_at": 1795149000.0,
+      "traded_price": 405.0,
+      "traded_quantity": 1,
+      "transaction_type": "BUY"
+    }
+  ],
+  "order_intents": [
+    {
+      "account_id": "9000001536",
+      "broker_order_id": "PDSL-BUY-001",
+      "correlation_id": "EQ-PDSL-G02-1",
+      "created_at": 1795149000.0,
+      "exchange_segment": "NSE_EQ",
+      "order_type": "LIMIT",
+      "price": 405.0,
+      "product_type": "CNC",
+      "protection_route": "FOREVER_OCO",
+      "quantity": 1,
+      "security_id": "13197",
+      "state": "TRADED",
+      "symbol": "PDSL-EQ",
+      "trading_symbol": "PDSL-EQ",
+      "updated_at": 1795149000.0
+    }
+  ],
+  "positions_lifecycle": [
+    {
+      "account_id": "9000001536",
+      "buy_filled_qty": 1,
+      "buy_vwap": 405.0,
+      "confirmed_open_qty": 1,
+      "entry_qty": 1,
+      "exchange_segment": "NSE_EQ",
+      "manual_exit_detected": 0,
+      "orphaned_legs_detected": 0,
+      "parent_order_id": "PDSL-BUY-001",
+      "position_state": "ENTRY_FILLED_UNPROTECTED",
+      "product_type": "CNC",
+      "protected_qty": 0,
+      "protection_route": "FOREVER_OCO",
+      "realized_pnl": 0.0,
+      "security_id": "13197",
+      "sell_filled_qty": 0,
+      "sell_vwap": 0.0,
+      "sl_price": 0.0,
+      "symbol": "PDSL-EQ",
+      "target_price": 0.0,
+      "trading_symbol": "PDSL-EQ",
+      "triggered_leg": "",
+      "updated_at": 1795149000.0
+    }
+  ],
+  "protection_attempts": [
+    {
+      "account_id": "9000001536",
+      "attempt_id": "PA-PDSL-1",
+      "correlation_id": "PA-CORR-PDSL-1",
+      "created_at": 1795149005.0,
+      "exchange_segment": "NSE_EQ",
+      "executed_price": 405.0,
+      "parent_order_id": "PDSL-BUY-001",
+      "product_type": "CNC",
+      "quantity": 1,
+      "root_order_id": "PDSL-BUY-001",
+      "route": "FOREVER_OCO",
+      "security_id": "13197",
+      "sl_limit": 391.0,
+      "sl_trigger": 392.0,
+      "state": "REJECTED",
+      "symbol": "PDSL-EQ",
+      "target_price": 420.0,
+      "tick_size": 0.05,
+      "trading_symbol": "PDSL-EQ",
+      "uncovered_from_qty": 1,
+      "updated_at": 1795149006.0
+    }
+  ]
+}

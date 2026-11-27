@@ -197,7 +197,7 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
             data_dir=self.data_dir,
         )
         stop_mgr = EmergencyStopManager(self.stop_path, expected_account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         # Activate transition gate
         self.tracker.set_transition_gate(
@@ -306,6 +306,18 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
     # B06 — Unsafe owner Stop after safety-check failure (P0)
     # =========================================================================
 
+    def _make_flat_live_broker(self):
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        b = MagicMock()
+        b.get_order_book.return_value = []
+        b.get_trade_book.return_value = []
+        b.get_holdings.return_value = []
+        b.get_positions.return_value = []
+        b.get_forever_orders.return_value = []
+        b.get_super_orders.return_value = []
+        attach_unified_live_evidence_to_stub_broker(b, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
+        return b
+
     def test_B06_owner_stop_defers_on_journal_error_and_unreadable_emergency_stop(self):
         stop_systemctl_mock = MagicMock(return_value=True)
 
@@ -355,6 +367,7 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
                 svc_state["state"] = "inactive"
             return True
         res_auto_stop = self.tracker.try_auto_complete_deferred_stop(
+            broker=self._make_flat_live_broker(),
             env_path=self.env_path,
             stop_state_path=self.stop_path,
             db_path=self.db_path,
@@ -394,6 +407,7 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
         res_start = self.tracker.control_service(
             action="start",
             reason="Owner pressed Start expecting TEST mode",
+            broker=self._make_flat_live_broker(),
             env_path=self.env_path,
             stop_state_path=self.stop_path,
             db_path=self.db_path,
@@ -457,6 +471,7 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
         self.db.update_order_intent("CORR-B10-1", state="CANCELLED")
         res_restart_ok = self.tracker.control_service(
             action="restart",
+            broker=self._make_flat_live_broker(),
             confirm_live=True,
             env_path=self.env_path,
             stop_state_path=self.stop_path,
@@ -514,10 +529,15 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
         # Verify TRADED order WITHOUT verified Forever OCO protection blocks transition
         unprot_broker = MagicMock()
         unprot_broker.get_order_book.return_value = [
-            {"orderId": "ORD-H4-1", "correlationId": "CORR-H4-1", "orderStatus": "TRADED", "filledQty": 5, "securityId": "3045"}
+            {"dhanClientId": "1113731536", "orderId": "ORD-H4-1", "correlationId": "CORR-H4-1", "orderStatus": "TRADED", "filledQty": 5, "remainingQuantity": 0, "quantity": 5, "transactionType": "BUY", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"}
         ]
         unprot_broker.get_forever_orders.return_value = []
         unprot_broker.get_super_orders.return_value = []
+        unprot_broker.get_trade_book.return_value = []
+        unprot_broker.get_holdings.return_value = []
+        unprot_broker.get_positions.return_value = []
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(unprot_broker, db_path=self.db_path, data_dir=self.data_dir, account_id='1113731536')
         ok_u, _, code_u, _ = self.tracker.evaluate_trading_safety_gate_detailed(
             db_path=self.db_path,
             stop_state_path=self.stop_path,
@@ -535,8 +555,15 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
             self.db.update_order_intent("CORR-H4-1", state="TRANSIT", broker_order_id="ORD-H4-1")
             term_broker = MagicMock()
             term_broker.get_order_book.return_value = [
-                {"orderId": "ORD-H4-1", "correlationId": "CORR-H4-1", "orderStatus": term_state, "filledQty": 0, "securityId": "3045"}
+                {"dhanClientId": "1113731536", "orderId": "ORD-H4-1", "correlationId": "CORR-H4-1", "orderStatus": term_state, "filledQty": 0, "remainingQuantity": 0, "quantity": 5, "transactionType": "BUY", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"}
             ]
+            term_broker.get_trade_book.return_value = []
+            term_broker.get_holdings.return_value = []
+            term_broker.get_positions.return_value = []
+            term_broker.get_forever_orders.return_value = []
+            term_broker.get_super_orders.return_value = []
+            from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+            attach_unified_live_evidence_to_stub_broker(term_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
             ok_t, _, code_t, _ = self.tracker.evaluate_trading_safety_gate_detailed(
                 db_path=self.db_path,
                 stop_state_path=self.stop_path,
@@ -553,6 +580,7 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
     def test_H4_partial_fill_with_outstanding_protection_blocks_until_protected_and_never_duplicates_orders(self):
         self.db.record_order_intent(
             correlation_id="CORR-PART-PROT",
+            account_id="1113731536",
             symbol="SBIN",
             security_id="3045",
             exchange_segment="NSE_EQ",
@@ -562,6 +590,17 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
             quantity=10,
         )
         self.db.update_order_intent("CORR-PART-PROT", state="CANCELLED", broker_order_id="ORD-PART-PROT")
+        self.db.record_fill(
+            "ORD-PART-PROT", "EID-PART-4", "SBIN", 800.0, 4, traded_at=time.time() - 30.0,
+            transaction_type="BUY", security_id="3045", exchange_segment="NSE_EQ",
+            product_type="CNC", parent_order_id="ORD-PART-PROT", is_verified_trade=True,
+        )
+        self.db.upsert_position_lifecycle(
+            parent_order_id="ORD-PART-PROT", account_id="1113731536", symbol="SBIN", security_id="3045",
+            exchange_segment="NSE_EQ", product_type="CNC", protection_route="FOREVER_OCO",
+            position_state="UNPROTECTED", entry_qty=10, buy_filled_qty=4, buy_vwap=800.0,
+            protected_qty=0, confirmed_open_qty=4,
+        )
         with self.db._get_conn() as conn:
             conn.execute(
                 "INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, sl_trigger, sl_limit, target_price, status, created_at) "
@@ -571,9 +610,15 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
 
         mock_broker = MagicMock()
         mock_broker.get_order_book.return_value = [
-            {"orderId": "ORD-PART-PROT", "correlationId": "CORR-PART-PROT", "orderStatus": "CANCELLED", "filledQty": 4, "securityId": "3045"}
+            {"dhanClientId": "1113731536", "orderId": "ORD-PART-PROT", "correlationId": "CORR-PART-PROT", "orderStatus": "CANCELLED", "filledQty": 4, "remainingQuantity": 0, "quantity": 10, "transactionType": "BUY", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"}
         ]
         mock_broker.get_forever_orders.return_value = []
+        mock_broker.get_super_orders.return_value = []
+        mock_broker.get_trade_book.return_value = []
+        mock_broker.get_holdings.return_value = []
+        mock_broker.get_positions.return_value = []
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(mock_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
 
         # Blocked while 4 partially-filled shares have UNVERIFIED protection
         ok1, _, code1, _ = self.tracker.evaluate_trading_safety_gate_detailed(
@@ -592,3 +637,10 @@ class TestV14WebUIBackendFix02(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

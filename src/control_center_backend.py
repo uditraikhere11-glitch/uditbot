@@ -167,6 +167,21 @@ def _cached_broker_status(cfg: AppConfig, *, refresh: bool = False) -> Dict[str,
                 value["detail"] = "Token expired"
             return value
         if not refresh:
+            uni = _display_unified_snapshot(str(getattr(cfg, "data_dir", "") or "data"), cfg)
+            if (
+                isinstance(uni, dict)
+                and uni.get("available") is True
+                and str(uni.get("status") or "").upper() in ("VERIFIED", "FRESH")
+                and uni.get("profile_verified", True) is True
+            ):
+                return {
+                    "status": "VERIFIED",
+                    "detail": "Dhan profile account identity verified (unified snapshot)",
+                    "verified_at": now,
+                    "token_expiration_ist": None,
+                    "source": "unified_snapshot",
+                    "snapshot_id": uni.get("snapshot_id"),
+                }
             return {"status": "UNVERIFIED", "detail": "No recent broker profile verification",
                     "verified_at": None, "token_expiration_ist": None}
         result = {"status": "UNVERIFIED", "detail": "Broker profile could not be verified",
@@ -384,7 +399,47 @@ def _build_control_status(tracker, raw, cfg, absolute_env, data_dir):
         "latest_change_state": newest.state.value if newest else None,
         "latest_change_id": newest.change_id if newest else None,
         "transition_gate_active": gate.get("active", True),
+        "unified_broker_snapshot": (uni_snap := _display_unified_snapshot(data_dir, cfg)),
+        "runtime_status_summary": _build_shared_runtime_status_summary(raw, uni_snap),
     }
+
+
+def _build_shared_runtime_status_summary(raw: Dict[str, Any], uni_snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase 4: Share exact runtime status summary projection with Telegram runtime_status."""
+    try:
+        from src.notifier.runtime_status import summarize_runtime_status
+        op_snap = raw.get("operational_snapshot") if isinstance(raw, dict) else None
+        if not isinstance(op_snap, dict):
+            op_snap = {}
+        return summarize_runtime_status(op_snap, unified_snapshot=uni_snap)
+    except Exception:
+        return {
+            "reconciliation_state": "UNKNOWN",
+            "entries_open": False,
+            "watcher_running": False,
+            "supervision_verified": False,
+            "status_badge": "BLOCKED",
+            "unified_snapshot_available": False,
+            "unified_snapshot_status": "UNAVAILABLE",
+            "session_phase": "UNKNOWN",
+            "display_only": True,
+            "authoritative_for_mutation": False,
+        }
+
+
+def _display_unified_snapshot(data_dir: str, cfg: Any) -> Dict[str, Any]:
+    """Phase 2D: Strictly read-only display snapshot metadata for WebUI (never refreshes broker)."""
+    try:
+        from src.engine.unified_account_runtime import peek_display_snapshot_summary
+        account_id = str(getattr(cfg, "dhan_client_id", "") or "").strip()
+        return peek_display_snapshot_summary(data_dir=data_dir, account_id=account_id)
+    except Exception as exc:
+        return {
+            "available": False,
+            "display_only": True,
+            "authoritative_for_mutation": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def build_control_health(env_path: str = ".env") -> Dict[str, Any]:

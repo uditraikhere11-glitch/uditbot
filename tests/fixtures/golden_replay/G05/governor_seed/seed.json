@@ -1,0 +1,14 @@
+{
+  "budgets": {
+    "DATA_PER_DAY": 100000,
+    "DATA_PER_SEC": 5,
+    "NON_TRADING_PER_SEC": 20,
+    "ORDER_PER_DAY": 7000,
+    "ORDER_PER_HR": 1000,
+    "ORDER_PER_MIN": 250,
+    "ORDER_PER_SEC": 10,
+    "QUOTE_PER_SEC": 1
+  },
+  "cooldown_until": 0.0,
+  "strikes": 0
+}

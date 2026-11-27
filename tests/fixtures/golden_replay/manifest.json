@@ -1,0 +1,92 @@
+{
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "baseline_tree": "3060dc0d9915d08ddd0035d3c892cfc6c10fa32f",
+  "scenario_count": 12,
+  "scenarios": [
+    {
+      "file_count": 8,
+      "primary_provenance": "OBSERVED_PROJECTION",
+      "scenario_id": "G01",
+      "sha256sums_digest": "c21126f16e8de0cd35d4bc9f0422abfc2f655cfc8ebfbc1d70d40f34a267bcfb",
+      "title": "YESBANK retained lots and 28-share exit"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "REPORTED_INCIDENT",
+      "scenario_id": "G02",
+      "sha256sums_digest": "8c53b28d855bb70e6b1fcdc4bb5ce87659beba8dbd8d71d66de10e0eb2ec269b",
+      "title": "PDSL manual exit"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "REPORTED_INCIDENT",
+      "scenario_id": "G03",
+      "sha256sums_digest": "e87b3a443191b63aa3dfe1b4c72bf22aa0a355c7252fc21be964e96831d6f0ff",
+      "title": "VEDPOWER triggered Forever target"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "SYNTHETIC",
+      "scenario_id": "G04",
+      "sha256sums_digest": "62eaebea7a4b7b44ff1b0a406a49bd54f935027cc4cfebca4bb53dc563e6276a",
+      "title": "Midnight / T+1 BUY and SELL archive rollups"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "OBSERVED_PROJECTION",
+      "scenario_id": "G05",
+      "sha256sums_digest": "ce8fbdb9bc14660f87e810ed5d109f8cd6c17a0a68b8b167dba93516f1bbcb5b",
+      "title": "Dhan cooldown and micro pacing"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "OBSERVED_PROJECTION",
+      "scenario_id": "G06",
+      "sha256sums_digest": "4359cecd16a5012a93f94daf8b33be0f10fc1ebd5b02a7a130830a11caeca5fa",
+      "title": "Owner STOP / Restart handoff"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "REPORTED_INCIDENT",
+      "scenario_id": "G07",
+      "sha256sums_digest": "d086c8642c3de4bc51ed848887c0c84c0ece710534b9362b02137d303bee2588",
+      "title": "Concurrent watcher, gate and token rotation"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "SYNTHETIC",
+      "scenario_id": "G08",
+      "sha256sums_digest": "96e0cde5c74a7ab978f5d7176761f9341d3b19c183fc546d0c22eebbd46fdb9d",
+      "title": "Mixed retained and protected portfolio"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "SYNTHETIC",
+      "scenario_id": "G09",
+      "sha256sums_digest": "7b36cfcf307365a53cf9d8e7659585c68e5da9003cafd1111ac2073f8de18974",
+      "title": "Sustained HTTP 429 across cooldowns"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "OBSERVED_PROJECTION",
+      "scenario_id": "G10",
+      "sha256sums_digest": "c49044eb71532a27183651e8f7a5a4300709eb8e009166eeaede6745e84eb1d0",
+      "title": "Uninterrupted watcher-only EOD rollover"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "SYNTHETIC",
+      "scenario_id": "G11",
+      "sha256sums_digest": "bc18bc79d390afcff9ef4c0c2ae181ce5fe86bfbe6aefc5376dd3e2db0f976b9",
+      "title": "Cross-process WebUI and trading bot reads"
+    },
+    {
+      "file_count": 8,
+      "primary_provenance": "SYNTHETIC",
+      "scenario_id": "G12",
+      "sha256sums_digest": "2bb04f2bb5d171ea09b3ec22c9d0b8e52e38c6213c9e6c1ead16a17ed6353264",
+      "title": "Crash during reconciliation persistence"
+    }
+  ],
+  "schema_version": 1
+}

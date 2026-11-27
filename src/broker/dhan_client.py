@@ -1,3 +1,7 @@
+from dataclasses import dataclass
+from types import MappingProxyType
+import hashlib
+import math
 """
 DhanHQ API v2 Client Interface + V13 Audit-Hardened Execution-Safety Edition.
 Handles:
@@ -40,6 +44,10 @@ from src.broker.yahoo_observer import (
     YAHOO_HTTP_HEADERS,
     configure_yahoo_http,
     parse_yahoo_response,
+)
+from src.broker.yahoo_quotes import (
+    YAHOO_CHART_URL, VALID_NSE_EXCHANGES, VALID_BSE_EXCHANGES,
+    get_yahoo_quote_details as _get_yahoo_quote_details,
 )
 from src.config import AppConfig
 from src.engine.emergency_stop import EmergencyStopManager
@@ -98,10 +106,6 @@ def _mask_client_id(acct: object) -> str:
     return f"***{raw[-4:]}"
 
 
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
-
-VALID_NSE_EXCHANGES = frozenset({"NSI", "NSE", "NATIONAL STOCK EXCHANGE OF INDIA"})
-VALID_BSE_EXCHANGES = frozenset({"BSE", "BOM", "BOMBAY STOCK EXCHANGE"})
 ACTIVE_BROKER_ORDER_STATES = frozenset({"PENDING", "OPEN", "TRANSIT", "CONFIRM", "ACTIVE"})
 TERMINAL_OR_INACTIVE_ORDER_STATES = frozenset({"REJECTED", "CANCELLED", "EXPIRED", "TRADED", "CLOSED", "TRIGGERED"})
 
@@ -806,6 +810,183 @@ def verify_super_order_record(
     )
 
 
+
+# =============================================================================
+# C58 + C62: Strict Pre-Conversion Numeric Validators & Immutable Operation Binding
+# =============================================================================
+
+MAX_SAFE_INT_QTY = 2_147_483_647
+MAX_SAFE_DECIMAL_PRICE = 1e9
+
+_CANONICAL_TO_WIRE_MAP = (
+    ("account_id", "dhanClientId"),
+    ("correlation_id", "correlationId"),
+    ("transaction_type", "transactionType"),
+    ("exchange_segment", "exchangeSegment"),
+    ("product_type", "productType"),
+    ("order_type", "orderType"),
+    ("security_id", "securityId"),
+    ("quantity", "quantity"),
+    ("price", "price"),
+    ("trigger_price", "triggerPrice"),
+    ("disclosed_quantity", "disclosedQuantity"),
+    ("is_amo", "afterMarketOrder"),
+    ("stop_loss_price", "stopLossPrice"),
+    ("target_price", "targetPrice"),
+    ("trailing_jump", "trailingJump"),
+    ("order_id", "orderId"),
+    ("leg_name", "legName"),
+)
+
+
+def _validate_raw_strict_int(val: Any, field: str, *, allow_zero: bool = False) -> Tuple[bool, Optional[int], str]:
+    """C58 + C68: Validate raw integer input BEFORE any int() conversion with 32-bit range ceiling."""
+    if isinstance(val, bool) or type(val) is not int:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: expected strict int, got {type(val).__name__} ({val!r})"
+    if val > MAX_SAFE_INT_QTY:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: exceeds max safe 32-bit integer ({val!r} > {MAX_SAFE_INT_QTY})"
+    if allow_zero:
+        if val < 0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be >= 0 (got {val!r})"
+    else:
+        if val <= 0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be > 0 (got {val!r})"
+    return True, val, "OK"
+
+
+def _validate_raw_strict_number(val: Any, field: str, *, allow_zero: bool = False) -> Tuple[bool, Optional[float], str]:
+    """C58 + C68: Validate raw numeric input BEFORE any float() conversion, catching OverflowError."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: expected finite int/float, got {type(val).__name__} ({val!r})"
+    try:
+        fv = float(val)
+    except OverflowError:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: numeric overflow ({val!r})"
+    if not math.isfinite(fv) or abs(fv) > MAX_SAFE_DECIMAL_PRICE:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be finite and within safe price range (got {val!r})"
+    if allow_zero:
+        if fv < 0.0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be >= 0 (got {val!r})"
+    else:
+        if fv <= 0.0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be > 0 (got {val!r})"
+    return True, fv, "OK"
+
+
+def _canonical_json_bytes_and_sha256(payload: Any) -> Tuple[str, str]:
+    """C62: Canonical deterministic JSON serialization (rejects NaN/Inf) + SHA-256."""
+    wire_str = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    digest = hashlib.sha256(wire_str.encode("utf-8")).hexdigest()
+    return wire_str, digest
+
+
+def _values_semantically_equal(cval: Any, wval: Any) -> bool:
+    if isinstance(cval, bool) or isinstance(wval, bool):
+        return isinstance(cval, bool) and isinstance(wval, bool) and cval == wval
+    if isinstance(cval, (int, float)) and isinstance(wval, (int, float)):
+        try:
+            return math.isfinite(float(cval)) and math.isfinite(float(wval)) and abs(float(cval) - float(wval)) <= 1e-9
+        except OverflowError:
+            return False
+    return str(cval).strip() == str(wval).strip()
+
+
+def _verify_canonical_wire_semantic_equivalence(
+    canonical_fields: Dict[str, Any], wire_payload: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """C66: Enforce exact semantic equivalence between canonical authorization fields and wire payload."""
+    if not isinstance(canonical_fields, dict) or not isinstance(wire_payload, dict):
+        return False, "SEMANTIC_WIRE_MISMATCH: non-dict canonical or wire payload"
+    for c_key, w_key in _CANONICAL_TO_WIRE_MAP:
+        c_in = c_key in canonical_fields
+        w_in = w_key in wire_payload
+        if c_in and w_in:
+            if not _values_semantically_equal(canonical_fields[c_key], wire_payload[w_key]):
+                return False, f"SEMANTIC_WIRE_MISMATCH:{c_key}({canonical_fields[c_key]!r})!={w_key}({wire_payload[w_key]!r})"
+        elif c_key in wire_payload and c_in:
+            if not _values_semantically_equal(canonical_fields[c_key], wire_payload[c_key]):
+                return False, f"SEMANTIC_WIRE_MISMATCH:{c_key}({canonical_fields[c_key]!r})!={wire_payload[c_key]!r}"
+    # Also verify any direct identically-named economic keys present in both dicts
+    for k in canonical_fields:
+        if k in wire_payload and not _values_semantically_equal(canonical_fields[k], wire_payload[k]):
+            return False, f"SEMANTIC_WIRE_MISMATCH:{k}({canonical_fields[k]!r})!={wire_payload[k]!r}"
+    return True, "SEMANTICALLY_EQUIVALENT"
+
+
+@dataclass(frozen=True)
+class AuthorizedBrokerOperation:
+    """C62 + C66: Single authoritative immutable operation descriptor binding canonical
+    authorization fields to the exact semantically equivalent HTTP method, endpoint URL,
+    and wire JSON payload.
+    """
+    method: str
+    url: str
+    account_id: str
+    operation_type: str
+    correlation_id: str
+    parent_order_id: str
+    canonical_json: str
+    wire_json: str
+    wire_payload_sha256: str
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        method: str,
+        url: str,
+        account_id: str,
+        operation_type: str,
+        correlation_id: str,
+        parent_order_id: str = "",
+        canonical_fields: Dict[str, Any],
+        wire_payload: Dict[str, Any],
+    ) -> "AuthorizedBrokerOperation":
+        ok_sem, msg_sem = _verify_canonical_wire_semantic_equivalence(canonical_fields, wire_payload)
+        if not ok_sem:
+            raise ValueError(msg_sem)
+        wire_str, wire_sha = _canonical_json_bytes_and_sha256(wire_payload)
+        full_canonical = dict(canonical_fields)
+        full_canonical["http_method"] = str(method).upper()
+        full_canonical["endpoint_url"] = str(url)
+        full_canonical["operation_type"] = str(operation_type)
+        full_canonical["wire_payload_sha256"] = wire_sha
+        canon_str, _ = _canonical_json_bytes_and_sha256(full_canonical)
+        return cls(
+            method=str(method).upper(),
+            url=str(url),
+            account_id=str(account_id).strip(),
+            operation_type=str(operation_type),
+            correlation_id=str(correlation_id).strip(),
+            parent_order_id=str(parent_order_id).strip(),
+            canonical_json=canon_str,
+            wire_json=wire_str,
+            wire_payload_sha256=wire_sha,
+        )
+
+    def canonical_payload_dict(self) -> Dict[str, Any]:
+        return json.loads(self.canonical_json)
+
+    def wire_payload_copy(self) -> Dict[str, Any]:
+        return json.loads(self.wire_json)
+
+    def verify_wire_binding(self, method: str, url: str, outgoing_json: Any) -> Tuple[bool, str]:
+        if str(method).upper() != self.method:
+            return False, f"WIRE_METHOD_MISMATCH:{method}!={self.method}"
+        if str(url) != self.url:
+            return False, f"WIRE_URL_MISMATCH:{url}!={self.url}"
+        effective_outgoing = {} if (outgoing_json is None and self.method == "DELETE" and self.wire_json == "{}") else outgoing_json
+        ok_sem, msg_sem = _verify_canonical_wire_semantic_equivalence(self.canonical_payload_dict(), effective_outgoing if isinstance(effective_outgoing, dict) else {})
+        if not ok_sem:
+            return False, msg_sem
+        try:
+            _, actual_sha = _canonical_json_bytes_and_sha256(effective_outgoing)
+        except (TypeError, ValueError) as exc:
+            return False, f"WIRE_PAYLOAD_UNSERIALIZABLE:{exc}"
+        if actual_sha != self.wire_payload_sha256:
+            return False, f"WIRE_PAYLOAD_DIGEST_MISMATCH:{actual_sha[:12]}!={self.wire_payload_sha256[:12]}"
+        return True, "WIRE_BOUND"
+
 class DhanClient:
     _require_broker_handoff = False
 
@@ -816,6 +997,7 @@ class DhanClient:
         reconciliation_gate: Optional[Any] = None,
         auto_generate_token: bool = True,
         *, require_broker_handoff: bool = False,
+        allow_read_auth_recovery: bool = True,
     ):
         self.cfg = config
         from src.broker.read_governor import ReadGovernor
@@ -826,6 +1008,7 @@ class DhanClient:
         # login just because the token file is missing.
         self._require_broker_handoff = require_broker_handoff
         self._auto_generate_token = auto_generate_token
+        self._allow_read_auth_recovery = allow_read_auth_recovery
         self.session = configure_yahoo_http(requests.Session())
         self.stop_manager = stop_manager or EmergencyStopManager(
             state_file=os.path.join(config.data_dir, "emergency_stop.json")
@@ -1077,6 +1260,7 @@ class DhanClient:
 
             if new_token:
                 self.token = new_token
+                self._note_token_event('TOKEN_PUBLISHED_OR_ADOPTED')
                 try:
                     if os.path.exists(token_path):
                         st = os.stat(token_path)
@@ -1091,6 +1275,11 @@ class DhanClient:
             return False, "", last_err[0]
         except Exception as e:
             return False, "", f"Exception generating token via TOTP: {e}"
+
+    def _note_token_event(self, reason):
+        from src.broker.evidence_events import note_event
+        if not note_event(getattr(self.cfg,'data_dir',None),getattr(self.cfg,'dhan_client_id',None),reason):
+            self._halt_for_read_deferral()
 
     def _signal_token_recovery(self, rejected, active):
         # Installed only by the runtime listener. A notification callback
@@ -1141,6 +1330,7 @@ class DhanClient:
                 logger.info("Adopted rotated Dhan access token from shared file.")
             self._token_mtime = stat_after.st_mtime
             self._token_file_signature = signature
+            self._note_token_event('TOKEN_FILE_ADOPTED')
         except (FileNotFoundError, PermissionError, OSError):
             # A missing/unreadable file must never be interpreted as a valid
             # authenticated balance or an empty broker order book.
@@ -1193,6 +1383,7 @@ class DhanClient:
         ambiguous response or bypass the protection handoff for a real send.
         The rate category is determined by verb and path, not caller priority.
         """
+        authorized_op = kwargs.pop("authorized_op", None)
         from src.broker.read_governor import ReadGovernor, ReadDeferred
         category = ReadGovernor.classify(method, url)
         if category != "ORDER":
@@ -1223,6 +1414,28 @@ class DhanClient:
                 except (ReadDeferred, OSError, sqlite3.Error) as exc:
                     finish(True)  # Known no-send; do not create UNKNOWN mutation.
                     return self._read_deferral_response(exc)
+                _tls_auth = getattr(self, "_pre_transport_auth_tls", None)
+                _pre_auth_cb = getattr(_tls_auth, "fn", None) if _tls_auth is not None else None
+                if callable(_pre_auth_cb):
+                    _ok_ta, _msg_ta = _pre_auth_cb()
+                    if not _ok_ta:
+                        finish(True)  # C44: Known NO-SEND before transport admission; never create UNKNOWN mutation.
+                        raise BrokerMutationNotSubmitted(f"MUTATION BLOCKED (FINAL TRANSPORT ADMISSION): {_msg_ta}")
+                # C62 + C66: Require immutable AuthorizedBrokerOperation in LIVE mode across ALL POST/PUT/DELETE routes
+                _bound_op = authorized_op or (getattr(_tls_auth, "op", None) if _tls_auth is not None else None)
+                _raw_tm = getattr(self.cfg, "trading_mode", None)
+                _is_live_mode = str(getattr(_raw_tm, "value", _raw_tm) or "").strip().upper() == "LIVE"
+                if _bound_op is None and _is_live_mode:
+                    finish(True)
+                    raise BrokerMutationNotSubmitted("MUTATION BLOCKED (WIRE PAYLOAD BINDING): MISSING_AUTHORIZED_OPERATION")
+                if _bound_op is not None:
+                    if not callable(getattr(_bound_op, "verify_wire_binding", None)):
+                        finish(True)
+                        raise BrokerMutationNotSubmitted("MUTATION BLOCKED (WIRE PAYLOAD BINDING): INVALID_AUTHORIZED_OPERATION")
+                    _ok_wb, _msg_wb = _bound_op.verify_wire_binding(method, url, kwargs.get("json"))
+                    if not _ok_wb:
+                        finish(True)  # Known NO-SEND before network transmission.
+                        raise BrokerMutationNotSubmitted(f"MUTATION BLOCKED (WIRE PAYLOAD BINDING): {_msg_wb}")
                 sent = True
                 result = fn(url, **kwargs)
                 status = getattr(result, "status_code", None)
@@ -1363,6 +1576,8 @@ class DhanClient:
                     )
                 return None
             payload = resp.json()
+            if isinstance(payload, dict) and payload.get("dhanClientId") == str(getattr(self.cfg, "dhan_client_id", "")):
+                self._record_validated_get(resp)
             return payload if isinstance(payload, dict) else None
         except Exception as exc:
             logger.warning("Dhan profile identity check unavailable: %s", type(exc).__name__)
@@ -1612,6 +1827,7 @@ class DhanClient:
                     return False, 0.0, f"Malformed Dhan funds response: non-numeric balance ({raw_bal!r})"
                 if not math.isfinite(avail):
                     return False, 0.0, f"Malformed Dhan funds response: non-finite balance ({raw_bal!r})"
+                self._record_validated_get(resp)
                 return True, avail, "Funds retrieved successfully"
             elif resp.headers.get("X-AuditBot-Local-Deferral") == "1":
                 wait = resp.headers.get("Retry-After")
@@ -1648,516 +1864,12 @@ class DhanClient:
         allow_cached: bool = False,
         cmp_policy: Optional[str] = None,
     ) -> QuoteResult:
-        seg = (exchange_segment or "").strip().upper()
-        clean_sym = (stock_symbol or "").replace("-EQ", "").strip().upper()
-        max_age = float(max_quote_age_sec) if max_quote_age_sec is not None else float(getattr(self.cfg, "max_quote_age_sec", 2.0))
-        current_utc = float(now_utc) if now_utc is not None else time.time()
-        effective_policy = str(cmp_policy or getattr(self.cfg, "equity_cmp_execution_policy", "STRICT_TIMESTAMP") or "STRICT_TIMESTAMP").upper().strip()
-        is_darvas_policy = (effective_policy == "DARVAS_HTTP_SUCCESS" and seg == "NSE_EQ")
-
-        if seg in ("NSE_FNO", "BSE_FNO") or seg not in ("NSE_EQ", "BSE_EQ"):
-            res = QuoteResult(
-                is_valid=False,
-                source="YAHOO_FINANCE",
-                ticker=clean_sym,
-                venue="UNKNOWN",
-                security_id=str(security_id or ""),
-                cmp_policy=effective_policy,
-                failure_reason=(
-                    f"Unsupported segment '{seg}' for Yahoo Finance equity price source: "
-                    f"cannot substitute underlying equity quote for F&O option contract premium"
-                ),
-            )
-            self.last_quote_result = res
-            return res
-
-        if not clean_sym:
-            res = QuoteResult(
-                is_valid=False,
-                source="YAHOO_FINANCE",
-                venue="UNKNOWN",
-                security_id=str(security_id or ""),
-                cmp_policy=effective_policy,
-                failure_reason="Missing stock symbol for Yahoo Finance quote",
-            )
-            self.last_quote_result = res
-            return res
-
-        cache_key = (seg, clean_sym)
-        if allow_cached and cache_key in self._quote_cache:
-            cached = self._quote_cache[cache_key]
-            recomputed_age = round(current_utc - cached.quote_timestamp, 6) if (cached.quote_timestamp is not None and cached.quote_timestamp > 0) else None
-            if cached.is_valid and (recomputed_age is not None and 0.0 <= recomputed_age <= max_age) and (is_darvas_policy or cached.freshness_verified) and (not security_id or cached.security_id == str(security_id)):
-                updated = cached.model_copy(update={"age_sec": recomputed_age}) if hasattr(cached, "model_copy") else cached.copy(update={"age_sec": recomputed_age})
-                self.last_quote_result = updated
-                return updated
-            else:
-                self._quote_cache.pop(cache_key, None)
-
-        suffix = ".BO" if seg == "BSE_EQ" else ".NS"
-        expected_ticker = f"{clean_sym}{suffix}"
-        url = YAHOO_CHART_URL.format(ticker=expected_ticker)
-        headers = YAHOO_HTTP_HEADERS
-
-        t4_start_ns = time.perf_counter_ns()
-        try:
-            t_req_start = time.time()
-            resp = self.session.get(url, headers=headers, timeout=YAHOO_HTTP_TIMEOUT)
-            t4_end_ns = time.perf_counter_ns()
-            http_latency_ms = round(max(0.0, (t4_end_ns - t4_start_ns) / 1_000_000.0), 3)
-            http_elapsed = max(0.0, time.time() - t_req_start)
-            eval_utc = (float(now_utc) + (http_elapsed if http_elapsed >= 0.05 else 0.0)) if now_utc is not None else time.time()
-
-            if resp.status_code != 200:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=seg,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Yahoo Finance returned HTTP {resp.status_code} for {expected_ticker}",
-                )
-                self.last_quote_result = res
-                return res
-
-            t5_start_ns = time.perf_counter_ns()
-            data = parse_yahoo_response(resp)
-            results = (data.get("chart") or {}).get("result") or []
-            if not results or not isinstance(results[0], dict):
-                t5_end_ns = time.perf_counter_ns()
-                parse_latency_ms = round(max(0.0, (t5_end_ns - t5_start_ns) / 1_000_000.0), 3)
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=seg,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Empty chart result in Yahoo Finance response for {expected_ticker}",
-                )
-                self.last_quote_result = res
-                return res
-
-            meta = results[0].get("meta") or {}
-            raw_price = meta.get("regularMarketPrice")
-            raw_ts = meta.get("regularMarketTime")
-            meta_sym = str(meta.get("symbol") or "").strip().upper()
-            meta_exch = str(meta.get("exchangeName") or meta.get("fullExchangeName") or "").strip().upper()
-            meta_curr = str(meta.get("currency") or "").strip().upper()
-            market_state = str(meta.get("marketState") or "").strip().upper()
-            observed_venue = meta_exch if meta_exch else "UNKNOWN"
-            observed_currency = meta_curr if meta_curr else "UNKNOWN"
-            observed_market_state = market_state if market_state else "UNKNOWN"
-            meta_sec_id = str(meta.get("securityId") or "").strip()
-            raw_delay = meta.get("exchangeDataDelayedBy")
-            t5_end_ns = time.perf_counter_ns()
-            parse_latency_ms = round(max(0.0, (t5_end_ns - t5_start_ns) / 1_000_000.0), 3)
-
-            t6_start_ns = time.perf_counter_ns()
-            if raw_price is None or isinstance(raw_price, bool) or not isinstance(raw_price, (int, float)):
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Missing or non-numeric regularMarketPrice for {expected_ticker}",
-                )
-                self.last_quote_result = res
-                return res
-
-            price = float(raw_price)
-            if not math.isfinite(price) or price <= 0.0:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=0.0,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Invalid non-positive or non-finite price ({raw_price}) for {expected_ticker}",
-                )
-                self.last_quote_result = res
-                return res
-
-            if not meta_sym or meta_sym != expected_ticker:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=meta_sym or expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Instrument identity mismatch: requested '{expected_ticker}', response had '{meta_sym}'",
-                )
-                self.last_quote_result = res
-                return res
-
-            if meta_sec_id and security_id and meta_sec_id != str(security_id):
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=meta_sec_id,
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Security ID mismatch: expected '{security_id}', response had '{meta_sec_id}'",
-                )
-                self.last_quote_result = res
-                return res
-
-            if seg == "NSE_EQ" and (not meta_exch or meta_exch not in VALID_NSE_EXCHANGES):
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Venue mismatch or missing exchangeName for NSE_EQ: Yahoo returned exchange '{observed_venue}'",
-                )
-                self.last_quote_result = res
-                return res
-
-            if seg == "BSE_EQ" and (not meta_exch or meta_exch not in VALID_BSE_EXCHANGES):
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Venue mismatch or missing exchangeName for BSE_EQ: Yahoo returned exchange '{observed_venue}'",
-                )
-                self.last_quote_result = res
-                return res
-
-            if meta_curr != "INR":
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Unsupported or missing quote currency '{observed_currency}' (expected INR)",
-                )
-                self.last_quote_result = res
-                return res
-
-            if is_darvas_policy:
-                # CV13-07: DARVAS_HTTP_SUCCESS policy for NSE_EQ
-                from src.engine.market import is_market_open
-                m_open = False
-                try:
-                    eval_dt = datetime.datetime.fromtimestamp(eval_utc, tz=IST) if eval_utc else None
-                    m_open = is_market_open(now=eval_dt)
-                except Exception:
-                    pass
-
-                delay_metadata_present = (raw_delay is not None and not isinstance(raw_delay, bool) and isinstance(raw_delay, (int, float)))
-                delay_seconds = float(raw_delay) if delay_metadata_present else None
-                is_delayed = bool(delay_seconds is not None and delay_seconds > 0.0)
-
-                quote_ts: Optional[float] = None
-                age_sec: Optional[float] = None
-                quote_age_status = "QUOTE_AGE_UNKNOWN"
-                freshness_verified = False
-                quote_freshness_status = "ACCEPTED_UNVERIFIED_TIMESTAMP"
-                if raw_ts is not None and not isinstance(raw_ts, bool) and isinstance(raw_ts, (int, float)):
-                    cand_ts = float(raw_ts)
-                    if math.isfinite(cand_ts) and cand_ts > 0.0:
-                        quote_ts = cand_ts
-                        calc_age = round(eval_utc - quote_ts, 6)
-                        if calc_age >= 0.0:
-                            age_sec = calc_age
-                            quote_age_status = f"{age_sec:.2f}s"
-                            if (
-                                observed_market_state in ("REGULAR", "OPEN")
-                                and delay_metadata_present
-                                and not is_delayed
-                                and age_sec <= max_age
-                            ):
-                                freshness_verified = True
-                                quote_freshness_status = "FRESHNESS_VERIFIED"
-                            elif age_sec > max_age:
-                                freshness_verified = False
-                                quote_freshness_status = f"ACCEPTED_BY_DARVAS_POLICY_EXCEEDS_2S ({age_sec:.2f}s > {max_age:.2f}s)"
-                            else:
-                                freshness_verified = False
-                                quote_freshness_status = f"ACCEPTED_BY_DARVAS_POLICY (state={observed_market_state}, delay_verified={delay_metadata_present and not is_delayed})"
-                        else:
-                            quote_age_status = "FUTURE_TIMESTAMP_INVALID"
-                            quote_freshness_status = "ACCEPTED_UNVERIFIED_TIMESTAMP"
-
-                is_current_session = m_open and observed_market_state not in ("CLOSED", "POST", "PRE", "POSTPOST", "PREPRE")
-                ref_label = "LIVE_REFERENCE" if is_current_session else "HISTORICAL_REFERENCE"
-                auth_latency_ms = round(max(0.0, (time.perf_counter_ns() - t6_start_ns) / 1_000_000.0), 3)
-                total_cmp_ms = round(http_latency_ms + parse_latency_ms + auth_latency_ms, 3)
-
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(
-                    True,
-                    http_latency_ms,
-                    age_sec if quote_age_status not in ("QUOTE_AGE_UNKNOWN", "FUTURE_TIMESTAMP_INVALID") else None,
-                    symbol=clean_sym,
-                )
-                res = QuoteResult(
-                    is_valid=True,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    security_id=str(security_id or ""),
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    quote_timestamp=quote_ts,
-                    age_sec=age_sec,
-                    is_delayed=is_delayed,
-                    delay_seconds=delay_seconds,
-                    delay_metadata_present=delay_metadata_present,
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    auth_latency_ms=auth_latency_ms,
-                    total_cmp_latency_ms=total_cmp_ms,
-                    quote_age_status=quote_age_status,
-                    freshness_verified=freshness_verified,
-                    quote_freshness_status=quote_freshness_status,
-                    cmp_policy="DARVAS_HTTP_SUCCESS",
-                    reference_label=ref_label,
-                    failure_reason="",
-                )
-                self._quote_cache[cache_key] = res
-                self.last_quote_result = res
-                return res
-
-            # STRICT_TIMESTAMP Policy
-            if market_state not in ("REGULAR", "OPEN"):
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Non-regular or closed market session state: '{market_state}'",
-                )
-                self.last_quote_result = res
-                return res
-
-            delay_metadata_present = (raw_delay is not None and not isinstance(raw_delay, bool) and isinstance(raw_delay, (int, float)))
-            delay_seconds = float(raw_delay) if delay_metadata_present else (900.0 if seg == "BSE_EQ" else 0.0)
-            is_delayed = (delay_seconds > 0.0) or (seg == "BSE_EQ")
-            if is_delayed:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    is_delayed=True,
-                    delay_seconds=delay_seconds,
-                    delay_metadata_present=delay_metadata_present,
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=(
-                        f"Delayed quote rejected for live execution ({expected_ticker}, venue={seg}, "
-                        f"delay={delay_seconds:g}s — BSE .BO / delayed feeds are prohibited for automated orders)"
-                    ),
-                )
-                self.last_quote_result = res
-                return res
-
-            if raw_ts is None or isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    quote_age_status="QUOTE_AGE_UNKNOWN",
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Missing or invalid source quote timestamp (regularMarketTime) for {expected_ticker}",
-                )
-                self.last_quote_result = res
-                return res
-
-            quote_ts = float(raw_ts)
-            if not math.isfinite(quote_ts) or quote_ts <= 0.0:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    quote_age_status="QUOTE_AGE_UNKNOWN",
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Non-positive or non-finite regularMarketTime ({raw_ts}) for {expected_ticker}",
-                )
-                self.last_quote_result = res
-                return res
-
-            age_sec = round(eval_utc - quote_ts, 6)
-            if age_sec < 0.0:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    quote_timestamp=quote_ts,
-                    age_sec=age_sec,
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Future source quote timestamp rejected (age={age_sec:.3f}s < 0.0s)",
-                )
-                self.last_quote_result = res
-                return res
-
-            if age_sec > max_age:
-                GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, age_sec)
-                res = QuoteResult(
-                    is_valid=False,
-                    price=price,
-                    source="YAHOO_FINANCE",
-                    ticker=expected_ticker,
-                    venue=observed_venue,
-                    currency=observed_currency,
-                    market_state=observed_market_state,
-                    security_id=str(security_id or ""),
-                    quote_timestamp=quote_ts,
-                    age_sec=age_sec,
-                    quote_age_status=f"{age_sec:.2f}s",
-                    http_latency_ms=http_latency_ms,
-                    parse_latency_ms=parse_latency_ms,
-                    cmp_policy=effective_policy,
-                    failure_reason=f"Stale source quote rejected: age {age_sec:.2f}s exceeds {max_age:.2f}s maximum",
-                )
-                self.last_quote_result = res
-                return res
-
-            auth_latency_ms = round(max(0.0, (time.perf_counter_ns() - t6_start_ns) / 1_000_000.0), 3)
-            total_cmp_ms = round(http_latency_ms + parse_latency_ms + auth_latency_ms, 3)
-            GLOBAL_LATENCY_MONITOR.record_yahoo_request(True, http_latency_ms, age_sec, symbol=clean_sym)
-            res = QuoteResult(
-                is_valid=True,
-                price=price,
-                source="YAHOO_FINANCE",
-                ticker=expected_ticker,
-                venue=observed_venue,
-                security_id=str(security_id or ""),
-                currency=observed_currency,
-                market_state=observed_market_state,
-                quote_timestamp=quote_ts,
-                age_sec=age_sec,
-                is_delayed=False,
-                delay_seconds=float(raw_delay) if delay_metadata_present else None,
-                delay_metadata_present=delay_metadata_present,
-                http_latency_ms=http_latency_ms,
-                parse_latency_ms=parse_latency_ms,
-                auth_latency_ms=auth_latency_ms,
-                total_cmp_latency_ms=total_cmp_ms,
-                quote_age_status=f"{age_sec:.2f}s",
-                freshness_verified=True,
-                quote_freshness_status="FRESHNESS_VERIFIED",
-                cmp_policy=effective_policy,
-                reference_label="LIVE_REFERENCE",
-                failure_reason="",
-            )
-            self._quote_cache[cache_key] = res
-            self.last_quote_result = res
-            return res
-
-        except Exception as e:
-            http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t4_start_ns) / 1_000_000.0), 3)
-            GLOBAL_LATENCY_MONITOR.record_yahoo_request(False, http_latency_ms, None)
-            res = QuoteResult(
-                is_valid=False,
-                source="YAHOO_FINANCE",
-                ticker=expected_ticker,
-                venue="UNKNOWN",
-                security_id=str(security_id or ""),
-                http_latency_ms=http_latency_ms,
-                cmp_policy=effective_policy,
-                failure_reason=f"Yahoo Finance exception for {expected_ticker}: {e}",
-            )
-            self.last_quote_result = res
-            return res
+        return _get_yahoo_quote_details(
+            self, stock_symbol, exchange_segment=exchange_segment,
+            security_id=security_id, now_utc=now_utc,
+            max_quote_age_sec=max_quote_age_sec, allow_cached=allow_cached,
+            cmp_policy=cmp_policy,
+        )
 
     def _fetch_ltp(
         self,
@@ -2316,7 +2028,8 @@ class DhanClient:
                     return True, ltp, "LTP retrieved successfully from Dhan"
                 return False, 0.0, f"LTP is 0 or missing in Dhan response: {resp.text}"
             elif retry and self._requires_token_refresh(resp.status_code, resp.text):
-                if "806" not in resp.text and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+                if (getattr(self, "_allow_read_auth_recovery", True) and "806" not in resp.text
+                        and self.cfg.dhan_pin and self.cfg.dhan_totp_secret):
                     ok, _, _ = self.generate_token_with_totp(
                         force=False, rejected_token=sent_headers.get("access-token", "")
                     )
@@ -2450,12 +2163,14 @@ class DhanClient:
         result.headers["X-AuditBot-Local-Deferral"] = "1"
         if isinstance(exc, ReadDeferred):
             result.headers["Retry-After"] = str(exc.seconds)
+            result._uditbot_deferral_short_window = exc.short_window
         return result
 
     def _governed_get(self, url, *, headers, timeout, priority=None):
         """All Dhan GETs, including candidate-profile and auth retry, share admission."""
         from src.broker.read_governor import ReadDeferred, RECONCILIATION_PACING
         governor = self._get_active_read_governor()
+        receipt = None
         try:
             if governor is not None:
                 from urllib.parse import urlsplit
@@ -2473,18 +2188,23 @@ class DhanClient:
                 from src.broker.read_governor import ReadGovernor
                 category = ReadGovernor.classify("GET", url)
                 try:
-                    governor.admit(historical=historical, priority=get_priority, category=category)
+                    receipt = governor.admit(historical=historical, priority=get_priority, category=category,
+                                            transport_timeout=timeout if isinstance(timeout, (int, float)) else sum(timeout))
                 except ReadDeferred as exc:
-                    if not (RECONCILIATION_PACING.get() and exc.short_window and exc.seconds == 1):
+                    if not (RECONCILIATION_PACING.get() and exc.short_window and 0 < exc.wait_seconds <= 1.5):
                         raise
                     # No HTTP request has been sent. Give a long reconciliation
                     # pass one more admission attempt after its burst ages out.
-                    time.sleep(1)
-                    governor.admit(historical=historical, priority=get_priority, category=category)
+                    time.sleep(exc.wait_seconds + 0.05)
+                    receipt = governor.admit(historical=historical, priority=get_priority, category=category,
+                                            transport_timeout=timeout if isinstance(timeout, (int, float)) else sum(timeout))
         except (ReadDeferred, OSError, sqlite3.Error) as exc:
             return self._read_deferral_response(exc)
         # Transport exceptions retain the callers' UNAVAILABLE classification.
         response = self.session.get(url, headers=headers, timeout=timeout)
+        status=getattr(response,'status_code',None)
+        if type(status) is int and self._requires_token_refresh(status,str(getattr(response,'text','') or '')):
+            self._note_token_event('TOKEN_AUTH_REJECTED')
         if self._is_rate_limited_response(response):
             self._halt_for_read_deferral()
             if governor is not None:
@@ -2496,12 +2216,28 @@ class DhanClient:
                 result = requests.Response()
                 result.status_code = 429
                 result._content = b'{"errorCode":"DH-904","errorMessage":"Broker rate limit"}'
+                result._uditbot_original_status = int(response.status_code)
+                if getattr(response, "headers", {}).get("Retry-After") is not None:
+                    result.headers["Retry-After"] = response.headers["Retry-After"]
                 return result
-        elif governor is not None and hasattr(governor, "record_success"):
-            status_code = int(getattr(response, "status_code", 0) or 0)
-            if 200 <= status_code < 300:
-                governor.record_success(category=category)
+        elif receipt is not None:
+            # The endpoint parser must validate the response before consuming
+            # the transport receipt. A malformed HTTP 200 cannot reopen recovery.
+            response._uditbot_recovery_receipt = receipt
         return response
+
+    def _record_validated_get(self, response):
+        from src.broker.read_recovery import RecoveryAdmission
+        receipt = getattr(response, "_uditbot_recovery_receipt", None)
+        if not isinstance(receipt, RecoveryAdmission):
+            return
+        governor = self._get_active_read_governor()
+        if governor is not None:
+            try:
+                governor.record_success(category=receipt.category, receipt=receipt)
+            except (OSError, sqlite3.Error):
+                self._halt_for_read_deferral()
+                raise
 
     def _get_with_auth_recovery(
         self, url: str, *, timeout: float = 5, allow_refresh: bool = True
@@ -2531,7 +2267,8 @@ class DhanClient:
         if self.token and self.token != rejected:
             logger.warning("Dhan read auth rejected; adopting updated shared token.")
             self._signal_token_recovery(rejected, self.token)
-        elif self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret:
+        elif (getattr(self, "_allow_read_auth_recovery", True)
+              and self.cfg.dhan_client_id and self.cfg.dhan_pin and self.cfg.dhan_totp_secret):
             coord_lock, inflight_map = globals().setdefault(
                 "_ASYNC_AUTH_COORD_STATE", (_threading.Lock(), {})
             )
@@ -2639,6 +2376,9 @@ class DhanClient:
                     logger.error(err)
                     return BrokerReadFailure(status=BrokerReadStatus.MALFORMED.value, error=err, status_code=status_code)
 
+                from src.broker.dhan_snapshot_source import valid_collection
+                if valid_collection(label, data, str(getattr(self.cfg, "dhan_client_id", ""))):
+                    self._record_validated_get(resp)
                 return BrokerReadList(
                     data,
                     status=BrokerReadStatus.OK_RECORDS.value if len(data) > 0 else BrokerReadStatus.OK_EMPTY.value,
@@ -2704,6 +2444,7 @@ class DhanClient:
             identity = profile.json()
             if not isinstance(identity, dict) or str(identity.get("dhanClientId") or "").strip() != account:
                 return None, None
+            self._record_validated_get(profile)
             response = self._governed_get(f"{BASE_URL}/holdings", headers=headers, timeout=5)
             if response.status_code != 200:
                 return None, None
@@ -2712,6 +2453,7 @@ class DhanClient:
                 return None, None
             if any("dhanClientId" in row and str(row["dhanClientId"] or "").strip() != account for row in rows):
                 return None, None
+            self._record_validated_get(response)
             return account, rows
         except Exception:
             # No credentials or response payloads in logs or return values.
@@ -2731,7 +2473,10 @@ class DhanClient:
                     or row.get("status") != "SUCCESS"):
                 return None
             qty = str(row.get("totalQty", ""))
-            return int(qty) if re.fullmatch(r"[0-9]+", qty) else None
+            if re.fullmatch(r"[0-9]+", qty):
+                self._record_validated_get(resp)
+                return int(qty)
+            return None
         except (requests.RequestException, ValueError, TypeError):
             return None
 
@@ -2918,9 +2663,62 @@ class DhanClient:
 
         return False, None, f"Ambiguous/uncertain response for correlation {corr_id}: outcome UNKNOWN (automatic resubmission prohibited)"
 
+
+    def _invoke_live_entry_authorization(
+        self,
+        op: AuthorizedBrokerOperation,
+        *,
+        post_registration: bool = False,
+    ) -> Tuple[bool, str]:
+        """C60: Single explicit production authorization interface for LIVE entry mutations.
+        ZERO reduced-argument fallbacks; any missing gate/callback/descriptor/correlation,
+        TypeError, unexpected exception, or invalid return value fails closed immediately.
+        """
+        is_live = (getattr(self.cfg, "trading_mode", None) == TradingMode.LIVE)
+        if not op.correlation_id or not op.account_id or not op.wire_payload_sha256:
+            return False, "INCOMPLETE_OPERATION_DESCRIPTOR: missing correlation_id, account_id, or wire_payload_sha256"
+        if self.reconciliation_gate is None:
+            if is_live:
+                return False, "RECONCILIATION_GATE_MISSING: LIVE entry mutation requires reconciliation_gate"
+            return True, "TEST_MODE_NO_GATE"
+        _reval = getattr(self.reconciliation_gate, "revalidate_for_transport_submission", None)
+        if not callable(_reval):
+            return False, "AUTHORIZATION_CALLBACK_MISSING: reconciliation_gate lacks callable revalidate_for_transport_submission"
+        try:
+            _rv = _reval(
+                pending_correlation_id=op.correlation_id,
+                post_registration=post_registration,
+                expected_order_payload=op.canonical_payload_dict(),
+            )
+        except Exception as exc:
+            return False, f"AUTHORIZATION_CALLBACK_ERROR:{type(exc).__name__}:{exc}"
+        if not (isinstance(_rv, tuple) and len(_rv) == 2 and type(_rv[0]) is bool):
+            return False, f"AUTHORIZATION_INVALID_RESULT: expected (bool, str), got {type(_rv).__name__}"
+        if not _rv[0]:
+            return False, str(_rv[1])
+        return True, str(_rv[1])
+
     def place_order(self, order_req: OrderRequest, retry: bool = True) -> Tuple[bool, Optional[str], str]:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} orders are forbidden on BUY-ONLY entry path"
+
+        # C58: Validate ALL raw numeric inputs BEFORE any int()/float() conversion
+        _ok_q, _v_qty, _msg_q = _validate_raw_strict_int(getattr(order_req, "quantity", None), "quantity", allow_zero=False)
+        if not _ok_q:
+            return False, None, f"MUTATION BLOCKED: {_msg_q}"
+        _order_type_str = str(order_req.order_type.value if hasattr(order_req.order_type, "value") else order_req.order_type).strip().upper()
+        _allow_zero_price = (_order_type_str == "MARKET")
+        _ok_p, _v_price, _msg_p = _validate_raw_strict_number(getattr(order_req, "price", None), "price", allow_zero=_allow_zero_price)
+        if not _ok_p:
+            return False, None, f"MUTATION BLOCKED: {_msg_p}"
+        _ok_tp, _v_trig, _msg_tp = _validate_raw_strict_number(getattr(order_req, "trigger_price", 0.0), "trigger_price", allow_zero=True)
+        if not _ok_tp:
+            return False, None, f"MUTATION BLOCKED: {_msg_tp}"
+        _ok_dq, _v_disc, _msg_dq = _validate_raw_strict_int(getattr(order_req, "disclosed_quantity", 0), "disclosed_quantity", allow_zero=True)
+        if not _ok_dq:
+            return False, None, f"MUTATION BLOCKED: {_msg_dq}"
+        if _v_disc > _v_qty:
+            return False, None, f"MUTATION BLOCKED: INVALID_NUMERIC_FIELD:disclosed_quantity ({_v_disc}) > quantity ({_v_qty})"
 
         # AMO is a documented Dhan /orders flag. Keep independent segment
         # switches and do not allow naked F&O order entry in other cases.
@@ -2944,11 +2742,9 @@ class DhanClient:
             if (order_req.order_type != OrderType.LIMIT
                     or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"
                     or not str(order_req.security_id).strip()
-                    or int(order_req.quantity) <= 0 or float(order_req.price) <= 0):
+                    or _v_qty <= 0 or _v_price <= 0.0):
                 return False, None, "AMO BLOCKED: Requires positive LIMIT price/quantity, securityId and OPEN"
             if segment == "NSE_FNO":
-                # Our 15:25 trading gate closes before Dhan's 15:30 F&O
-                # AMO window begins. Refuse the 5-minute unsafe overlap.
                 now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
                 if (now_ist.weekday() < 5
                         and clock_time(9, 15) <= now_ist.time() < clock_time(15, 30)):
@@ -2962,7 +2758,71 @@ class DhanClient:
             )):
                 return False, None, f"AMO BLOCKED: Not an eligible closed-market session ({m_reason})"
 
-        corr_id = order_req.correlation_id[:30]
+        corr_id = str(getattr(order_req, "correlation_id", "") or "").strip()[:30]
+        if not corr_id:
+            return False, None, "MUTATION BLOCKED: MISSING_CORRELATION_ID"
+
+        _acct_id = str(self.cfg.dhan_client_id or "").strip()
+        _sec_id = str(order_req.security_id or "").strip()
+        _seg_str = str(order_req.exchange_segment or "").strip().upper()
+        _prod_str = str(order_req.product_type.value if hasattr(order_req.product_type, "value") else order_req.product_type).strip().upper()
+        _txn_str = str(order_req.transaction_type.value if hasattr(order_req.transaction_type, "value") else order_req.transaction_type).strip().upper()
+
+        url = f"{BASE_URL}/orders"
+        _wire_payload: Dict[str, Any] = {
+            "dhanClientId": self.cfg.dhan_client_id,
+            "correlationId": corr_id,
+            "transactionType": "BUY",
+            "exchangeSegment": order_req.exchange_segment,
+            "productType": _prod_str,
+            "orderType": "LIMIT" if _order_type_str != "MARKET" else "MARKET",
+            "validity": "DAY",
+            "securityId": _sec_id,
+            "quantity": _v_qty,
+            "price": _v_price,
+            "triggerPrice": _v_trig,
+            "disclosedQuantity": _v_disc,
+            "afterMarketOrder": is_amo,
+        }
+        if is_amo:
+            _wire_payload["amoTime"] = "OPEN"
+
+        # C62: Single authoritative immutable operation binding canonical auth & wire payload
+        _auth_op = AuthorizedBrokerOperation.build(
+            method="POST",
+            url=url,
+            account_id=_acct_id,
+            operation_type="PLACE_ORDER",
+            correlation_id=corr_id,
+            parent_order_id=str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+            canonical_fields={
+                "account_id": _acct_id,
+                "correlation_id": corr_id,
+                "security_id": _sec_id,
+                "exchange_segment": _seg_str,
+                "product_type": _prod_str,
+                "transaction_type": _txn_str,
+                "order_type": _order_type_str,
+                "quantity": _v_qty,
+                "price": _v_price,
+                "trigger_price": _v_trig,
+                "disclosed_quantity": _v_disc,
+                "is_amo": bool(is_amo),
+                "is_super_order": False,
+                "is_retry": bool(getattr(order_req, "is_retry", False)) or corr_id.startswith("RTRY-"),
+                "retry_parent_id": str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+                "retry_root_id": str(getattr(order_req, "retry_root_id", "") or "").strip(),
+            },
+            wire_payload=_wire_payload,
+        )
+
+        # C60: Single explicit authorization check (ZERO reduced-argument fallback)
+        _ok_rv, _rv_msg = self._invoke_live_entry_authorization(_auth_op, post_registration=False)
+        if not _ok_rv:
+            reason_msg = f"MUTATION BLOCKED: {_rv_msg}"
+            logger.critical(f"[GATE_CLOSED] {reason_msg}")
+            return False, None, reason_msg
+
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
@@ -2982,12 +2842,6 @@ class DhanClient:
             return False, None, reason_msg
         else:
             self.stop_manager.register_in_flight(corr_id)
-
-        if self.reconciliation_gate and not self.reconciliation_gate.is_accepting_entries:
-            self.stop_manager.deregister_in_flight(corr_id)
-            reason_msg = "MUTATION BLOCKED: Startup reconciliation gate is CLOSED (broker state unverified)"
-            logger.critical(f"[GATE_CLOSED] {reason_msg}")
-            return False, None, reason_msg
 
         if self.cfg.trading_mode == TradingMode.TEST:
             self.stop_manager.deregister_in_flight(corr_id)
@@ -3009,30 +2863,42 @@ class DhanClient:
                 self.stop_manager.deregister_in_flight(corr_id)
                 return False, None, f"MUTATION BLOCKED: Could not verify mode transition gate (failing closed): {e}"
 
-        url = f"{BASE_URL}/orders"
-        payload = {
-            "dhanClientId": self.cfg.dhan_client_id,
-            "correlationId": corr_id,
-            "transactionType": "BUY",
-            "exchangeSegment": order_req.exchange_segment,
-            "productType": order_req.product_type.value,
-            "orderType": "LIMIT",
-            "validity": "DAY",
-            "securityId": str(order_req.security_id),
-            "quantity": int(order_req.quantity),
-            "price": float(order_req.price),
-            "triggerPrice": 0.0,
-            "disclosedQuantity": 0,
-            "afterMarketOrder": is_amo,
-        }
-        if is_amo:
-            payload["amoTime"] = "OPEN"
+        # C41 + C44 + C51 + C60 + C62: Final post-registration & transport-admission authorization
+        def _final_transport_authorize() -> Tuple[bool, str]:
+            if self.stop_manager is not None:
+                try:
+                    if self.stop_manager.is_stopped() is True:
+                        return False, "EMERGENCY_STOP_ACTIVE: Durable emergency stop active at transport admission"
+                except Exception:
+                    return False, "EMERGENCY_STOP_UNVERIFIED: Could not verify emergency stop at transport admission"
+            return self._invoke_live_entry_authorization(_auth_op, post_registration=True)
+
+        _ok_pre_http, _msg_pre_http = _final_transport_authorize()
+        if not _ok_pre_http:
+            self.stop_manager.deregister_in_flight(corr_id)
+            reason_msg = f"MUTATION BLOCKED: {_msg_pre_http}"
+            logger.critical(f"[GATE_CLOSED_FINAL_INTERLOCK] {reason_msg}")
+            return False, None, reason_msg
 
         uncertain_outcome = False
         self.last_order_http_latency_ms = None
         t_order_start_ns = time.perf_counter_ns()
         try:
-            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.fn = _final_transport_authorize
+            self._pre_transport_auth_tls.op = _auth_op
+            try:
+                resp = self._broker_mutating_http(
+                    "POST",
+                    url,
+                    headers=self._headers(),
+                    json=_auth_op.wire_payload_copy(),
+                    timeout=5,
+                )
+            finally:
+                self._pre_transport_auth_tls.fn = None
+                self._pre_transport_auth_tls.op = None
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
@@ -3114,7 +2980,90 @@ class DhanClient:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} super orders are forbidden"
 
-        corr_id = order_req.correlation_id[:30]
+        # C58: Validate ALL raw numeric inputs BEFORE any int()/float() conversion
+        _ok_q, _v_qty, _msg_q = _validate_raw_strict_int(getattr(order_req, "quantity", None), "quantity", allow_zero=False)
+        if not _ok_q:
+            return False, None, f"MUTATION BLOCKED: {_msg_q}"
+        _ok_p, _v_price, _msg_p = _validate_raw_strict_number(getattr(order_req, "price", None), "price", allow_zero=False)
+        if not _ok_p:
+            return False, None, f"MUTATION BLOCKED: {_msg_p}"
+        _ok_sl, _v_sl, _msg_sl = _validate_raw_strict_number(stop_loss_price, "stop_loss_price", allow_zero=False)
+        if not _ok_sl:
+            return False, None, f"MUTATION BLOCKED: {_msg_sl}"
+        _ok_tg, _v_tg, _msg_tg = _validate_raw_strict_number(target_price, "target_price", allow_zero=False)
+        if not _ok_tg:
+            return False, None, f"MUTATION BLOCKED: {_msg_tg}"
+        _ok_tj, _v_tj, _msg_tj = _validate_raw_strict_number(trailing_jump, "trailing_jump", allow_zero=True)
+        if not _ok_tj:
+            return False, None, f"MUTATION BLOCKED: {_msg_tj}"
+        if _v_tg <= _v_sl:
+            return False, None, f"Invalid Super Order protection levels: SL={_v_sl}, Target={_v_tg}"
+
+        corr_id = str(getattr(order_req, "correlation_id", "") or "").strip()[:30]
+        if not corr_id:
+            return False, None, "MUTATION BLOCKED: MISSING_CORRELATION_ID"
+
+        _acct_id = str(self.cfg.dhan_client_id or "").strip()
+        _sec_id = str(order_req.security_id or "").strip()
+        _seg_str = str(order_req.exchange_segment or "").strip().upper()
+        _prod_str = str(order_req.product_type.value if hasattr(order_req.product_type, "value") else order_req.product_type).strip().upper()
+        _txn_str = str(order_req.transaction_type.value if hasattr(order_req.transaction_type, "value") else order_req.transaction_type).strip().upper()
+        _order_type_str = str(order_req.order_type.value if hasattr(order_req.order_type, "value") else order_req.order_type).strip().upper()
+
+        url = f"{BASE_URL}/super/orders"
+        _wire_payload: Dict[str, Any] = {
+            "dhanClientId": self.cfg.dhan_client_id,
+            "correlationId": corr_id,
+            "transactionType": "BUY",
+            "exchangeSegment": order_req.exchange_segment,
+            "productType": _prod_str,
+            "orderType": "LIMIT",
+            "securityId": _sec_id,
+            "quantity": _v_qty,
+            "price": _v_price,
+            "targetPrice": _v_tg,
+            "stopLossPrice": _v_sl,
+            "trailingJump": _v_tj,
+        }
+
+        _auth_op = AuthorizedBrokerOperation.build(
+            method="POST",
+            url=url,
+            account_id=_acct_id,
+            operation_type="PLACE_SUPER_ORDER",
+            correlation_id=corr_id,
+            parent_order_id=str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+            canonical_fields={
+                "account_id": _acct_id,
+                "correlation_id": corr_id,
+                "security_id": _sec_id,
+                "exchange_segment": _seg_str,
+                "product_type": _prod_str,
+                "transaction_type": _txn_str,
+                "order_type": _order_type_str,
+                "quantity": _v_qty,
+                "price": _v_price,
+                "is_amo": False,
+                "is_super_order": True,
+                "stop_loss_price": _v_sl,
+                "target_price": _v_tg,
+                "trailing_jump": _v_tj,
+                "max_sl_pct": float(getattr(self.cfg, "fno_sl_pct", 3.0) if "FNO" in _seg_str else getattr(self.cfg, "equity_sl_pct", 1.0)),
+                "max_target_pct": float(getattr(self.cfg, "fno_target_pct", 6.0) if "FNO" in _seg_str else getattr(self.cfg, "equity_target_pct", 2.0)),
+                "is_retry": bool(retry) or corr_id.startswith("RTRY-"),
+                "retry_parent_id": str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+                "retry_root_id": str(getattr(order_req, "retry_root_id", "") or "").strip(),
+            },
+            wire_payload=_wire_payload,
+        )
+
+        # C60: Single explicit authorization check (ZERO reduced-argument fallback)
+        _ok_rv, _rv_msg = self._invoke_live_entry_authorization(_auth_op, post_registration=False)
+        if not _ok_rv:
+            reason_msg = f"MUTATION BLOCKED: {_rv_msg}"
+            logger.critical(f"[GATE_CLOSED] {reason_msg}")
+            return False, None, reason_msg
+
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
@@ -3134,12 +3083,6 @@ class DhanClient:
             return False, None, reason_msg
         else:
             self.stop_manager.register_in_flight(corr_id)
-
-        if self.reconciliation_gate and not self.reconciliation_gate.is_accepting_entries:
-            self.stop_manager.deregister_in_flight(corr_id)
-            reason_msg = "MUTATION BLOCKED: Startup reconciliation gate is CLOSED (broker state unverified)"
-            logger.critical(f"[GATE_CLOSED] {reason_msg}")
-            return False, None, reason_msg
 
         if self.cfg.trading_mode == TradingMode.TEST:
             self.stop_manager.deregister_in_flight(corr_id)
@@ -3161,31 +3104,42 @@ class DhanClient:
                 self.stop_manager.deregister_in_flight(corr_id)
                 return False, None, f"MUTATION BLOCKED: Could not verify mode transition gate (failing closed): {e}"
 
-        if stop_loss_price <= 0 or target_price <= 0 or target_price <= stop_loss_price:
-            self.stop_manager.deregister_in_flight(corr_id)
-            return False, None, f"Invalid Super Order protection levels: SL={stop_loss_price}, Target={target_price}"
+        # C41 + C44 + C51 + C60 + C62: Final post-registration & transport-admission authorization
+        def _final_transport_authorize() -> Tuple[bool, str]:
+            if self.stop_manager is not None:
+                try:
+                    if self.stop_manager.is_stopped() is True:
+                        return False, "EMERGENCY_STOP_ACTIVE: Durable emergency stop active at transport admission"
+                except Exception:
+                    return False, "EMERGENCY_STOP_UNVERIFIED: Could not verify emergency stop at transport admission"
+            return self._invoke_live_entry_authorization(_auth_op, post_registration=True)
 
-        url = f"{BASE_URL}/super/orders"
-        payload = {
-            "dhanClientId": self.cfg.dhan_client_id,
-            "correlationId": corr_id,
-            "transactionType": "BUY",
-            "exchangeSegment": order_req.exchange_segment,
-            "productType": order_req.product_type.value,
-            "orderType": "LIMIT",
-            "securityId": str(order_req.security_id),
-            "quantity": int(order_req.quantity),
-            "price": float(order_req.price),
-            "targetPrice": float(target_price),
-            "stopLossPrice": float(stop_loss_price),
-            "trailingJump": float(trailing_jump),
-        }
+        _ok_pre_http, _msg_pre_http = _final_transport_authorize()
+        if not _ok_pre_http:
+            self.stop_manager.deregister_in_flight(corr_id)
+            reason_msg = f"MUTATION BLOCKED: {_msg_pre_http}"
+            logger.critical(f"[GATE_CLOSED_FINAL_INTERLOCK] {reason_msg}")
+            return False, None, reason_msg
 
         uncertain_outcome = False
         self.last_order_http_latency_ms = None
         t_order_start_ns = time.perf_counter_ns()
         try:
-            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.fn = _final_transport_authorize
+            self._pre_transport_auth_tls.op = _auth_op
+            try:
+                resp = self._broker_mutating_http(
+                    "POST",
+                    url,
+                    headers=self._headers(),
+                    json=_auth_op.wire_payload_copy(),
+                    timeout=5,
+                )
+            finally:
+                self._pre_transport_auth_tls.fn = None
+                self._pre_transport_auth_tls.op = None
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
@@ -3252,28 +3206,52 @@ class DhanClient:
         """P0-04: Modifies a single Super Order leg (TARGET_LEG or STOP_LOSS_LEG) and returns structured outcome."""
         if self.cfg.trading_mode == TradingMode.TEST:
             return False, "SUPER ORDER MODIFY BLOCKED: System is in TEST mode", {"state": "REJECTED"}
+        _ok_mp, _v_mp, _msg_mp = _validate_raw_strict_number(price, "price", allow_zero=False)
+        if not _ok_mp:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_mp}", {"state": "REJECTED"}
+        _ok_mtj, _v_mtj, _msg_mtj = _validate_raw_strict_number(trailing_jump, "trailing_jump", allow_zero=True)
+        if not _ok_mtj:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_mtj}", {"state": "REJECTED"}
         leg_clean = str(leg_name or "").strip().upper()
         if leg_clean == "TARGET_LEG":
             body: Dict[str, Any] = {
                 "dhanClientId": self.cfg.dhan_client_id,
                 "orderId": str(order_id),
                 "legName": "TARGET_LEG",
-                "targetPrice": float(price),
+                "targetPrice": _v_mp,
             }
         elif leg_clean == "STOP_LOSS_LEG":
             body = {
                 "dhanClientId": self.cfg.dhan_client_id,
                 "orderId": str(order_id),
                 "legName": "STOP_LOSS_LEG",
-                "stopLossPrice": float(price),
-                "trailingJump": float(trailing_jump),
+                "stopLossPrice": _v_mp,
+                "trailingJump": _v_mtj,
             }
         else:
             return False, f"Unsupported Super Order leg '{leg_name}'", {"state": "REJECTED"}
 
         url = f"{BASE_URL}/super/orders/{order_id}"
+        _mod_op = AuthorizedBrokerOperation.build(
+            method="PUT",
+            url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type=f"MODIFY_SUPER_{leg_clean}",
+            correlation_id=str(order_id),
+            parent_order_id=str(order_id),
+            canonical_fields=body,
+            wire_payload=body,
+        )
         try:
-            resp = self._broker_mutating_http("PUT", url, headers=self._headers(), json=body, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _mod_op
+            try:
+                resp = self._broker_mutating_http(
+                    "PUT", url, headers=self._headers(), json=_mod_op.wire_payload_copy(), timeout=5
+                )
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 msg = f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
                 return False, msg, {"state": "DEFERRED", "status_code": resp.status_code,
@@ -3315,23 +3293,33 @@ class DhanClient:
         leg_outcomes: Dict[str, Dict[str, Any]] = {}
         self.last_super_leg_mod_results[str(order_id)] = leg_outcomes
 
+        _ok_psl, _v_psl, _msg_psl = _validate_raw_strict_number(stop_loss_price, "stop_loss_price", allow_zero=False)
+        if not _ok_psl:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_psl}"
+        _ok_ptg, _v_ptg, _msg_ptg = _validate_raw_strict_number(target_price, "target_price", allow_zero=False)
+        if not _ok_ptg:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_ptg}"
+        _ok_ptj, _v_ptj, _msg_ptj = _validate_raw_strict_number(trailing_jump, "trailing_jump", allow_zero=True)
+        if not _ok_ptj:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_ptj}"
+
         if "TARGET_LEG" in requested_legs:
             ok_t, msg_t, info_t = self.modify_super_order_leg(
                 order_id=order_id,
                 leg_name="TARGET_LEG",
-                price=float(target_price),
+                price=_v_ptg,
             )
             leg_outcomes["TARGET_LEG"] = info_t
             if not ok_t:
-                leg_outcomes.setdefault("STOP_LOSS_LEG", {"state": "NOT_ATTEMPTED", "price": float(stop_loss_price)})
+                leg_outcomes.setdefault("STOP_LOSS_LEG", {"state": "NOT_ATTEMPTED", "price": _v_psl})
                 return False, msg_t
 
         if "STOP_LOSS_LEG" in requested_legs:
             ok_sl, msg_sl, info_sl = self.modify_super_order_leg(
                 order_id=order_id,
                 leg_name="STOP_LOSS_LEG",
-                price=float(stop_loss_price),
-                trailing_jump=float(trailing_jump),
+                price=_v_psl,
+                trailing_jump=_v_ptj,
             )
             leg_outcomes["STOP_LOSS_LEG"] = info_sl
             if not ok_sl:
@@ -3351,8 +3339,22 @@ class DhanClient:
             return True, f"TEST mode: simulated super order {leg_name} cancel accepted (HTTP 202)"
 
         url = f"{BASE_URL}/super/orders/{order_id_clean}/{leg_name}"
+        _del_op = AuthorizedBrokerOperation.build(
+            method="DELETE", url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="CANCEL_SUPER_ORDER_LEG",
+            correlation_id=order_id_clean, parent_order_id=order_id_clean,
+            canonical_fields={"order_id": order_id_clean, "leg_name": str(leg_name)},
+            wire_payload={},
+        )
         try:
-            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _del_op
+            try:
+                resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
@@ -3375,8 +3377,22 @@ class DhanClient:
             return True, "TEST mode: simulated cancel request accepted (HTTP 202)"
 
         url = f"{BASE_URL}/orders/{order_id_clean}"
+        _del_op = AuthorizedBrokerOperation.build(
+            method="DELETE", url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="CANCEL_ORDER",
+            correlation_id=order_id_clean, parent_order_id=order_id_clean,
+            canonical_fields={"order_id": order_id_clean},
+            wire_payload={},
+        )
         try:
-            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _del_op
+            try:
+                resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code == 202:
@@ -3412,24 +3428,42 @@ class DhanClient:
             logger.critical(f"[PROTECTION_REJECTED] {err}")
             return False, None, err
 
-        qty = int(levels.quantity)
-        if qty <= 0:
-            err = f"Forever OCO rejected: invalid quantity {qty} <= 0"
+        _ok_fq, qty, _msg_fq = _validate_raw_strict_int(getattr(levels, "quantity", None), "levels.quantity", allow_zero=False)
+        if not _ok_fq:
+            err = f"Forever OCO rejected: invalid quantity ({_msg_fq})"
             logger.error(f"[PROTECTION_REJECTED] {err}")
             return False, None, err
 
-        if max_protectable_qty is not None and qty > max_protectable_qty:
-            err = (
-                f"Forever OCO rejected: protective quantity ({qty}) exceeds confirmed net open position "
-                f"({max_protectable_qty}) — oversell blocked"
-            )
-            logger.critical(f"[PROTECTION_REJECTED] {err}")
-            return False, None, err
+        if max_protectable_qty is not None:
+            _ok_mq, _v_mq, _msg_mq = _validate_raw_strict_int(max_protectable_qty, "max_protectable_qty", allow_zero=True)
+            if not _ok_mq:
+                err = f"Forever OCO rejected: {_msg_mq}"
+                logger.error(f"[PROTECTION_REJECTED] {err}")
+                return False, None, err
+            if qty > _v_mq:
+                err = (
+                    f"Forever OCO rejected: protective quantity ({qty}) exceeds confirmed net open position "
+                    f"({_v_mq}) — oversell blocked"
+                )
+                logger.critical(f"[PROTECTION_REJECTED] {err}")
+                return False, None, err
 
-        sl_limit = float(levels.sl_limit)
-        sl_trigger = float(levels.sl_trigger)
-        target_price = float(levels.target_price)
-        target_trigger = float(getattr(levels, "target_trigger", None) or levels.target_price)
+        _ok_sll, sl_limit, _msg_sll = _validate_raw_strict_number(getattr(levels, "sl_limit", None), "levels.sl_limit", allow_zero=False)
+        if not _ok_sll:
+            return False, None, f"Forever OCO rejected: {_msg_sll}"
+        _ok_slt, sl_trigger, _msg_slt = _validate_raw_strict_number(getattr(levels, "sl_trigger", None), "levels.sl_trigger", allow_zero=False)
+        if not _ok_slt:
+            return False, None, f"Forever OCO rejected: {_msg_slt}"
+        _ok_tp, target_price, _msg_tp = _validate_raw_strict_number(getattr(levels, "target_price", None), "levels.target_price", allow_zero=False)
+        if not _ok_tp:
+            return False, None, f"Forever OCO rejected: {_msg_tp}"
+        _raw_tt = getattr(levels, "target_trigger", None)
+        if _raw_tt is None:
+            target_trigger = target_price
+        else:
+            _ok_tt, target_trigger, _msg_tt = _validate_raw_strict_number(_raw_tt, "levels.target_trigger", allow_zero=False)
+            if not _ok_tt:
+                return False, None, f"Forever OCO rejected: {_msg_tt}"
 
         if sl_limit <= 0 or sl_trigger <= 0 or target_price <= 0 or target_trigger <= 0:
             err = "Forever OCO rejected: all price and trigger fields must be > 0"
@@ -3483,8 +3517,25 @@ class DhanClient:
             "quantity1": qty,
         }
 
+        _oco_op = AuthorizedBrokerOperation.build(
+            method="POST",
+            url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="PLACE_FOREVER_OCO",
+            correlation_id=correlation_id[:30],
+            canonical_fields=payload,
+            wire_payload=payload,
+        )
         try:
-            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _oco_op
+            try:
+                resp = self._broker_mutating_http(
+                    "POST", url, headers=self._headers(), json=_oco_op.wire_payload_copy(), timeout=5
+                )
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 201):
@@ -3514,8 +3565,22 @@ class DhanClient:
         if self.cfg.trading_mode == TradingMode.TEST:
             return True, f"TEST mode: simulated Forever order cancel accepted (HTTP 202) for {oid_clean}"
         url = f"{BASE_URL}/forever/orders/{oid_clean}"
+        _del_op = AuthorizedBrokerOperation.build(
+            method="DELETE", url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="CANCEL_FOREVER_ORDER",
+            correlation_id=oid_clean, parent_order_id=oid_clean,
+            canonical_fields={"order_id": oid_clean},
+            wire_payload={},
+        )
         try:
-            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _del_op
+            try:
+                resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
@@ -3550,6 +3615,8 @@ class DhanClient:
                     and x.get("orderStatus")
                 ]
                 if len(matches) == 1:
+                    if "dhanClientId" not in matches[0] or matches[0]["dhanClientId"] == str(self.cfg.dhan_client_id):
+                        self._record_validated_get(resp)
                     return matches[0]
             else:
                 logger.warning(
@@ -3908,6 +3975,12 @@ class DhanClient:
         norm["_broker_attested_no_execution_id"] = missing_exchange_trade_id
         norm["exchangeOrderId"] = exchange_order_id
         norm["exchangeTime"] = exchange_time
+        if exchange_time and norm.get("traded_at") is None:
+            try:
+                from src.engine.unified_exit_reconciliation import _exchange_time as _parse_ex_ts
+                norm["traded_at"] = _parse_ex_ts(exchange_time)
+            except Exception:
+                pass
         norm["securityId"] = t_sec
         norm["exchangeSegment"] = t_seg
         norm["productType"] = t_prod
@@ -3985,6 +4058,7 @@ class DhanClient:
                 )
 
             if not raw_list:
+                self._record_validated_get(resp)
                 return BrokerReadList([], status=BrokerReadStatus.OK_EMPTY.value, status_code=200)
 
             validated_rows: List[Dict[str, Any]] = []
@@ -4003,6 +4077,7 @@ class DhanClient:
                     )
                 validated_rows.append(norm_row)
 
+            self._record_validated_get(resp)
             return BrokerReadList(
                 validated_rows,
                 status=BrokerReadStatus.OK_RECORDS.value,

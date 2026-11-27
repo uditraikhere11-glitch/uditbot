@@ -1,0 +1,16 @@
+{
+  "backoff_schedule_s": [
+    60,
+    120,
+    240,
+    480,
+    960,
+    1920,
+    3840
+  ],
+  "decay_gets": 10,
+  "decay_quiet_s": 600,
+  "decay_snapshots": 2,
+  "max_strikes": 7,
+  "recovery_spacing_ms": 500
+}

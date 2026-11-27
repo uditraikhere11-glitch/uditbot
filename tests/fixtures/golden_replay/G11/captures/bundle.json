@@ -1,0 +1,26 @@
+{
+  "profile": {
+    "account_pseudonym": "9000001536",
+    "broker_error_code": null,
+    "caller_identity": "DhanSnapshotSource",
+    "completeness_state": "COMPLETE",
+    "endpoint": "/v2/profile",
+    "exchange_ist_date": "2026-11-26",
+    "http_status": 200,
+    "monotonic_request_start_ns": 10000000000000,
+    "monotonic_response_receipt_ns": 10000005000000,
+    "payload": {
+      "dhanClientId": "9000001536"
+    },
+    "payload_sha256": "3f3f26925521111f01dcdf8f85aa109d5e14306c4a89d2d893f9e7ac068de585",
+    "provenance": "SYNTHETIC",
+    "request_identity": "req-v2-profile",
+    "request_params": {},
+    "retry_after": null,
+    "sanitized_error_body": null,
+    "token_epoch_label": "epoch-1",
+    "transport_sent": true,
+    "utc_request_start": "2026-11-26T04:00:00Z",
+    "utc_response_receipt": "2026-11-26T04:00:00Z"
+  }
+}

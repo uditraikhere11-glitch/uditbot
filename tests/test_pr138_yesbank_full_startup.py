@@ -27,9 +27,14 @@ class FullStartupThreeParentYESBANK(unittest.TestCase):
     _assert_no_mutation = _synthetic.ThreeParentRealWatcher._assert_no_mutation
 
     def gate(self, *, stopped=False, db=None, watcher=None):
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
         self.broker.cfg = NS(
             dhan_client_id=self.ACCOUNT, trading_mode="LIVE",
             data_dir=str(self.root),
+            journal_db_path=str((db or self.db).db_path),
+        )
+        attach_unified_live_evidence_to_stub_broker(
+            self.broker, db_path=(db or self.db).db_path, data_dir=str(self.root), account_id=self.ACCOUNT
         )
         self.broker.get_fund_limits = Mock(return_value=(True, 20000.0, "OK"))
         gate = StartupReconciliationGate(

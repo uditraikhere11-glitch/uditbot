@@ -1,0 +1,6 @@
+{
+  "min_cooldown_s": 60,
+  "prohibited_sends_during_cooldown": 0,
+  "single_half_open_probe": true,
+  "strike_after_burst": 1
+}
