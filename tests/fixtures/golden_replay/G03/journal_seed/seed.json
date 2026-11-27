@@ -1,0 +1,77 @@
+{
+  "fills": [
+    {
+      "broker_order_id": "VED-BUY-001",
+      "exchange_segment": "NSE_EQ",
+      "exchange_trade_id": "VED-EID-BUY-1",
+      "is_verified_trade": 1,
+      "parent_order_id": "VED-BUY-001",
+      "product_type": "CNC",
+      "security_id": "19991",
+      "symbol": "VEDPOWER-EQ",
+      "traded_at": 1795235700.0,
+      "traded_price": 100.0,
+      "traded_quantity": 10,
+      "transaction_type": "BUY"
+    }
+  ],
+  "order_intents": [
+    {
+      "account_id": "9000001536",
+      "broker_order_id": "VED-BUY-001",
+      "correlation_id": "EQ-VEDPOWER-G03-1",
+      "created_at": 1795235700.0,
+      "exchange_segment": "NSE_EQ",
+      "order_type": "LIMIT",
+      "price": 100.0,
+      "product_type": "CNC",
+      "protection_route": "FOREVER_OCO",
+      "quantity": 10,
+      "security_id": "19991",
+      "state": "TRADED",
+      "symbol": "VEDPOWER-EQ",
+      "trading_symbol": "VEDPOWER-EQ",
+      "updated_at": 1795235700.0
+    }
+  ],
+  "positions_lifecycle": [
+    {
+      "account_id": "9000001536",
+      "buy_filled_qty": 10,
+      "buy_vwap": 100.0,
+      "confirmed_open_qty": 10,
+      "entry_qty": 10,
+      "exchange_segment": "NSE_EQ",
+      "manual_exit_detected": 0,
+      "orphaned_legs_detected": 0,
+      "parent_order_id": "VED-BUY-001",
+      "position_state": "PROTECTED",
+      "product_type": "CNC",
+      "protected_qty": 10,
+      "protection_route": "FOREVER_OCO",
+      "realized_pnl": 0.0,
+      "security_id": "19991",
+      "sell_filled_qty": 0,
+      "sell_vwap": 0.0,
+      "sl_price": 95.0,
+      "symbol": "VEDPOWER-EQ",
+      "target_price": 108.0,
+      "trading_symbol": "VEDPOWER-EQ",
+      "triggered_leg": "",
+      "updated_at": 1795235700.0
+    }
+  ],
+  "protection_orders": [
+    {
+      "created_at": 1795235702.0,
+      "forever_order_id": "FO-VED-001",
+      "parent_order_id": "VED-BUY-001",
+      "quantity": 10,
+      "sl_limit": 94.5,
+      "sl_trigger": 95.0,
+      "status": "ACTIVE_CONFIRMED",
+      "symbol": "VEDPOWER-EQ",
+      "target_price": 108.0
+    }
+  ]
+}

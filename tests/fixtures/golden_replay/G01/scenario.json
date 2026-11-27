@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Three-parent YESBANK (11915 NSE_EQ CNC) portfolio: two retained 1-share manual-risk lots (221261102657708 @ 15.52, 23126110439808 @ 15.51) plus closed 28-share sibling (221261123606908 -> child 22126112566908, EID 600252830 @ 17.93, Forever 23132611231775). Signed T+0 (totalQty=30, netQty=-28 => effective=2), prior-signed, ambiguous settlement, and settled (totalQty=2) transitions.",
+  "primary_provenance": "OBSERVED_PROJECTION",
+  "scenario_id": "G01",
+  "title": "YESBANK retained lots and 28-share exit"
+}

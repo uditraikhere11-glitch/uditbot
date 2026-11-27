@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "17:00 IST auth failure and 17:02 automatic token rotation recovery: old-generation rejection, closed entry gate, synthetic new token epoch, profile identity verification, single recovery notification, and negative wrong-profile/mixed-epoch variants.",
+  "primary_provenance": "REPORTED_INCIDENT",
+  "scenario_id": "G07",
+  "title": "Concurrent watcher, gate and token rotation"
+}

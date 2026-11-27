@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Owner STOP intent persistence, entry fence activation, owner generation invalidation, fresh post-intent broker acquisition on G01 portfolio, final interlock verification, simulated systemctl STOP/Restart, idempotent STOP, and 18 negative variants.",
+  "primary_provenance": "OBSERVED_PROJECTION",
+  "scenario_id": "G06",
+  "title": "Owner STOP / Restart handoff"
+}

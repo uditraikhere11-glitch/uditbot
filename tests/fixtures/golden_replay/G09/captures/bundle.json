@@ -1,0 +1,28 @@
+{
+  "throttle_429_numeric_ra": {
+    "account_pseudonym": "9000001536",
+    "broker_error_code": "DH-904",
+    "caller_identity": "DhanSnapshotSource",
+    "completeness_state": "COMPLETE",
+    "endpoint": "/v2/positions",
+    "exchange_ist_date": "2026-11-26",
+    "http_status": 429,
+    "monotonic_request_start_ns": 10000000000000,
+    "monotonic_response_receipt_ns": 10000005000000,
+    "payload": {
+      "errorCode": "DH-904"
+    },
+    "payload_sha256": "be70b839000427df0cb66ab80e1ebc1328bca928875dcdfa694bf8f01507073a",
+    "provenance": "SYNTHETIC",
+    "request_identity": "req-v2-positions",
+    "request_params": {},
+    "retry_after": "180",
+    "sanitized_error_body": {
+      "errorCode": "DH-904"
+    },
+    "token_epoch_label": "epoch-1",
+    "transport_sent": true,
+    "utc_request_start": "2026-11-26T04:00:00Z",
+    "utc_response_receipt": "2026-11-26T04:00:00Z"
+  }
+}

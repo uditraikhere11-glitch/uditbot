@@ -1,0 +1,6 @@
+{
+  "deferred_stop_pending": true,
+  "desired_service_state": "STOPPED",
+  "observed_state": "RUNNING",
+  "owner_epoch": 2
+}

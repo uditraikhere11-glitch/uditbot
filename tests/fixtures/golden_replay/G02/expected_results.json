@@ -1,0 +1,7 @@
+{
+  "canonical_sell_attributed_qty": 1,
+  "canonical_sell_attribution_count": 1,
+  "closure_entry_eligible": true,
+  "ledger_open_qty_after": 0,
+  "negative_missing_eid_blocks": true
+}

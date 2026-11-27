@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Bounded exponential backoff (60, 120, 240, 480, 960, 1920, 3840s; max 7 strikes), Retry-After numeric & HTTP-date handling, single half-open probe, 500ms RECOVERY spacing, and 600s + 10 GETs + 2 coherent snapshots decay rule.",
+  "primary_provenance": "SYNTHETIC",
+  "scenario_id": "G09",
+  "title": "Sustained HTTP 429 across cooldowns"
+}

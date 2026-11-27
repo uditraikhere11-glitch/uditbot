@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Persisted ReadGovernor micro-pacing (0 < wait <= 1.5s bounded wait+0.05s retry), real DH-904 HTTP 429 strike 1, concurrent burst coalescing, >=60s cooldown, zero prohibited HTTP sends, single half-open probe, and frozen rate budgets.",
+  "primary_provenance": "OBSERVED_PROJECTION",
+  "scenario_id": "G05",
+  "title": "Dhan cooldown and micro pacing"
+}

@@ -1,0 +1,8 @@
+{
+  "account_pseudonym": "9000001536",
+  "baseline_commit": "fe946810f1d9229600ac9d3939340277222cd4d9",
+  "description": "Real OS multiprocessing against shared CrossProcessReadCoordinator sidecar, SQLite WAL, and ReadGovernor: single-flight coalescing, account/token isolation, producer crash lock release, independent 2s orphan confirmations, and read-only WebUI peek.",
+  "primary_provenance": "SYNTHETIC",
+  "scenario_id": "G11",
+  "title": "Cross-process WebUI and trading bot reads"
+}

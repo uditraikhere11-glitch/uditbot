@@ -1,0 +1,5 @@
+{
+  "automatic_watcher_recovery": true,
+  "no_restart_required": true,
+  "temporary_block_on_ambiguity": true
+}

@@ -1,0 +1,6 @@
+{
+  "orphan_2s_separation": true,
+  "single_flight_coalesced": true,
+  "webui_read_only": true,
+  "zero_deadlocks": true
+}
