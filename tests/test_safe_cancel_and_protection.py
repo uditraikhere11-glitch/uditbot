@@ -199,7 +199,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
 
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         ok, msg = client.cancel_order("ORD-101")
         self.assertTrue(ok)
@@ -231,7 +231,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         ok, msg = client.cancel_order("ORD-102")
         self.assertTrue(ok)
@@ -254,7 +254,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         watcher = ProtectionWatcher(broker=client, sl_pct=3.0, target_pct=3.0, path=os.path.join(self.temp_dir.name, "p2.json"))
         oid = watcher.track("ORD-103", "INFY", "1594", "NSE_EQ", 50)
@@ -281,7 +281,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         ok, msg = client.cancel_order("ORD-104")
         self.assertFalse(ok)
@@ -304,7 +304,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         watcher = ProtectionWatcher(broker=client, sl_pct=3.0, target_pct=3.0, path=os.path.join(self.temp_dir.name, "p3.json"))
         oid = watcher.track("ORD-105", "INFY", "1594", "NSE_EQ", 50)
@@ -333,7 +333,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         ok, msg = client.cancel_order("ORD-106")
         self.assertFalse(ok)
@@ -353,7 +353,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         watcher = ProtectionWatcher(broker=client, sl_pct=3.0, target_pct=3.0, path=os.path.join(self.temp_dir.name, "p4.json"))
         oid = watcher.track("ORD-107", "INFY", "1594", "NSE_EQ", 50)
@@ -459,7 +459,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.TEST
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         ok, msg = client.cancel_order("ORD-TEST-1")
         self.assertTrue(ok)
@@ -477,7 +477,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         for invalid_id in ("", "   ", None, "ORD/123", "ORD;DROP TABLE", "ORD!@#"):
             ok, msg = client.cancel_order(invalid_id)
@@ -501,7 +501,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.LIVE
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         # Trigger emergency stop
         stop_mgr.trigger_stop(operator="Udit", reason="Market anomaly")
@@ -610,7 +610,7 @@ class TestSafeCancelAndProtection(unittest.TestCase):
         cfg.trading_mode = TradingMode.TEST
         stop_mgr = EmergencyStopManager(state_file=os.path.join(self.temp_dir.name, "retry_stop.json"), fail_closed_if_missing=True)
         stop_mgr.provision_initial_clean_state(operator="TestRunner", account_id="1113731536")
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         watcher = ProtectionWatcher(
             broker=client,
@@ -651,3 +651,10 @@ class TestSafeCancelAndProtection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

@@ -695,7 +695,7 @@ class BrokerLedgerReconciler:
             if f['transaction_type']!='SELL': continue
             shares=allocated[fid]; p=f.get('parent_order_id')
             if not shares and p in lifecycle: shares=[(p,f['traded_quantity'])]
-            if not shares or sum(q for _,q in shares)!=f['traded_quantity'] or (p and p not in {a for a,_ in shares}):
+            if not shares or sum(q for _,q in shares)!=f['traded_quantity'] or (p and p!='MULTI_LOT_ALLOCATED' and p not in {a for a,_ in shares}) or (p=='MULTI_LOT_ALLOCATED' and len(shares)<2):
                 issue('SELL_ALLOCATION_UNVERIFIED',subject=fid[0],scope='EXECUTION');continue
             for owner,qty in shares: by_parent[owner].append((fid,qty))
         # Require exact prior-day coverage from original intent through the latest

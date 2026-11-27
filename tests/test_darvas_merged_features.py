@@ -258,7 +258,7 @@ class TestDarvasMergedFeatures(unittest.TestCase):
             cfg.dhan_access_token = "mock_token"
             cfg.trading_mode = TradingMode.LIVE
 
-            client = DhanClient(cfg, stop_manager=stop_mgr)
+            client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
             post_resp = MagicMock()
             post_resp.status_code = 200
@@ -367,3 +367,10 @@ class TestDarvasMergedFeatures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

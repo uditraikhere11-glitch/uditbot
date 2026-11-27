@@ -384,7 +384,23 @@ def _build_control_status(tracker, raw, cfg, absolute_env, data_dir):
         "latest_change_state": newest.state.value if newest else None,
         "latest_change_id": newest.change_id if newest else None,
         "transition_gate_active": gate.get("active", True),
+        "unified_broker_snapshot": _display_unified_snapshot(data_dir, cfg),
     }
+
+
+def _display_unified_snapshot(data_dir: str, cfg: Any) -> Dict[str, Any]:
+    """Phase 2D: Strictly read-only display snapshot metadata for WebUI (never refreshes broker)."""
+    try:
+        from src.engine.unified_account_runtime import peek_display_snapshot_summary
+        account_id = str(getattr(cfg, "dhan_client_id", "") or "").strip()
+        return peek_display_snapshot_summary(data_dir=data_dir, account_id=account_id)
+    except Exception as exc:
+        return {
+            "available": False,
+            "display_only": True,
+            "authoritative_for_mutation": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def build_control_health(env_path: str = ".env") -> Dict[str, Any]:

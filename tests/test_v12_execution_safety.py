@@ -105,7 +105,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     @patch("requests.Session.get")
     def test_01_yahoo_quote_age_1_9s_eligible(self, mock_get):
         mock_get.return_value = _make_yf_response(price=812.50, quote_ts=1730200000.0, symbol="SBIN.NS")
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         q = client.get_yahoo_quote_details("SBIN", "NSE_EQ", security_id="3045", now_utc=1730200001.9)
         self.assertTrue(q.is_valid)
@@ -119,7 +119,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     @patch("requests.Session.get")
     def test_02_yahoo_quote_age_2_0s_inclusive_eligible(self, mock_get):
         mock_get.return_value = _make_yf_response(price=812.50, quote_ts=1730200000.0, symbol="SBIN.NS")
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         q = client.get_yahoo_quote_details("SBIN", "NSE_EQ", security_id="3045", now_utc=1730200002.0)
         self.assertTrue(q.is_valid)
@@ -132,7 +132,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     @patch("requests.Session.get")
     def test_03_yahoo_quote_age_2_1s_rejected(self, mock_get):
         mock_get.return_value = _make_yf_response(price=812.50, quote_ts=1730200000.0, symbol="SBIN.NS")
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         q = client.get_yahoo_quote_details("SBIN", "NSE_EQ", security_id="3045", now_utc=1730200002.1)
         self.assertFalse(q.is_valid)
@@ -151,7 +151,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     # ------------------------------------------------------------------
     @patch("requests.Session.get")
     def test_04_missing_invalid_or_future_timestamp_rejected(self, mock_get):
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         # 4a. Missing regularMarketTime
         mock_get.return_value = _make_yf_response(price=810.0, quote_ts=None)
@@ -178,7 +178,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
         mock_get.return_value = _make_yf_response(
             price=810.0, quote_ts=1730200000.0, symbol="SBIN.BO", exchange="BSE", delayed_by=900
         )
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         q = client.get_yahoo_quote_details("SBIN", "BSE_EQ", now_utc=1730200000.5)
         self.assertFalse(q.is_valid)
@@ -190,7 +190,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     # ------------------------------------------------------------------
     @patch("requests.Session.get")
     def test_06_wrong_exchange_or_security_identity_rejected(self, mock_get):
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         # 6a. Wrong symbol in payload (requested SBIN.NS, got RELIANCE.NS)
         mock_get.return_value = _make_yf_response(price=810.0, quote_ts=1730200000.0, symbol="RELIANCE.NS")
@@ -219,7 +219,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     def test_07_fresh_http_response_with_stale_market_timestamp_rejected(self, mock_get):
         # HTTP call completes in <1ms at t=1730200000.0, but Yahoo market quote is from 60 seconds ago
         mock_get.return_value = _make_yf_response(price=810.0, quote_ts=1730199940.0, symbol="SBIN.NS")
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         ok, ltp, msg = client.fetch_yahoo_ltp("SBIN", "NSE_EQ", now_utc=1730200000.0)
         self.assertFalse(ok)
@@ -232,7 +232,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     @patch("requests.Session.get")
     def test_08_nse_fno_using_underlying_yahoo_price_rejected(self, mock_get):
         mock_get.return_value = _make_yf_response(price=7000.0, quote_ts=1730200000.0, symbol="POLYCAB.NS")
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         q = client.get_yahoo_quote_details("POLYCAB", "NSE_FNO", security_id="54231", now_utc=1730200001.0)
         self.assertFalse(q.is_valid)
@@ -430,7 +430,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     @patch("requests.Session.post")
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_14_super_order_token_error_ambiguous_outcome_zero_resubmission(self, mock_post, mock_get):
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         # First POST to /super/orders returns 401 token error; second POST is to /app/generateAccessToken (auth only)
         super_401 = MagicMock()
@@ -506,7 +506,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     # Scenario 16: OCO ACK without active legs — not PROTECTED
     # ------------------------------------------------------------------
     def test_16_oco_ack_without_active_legs_not_protected(self):
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
         gate = StartupReconciliationGate(client, self.db, MagicMock(), self.stop_mgr)
         gate._accepting_entries = True
         gate.state = ReconciliationState.HEALTHY
@@ -546,7 +546,7 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
     # Scenario 17: Failed Super Order reanchoring — no false confirmation
     # ------------------------------------------------------------------
     def test_17_failed_super_order_reanchoring_no_false_confirmation(self):
-        client = DhanClient(self.cfg, stop_manager=self.stop_mgr)
+        client = DhanClient(self.cfg, stop_manager=self.stop_mgr, reconciliation_gate=_c60_admit_gate())
         gate = StartupReconciliationGate(client, self.db, MagicMock(), self.stop_mgr)
         gate._accepting_entries = True
         gate.state = ReconciliationState.HEALTHY
@@ -667,3 +667,10 @@ class TestV12ExecutionSafetyRegressions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

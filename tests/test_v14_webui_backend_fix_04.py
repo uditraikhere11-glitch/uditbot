@@ -134,13 +134,26 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
         mock_broker = MagicMock()
         mock_broker.get_order_book.return_value = [
             {
+                "dhanClientId": "1113731536",
                 "orderId": "ORD-F03-01-CANC",
                 "correlationId": "CORR-F03-01-CANC",
                 "orderStatus": "CANCELLED",
                 "filledQty": 0,
+                "remainingQuantity": 0,
                 "securityId": "3045",
+                "exchangeSegment": "NSE_EQ",
+                "productType": "CNC",
+                "transactionType": "BUY",
+                "quantity": 5,
             }
         ]
+        mock_broker.get_trade_book.return_value = []
+        mock_broker.get_forever_orders.return_value = []
+        mock_broker.get_super_orders.return_value = []
+        mock_broker.get_holdings.return_value = []
+        mock_broker.get_positions.return_value = []
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(mock_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
 
         ok, err = self.tracker.reconcile_stale_journal_with_broker(
             db_path=self.db_path,
@@ -194,7 +207,12 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
 
         order_book_payload = []
         forever_book_payload = []
-        now = time.time()
+        trade_book_payload = []
+        positions_payload = []
+        now = float(int(time.time()))
+        from datetime import datetime as _dt
+        from src.engine.broker_session import IST as _IST
+        now_ex_time = _dt.fromtimestamp(now, _IST).strftime("%Y-%m-%d %H:%M:%S")
 
         for cid, boid, sec_id, req_qty, fill_qty, term_st, oco_id in cases:
             self.db.record_order_intent(cid, f"SYM-{sec_id}", sec_id, "NSE_EQ", "CNC", "LIMIT", 100.0, req_qty)
@@ -244,8 +262,46 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                 "productType": "CNC",
             })
             if oco_id and fill_qty > 0:
+                with self.db._get_conn() as conn:
+                    conn.execute(
+                        "INSERT INTO positions_lifecycle (parent_order_id, account_id, symbol, security_id, exchange_segment, product_type, protection_route, position_state, entry_qty, buy_filled_qty, sell_filled_qty, confirmed_open_qty, updated_at) VALUES (?, '1113731536', ?, ?, 'NSE_EQ', 'CNC', 'FOREVER_OCO', 'PROTECTED', ?, ?, 0, ?, ?)",
+                        (boid, f"SYM-{sec_id}", sec_id, req_qty, fill_qty, fill_qty, now),
+                    )
+                    conn.execute(
+                        "INSERT INTO fills (broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity, traded_at, transaction_type, security_id, exchange_segment, product_type, parent_order_id, is_verified_trade) VALUES (?, ?, ?, 100.0, ?, ?, 'BUY', ?, 'NSE_EQ', 'CNC', ?, 1)",
+                        (boid, f"ET{sec_id}", f"SYM-{sec_id}", fill_qty, now, sec_id, boid),
+                    )
+                    conn.execute(
+                        "INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, 'CONFIRM', ?)",
+                        (boid, oco_id, f"SYM-{sec_id}", fill_qty, now),
+                    )
+                trade_book_payload.append({
+                    "dhanClientId": "1113731536",
+                    "orderId": boid,
+                    "exchangeTradeId": f"ET{sec_id}",
+                    "exchangeOrderId": f"EXO-{boid}",
+                    "securityId": sec_id,
+                    "exchangeSegment": "NSE_EQ",
+                    "productType": "CNC",
+                    "transactionType": "BUY",
+                    "tradedQuantity": fill_qty,
+                    "tradedPrice": 100.0,
+                    "exchangeTime": now_ex_time,
+                })
+                positions_payload.append({
+                    "dhanClientId": "1113731536",
+                    "securityId": sec_id,
+                    "exchangeSegment": "NSE_EQ",
+                    "productType": "CNC",
+                    "netQty": fill_qty,
+                    "dayBuyQty": fill_qty,
+                    "daySellQty": 0,
+                    "carryForwardBuyQty": 0,
+                    "carryForwardSellQty": 0,
+                })
                 forever_book_payload.extend([
                     {
+                        "dhanClientId": "1113731536",
                         "orderId": oco_id,
                         "parentOrderId": boid,
                         "securityId": sec_id,
@@ -259,6 +315,7 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                         "price": 96.0,
                     },
                     {
+                        "dhanClientId": "1113731536",
                         "orderId": oco_id,
                         "parentOrderId": boid,
                         "securityId": sec_id,
@@ -273,9 +330,22 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                     },
                 ])
 
+        for _row in order_book_payload:
+            _row.setdefault("dhanClientId", "1113731536")
+            _row.setdefault("exchangeSegment", "NSE_EQ")
+            _row.setdefault("productType", "CNC")
+            _row.setdefault("remainingQuantity", 0)
+            _row.setdefault("transactionType", "BUY")
+            _row.setdefault("quantity", _row.get("filledQty", 5) or 5)
         mock_broker = MagicMock()
         mock_broker.get_order_book.return_value = order_book_payload
         mock_broker.get_forever_orders.return_value = forever_book_payload
+        mock_broker.get_trade_book.return_value = trade_book_payload
+        mock_broker.get_super_orders.return_value = []
+        mock_broker.get_holdings.return_value = []
+        mock_broker.get_positions.return_value = positions_payload
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(mock_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
 
         # Run reconciliation twice to verify idempotence
         for _ in range(2):
@@ -309,7 +379,7 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
 
         # Broker terminal summaries must not become fabricated exchange fills.
         with self.db._get_conn() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0], 3)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM fills WHERE exchange_trade_id LIKE '%-RECON-FILL-%' AND is_verified_trade=1").fetchone()[0], 0)
 
         # Only the 3 orders with filled_qty > 0 (5 + 4 + 3 = 12 shares @ 100.0 = 1200.0 INR) count toward daily trades & exposure
@@ -439,8 +509,16 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
         4. Prevents duplicate/cross-parent OCO credit.
         5. Succeeds when authoritative Dhan read-only APIs confirm active SL and Target legs for all parents.
         """
-        # 1. Empty journal (zero open/filled obligations) -> zero broker queries executed
+        # 1. Empty journal in LIVE mode verifies clean flat broker state via unified acquisition (C06)
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
         spy_broker = MagicMock()
+        spy_broker.get_order_book.return_value = []
+        spy_broker.get_trade_book.return_value = []
+        spy_broker.get_holdings.return_value = []
+        spy_broker.get_positions.return_value = []
+        spy_broker.get_forever_orders.return_value = []
+        spy_broker.get_super_orders.return_value = []
+        attach_unified_live_evidence_to_stub_broker(spy_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
         ok_idle, err_idle = self.tracker.reconcile_stale_journal_with_broker(
             db_path=self.db_path,
             broker=spy_broker,
@@ -448,16 +526,18 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
             is_live_mode=True,
             is_service_running=True,
         )
-        self.assertTrue(ok_idle)
+        self.assertTrue(ok_idle, err_idle)
         self.assertIsNone(err_idle)
-        spy_broker.get_order_book.assert_not_called()
 
         # Seed two orders: ORD-P1 (5 qty) and ORD-P2 (5 qty), with watcher claiming both are TRADED & protected
-        now = time.time()
+        now = float(int(time.time()))
+        from datetime import datetime as _dt
+        from src.engine.broker_session import IST as _IST
+        now_ex_time = _dt.fromtimestamp(now, _IST).strftime("%Y-%m-%d %H:%M:%S")
         for cid, boid in (("CORR-P1", "ORD-P1"), ("CORR-P2", "ORD-P2")):
             self.db.record_order_intent(cid, "SBIN", "3045", "NSE_EQ", "CNC", "LIMIT", 800.0, 5)
             self.db.update_order_intent(cid, state="PENDING", broker_order_id=boid)
-            self.db.record_order(cid, boid, "LIVE", "CNC", "NSE_EQ", "SBIN", "3045", "LIMIT", 800.0, 5, "PENDING")
+            self.db.record_order(correlation_id=cid, broker_order_id=boid, trading_mode="LIVE", product_type="CNC", exchange_segment="NSE_EQ", symbol="SBIN", security_id="3045", order_type="LIMIT", price=800.0, quantity=5, status="PENDING")
             with self.db._get_conn() as conn:
                 conn.execute(
                     "INSERT INTO watcher_orders (order_id, is_terminal, record_json, updated_at) VALUES (?, 1, ?, ?)",
@@ -483,8 +563,8 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
         # 2. Broker timeout on Forever OCO readback -> BROKER_RECONCILIATION_FAILED
         timeout_broker = MagicMock()
         timeout_broker.get_order_book.return_value = [
-            {"orderId": "ORD-P1", "correlationId": "CORR-P1", "orderStatus": "TRADED", "filledQty": 5, "securityId": "3045"},
-            {"orderId": "ORD-P2", "correlationId": "CORR-P2", "orderStatus": "TRADED", "filledQty": 5, "securityId": "3045"},
+            {"dhanClientId": "1113731536", "orderId": "ORD-P1", "correlationId": "CORR-P1", "orderStatus": "TRADED", "transactionType": "BUY", "quantity": 5, "filledQty": 5, "remainingQuantity": 0, "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"},
+            {"dhanClientId": "1113731536", "orderId": "ORD-P2", "correlationId": "CORR-P2", "orderStatus": "TRADED", "transactionType": "BUY", "quantity": 5, "filledQty": 5, "remainingQuantity": 0, "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"},
         ]
         timeout_broker.get_forever_orders.return_value = BrokerReadFailure(status="TIMEOUT", error="Forever OCO read timed out", status_code=504)
         ok_to, _, code_to, _ = self.tracker.evaluate_trading_safety_gate_detailed(
@@ -497,9 +577,33 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
         # OCO-SHARED-1 is credited to ORD-P1 only; ORD-P2 remains unprotected and blocks transition!
         dup_broker = MagicMock()
         dup_broker.get_order_book.return_value = timeout_broker.get_order_book.return_value
+        with self.db._get_conn() as conn:
+            for cid, boid, oid_oco, etid in (("CORR-P1", "ORD-P1", "OCO-SHARED-1", "ET304501"), ("CORR-P2", "ORD-P2", "OCO-P2-OWN", "ET304502")):
+                conn.execute(
+                    "INSERT OR IGNORE INTO positions_lifecycle (parent_order_id, account_id, symbol, security_id, exchange_segment, product_type, protection_route, position_state, entry_qty, buy_filled_qty, sell_filled_qty, confirmed_open_qty, updated_at) VALUES (?, '1113731536', 'SBIN', '3045', 'NSE_EQ', 'CNC', 'FOREVER_OCO', 'PROTECTED', 5, 5, 0, 5, ?)",
+                    (boid, now),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO fills (broker_order_id, exchange_trade_id, symbol, traded_price, traded_quantity, traded_at, transaction_type, security_id, exchange_segment, product_type, parent_order_id, is_verified_trade) VALUES (?, ?, 'SBIN', 800.0, 5, ?, 'BUY', '3045', 'NSE_EQ', 'CNC', ?, 1)",
+                    (boid, etid, now, boid),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, 'SBIN', 5, 'CONFIRM', ?)",
+                    (boid, oid_oco, now),
+                )
+        dup_broker.get_trade_book.return_value = [
+            {"dhanClientId": "1113731536", "orderId": "ORD-P1", "exchangeTradeId": "ET304501", "exchangeOrderId": "EXO-P1", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "transactionType": "BUY", "tradedQuantity": 5, "tradedPrice": 800.0, "exchangeTime": now_ex_time},
+            {"dhanClientId": "1113731536", "orderId": "ORD-P2", "exchangeTradeId": "ET304502", "exchangeOrderId": "EXO-P2", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "transactionType": "BUY", "tradedQuantity": 5, "tradedPrice": 800.0, "exchangeTime": now_ex_time},
+        ]
+        dup_broker.get_holdings.return_value = []
+        dup_broker.get_positions.return_value = [
+            {"dhanClientId": "1113731536", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 10, "dayBuyQty": 10, "daySellQty": 0, "carryForwardBuyQty": 0, "carryForwardSellQty": 0}
+        ]
+        dup_broker.get_super_orders.return_value = []
+        attach_unified_live_evidence_to_stub_broker(dup_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
         dup_broker.get_forever_orders.return_value = [
             {
-                "orderId": "OCO-SHARED-1",
+                "dhanClientId": "1113731536", "orderId": "OCO-SHARED-1",
                 "parentOrderId": "ORD-P1",
                 "securityId": "3045",
                 "exchangeSegment": "NSE_EQ",
@@ -512,7 +616,7 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                 "price": 768.0,
             },
             {
-                "orderId": "OCO-SHARED-1",
+                "dhanClientId": "1113731536", "orderId": "OCO-SHARED-1",
                 "parentOrderId": "ORD-P1",
                 "securityId": "3045",
                 "exchangeSegment": "NSE_EQ",
@@ -526,7 +630,7 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
             },
         ]
         ok_dup, reason_dup, code_dup, _ = self.tracker.evaluate_trading_safety_gate_detailed(
-            self.db_path, self.stop_path, is_service_running=True, is_live_mode=True, target_is_live=False, broker=dup_broker
+            self.db_path, self.stop_path, is_service_running=True, is_live_mode=True, target_is_live=False, broker=dup_broker, env_path=self.env_path
         )
         self.assertFalse(ok_dup)
         self.assertEqual(code_dup, "UNPROTECTED_POSITION")
@@ -535,7 +639,7 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
         # 4. Add distinct verified Forever OCO for ORD-P2 -> transition succeeds!
         dup_broker.get_forever_orders.return_value.extend([
             {
-                "orderId": "OCO-P2-OWN",
+                "dhanClientId": "1113731536", "orderId": "OCO-P2-OWN",
                 "parentOrderId": "ORD-P2",
                 "securityId": "3045",
                 "exchangeSegment": "NSE_EQ",
@@ -548,7 +652,7 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                 "price": 768.0,
             },
             {
-                "orderId": "OCO-P2-OWN",
+                "dhanClientId": "1113731536", "orderId": "OCO-P2-OWN",
                 "parentOrderId": "ORD-P2",
                 "securityId": "3045",
                 "exchangeSegment": "NSE_EQ",
@@ -561,8 +665,13 @@ class TestV14WebUIBackendFix04(unittest.TestCase):
                 "price": 824.0,
             },
         ])
+        with self.db._get_conn() as conn:
+            row_p2 = conn.execute("SELECT record_json FROM watcher_orders WHERE order_id = 'ORD-P2'").fetchone()
+            rec_p2 = json.loads(row_p2[0])
+            rec_p2["confirmed_protection_ids"] = ["OCO-P2-OWN"]
+            conn.execute("UPDATE watcher_orders SET record_json = ? WHERE order_id = 'ORD-P2'", (json.dumps(rec_p2),))
         ok_valid, _, code_valid, _ = self.tracker.evaluate_trading_safety_gate_detailed(
-            self.db_path, self.stop_path, is_service_running=True, is_live_mode=True, target_is_live=False, broker=dup_broker
+            self.db_path, self.stop_path, is_service_running=True, is_live_mode=True, target_is_live=False, broker=dup_broker, env_path=self.env_path
         )
         self.assertTrue(ok_valid)
         self.assertEqual(code_valid, "")

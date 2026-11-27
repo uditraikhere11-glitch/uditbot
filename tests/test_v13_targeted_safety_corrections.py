@@ -131,7 +131,8 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         broker = MagicMock()
         broker.cfg = self.cfg
         gate = StartupReconciliationGate(broker, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         broker.reconciliation_gate = gate
 
@@ -761,6 +762,8 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         client.get_positions = Mock(
             return_value=[{"securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 10}]
         )
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(client, db_path=self.db.db_path, data_dir=os.path.dirname(self.db.db_path))
         gate = StartupReconciliationGate(client, self.db, watcher, self.stop)
         ok_10, msg_10 = gate.run_startup_reconciliation()
         self.assertFalse(ok_10)
@@ -873,6 +876,8 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         """C.7: A genuinely empty account with HTTP 200 [] reads starts cleanly."""
         client = DhanClient(self.cfg, self.stop)
         watcher = self._make_watcher(client)
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(client, db_path=self.db.db_path, data_dir=os.path.dirname(self.db.db_path))
         gate = StartupReconciliationGate(client, self.db, watcher, self.stop)
 
         def get_router_empty(url, **kwargs):
@@ -889,7 +894,38 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         """C.8: Account with open position and matching verified active broker protection starts cleanly."""
         client = DhanClient(self.cfg, self.stop)
         watcher = self._make_watcher(client)
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(client, db_path=self.db.db_path, data_dir=os.path.dirname(self.db.db_path))
         gate = StartupReconciliationGate(client, self.db, watcher, self.stop)
+
+        from datetime import datetime as _dt
+        from src.engine.broker_session import IST as _IST
+        import time as _t_c8
+        _now_c8 = _t_c8.time() - 60.0
+        _ex_c8 = _dt.fromtimestamp(_now_c8, _IST).isoformat()
+        _acct_c8 = str(self.cfg.dhan_client_id)
+        self.db.record_order_intent(
+            correlation_id="ORD-C8-1", account_id=_acct_c8, symbol="SBIN-EQ", security_id="3045",
+            exchange_segment="NSE_EQ", product_type="CNC", order_type="LIMIT", price=100.0,
+            quantity=5, protection_route="FOREVER_OCO",
+        )
+        self.db.update_order_intent("ORD-C8-1", "TRADED", broker_order_id="ORD-C8-1")
+        self.db.record_fill(
+            "ORD-C8-1", "EID-C8-1", "SBIN-EQ", 100.0, 5, traded_at=_now_c8,
+            transaction_type="BUY", security_id="3045", exchange_segment="NSE_EQ",
+            product_type="CNC", parent_order_id="ORD-C8-1", is_verified_trade=True,
+        )
+        self.db.upsert_position_lifecycle(
+            parent_order_id="ORD-C8-1", account_id=_acct_c8, symbol="SBIN-EQ", security_id="3045",
+            exchange_segment="NSE_EQ", product_type="CNC", protection_route="FOREVER_OCO",
+            position_state="PROTECTED", entry_qty=5, buy_filled_qty=5, buy_vwap=100.0,
+            protected_qty=5, confirmed_open_qty=5,
+        )
+        with self.db._get_conn() as _c8_con:
+            _c8_con.execute(
+                "INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, sl_trigger, sl_limit, target_price, quantity, status, created_at, protection_route) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("ORD-C8-1", "OCO-VALID-5", "SBIN-EQ", 97.0, 96.5, 103.0, 5, "ACTIVE_CONFIRMED", _now_c8, "FOREVER_OCO"),
+            )
 
         def get_router_protected(url, **kwargs):
             if "/fundlimit" in url:
@@ -898,7 +934,13 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
                 return SimpleNamespace(
                     status_code=200,
                     text="[...]",
-                    json=lambda: [{"securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 5}],
+                    json=lambda: [{"dhanClientId": _acct_c8, "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "netQty": 5, "dayBuyQty": 5, "daySellQty": 0, "carryForwardBuyQty": 0, "carryForwardSellQty": 0}],
+                )
+            if "/trades" in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    text="[...]",
+                    json=lambda: [{"dhanClientId": _acct_c8, "orderId": "ORD-C8-1", "exchangeTradeId": "EID-C8-1", "exchangeOrderId": "EXO-C8-1", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC", "transactionType": "BUY", "tradedQuantity": 5, "tradedPrice": 100.0, "exchangeTime": _ex_c8}],
                 )
             if "/forever/orders" in url:
                 return SimpleNamespace(
@@ -906,6 +948,7 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
                     text="[...]",
                     json=lambda: [
                         {
+                            "dhanClientId": _acct_c8,
                             "orderId": "OCO-VALID-5",
                             "orderStatus": "PENDING",
                             "securityId": "3045",
@@ -945,7 +988,8 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
         self.addCleanup(self._wait_for_historical_background, gate)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -1075,7 +1119,8 @@ class TestV13TargetedSafetyCorrections(unittest.TestCase):
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
         self.addCleanup(self._wait_for_historical_background, gate)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 

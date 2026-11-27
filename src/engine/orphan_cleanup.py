@@ -100,7 +100,15 @@ def _snapshot(broker: Any, account: str) -> Dict[str, List[dict]]:
     for item in forever:
         if not str(item.get("orderId") or "").strip() or not str(item.get("orderStatus") or "").strip():
             raise ValueError("forever: missing id/status")
-    return {"positions": positions, "holdings": holdings, "orders": orders, "forever": forever}
+    import uuid
+    return {
+        "snapshot_id": f"orphan-snap-{uuid.uuid4().hex}",
+        "account_id": account,
+        "positions": positions,
+        "holdings": holdings,
+        "orders": orders,
+        "forever": forever,
+    }
 
 
 def _journal_candidates(db_path: str) -> List[dict]:
@@ -290,6 +298,13 @@ def clean_orphaned_forever_orders(
             raise ValueError("independent confirmation delay must be at least 1 second")
         sleep(confirm_delay_sec)
         second = _snapshot(broker, account)
+        if (
+            not first.get("snapshot_id")
+            or not second.get("snapshot_id")
+            or first["snapshot_id"] == second["snapshot_id"]
+        ):
+            raise ValueError("C02: two genuinely independent broker snapshots required before orphan cancellation")
+        result["independent_snapshot_ids"] = [first["snapshot_id"], second["snapshot_id"]]
         fresh_owned = {str(r["broker_order_id"]): r for r in _journal_candidates(db_path)}
         for oid, row in initial.items():
             if oid not in fresh_owned or fresh_owned[oid] != row:
@@ -311,6 +326,25 @@ def clean_orphaned_forever_orders(
         result["error"] = f"{type(exc).__name__}: {exc}"
         logger.warning("[OCO CLEANUP] Fail closed: %s", result["error"])
         return result
+
+
+def verify_and_resolve_orphan_legs(
+    record: Dict[str, Any],
+    snapshot_1: Any,
+    snapshot_2: Any,
+    *,
+    expected_account_id: str,
+    now_mono_ns: Optional[int] = None,
+) -> Any:
+    """Phase 2D C02-safe durable orphan-leg resolution via two independent BrokerSnapshots."""
+    from src.engine.durable_risk_resolution import resolve_durable_orphan_legs
+    return resolve_durable_orphan_legs(
+        record=record,
+        snap1=snapshot_1,
+        snap2=snapshot_2,
+        expected_account_id=expected_account_id,
+        now_mono_ns=(now_mono_ns if now_mono_ns is not None else time.monotonic_ns()),
+    )
 
 
 def main() -> int:

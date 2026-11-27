@@ -60,6 +60,8 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 def _http_resp(status: int, payload=None, text: str = "") -> MagicMock:
     r = MagicMock()
     r.status_code = status
+    r.headers = {}
+    r._uditbot_original_status = status
     r.text = text or (json.dumps(payload) if payload is not None and not isinstance(payload, Exception) else "")
     if isinstance(payload, Exception):
         r.json.side_effect = payload
@@ -119,7 +121,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         self.stop_path = os.path.join(self.data_dir, "emergency_stop.json")
         self.watcher_path = os.path.join(self.data_dir, "pending_protection.json")
 
-        write_token_atomic("TEST_ACTIVE_TOKEN", self.tok_path)
+        from tests._phase2d_live_harness import make_synthetic_jwt
+        write_token_atomic(make_synthetic_jwt(FAKE_ACCT, expires_in_sec=86400.0 * 365.0), self.tok_path)
         self.cfg = AppConfig(
             trading_mode=TradingMode.LIVE,
             dhan_client_id=FAKE_ACCT,
@@ -147,6 +150,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             dry_run=False,
             journal_db=self.db,
         )
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(self.client, db_path=self.db.db_path, data_dir=os.path.dirname(self.db.db_path))
         self.gate = StartupReconciliationGate(
             broker=self.client,
             journal_db=self.db,
@@ -228,13 +233,15 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
         )
 
         with self.db._get_conn() as conn:
-            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
-                         ("900001102657701", "FO-YES-1"))
+            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         ("900001102657701", "FO-YES-1", "YESBANK-EQ", 1, "ACTIVE", mon_ts))
 
         hist_trade = {
             "dhanClientId": FAKE_ACCT,
             "orderId": "900001102657701",
             "exchangeTradeId": "ETID-20261102-001",
+            "exchangeOrderId": "EXO-20261102-001",
+            "exchangeTime": "2026-11-02 14:01:18",
             "tradingSymbol": "YESBANK-EQ",
             "securityId": "11915",
             "exchangeSegment": "NSE_EQ",
@@ -260,7 +267,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "totalQty": 1, "dpQty": 1}])
+                return _http_resp(200, [{"dhanClientId": FAKE_ACCT, "securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 1, "dpQty": 1, "t1Qty": 0, "availableQty": 1}])
             return _http_resp(200, [])
 
         with patch.object(self.client.session, "get", side_effect=fake_get), \
@@ -293,11 +300,11 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
 
     def _two_independent_lots(self, bind_second, second_group_qty=1):
         with self.db._get_conn() as conn:
-            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
-                         ("900001102657701", "FO-FIRST"))
+            conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         ("900001102657701", "FO-FIRST", "YESBANK-EQ", 1, "ACTIVE", time.time() - 86400))
             if bind_second:
-                conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id) VALUES (?, ?)",
-                             ("900001104398802", "FO-SECOND"))
+                conn.execute("INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                             ("900001104398802", "FO-SECOND", "YESBANK-EQ", 1, "ACTIVE", time.time() - 86400))
         nov2_ts = datetime.datetime(2026, 11, 2, 14, 1, 18, tzinfo=IST).timestamp()
         nov4_ts = datetime.datetime(2026, 11, 4, 11, 25, 21, tzinfo=IST).timestamp()
         self._seed_acked_intent(
@@ -320,6 +327,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001102657701",
                 "exchangeTradeId": "ETID-NOV2-11915",
+                "exchangeOrderId": "EXO-NOV2-11915",
+                "exchangeTime": "2026-11-02 14:01:18",
                 "tradingSymbol": "YESBANK-EQ",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
@@ -332,6 +341,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001104398802",
                 "exchangeTradeId": "ETID-NOV4-11915",
+                "exchangeOrderId": "EXO-NOV4-11915",
+                "exchangeTime": "2026-11-04 14:05:10",
                 "tradingSymbol": "YESBANK-EQ",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
@@ -358,7 +369,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "totalQty": 2, "dpQty": 2, "avgCostPrice": 15.515}])
+                return _http_resp(200, [{"dhanClientId": FAKE_ACCT, "securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2, "t1Qty": 0, "availableQty": 2, "avgCostPrice": 15.515}])
             return _http_resp(200, [])
 
         with patch.object(self.client.session, "get", side_effect=fake_get):
@@ -986,6 +997,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001102657701",
                 "exchangeTradeId": "ETID-NOV2-1",
+                "exchangeOrderId": "EXO-NOV2-1",
+                "exchangeTime": "2026-11-02 14:01:18",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
                 "productType": "CNC",
@@ -997,6 +1010,8 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
                 "dhanClientId": FAKE_ACCT,
                 "orderId": "900001104398802",
                 "exchangeTradeId": "ETID-NOV4-1",
+                "exchangeOrderId": "EXO-NOV4-1",
+                "exchangeTime": "2026-11-04 14:05:10",
                 "securityId": "11915",
                 "exchangeSegment": "NSE_EQ",
                 "productType": "CNC",
@@ -1016,7 +1031,7 @@ class TestHistoricalFillReconciliationH01ToH17(unittest.TestCase):
             if "/trades/2026-11-02/" in url and url.endswith("/1"):
                 return _http_resp(200, [])
             if url.endswith("/holdings"):
-                return _http_resp(200, [{"securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2}])
+                return _http_resp(200, [{"dhanClientId": FAKE_ACCT, "securityId": "11915", "tradingSymbol": "YESBANK", "isin": "INE528G01035", "totalQty": 2, "dpQty": 2, "t1Qty": 0, "availableQty": 2}])
             if url.endswith("/forever/orders"):
                 return _http_resp(200, [])
             return _http_resp(200, [])

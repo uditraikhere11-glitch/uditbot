@@ -254,9 +254,16 @@ class TestV14WebUIBackendFix03(unittest.TestCase):
         F02-03: Deferred Owner Stop automatically completes when blocking LIVE order resolves
         without any manual coordinator tick.
         """
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
         mock_broker = MagicMock()
-        mock_broker.cfg = AppConfig(trading_mode=TradingMode.LIVE, dhan_client_id="1113731536", data_dir=self.data_dir)
-        mock_broker.order_status.return_value = {"orderId": "ORD-STOP-AUTO", "orderStatus": "PENDING", "filledQty": 0}
+        mock_broker.cfg = AppConfig(trading_mode=TradingMode.LIVE, dhan_client_id="1113731536", data_dir=self.data_dir, journal_db_path=self.db_path)
+        mock_broker.order_status.return_value = {"dhanClientId": "1113731536", "orderId": "ORD-STOP-AUTO", "orderStatus": "PENDING", "filledQty": 0, "remainingQuantity": 5, "quantity": 5, "transactionType": "BUY", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"}
+        mock_broker.get_trade_book.return_value = []
+        mock_broker.get_holdings.return_value = []
+        mock_broker.get_positions.return_value = []
+        mock_broker.get_forever_orders.return_value = []
+        mock_broker.get_super_orders.return_value = []
+        attach_unified_live_evidence_to_stub_broker(mock_broker, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
         mock_broker.get_order_book.return_value = [
             {"orderId": "ORD-STOP-AUTO", "correlationId": "CORR-STOP-AUTO", "orderStatus": "PENDING", "filledQty": 0}
         ]
@@ -326,10 +333,9 @@ class TestV14WebUIBackendFix03(unittest.TestCase):
         )
 
         # Now order is cancelled on broker with 0 fills
-        mock_broker.order_status.return_value = {"orderId": "ORD-STOP-AUTO", "orderStatus": "CANCELLED", "filledQty": 0}
-        mock_broker.get_order_book.return_value = [
-            {"orderId": "ORD-STOP-AUTO", "correlationId": "CORR-STOP-AUTO", "orderStatus": "CANCELLED", "filledQty": 0}
-        ]
+        _canc_row = {"dhanClientId": "1113731536", "orderId": "ORD-STOP-AUTO", "correlationId": "CORR-STOP-AUTO", "orderStatus": "CANCELLED", "filledQty": 0, "remainingQuantity": 0, "quantity": 5, "transactionType": "BUY", "securityId": "3045", "exchangeSegment": "NSE_EQ", "productType": "CNC"}
+        mock_broker.order_status.return_value = dict(_canc_row)
+        mock_broker.get_order_book.return_value = [dict(_canc_row)]
         watcher.check_once()
 
         deadline = time.time() + 2.5
@@ -357,7 +363,16 @@ class TestV14WebUIBackendFix03(unittest.TestCase):
         actual state (RUNNING / FAILED / STOPPING / UNKNOWN), and does NOT claim STOPPED_BY_OWNER.
         """
         # 1. Service remains "active" despite systemctl stop returning True
-        res_still_running = self.tracker.control_service(
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        _flat_b14 = MagicMock()
+        _flat_b14.get_order_book.return_value = []
+        _flat_b14.get_trade_book.return_value = []
+        _flat_b14.get_holdings.return_value = []
+        _flat_b14.get_positions.return_value = []
+        _flat_b14.get_forever_orders.return_value = []
+        _flat_b14.get_super_orders.return_value = []
+        attach_unified_live_evidence_to_stub_broker(_flat_b14, db_path=self.db_path, data_dir=self.data_dir, account_id="1113731536")
+        res_still_running = self.tracker.control_service(broker=_flat_b14,
             action="stop",
             reason="Stop where unit stays active",
             env_path=self.env_path,
@@ -376,7 +391,7 @@ class TestV14WebUIBackendFix03(unittest.TestCase):
 
         # 2. Service enters "failed" during stop
         states_seq = ["active", "failed", "failed"]
-        res_failed_stop = self.tracker.control_service(
+        res_failed_stop = self.tracker.control_service(broker=_flat_b14,
             action="stop",
             reason="Stop where unit crashes into failed",
             env_path=self.env_path,
@@ -392,7 +407,7 @@ class TestV14WebUIBackendFix03(unittest.TestCase):
 
         # 3. Service stays in "deactivating" (STOPPING) past timeout
         deact_seq = ["active", "deactivating", "deactivating"]
-        res_stopping = self.tracker.control_service(
+        res_stopping = self.tracker.control_service(broker=_flat_b14,
             action="stop",
             reason="Stop where unit hangs in deactivating",
             env_path=self.env_path,

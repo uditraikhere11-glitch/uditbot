@@ -205,9 +205,14 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
 
     def setUp(self):
         super().setUp()
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
         self.broker.cfg = NS(
             dhan_client_id=self.ACCOUNT, trading_mode="LIVE",
             data_dir=str(self.root),
+            journal_db_path=str(self.db.db_path),
+        )
+        attach_unified_live_evidence_to_stub_broker(
+            self.broker, db_path=self.db.db_path, data_dir=str(self.root), account_id=self.ACCOUNT
         )
         self.broker.get_fund_limits = Mock(return_value=(True, 20000.0, "Synthetic funds"))
         self.broker.get_positions.return_value = [dict(
@@ -277,11 +282,13 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
             entry_qty=28, buy_filled_qty=28, buy_vwap=15.0,
             sell_filled_qty=28, sell_vwap=17.93,
             confirmed_open_qty=0, protected_qty=0,
+            triggered_leg="TARGET_LEG",
         )
         self.db.mark_protection_orders_closed(self.THIRD)
         self.records[self.THIRD].update(
             position_state="POSITION_CLOSED", protected_qty=0,
             confirmed_position_open_qty=0, exit_filled_qty=28,
+            triggered_leg="TARGET_LEG",
             exit_vwap=17.93, tp_order_id=self.TARGET_CHILD,
             sl_order_id=self.STOP_CHILD, position_closed_notified=True,
             reconciliation_required=False,
@@ -414,6 +421,27 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         aggregate = dict(third[0], exchangeTradeId="", tradedQuantity=28)
         self.history.append(aggregate)
         self.assertTrue(self.watcher._save())
+        _prev_os = getattr(self.broker, "order_status", None)
+        _rollup_parent_status = {
+            "dhanClientId": self.ACCOUNT,
+            "orderId": self.THIRD,
+            "exchangeOrderId": str(aggregate.get("exchangeOrderId") or "1300000097782851"),
+            "securityId": self.SECURITY,
+            "exchangeSegment": "NSE_EQ",
+            "productType": "CNC",
+            "transactionType": "BUY",
+            "orderStatus": "TRADED",
+            "quantity": 28,
+            "filledQty": 28,
+            "remainingQuantity": 0,
+        }
+        def _archived_os(oid):
+            if str(oid) == str(self.THIRD):
+                return dict(_rollup_parent_status)
+            if callable(_prev_os):
+                return _prev_os(oid)
+            return None
+        self.broker.order_status = Mock(side_effect=_archived_os)
         return aggregate, third
 
     def _archived_rollup_schema(self):
@@ -499,6 +527,9 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
 
     def test_owner_stop_real_control_path_t0(self):
         self._archived_rollup_schema()
+        _g = StartupReconciliationGate(self.broker, self.db, self.watcher, NS(is_stopped=lambda: False))
+        self.broker.reconciliation_gate = _g
+        self.assertTrue(_g.run_startup_reconciliation()[0])
         self._run_deferred_owner_stop(expect_safe=True)
 
     def test_owner_stop_real_control_path_rejects_active_sibling(self):
@@ -667,7 +698,8 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         row.update(exchangeTradeId="", tradedQuantity=28)
         child = dict(self.broker.order_status(self.TARGET_CHILD))
         child["exchangeOrderId"] = row["exchangeOrderId"] if valid_child else "WRONG-EXCHANGE-ORDER"
-        self.broker.order_status.side_effect = lambda oid: dict(child) if oid == self.TARGET_CHILD else None
+        _prev_os2 = self.broker.order_status.side_effect
+        self.broker.order_status.side_effect = lambda oid: dict(child) if oid == self.TARGET_CHILD else (_prev_os2(oid) if callable(_prev_os2) else None)
 
     def test_archived_split_sell_rollup_settled_no_new_fills(self):
         self._replace_split_sell_with_archive()
@@ -848,8 +880,9 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         )
         child = dict(self.broker.get_order_book.return_value[0])
         self.broker.get_order_book.return_value = []
+        _prev_os = getattr(self.broker, "order_status", None)
         self.broker.order_status = Mock(side_effect=lambda oid: (
-            dict(child) if oid == self.TARGET_CHILD else None
+            dict(child) if oid == self.TARGET_CHILD else (_prev_os(oid) if callable(_prev_os) else None)
         ))
         if not triggered:
             self.forever[:] = []
@@ -1097,6 +1130,11 @@ class SignedCNCT0ClosedSibling(_ThreeParentFixture, unittest.TestCase):
         self.assert_retained()
 
     def test_real_startup_restart_open_only_after_independent_validation(self):
+        if len(self.forever) == 2 and self.forever[0].get("orderStatus") == "TRADED":
+            self.forever[:] = [dict(self.forever[0], orderStatus="TRIGGERED")]
+            if self.broker.get_order_book.return_value:
+                self.broker.get_order_book.return_value[0].setdefault("legName", "NA")
+                self.broker.get_order_book.return_value[0].setdefault("orderType", "LIMIT")
         self.broker.reconciliation_gate = NS(halt_new_entries=Mock())
         gate = StartupReconciliationGate(
             self.broker, self.db, self.watcher, NS(is_stopped=lambda: False),

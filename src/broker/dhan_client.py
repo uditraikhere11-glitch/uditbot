@@ -1,3 +1,7 @@
+from dataclasses import dataclass
+from types import MappingProxyType
+import hashlib
+import math
 """
 DhanHQ API v2 Client Interface + V13 Audit-Hardened Execution-Safety Edition.
 Handles:
@@ -806,6 +810,183 @@ def verify_super_order_record(
     )
 
 
+
+# =============================================================================
+# C58 + C62: Strict Pre-Conversion Numeric Validators & Immutable Operation Binding
+# =============================================================================
+
+MAX_SAFE_INT_QTY = 2_147_483_647
+MAX_SAFE_DECIMAL_PRICE = 1e9
+
+_CANONICAL_TO_WIRE_MAP = (
+    ("account_id", "dhanClientId"),
+    ("correlation_id", "correlationId"),
+    ("transaction_type", "transactionType"),
+    ("exchange_segment", "exchangeSegment"),
+    ("product_type", "productType"),
+    ("order_type", "orderType"),
+    ("security_id", "securityId"),
+    ("quantity", "quantity"),
+    ("price", "price"),
+    ("trigger_price", "triggerPrice"),
+    ("disclosed_quantity", "disclosedQuantity"),
+    ("is_amo", "afterMarketOrder"),
+    ("stop_loss_price", "stopLossPrice"),
+    ("target_price", "targetPrice"),
+    ("trailing_jump", "trailingJump"),
+    ("order_id", "orderId"),
+    ("leg_name", "legName"),
+)
+
+
+def _validate_raw_strict_int(val: Any, field: str, *, allow_zero: bool = False) -> Tuple[bool, Optional[int], str]:
+    """C58 + C68: Validate raw integer input BEFORE any int() conversion with 32-bit range ceiling."""
+    if isinstance(val, bool) or type(val) is not int:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: expected strict int, got {type(val).__name__} ({val!r})"
+    if val > MAX_SAFE_INT_QTY:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: exceeds max safe 32-bit integer ({val!r} > {MAX_SAFE_INT_QTY})"
+    if allow_zero:
+        if val < 0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be >= 0 (got {val!r})"
+    else:
+        if val <= 0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be > 0 (got {val!r})"
+    return True, val, "OK"
+
+
+def _validate_raw_strict_number(val: Any, field: str, *, allow_zero: bool = False) -> Tuple[bool, Optional[float], str]:
+    """C58 + C68: Validate raw numeric input BEFORE any float() conversion, catching OverflowError."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: expected finite int/float, got {type(val).__name__} ({val!r})"
+    try:
+        fv = float(val)
+    except OverflowError:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: numeric overflow ({val!r})"
+    if not math.isfinite(fv) or abs(fv) > MAX_SAFE_DECIMAL_PRICE:
+        return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be finite and within safe price range (got {val!r})"
+    if allow_zero:
+        if fv < 0.0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be >= 0 (got {val!r})"
+    else:
+        if fv <= 0.0:
+            return False, None, f"INVALID_NUMERIC_FIELD:{field}: must be > 0 (got {val!r})"
+    return True, fv, "OK"
+
+
+def _canonical_json_bytes_and_sha256(payload: Any) -> Tuple[str, str]:
+    """C62: Canonical deterministic JSON serialization (rejects NaN/Inf) + SHA-256."""
+    wire_str = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    digest = hashlib.sha256(wire_str.encode("utf-8")).hexdigest()
+    return wire_str, digest
+
+
+def _values_semantically_equal(cval: Any, wval: Any) -> bool:
+    if isinstance(cval, bool) or isinstance(wval, bool):
+        return isinstance(cval, bool) and isinstance(wval, bool) and cval == wval
+    if isinstance(cval, (int, float)) and isinstance(wval, (int, float)):
+        try:
+            return math.isfinite(float(cval)) and math.isfinite(float(wval)) and abs(float(cval) - float(wval)) <= 1e-9
+        except OverflowError:
+            return False
+    return str(cval).strip() == str(wval).strip()
+
+
+def _verify_canonical_wire_semantic_equivalence(
+    canonical_fields: Dict[str, Any], wire_payload: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """C66: Enforce exact semantic equivalence between canonical authorization fields and wire payload."""
+    if not isinstance(canonical_fields, dict) or not isinstance(wire_payload, dict):
+        return False, "SEMANTIC_WIRE_MISMATCH: non-dict canonical or wire payload"
+    for c_key, w_key in _CANONICAL_TO_WIRE_MAP:
+        c_in = c_key in canonical_fields
+        w_in = w_key in wire_payload
+        if c_in and w_in:
+            if not _values_semantically_equal(canonical_fields[c_key], wire_payload[w_key]):
+                return False, f"SEMANTIC_WIRE_MISMATCH:{c_key}({canonical_fields[c_key]!r})!={w_key}({wire_payload[w_key]!r})"
+        elif c_key in wire_payload and c_in:
+            if not _values_semantically_equal(canonical_fields[c_key], wire_payload[c_key]):
+                return False, f"SEMANTIC_WIRE_MISMATCH:{c_key}({canonical_fields[c_key]!r})!={wire_payload[c_key]!r}"
+    # Also verify any direct identically-named economic keys present in both dicts
+    for k in canonical_fields:
+        if k in wire_payload and not _values_semantically_equal(canonical_fields[k], wire_payload[k]):
+            return False, f"SEMANTIC_WIRE_MISMATCH:{k}({canonical_fields[k]!r})!={wire_payload[k]!r}"
+    return True, "SEMANTICALLY_EQUIVALENT"
+
+
+@dataclass(frozen=True)
+class AuthorizedBrokerOperation:
+    """C62 + C66: Single authoritative immutable operation descriptor binding canonical
+    authorization fields to the exact semantically equivalent HTTP method, endpoint URL,
+    and wire JSON payload.
+    """
+    method: str
+    url: str
+    account_id: str
+    operation_type: str
+    correlation_id: str
+    parent_order_id: str
+    canonical_json: str
+    wire_json: str
+    wire_payload_sha256: str
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        method: str,
+        url: str,
+        account_id: str,
+        operation_type: str,
+        correlation_id: str,
+        parent_order_id: str = "",
+        canonical_fields: Dict[str, Any],
+        wire_payload: Dict[str, Any],
+    ) -> "AuthorizedBrokerOperation":
+        ok_sem, msg_sem = _verify_canonical_wire_semantic_equivalence(canonical_fields, wire_payload)
+        if not ok_sem:
+            raise ValueError(msg_sem)
+        wire_str, wire_sha = _canonical_json_bytes_and_sha256(wire_payload)
+        full_canonical = dict(canonical_fields)
+        full_canonical["http_method"] = str(method).upper()
+        full_canonical["endpoint_url"] = str(url)
+        full_canonical["operation_type"] = str(operation_type)
+        full_canonical["wire_payload_sha256"] = wire_sha
+        canon_str, _ = _canonical_json_bytes_and_sha256(full_canonical)
+        return cls(
+            method=str(method).upper(),
+            url=str(url),
+            account_id=str(account_id).strip(),
+            operation_type=str(operation_type),
+            correlation_id=str(correlation_id).strip(),
+            parent_order_id=str(parent_order_id).strip(),
+            canonical_json=canon_str,
+            wire_json=wire_str,
+            wire_payload_sha256=wire_sha,
+        )
+
+    def canonical_payload_dict(self) -> Dict[str, Any]:
+        return json.loads(self.canonical_json)
+
+    def wire_payload_copy(self) -> Dict[str, Any]:
+        return json.loads(self.wire_json)
+
+    def verify_wire_binding(self, method: str, url: str, outgoing_json: Any) -> Tuple[bool, str]:
+        if str(method).upper() != self.method:
+            return False, f"WIRE_METHOD_MISMATCH:{method}!={self.method}"
+        if str(url) != self.url:
+            return False, f"WIRE_URL_MISMATCH:{url}!={self.url}"
+        effective_outgoing = {} if (outgoing_json is None and self.method == "DELETE" and self.wire_json == "{}") else outgoing_json
+        ok_sem, msg_sem = _verify_canonical_wire_semantic_equivalence(self.canonical_payload_dict(), effective_outgoing if isinstance(effective_outgoing, dict) else {})
+        if not ok_sem:
+            return False, msg_sem
+        try:
+            _, actual_sha = _canonical_json_bytes_and_sha256(effective_outgoing)
+        except (TypeError, ValueError) as exc:
+            return False, f"WIRE_PAYLOAD_UNSERIALIZABLE:{exc}"
+        if actual_sha != self.wire_payload_sha256:
+            return False, f"WIRE_PAYLOAD_DIGEST_MISMATCH:{actual_sha[:12]}!={self.wire_payload_sha256[:12]}"
+        return True, "WIRE_BOUND"
+
 class DhanClient:
     _require_broker_handoff = False
 
@@ -1202,6 +1383,7 @@ class DhanClient:
         ambiguous response or bypass the protection handoff for a real send.
         The rate category is determined by verb and path, not caller priority.
         """
+        authorized_op = kwargs.pop("authorized_op", None)
         from src.broker.read_governor import ReadGovernor, ReadDeferred
         category = ReadGovernor.classify(method, url)
         if category != "ORDER":
@@ -1232,6 +1414,28 @@ class DhanClient:
                 except (ReadDeferred, OSError, sqlite3.Error) as exc:
                     finish(True)  # Known no-send; do not create UNKNOWN mutation.
                     return self._read_deferral_response(exc)
+                _tls_auth = getattr(self, "_pre_transport_auth_tls", None)
+                _pre_auth_cb = getattr(_tls_auth, "fn", None) if _tls_auth is not None else None
+                if callable(_pre_auth_cb):
+                    _ok_ta, _msg_ta = _pre_auth_cb()
+                    if not _ok_ta:
+                        finish(True)  # C44: Known NO-SEND before transport admission; never create UNKNOWN mutation.
+                        raise BrokerMutationNotSubmitted(f"MUTATION BLOCKED (FINAL TRANSPORT ADMISSION): {_msg_ta}")
+                # C62 + C66: Require immutable AuthorizedBrokerOperation in LIVE mode across ALL POST/PUT/DELETE routes
+                _bound_op = authorized_op or (getattr(_tls_auth, "op", None) if _tls_auth is not None else None)
+                _raw_tm = getattr(self.cfg, "trading_mode", None)
+                _is_live_mode = str(getattr(_raw_tm, "value", _raw_tm) or "").strip().upper() == "LIVE"
+                if _bound_op is None and _is_live_mode:
+                    finish(True)
+                    raise BrokerMutationNotSubmitted("MUTATION BLOCKED (WIRE PAYLOAD BINDING): MISSING_AUTHORIZED_OPERATION")
+                if _bound_op is not None:
+                    if not callable(getattr(_bound_op, "verify_wire_binding", None)):
+                        finish(True)
+                        raise BrokerMutationNotSubmitted("MUTATION BLOCKED (WIRE PAYLOAD BINDING): INVALID_AUTHORIZED_OPERATION")
+                    _ok_wb, _msg_wb = _bound_op.verify_wire_binding(method, url, kwargs.get("json"))
+                    if not _ok_wb:
+                        finish(True)  # Known NO-SEND before network transmission.
+                        raise BrokerMutationNotSubmitted(f"MUTATION BLOCKED (WIRE PAYLOAD BINDING): {_msg_wb}")
                 sent = True
                 result = fn(url, **kwargs)
                 status = getattr(result, "status_code", None)
@@ -2459,9 +2663,62 @@ class DhanClient:
 
         return False, None, f"Ambiguous/uncertain response for correlation {corr_id}: outcome UNKNOWN (automatic resubmission prohibited)"
 
+
+    def _invoke_live_entry_authorization(
+        self,
+        op: AuthorizedBrokerOperation,
+        *,
+        post_registration: bool = False,
+    ) -> Tuple[bool, str]:
+        """C60: Single explicit production authorization interface for LIVE entry mutations.
+        ZERO reduced-argument fallbacks; any missing gate/callback/descriptor/correlation,
+        TypeError, unexpected exception, or invalid return value fails closed immediately.
+        """
+        is_live = (getattr(self.cfg, "trading_mode", None) == TradingMode.LIVE)
+        if not op.correlation_id or not op.account_id or not op.wire_payload_sha256:
+            return False, "INCOMPLETE_OPERATION_DESCRIPTOR: missing correlation_id, account_id, or wire_payload_sha256"
+        if self.reconciliation_gate is None:
+            if is_live:
+                return False, "RECONCILIATION_GATE_MISSING: LIVE entry mutation requires reconciliation_gate"
+            return True, "TEST_MODE_NO_GATE"
+        _reval = getattr(self.reconciliation_gate, "revalidate_for_transport_submission", None)
+        if not callable(_reval):
+            return False, "AUTHORIZATION_CALLBACK_MISSING: reconciliation_gate lacks callable revalidate_for_transport_submission"
+        try:
+            _rv = _reval(
+                pending_correlation_id=op.correlation_id,
+                post_registration=post_registration,
+                expected_order_payload=op.canonical_payload_dict(),
+            )
+        except Exception as exc:
+            return False, f"AUTHORIZATION_CALLBACK_ERROR:{type(exc).__name__}:{exc}"
+        if not (isinstance(_rv, tuple) and len(_rv) == 2 and type(_rv[0]) is bool):
+            return False, f"AUTHORIZATION_INVALID_RESULT: expected (bool, str), got {type(_rv).__name__}"
+        if not _rv[0]:
+            return False, str(_rv[1])
+        return True, str(_rv[1])
+
     def place_order(self, order_req: OrderRequest, retry: bool = True) -> Tuple[bool, Optional[str], str]:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} orders are forbidden on BUY-ONLY entry path"
+
+        # C58: Validate ALL raw numeric inputs BEFORE any int()/float() conversion
+        _ok_q, _v_qty, _msg_q = _validate_raw_strict_int(getattr(order_req, "quantity", None), "quantity", allow_zero=False)
+        if not _ok_q:
+            return False, None, f"MUTATION BLOCKED: {_msg_q}"
+        _order_type_str = str(order_req.order_type.value if hasattr(order_req.order_type, "value") else order_req.order_type).strip().upper()
+        _allow_zero_price = (_order_type_str == "MARKET")
+        _ok_p, _v_price, _msg_p = _validate_raw_strict_number(getattr(order_req, "price", None), "price", allow_zero=_allow_zero_price)
+        if not _ok_p:
+            return False, None, f"MUTATION BLOCKED: {_msg_p}"
+        _ok_tp, _v_trig, _msg_tp = _validate_raw_strict_number(getattr(order_req, "trigger_price", 0.0), "trigger_price", allow_zero=True)
+        if not _ok_tp:
+            return False, None, f"MUTATION BLOCKED: {_msg_tp}"
+        _ok_dq, _v_disc, _msg_dq = _validate_raw_strict_int(getattr(order_req, "disclosed_quantity", 0), "disclosed_quantity", allow_zero=True)
+        if not _ok_dq:
+            return False, None, f"MUTATION BLOCKED: {_msg_dq}"
+        if _v_disc > _v_qty:
+            return False, None, f"MUTATION BLOCKED: INVALID_NUMERIC_FIELD:disclosed_quantity ({_v_disc}) > quantity ({_v_qty})"
 
         # AMO is a documented Dhan /orders flag. Keep independent segment
         # switches and do not allow naked F&O order entry in other cases.
@@ -2485,11 +2742,9 @@ class DhanClient:
             if (order_req.order_type != OrderType.LIMIT
                     or str(getattr(order_req, "amo_time", "OPEN")).upper() != "OPEN"
                     or not str(order_req.security_id).strip()
-                    or int(order_req.quantity) <= 0 or float(order_req.price) <= 0):
+                    or _v_qty <= 0 or _v_price <= 0.0):
                 return False, None, "AMO BLOCKED: Requires positive LIMIT price/quantity, securityId and OPEN"
             if segment == "NSE_FNO":
-                # Our 15:25 trading gate closes before Dhan's 15:30 F&O
-                # AMO window begins. Refuse the 5-minute unsafe overlap.
                 now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
                 if (now_ist.weekday() < 5
                         and clock_time(9, 15) <= now_ist.time() < clock_time(15, 30)):
@@ -2503,7 +2758,71 @@ class DhanClient:
             )):
                 return False, None, f"AMO BLOCKED: Not an eligible closed-market session ({m_reason})"
 
-        corr_id = order_req.correlation_id[:30]
+        corr_id = str(getattr(order_req, "correlation_id", "") or "").strip()[:30]
+        if not corr_id:
+            return False, None, "MUTATION BLOCKED: MISSING_CORRELATION_ID"
+
+        _acct_id = str(self.cfg.dhan_client_id or "").strip()
+        _sec_id = str(order_req.security_id or "").strip()
+        _seg_str = str(order_req.exchange_segment or "").strip().upper()
+        _prod_str = str(order_req.product_type.value if hasattr(order_req.product_type, "value") else order_req.product_type).strip().upper()
+        _txn_str = str(order_req.transaction_type.value if hasattr(order_req.transaction_type, "value") else order_req.transaction_type).strip().upper()
+
+        url = f"{BASE_URL}/orders"
+        _wire_payload: Dict[str, Any] = {
+            "dhanClientId": self.cfg.dhan_client_id,
+            "correlationId": corr_id,
+            "transactionType": "BUY",
+            "exchangeSegment": order_req.exchange_segment,
+            "productType": _prod_str,
+            "orderType": "LIMIT" if _order_type_str != "MARKET" else "MARKET",
+            "validity": "DAY",
+            "securityId": _sec_id,
+            "quantity": _v_qty,
+            "price": _v_price,
+            "triggerPrice": _v_trig,
+            "disclosedQuantity": _v_disc,
+            "afterMarketOrder": is_amo,
+        }
+        if is_amo:
+            _wire_payload["amoTime"] = "OPEN"
+
+        # C62: Single authoritative immutable operation binding canonical auth & wire payload
+        _auth_op = AuthorizedBrokerOperation.build(
+            method="POST",
+            url=url,
+            account_id=_acct_id,
+            operation_type="PLACE_ORDER",
+            correlation_id=corr_id,
+            parent_order_id=str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+            canonical_fields={
+                "account_id": _acct_id,
+                "correlation_id": corr_id,
+                "security_id": _sec_id,
+                "exchange_segment": _seg_str,
+                "product_type": _prod_str,
+                "transaction_type": _txn_str,
+                "order_type": _order_type_str,
+                "quantity": _v_qty,
+                "price": _v_price,
+                "trigger_price": _v_trig,
+                "disclosed_quantity": _v_disc,
+                "is_amo": bool(is_amo),
+                "is_super_order": False,
+                "is_retry": bool(getattr(order_req, "is_retry", False)) or corr_id.startswith("RTRY-"),
+                "retry_parent_id": str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+                "retry_root_id": str(getattr(order_req, "retry_root_id", "") or "").strip(),
+            },
+            wire_payload=_wire_payload,
+        )
+
+        # C60: Single explicit authorization check (ZERO reduced-argument fallback)
+        _ok_rv, _rv_msg = self._invoke_live_entry_authorization(_auth_op, post_registration=False)
+        if not _ok_rv:
+            reason_msg = f"MUTATION BLOCKED: {_rv_msg}"
+            logger.critical(f"[GATE_CLOSED] {reason_msg}")
+            return False, None, reason_msg
+
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
@@ -2523,12 +2842,6 @@ class DhanClient:
             return False, None, reason_msg
         else:
             self.stop_manager.register_in_flight(corr_id)
-
-        if self.reconciliation_gate and not self.reconciliation_gate.is_accepting_entries:
-            self.stop_manager.deregister_in_flight(corr_id)
-            reason_msg = "MUTATION BLOCKED: Startup reconciliation gate is CLOSED (broker state unverified)"
-            logger.critical(f"[GATE_CLOSED] {reason_msg}")
-            return False, None, reason_msg
 
         if self.cfg.trading_mode == TradingMode.TEST:
             self.stop_manager.deregister_in_flight(corr_id)
@@ -2550,30 +2863,42 @@ class DhanClient:
                 self.stop_manager.deregister_in_flight(corr_id)
                 return False, None, f"MUTATION BLOCKED: Could not verify mode transition gate (failing closed): {e}"
 
-        url = f"{BASE_URL}/orders"
-        payload = {
-            "dhanClientId": self.cfg.dhan_client_id,
-            "correlationId": corr_id,
-            "transactionType": "BUY",
-            "exchangeSegment": order_req.exchange_segment,
-            "productType": order_req.product_type.value,
-            "orderType": "LIMIT",
-            "validity": "DAY",
-            "securityId": str(order_req.security_id),
-            "quantity": int(order_req.quantity),
-            "price": float(order_req.price),
-            "triggerPrice": 0.0,
-            "disclosedQuantity": 0,
-            "afterMarketOrder": is_amo,
-        }
-        if is_amo:
-            payload["amoTime"] = "OPEN"
+        # C41 + C44 + C51 + C60 + C62: Final post-registration & transport-admission authorization
+        def _final_transport_authorize() -> Tuple[bool, str]:
+            if self.stop_manager is not None:
+                try:
+                    if self.stop_manager.is_stopped() is True:
+                        return False, "EMERGENCY_STOP_ACTIVE: Durable emergency stop active at transport admission"
+                except Exception:
+                    return False, "EMERGENCY_STOP_UNVERIFIED: Could not verify emergency stop at transport admission"
+            return self._invoke_live_entry_authorization(_auth_op, post_registration=True)
+
+        _ok_pre_http, _msg_pre_http = _final_transport_authorize()
+        if not _ok_pre_http:
+            self.stop_manager.deregister_in_flight(corr_id)
+            reason_msg = f"MUTATION BLOCKED: {_msg_pre_http}"
+            logger.critical(f"[GATE_CLOSED_FINAL_INTERLOCK] {reason_msg}")
+            return False, None, reason_msg
 
         uncertain_outcome = False
         self.last_order_http_latency_ms = None
         t_order_start_ns = time.perf_counter_ns()
         try:
-            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.fn = _final_transport_authorize
+            self._pre_transport_auth_tls.op = _auth_op
+            try:
+                resp = self._broker_mutating_http(
+                    "POST",
+                    url,
+                    headers=self._headers(),
+                    json=_auth_op.wire_payload_copy(),
+                    timeout=5,
+                )
+            finally:
+                self._pre_transport_auth_tls.fn = None
+                self._pre_transport_auth_tls.op = None
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
@@ -2655,7 +2980,90 @@ class DhanClient:
         if order_req.transaction_type != TransactionType.BUY:
             return False, None, f"MUTATION BLOCKED: Direct {order_req.transaction_type} super orders are forbidden"
 
-        corr_id = order_req.correlation_id[:30]
+        # C58: Validate ALL raw numeric inputs BEFORE any int()/float() conversion
+        _ok_q, _v_qty, _msg_q = _validate_raw_strict_int(getattr(order_req, "quantity", None), "quantity", allow_zero=False)
+        if not _ok_q:
+            return False, None, f"MUTATION BLOCKED: {_msg_q}"
+        _ok_p, _v_price, _msg_p = _validate_raw_strict_number(getattr(order_req, "price", None), "price", allow_zero=False)
+        if not _ok_p:
+            return False, None, f"MUTATION BLOCKED: {_msg_p}"
+        _ok_sl, _v_sl, _msg_sl = _validate_raw_strict_number(stop_loss_price, "stop_loss_price", allow_zero=False)
+        if not _ok_sl:
+            return False, None, f"MUTATION BLOCKED: {_msg_sl}"
+        _ok_tg, _v_tg, _msg_tg = _validate_raw_strict_number(target_price, "target_price", allow_zero=False)
+        if not _ok_tg:
+            return False, None, f"MUTATION BLOCKED: {_msg_tg}"
+        _ok_tj, _v_tj, _msg_tj = _validate_raw_strict_number(trailing_jump, "trailing_jump", allow_zero=True)
+        if not _ok_tj:
+            return False, None, f"MUTATION BLOCKED: {_msg_tj}"
+        if _v_tg <= _v_sl:
+            return False, None, f"Invalid Super Order protection levels: SL={_v_sl}, Target={_v_tg}"
+
+        corr_id = str(getattr(order_req, "correlation_id", "") or "").strip()[:30]
+        if not corr_id:
+            return False, None, "MUTATION BLOCKED: MISSING_CORRELATION_ID"
+
+        _acct_id = str(self.cfg.dhan_client_id or "").strip()
+        _sec_id = str(order_req.security_id or "").strip()
+        _seg_str = str(order_req.exchange_segment or "").strip().upper()
+        _prod_str = str(order_req.product_type.value if hasattr(order_req.product_type, "value") else order_req.product_type).strip().upper()
+        _txn_str = str(order_req.transaction_type.value if hasattr(order_req.transaction_type, "value") else order_req.transaction_type).strip().upper()
+        _order_type_str = str(order_req.order_type.value if hasattr(order_req.order_type, "value") else order_req.order_type).strip().upper()
+
+        url = f"{BASE_URL}/super/orders"
+        _wire_payload: Dict[str, Any] = {
+            "dhanClientId": self.cfg.dhan_client_id,
+            "correlationId": corr_id,
+            "transactionType": "BUY",
+            "exchangeSegment": order_req.exchange_segment,
+            "productType": _prod_str,
+            "orderType": "LIMIT",
+            "securityId": _sec_id,
+            "quantity": _v_qty,
+            "price": _v_price,
+            "targetPrice": _v_tg,
+            "stopLossPrice": _v_sl,
+            "trailingJump": _v_tj,
+        }
+
+        _auth_op = AuthorizedBrokerOperation.build(
+            method="POST",
+            url=url,
+            account_id=_acct_id,
+            operation_type="PLACE_SUPER_ORDER",
+            correlation_id=corr_id,
+            parent_order_id=str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+            canonical_fields={
+                "account_id": _acct_id,
+                "correlation_id": corr_id,
+                "security_id": _sec_id,
+                "exchange_segment": _seg_str,
+                "product_type": _prod_str,
+                "transaction_type": _txn_str,
+                "order_type": _order_type_str,
+                "quantity": _v_qty,
+                "price": _v_price,
+                "is_amo": False,
+                "is_super_order": True,
+                "stop_loss_price": _v_sl,
+                "target_price": _v_tg,
+                "trailing_jump": _v_tj,
+                "max_sl_pct": float(getattr(self.cfg, "fno_sl_pct", 3.0) if "FNO" in _seg_str else getattr(self.cfg, "equity_sl_pct", 1.0)),
+                "max_target_pct": float(getattr(self.cfg, "fno_target_pct", 6.0) if "FNO" in _seg_str else getattr(self.cfg, "equity_target_pct", 2.0)),
+                "is_retry": bool(retry) or corr_id.startswith("RTRY-"),
+                "retry_parent_id": str(getattr(order_req, "retry_parent_id", "") or "").strip(),
+                "retry_root_id": str(getattr(order_req, "retry_root_id", "") or "").strip(),
+            },
+            wire_payload=_wire_payload,
+        )
+
+        # C60: Single explicit authorization check (ZERO reduced-argument fallback)
+        _ok_rv, _rv_msg = self._invoke_live_entry_authorization(_auth_op, post_registration=False)
+        if not _ok_rv:
+            reason_msg = f"MUTATION BLOCKED: {_rv_msg}"
+            logger.critical(f"[GATE_CLOSED] {reason_msg}")
+            return False, None, reason_msg
+
         if hasattr(self.stop_manager, "try_begin_mutation"):
             allowed, st = self.stop_manager.try_begin_mutation(corr_id)
             if not allowed:
@@ -2675,12 +3083,6 @@ class DhanClient:
             return False, None, reason_msg
         else:
             self.stop_manager.register_in_flight(corr_id)
-
-        if self.reconciliation_gate and not self.reconciliation_gate.is_accepting_entries:
-            self.stop_manager.deregister_in_flight(corr_id)
-            reason_msg = "MUTATION BLOCKED: Startup reconciliation gate is CLOSED (broker state unverified)"
-            logger.critical(f"[GATE_CLOSED] {reason_msg}")
-            return False, None, reason_msg
 
         if self.cfg.trading_mode == TradingMode.TEST:
             self.stop_manager.deregister_in_flight(corr_id)
@@ -2702,31 +3104,42 @@ class DhanClient:
                 self.stop_manager.deregister_in_flight(corr_id)
                 return False, None, f"MUTATION BLOCKED: Could not verify mode transition gate (failing closed): {e}"
 
-        if stop_loss_price <= 0 or target_price <= 0 or target_price <= stop_loss_price:
-            self.stop_manager.deregister_in_flight(corr_id)
-            return False, None, f"Invalid Super Order protection levels: SL={stop_loss_price}, Target={target_price}"
+        # C41 + C44 + C51 + C60 + C62: Final post-registration & transport-admission authorization
+        def _final_transport_authorize() -> Tuple[bool, str]:
+            if self.stop_manager is not None:
+                try:
+                    if self.stop_manager.is_stopped() is True:
+                        return False, "EMERGENCY_STOP_ACTIVE: Durable emergency stop active at transport admission"
+                except Exception:
+                    return False, "EMERGENCY_STOP_UNVERIFIED: Could not verify emergency stop at transport admission"
+            return self._invoke_live_entry_authorization(_auth_op, post_registration=True)
 
-        url = f"{BASE_URL}/super/orders"
-        payload = {
-            "dhanClientId": self.cfg.dhan_client_id,
-            "correlationId": corr_id,
-            "transactionType": "BUY",
-            "exchangeSegment": order_req.exchange_segment,
-            "productType": order_req.product_type.value,
-            "orderType": "LIMIT",
-            "securityId": str(order_req.security_id),
-            "quantity": int(order_req.quantity),
-            "price": float(order_req.price),
-            "targetPrice": float(target_price),
-            "stopLossPrice": float(stop_loss_price),
-            "trailingJump": float(trailing_jump),
-        }
+        _ok_pre_http, _msg_pre_http = _final_transport_authorize()
+        if not _ok_pre_http:
+            self.stop_manager.deregister_in_flight(corr_id)
+            reason_msg = f"MUTATION BLOCKED: {_msg_pre_http}"
+            logger.critical(f"[GATE_CLOSED_FINAL_INTERLOCK] {reason_msg}")
+            return False, None, reason_msg
 
         uncertain_outcome = False
         self.last_order_http_latency_ms = None
         t_order_start_ns = time.perf_counter_ns()
         try:
-            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.fn = _final_transport_authorize
+            self._pre_transport_auth_tls.op = _auth_op
+            try:
+                resp = self._broker_mutating_http(
+                    "POST",
+                    url,
+                    headers=self._headers(),
+                    json=_auth_op.wire_payload_copy(),
+                    timeout=5,
+                )
+            finally:
+                self._pre_transport_auth_tls.fn = None
+                self._pre_transport_auth_tls.op = None
             self.last_order_http_latency_ms = round(max(0.0, (time.perf_counter_ns() - t_order_start_ns) / 1_000_000.0), 3)
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
@@ -2793,28 +3206,52 @@ class DhanClient:
         """P0-04: Modifies a single Super Order leg (TARGET_LEG or STOP_LOSS_LEG) and returns structured outcome."""
         if self.cfg.trading_mode == TradingMode.TEST:
             return False, "SUPER ORDER MODIFY BLOCKED: System is in TEST mode", {"state": "REJECTED"}
+        _ok_mp, _v_mp, _msg_mp = _validate_raw_strict_number(price, "price", allow_zero=False)
+        if not _ok_mp:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_mp}", {"state": "REJECTED"}
+        _ok_mtj, _v_mtj, _msg_mtj = _validate_raw_strict_number(trailing_jump, "trailing_jump", allow_zero=True)
+        if not _ok_mtj:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_mtj}", {"state": "REJECTED"}
         leg_clean = str(leg_name or "").strip().upper()
         if leg_clean == "TARGET_LEG":
             body: Dict[str, Any] = {
                 "dhanClientId": self.cfg.dhan_client_id,
                 "orderId": str(order_id),
                 "legName": "TARGET_LEG",
-                "targetPrice": float(price),
+                "targetPrice": _v_mp,
             }
         elif leg_clean == "STOP_LOSS_LEG":
             body = {
                 "dhanClientId": self.cfg.dhan_client_id,
                 "orderId": str(order_id),
                 "legName": "STOP_LOSS_LEG",
-                "stopLossPrice": float(price),
-                "trailingJump": float(trailing_jump),
+                "stopLossPrice": _v_mp,
+                "trailingJump": _v_mtj,
             }
         else:
             return False, f"Unsupported Super Order leg '{leg_name}'", {"state": "REJECTED"}
 
         url = f"{BASE_URL}/super/orders/{order_id}"
+        _mod_op = AuthorizedBrokerOperation.build(
+            method="PUT",
+            url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type=f"MODIFY_SUPER_{leg_clean}",
+            correlation_id=str(order_id),
+            parent_order_id=str(order_id),
+            canonical_fields=body,
+            wire_payload=body,
+        )
         try:
-            resp = self._broker_mutating_http("PUT", url, headers=self._headers(), json=body, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _mod_op
+            try:
+                resp = self._broker_mutating_http(
+                    "PUT", url, headers=self._headers(), json=_mod_op.wire_payload_copy(), timeout=5
+                )
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 msg = f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
                 return False, msg, {"state": "DEFERRED", "status_code": resp.status_code,
@@ -2856,23 +3293,33 @@ class DhanClient:
         leg_outcomes: Dict[str, Dict[str, Any]] = {}
         self.last_super_leg_mod_results[str(order_id)] = leg_outcomes
 
+        _ok_psl, _v_psl, _msg_psl = _validate_raw_strict_number(stop_loss_price, "stop_loss_price", allow_zero=False)
+        if not _ok_psl:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_psl}"
+        _ok_ptg, _v_ptg, _msg_ptg = _validate_raw_strict_number(target_price, "target_price", allow_zero=False)
+        if not _ok_ptg:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_ptg}"
+        _ok_ptj, _v_ptj, _msg_ptj = _validate_raw_strict_number(trailing_jump, "trailing_jump", allow_zero=True)
+        if not _ok_ptj:
+            return False, f"SUPER ORDER MODIFY BLOCKED: {_msg_ptj}"
+
         if "TARGET_LEG" in requested_legs:
             ok_t, msg_t, info_t = self.modify_super_order_leg(
                 order_id=order_id,
                 leg_name="TARGET_LEG",
-                price=float(target_price),
+                price=_v_ptg,
             )
             leg_outcomes["TARGET_LEG"] = info_t
             if not ok_t:
-                leg_outcomes.setdefault("STOP_LOSS_LEG", {"state": "NOT_ATTEMPTED", "price": float(stop_loss_price)})
+                leg_outcomes.setdefault("STOP_LOSS_LEG", {"state": "NOT_ATTEMPTED", "price": _v_psl})
                 return False, msg_t
 
         if "STOP_LOSS_LEG" in requested_legs:
             ok_sl, msg_sl, info_sl = self.modify_super_order_leg(
                 order_id=order_id,
                 leg_name="STOP_LOSS_LEG",
-                price=float(stop_loss_price),
-                trailing_jump=float(trailing_jump),
+                price=_v_psl,
+                trailing_jump=_v_ptj,
             )
             leg_outcomes["STOP_LOSS_LEG"] = info_sl
             if not ok_sl:
@@ -2892,8 +3339,22 @@ class DhanClient:
             return True, f"TEST mode: simulated super order {leg_name} cancel accepted (HTTP 202)"
 
         url = f"{BASE_URL}/super/orders/{order_id_clean}/{leg_name}"
+        _del_op = AuthorizedBrokerOperation.build(
+            method="DELETE", url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="CANCEL_SUPER_ORDER_LEG",
+            correlation_id=order_id_clean, parent_order_id=order_id_clean,
+            canonical_fields={"order_id": order_id_clean, "leg_name": str(leg_name)},
+            wire_payload={},
+        )
         try:
-            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _del_op
+            try:
+                resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
@@ -2916,8 +3377,22 @@ class DhanClient:
             return True, "TEST mode: simulated cancel request accepted (HTTP 202)"
 
         url = f"{BASE_URL}/orders/{order_id_clean}"
+        _del_op = AuthorizedBrokerOperation.build(
+            method="DELETE", url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="CANCEL_ORDER",
+            correlation_id=order_id_clean, parent_order_id=order_id_clean,
+            canonical_fields={"order_id": order_id_clean},
+            wire_payload={},
+        )
         try:
-            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _del_op
+            try:
+                resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code == 202:
@@ -2953,24 +3428,42 @@ class DhanClient:
             logger.critical(f"[PROTECTION_REJECTED] {err}")
             return False, None, err
 
-        qty = int(levels.quantity)
-        if qty <= 0:
-            err = f"Forever OCO rejected: invalid quantity {qty} <= 0"
+        _ok_fq, qty, _msg_fq = _validate_raw_strict_int(getattr(levels, "quantity", None), "levels.quantity", allow_zero=False)
+        if not _ok_fq:
+            err = f"Forever OCO rejected: invalid quantity ({_msg_fq})"
             logger.error(f"[PROTECTION_REJECTED] {err}")
             return False, None, err
 
-        if max_protectable_qty is not None and qty > max_protectable_qty:
-            err = (
-                f"Forever OCO rejected: protective quantity ({qty}) exceeds confirmed net open position "
-                f"({max_protectable_qty}) — oversell blocked"
-            )
-            logger.critical(f"[PROTECTION_REJECTED] {err}")
-            return False, None, err
+        if max_protectable_qty is not None:
+            _ok_mq, _v_mq, _msg_mq = _validate_raw_strict_int(max_protectable_qty, "max_protectable_qty", allow_zero=True)
+            if not _ok_mq:
+                err = f"Forever OCO rejected: {_msg_mq}"
+                logger.error(f"[PROTECTION_REJECTED] {err}")
+                return False, None, err
+            if qty > _v_mq:
+                err = (
+                    f"Forever OCO rejected: protective quantity ({qty}) exceeds confirmed net open position "
+                    f"({_v_mq}) — oversell blocked"
+                )
+                logger.critical(f"[PROTECTION_REJECTED] {err}")
+                return False, None, err
 
-        sl_limit = float(levels.sl_limit)
-        sl_trigger = float(levels.sl_trigger)
-        target_price = float(levels.target_price)
-        target_trigger = float(getattr(levels, "target_trigger", None) or levels.target_price)
+        _ok_sll, sl_limit, _msg_sll = _validate_raw_strict_number(getattr(levels, "sl_limit", None), "levels.sl_limit", allow_zero=False)
+        if not _ok_sll:
+            return False, None, f"Forever OCO rejected: {_msg_sll}"
+        _ok_slt, sl_trigger, _msg_slt = _validate_raw_strict_number(getattr(levels, "sl_trigger", None), "levels.sl_trigger", allow_zero=False)
+        if not _ok_slt:
+            return False, None, f"Forever OCO rejected: {_msg_slt}"
+        _ok_tp, target_price, _msg_tp = _validate_raw_strict_number(getattr(levels, "target_price", None), "levels.target_price", allow_zero=False)
+        if not _ok_tp:
+            return False, None, f"Forever OCO rejected: {_msg_tp}"
+        _raw_tt = getattr(levels, "target_trigger", None)
+        if _raw_tt is None:
+            target_trigger = target_price
+        else:
+            _ok_tt, target_trigger, _msg_tt = _validate_raw_strict_number(_raw_tt, "levels.target_trigger", allow_zero=False)
+            if not _ok_tt:
+                return False, None, f"Forever OCO rejected: {_msg_tt}"
 
         if sl_limit <= 0 or sl_trigger <= 0 or target_price <= 0 or target_trigger <= 0:
             err = "Forever OCO rejected: all price and trigger fields must be > 0"
@@ -3024,8 +3517,25 @@ class DhanClient:
             "quantity1": qty,
         }
 
+        _oco_op = AuthorizedBrokerOperation.build(
+            method="POST",
+            url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="PLACE_FOREVER_OCO",
+            correlation_id=correlation_id[:30],
+            canonical_fields=payload,
+            wire_payload=payload,
+        )
         try:
-            resp = self._broker_mutating_http("POST", url, headers=self._headers(), json=payload, timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _oco_op
+            try:
+                resp = self._broker_mutating_http(
+                    "POST", url, headers=self._headers(), json=_oco_op.wire_payload_copy(), timeout=5
+                )
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, None, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 201):
@@ -3055,8 +3565,22 @@ class DhanClient:
         if self.cfg.trading_mode == TradingMode.TEST:
             return True, f"TEST mode: simulated Forever order cancel accepted (HTTP 202) for {oid_clean}"
         url = f"{BASE_URL}/forever/orders/{oid_clean}"
+        _del_op = AuthorizedBrokerOperation.build(
+            method="DELETE", url=url,
+            account_id=str(self.cfg.dhan_client_id or "").strip(),
+            operation_type="CANCEL_FOREVER_ORDER",
+            correlation_id=oid_clean, parent_order_id=oid_clean,
+            canonical_fields={"order_id": oid_clean},
+            wire_payload={},
+        )
         try:
-            resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            if not hasattr(self, "_pre_transport_auth_tls"):
+                self._pre_transport_auth_tls = threading.local()
+            self._pre_transport_auth_tls.op = _del_op
+            try:
+                resp = self._broker_mutating_http("DELETE", url, headers=self._headers(), timeout=5)
+            finally:
+                self._pre_transport_auth_tls.op = None
             if getattr(resp, "headers", {}).get("X-AuditBot-Local-Deferral") == "1":
                 return False, f"MUTATION NOT_SUBMITTED (local admission): {resp.text}"
             if resp.status_code in (200, 202):
@@ -3451,6 +3975,12 @@ class DhanClient:
         norm["_broker_attested_no_execution_id"] = missing_exchange_trade_id
         norm["exchangeOrderId"] = exchange_order_id
         norm["exchangeTime"] = exchange_time
+        if exchange_time and norm.get("traded_at") is None:
+            try:
+                from src.engine.unified_exit_reconciliation import _exchange_time as _parse_ex_ts
+                norm["traded_at"] = _parse_ex_ts(exchange_time)
+            except Exception:
+                pass
         norm["securityId"] = t_sec
         norm["exchangeSegment"] = t_seg
         norm["productType"] = t_prod

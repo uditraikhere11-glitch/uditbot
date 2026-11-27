@@ -26,6 +26,7 @@ def client(fno=True, equity=False, status="PENDING", oid="112111182198"):
     c.stop_manager.try_begin_mutation.return_value=(True,{})
     c.reconciliation_gate=MagicMock()
     c.reconciliation_gate.is_accepting_entries=True
+    c.reconciliation_gate.revalidate_for_transport_submission=lambda *, pending_correlation_id=None, post_registration=False, expected_order_payload=None: (True, 'ADMITTED') if c.reconciliation_gate.is_accepting_entries else (False, 'GATE_CLOSED')
     c._headers=MagicMock(return_value={})
     c.session=MagicMock()
     resp=c.session.post.return_value

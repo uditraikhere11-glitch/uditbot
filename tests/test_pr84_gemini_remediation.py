@@ -161,6 +161,28 @@ class ManualRiskGateRegression(WebUIRegression):
                 symbol="YESBANK", security_id="11915", quantity=1,
                 acknowledged_by="SYNTHETIC_OWNER", reason="Controlled test holding",
             )
+        # Phase 2D C06 (Approved Safety Improvement #1): LIVE broker unavailability MUST fail closed
+        # even when local journal has only owner-acknowledged settled holdings.
+        prior_ts = time.time() - 2 * 86400
+        from datetime import datetime as _dt
+        from src.engine.broker_session import IST as _IST
+        prior_iso = _dt.fromtimestamp(prior_ts, _IST).isoformat()
+        with db._get_conn() as conn:
+            for idx_r, (oid, cid) in enumerate(refs, 1):
+                conn.execute("UPDATE order_intents SET created_at=?, updated_at=? WHERE correlation_id=?", (prior_ts, prior_ts, cid))
+                conn.execute("UPDATE orders SET created_at=?, updated_at=? WHERE broker_order_id=?", (prior_ts, prior_ts, oid))
+        for idx_r, (oid, cid) in enumerate(refs, 1):
+            db.record_fill(
+                oid, f"EID-PR84-{idx_r}", "YESBANK", 15.6, 1, traded_at=prior_ts,
+                transaction_type="BUY", security_id="11915", exchange_segment="NSE_EQ",
+                product_type="CNC", parent_order_id=oid, is_verified_trade=True,
+            )
+            db.upsert_position_lifecycle(
+                parent_order_id=oid, account_id="FAKE_ACCOUNT", symbol="YESBANK", security_id="11915",
+                exchange_segment="NSE_EQ", product_type="CNC", protection_route="FOREVER_OCO",
+                position_state="UNPROTECTED_MANUAL_RISK", entry_qty=1, buy_filled_qty=1,
+                buy_vwap=15.6, protected_qty=0, confirmed_open_qty=1,
+            )
         tracker = ConfigChangeTracker(data_dir=str(db_path.parent))
         with patch.object(tracker, "get_readonly_broker", return_value=None):
             ok, reason, code, count = tracker.evaluate_trading_safety_gate_detailed(
@@ -168,16 +190,26 @@ class ManualRiskGateRegression(WebUIRegression):
                 env_path=str(self.path.resolve()), is_service_running=True,
                 is_live_mode=True, target_is_live=False,
             )
-        self.assertTrue(ok, (reason, code, count))
+        self.assertFalse(ok, "C06: LIVE broker unavailability must fail closed even with owner ACKs")
 
-        # Even with a broker adapter connected, manual-only settled holdings
-        # are not a reason to spend Dhan/ReadGovernor GET budget. Any unrelated
-        # outstanding order still forces authoritative broker reconciliation.
+        # With authoritative offline broker corroborating the exact 2-share YESBANK holding + prior fills,
+        # two exact owner-acknowledged filled holdings do NOT block safe stop.
         from unittest.mock import MagicMock
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
         broker = MagicMock()
-        broker.get_order_book.side_effect = AssertionError("No broker GET for acknowledged settled-only holdings")
-        broker.get_forever_orders.side_effect = AssertionError("No OCO GET for acknowledged settled-only holdings")
-        broker.get_super_orders.side_effect = AssertionError("No super-order GET for acknowledged settled-only holdings")
+        broker.get_order_book.return_value = []
+        broker.get_trade_book.return_value = []
+        broker.get_positions.return_value = []
+        broker.get_holdings.return_value = [
+            {"dhanClientId": "FAKE_ACCOUNT", "securityId": "11915", "isin": "INE528G01035", "tradingSymbol": "YESBANK-EQ", "totalQty": 2, "dpQty": 2, "t1Qty": 0}
+        ]
+        broker.get_forever_orders.return_value = []
+        broker.get_super_orders.return_value = []
+        broker.get_historical_trades.return_value = [
+            {"dhanClientId": "FAKE_ACCOUNT", "orderId": oid, "exchangeTradeId": f"EID-PR84-{idx_r}", "exchangeOrderId": f"EXO-{oid}", "securityId": "11915", "isin": "INE528G01035", "exchangeSegment": "NSE_EQ", "productType": "CNC", "transactionType": "BUY", "tradedQuantity": 1, "tradedPrice": 15.6, "exchangeTime": prior_iso}
+            for idx_r, (oid, _cid) in enumerate(refs, 1)
+        ]
+        attach_unified_live_evidence_to_stub_broker(broker, db_path=str(db_path), data_dir=str(db_path.parent), account_id="FAKE_ACCOUNT")
         with patch.object(tracker, "get_readonly_broker", return_value=broker):
             accepted, reason, code, count = tracker.evaluate_trading_safety_gate_detailed(
                 db_path=str(db_path), stop_state_path=str(db_path.parent / "emergency_stop.json"),
@@ -185,9 +217,6 @@ class ManualRiskGateRegression(WebUIRegression):
                 is_live_mode=True, target_is_live=False,
             )
         self.assertTrue(accepted, (reason, code, count))
-        broker.get_order_book.assert_not_called()
-        broker.get_forever_orders.assert_not_called()
-        broker.get_super_orders.assert_not_called()
 
         # Changing just one share's filled quantity invalidates the waiver,
         # and must fail closed rather than crediting another parent's ack.

@@ -71,7 +71,7 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
         )
         stop_mgr = EmergencyStopManager(self.stop_file, fail_closed_if_missing=True, expected_account_id="1113731536")
         self.assertTrue(stop_mgr.is_stopped())
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         req = OrderRequest(
             correlation_id="SAFE01-ORD-1",
@@ -119,7 +119,7 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
             dhan_access_token="mock_token",
             data_dir=self.data_dir,
         )
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         mock_post.side_effect = requests.exceptions.Timeout("Read timeout after POST sent")
         req1 = OrderRequest(
@@ -179,11 +179,20 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
     @patch("requests.Session.post")
     @patch.object(DhanClient, "_broker_mutating_http", new=mocked_order_transport)
     def test_journal_02_timeout_persists_unknown_not_rejected(self, mock_post, mock_get, _mock_mkt):
+        from tests._phase2d_live_harness import make_synthetic_jwt
+        _tok = make_synthetic_jwt("1113731536", expires_in_sec=3600.0)
+        _tok_path = os.path.join(self.data_dir, "dhan_access_token.txt")
+        with open(_tok_path, "w", encoding="utf-8") as _tf:
+            _tf.write(_tok)
+        os.chmod(_tok_path, 0o600)
+        with open(os.path.join(self.data_dir, "active_broker_mutations.json"), "w", encoding="utf-8") as _mf:
+            __import__('json').dump({"schema_version": 2, "account_id": "1113731536", "handoff_verified": True, "active": [], "unresolved": []}, _mf)
         cfg = AppConfig(
             trading_mode=TradingMode.LIVE,
             equity_active=True,
             dhan_client_id="1113731536",
-            dhan_access_token="mock_token",
+            dhan_access_token=_tok,
+            dhan_token_file=_tok_path,
             data_dir=self.data_dir,
             journal_db_path=self.db_path,
         )
@@ -191,17 +200,14 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
         pipeline.stop_manager.provision_initial_clean_state("Udit", "1113731536")
         pipeline.resolver.load_equity("SBIN", security_id="3045", exchange_segment="NSE_EQ")
 
+        from tests._phase2d_live_harness import make_http_response
         def _get_router(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.text = "{}"
-            if url.endswith("/profile"):
-                r.json.return_value = {"dhanClientId": cfg.dhan_client_id}
+            if str(url).endswith("/profile"):
+                return make_http_response(200, {"dhanClientId": cfg.dhan_client_id, "tokenValidity": "30/12/2099 23:59"})
             elif "/fundlimit" in str(url):
-                r.json.return_value = {"availabelBalance": 100000.0}
+                return make_http_response(200, {"availabelBalance": 100000.0})
             else:
-                r.json.return_value = []
-            return r
+                return make_http_response(200, [])
         mock_get.side_effect = _get_router
 
         rec_ok, _ = pipeline.reconciliation_gate.run_startup_reconciliation()
@@ -303,7 +309,7 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
             dhan_access_token="mock_token",
             data_dir=self.data_dir,
         )
-        client = DhanClient(cfg, stop_manager=stop_mgr)
+        client = DhanClient(cfg, stop_manager=stop_mgr, reconciliation_gate=_c60_admit_gate())
 
         levels = ProtectionLevels(
             executed_price=1000.0,
@@ -511,3 +517,10 @@ class Test11StepReworkProofMatrix(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _c60_admit_gate():
+    class _Gate:
+        is_accepting_entries = True
+        def revalidate_for_transport_submission(self, *, pending_correlation_id=None, post_registration=False, expected_order_payload=None):
+            return (True, 'ADMITTED')
+    return _Gate()

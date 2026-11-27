@@ -2770,24 +2770,29 @@ class ConfigChangeTracker:
         stop_state_path: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
         """
-        B12, F02-02, F03-01, F03-02 & F03-03:
-        Reconciles journal and watcher state against authoritative Dhan read-only broker state:
-        - F03-01: Maintains an authoritative `correlation_id / broker_order_id -> terminal status` mapping
-          (`reconciled_status_by_key`) and propagates the exact terminal status (`CANCELLED`, `REJECTED`,
-          `EXPIRED`, `TRADED`) to `order_intents`, `orders`, and `watcher_orders`, never substituting
-          `TRADED` for `CANCELLED`, `REJECTED`, or `EXPIRED`, while preserving partial-fill quantities independently.
-        - F03-02: Distinguishes `NEW_EMPTY_INSTALLATION`, `MISSING_JOURNAL`, `CORRUPTED_JOURNAL`, and
-          `INACCESSIBLE_JOURNAL`; requires authoritative Dhan reconciliation when a LIVE journal is missing
-          and never creates an empty DB merely to pass the gate.
-        - F03-03: Never accepts locally stored `watcher_orders.protected_qty` or local `protection_orders`
-          without live broker confirmation when reconciling unresolved LIVE orders or protective obligations;
-          fails closed (`BROKER_RECONCILIATION_FAILED`) when read-only broker data is unavailable.
+        Phase 2D Unified Reconciliation Entrypoint (replaces legacy 932-line duplicate body):
+        - F03-02: Classifies journal state (`NEW_EMPTY_INSTALLATION`, `MISSING_JOURNAL`,
+          `CORRUPTED_JOURNAL`, `INACCESSIBLE_JOURNAL`) and fails closed on unreadable DBs.
+        - F03-01: Applies atomic verified terminal order repairs (`CANCELLED`, `REJECTED`,
+          `EXPIRED`, `TRADED`) via `apply_verified_terminal_order_repair()` with zero
+          synthetic `-RECON-FILL-` fabrication and rollback on any broker/SQLite error.
+        - Unified Account Verification: Delegates protection, exposure, closed-parent, and
+          settled-session verification to `UnifiedAccountRuntime` (`BrokerLedgerReconciler`)
+          preserving all three approved safety improvements (blocking unmatched broker
+          exposure, blocking unverified historical closures, and permitting verified
+          closed-sibling + retained owner-acknowledged lots).
         """
         resolved_broker = self.get_readonly_broker(explicit_broker=broker, env_path=env_path)
         valid_live_broker = None
         if resolved_broker is not None:
             broker_cfg = getattr(resolved_broker, "cfg", None)
-            broker_mode = str(getattr(getattr(broker_cfg, "trading_mode", None), "value", getattr(broker_cfg, "trading_mode", "LIVE"))).upper()
+            broker_mode = str(
+                getattr(
+                    getattr(broker_cfg, "trading_mode", None),
+                    "value",
+                    getattr(broker_cfg, "trading_mode", "LIVE"),
+                )
+            ).upper()
             is_real_dhan_test = (
                 type(resolved_broker).__name__ == "DhanClient"
                 and broker_mode == "TEST"
@@ -2814,873 +2819,54 @@ class ConfigChangeTracker:
                 j_detail=j_detail,
             )
 
+        from src.config import parse_env_dict
+        current_account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip()
+        if not current_account_id and valid_live_broker is not None:
+            current_account_id = str(
+                getattr(getattr(valid_live_broker, "cfg", None), "dhan_client_id", "") or ""
+            ).strip()
+
+        # 1. Inspect DB for pending/unreconciled intents or orders and verify SQLite readability.
         con = None
         cur = None
+        has_pending_or_active_rows = False
+        pending_keys: List[Tuple[str, str]] = []
         try:
             con = sqlite3.connect(db_path, timeout=5.0)
             con.row_factory = sqlite3.Row
             cur = con.cursor()
-
-            # F-02: Manual-risk acknowledgement is narrowly tied to a single
-            # terminal filled parent order. It is never a generic protection
-            # waiver, and it must not suppress pending entries or broker errors.
-            from src.config import parse_env_dict
-            current_account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip()
-            manual_risk_by_parent: Dict[str, Dict[str, Any]] = {}
-            try:
-                for row in cur.execute(
-                    "SELECT parent_order_id, correlation_id, account_id, "
-                    "security_id, quantity, status, acknowledged_at "
-                    "FROM manual_risk_acknowledgements"
-                ).fetchall():
-                    item = dict(row)
-                    parent = str(item.get("parent_order_id") or "").strip()
-                    if parent and str(item.get("status") or "").upper() == "UNPROTECTED_MANUAL_RISK":
-                        manual_risk_by_parent[parent] = item
-            except sqlite3.OperationalError:
-                # Older journals without the acknowledgement table remain
-                # subject to ordinary verified-protection requirements.
-                pass
-
-            def _owner_accepted_manual_risk(
-                parent_order_id: str, correlation_id: str, security_id: str,
-                filled_qty: int, state: str,
-            ) -> bool:
-                # Only an already terminal, fully filled parent can be
-                # assigned to manual monitoring; never pending/partial orders.
-                if str(state or "").upper() != "TRADED":
-                    return False
-                parent = str(parent_order_id or "").strip()
-                ack = manual_risk_by_parent.get(parent)
-                if not ack or not current_account_id or int(filled_qty or 0) <= 0:
-                    return False
-                if str(ack.get("account_id") or "").strip() != current_account_id:
-                    return False
-                if str(ack.get("security_id") or "").strip() != str(security_id or "").strip():
-                    return False
-                cid = str(correlation_id or "").strip()
-                if cid and str(ack.get("correlation_id") or "").strip() != cid:
-                    return False
-                try:
-                    return (int(ack.get("quantity") or 0) >= int(filled_qty)
-                            and float(ack.get("acknowledged_at") or 0) > 0)
-                except (TypeError, ValueError):
-                    return False
-
-            # 1. Load watcher_orders map (by order_id and correlation_id)
-            watcher_map: Dict[str, Dict[str, Any]] = {}
-            all_watcher_records: List[Dict[str, Any]] = []
-            try:
-                w_rows = cur.execute("SELECT order_id, is_terminal, record_json FROM watcher_orders").fetchall()
-                for wr in w_rows:
-                    try:
-                        w_data = json.loads(wr["record_json"] or "{}")
-                        w_data["_is_terminal_col"] = bool(wr["is_terminal"])
-                        w_oid = str(wr["order_id"] or "").strip()
-                        w_cid = str(w_data.get("correlation_id") or "").strip()
-                        w_data.setdefault("order_id", w_oid)
-                        if w_oid:
-                            watcher_map[w_oid] = w_data
-                        if w_cid and w_cid not in watcher_map:
-                            watcher_map[w_cid] = w_data
-                        all_watcher_records.append(w_data)
-                    except Exception:
-                        pass
-            except sqlite3.OperationalError:
-                pass
-
-            # 2. Load durable parent -> protection_orders mappings
-            prot_orders_by_parent: Dict[str, List[Dict[str, Any]]] = {}
-            all_active_prot_orders: List[Dict[str, Any]] = []
-            try:
-                p_rows = cur.execute(
-                    "SELECT parent_order_id, forever_order_id, symbol, quantity, status FROM protection_orders"
+            tables = {
+                r[0]
+                for r in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
-                for pr in p_rows:
-                    p_dict = dict(pr)
-                    pid = str(p_dict.get("parent_order_id") or "").strip()
-                    st = str(p_dict.get("status") or "").strip().upper()
-                    if pid and st in ("ACTIVE", "ACTIVE_CONFIRMED", "TRADED"):
-                        prot_orders_by_parent.setdefault(pid, []).append(p_dict)
-                        all_active_prot_orders.append(p_dict)
-            except sqlite3.OperationalError:
-                pass
-
-            # 3. Load durable parent -> protection_attempts mappings
-            prot_attempts_by_parent: Dict[str, List[Dict[str, Any]]] = {}
-            attempt_corr_to_parent: Dict[str, str] = {}
-            has_unresolved_prot_attempts = False
-            try:
-                pa_cols = [c[1] for c in cur.execute("PRAGMA table_info(protection_attempts)").fetchall()]
-                if pa_cols:
-                    pa_rows = cur.execute("SELECT * FROM protection_attempts").fetchall()
-                    for par in pa_rows:
-                        pa_dict = dict(par)
-                        pid = str(pa_dict.get("parent_order_id") or "").strip()
-                        acid = str(pa_dict.get("correlation_id") or "").strip()
-                        st_pa = str(pa_dict.get("state") or "").strip().upper()
-                        if st_pa in ("SUBMITTING", "UNKNOWN", "ACKED_UNVERIFIED"):
-                            has_unresolved_prot_attempts = True
-                        if pid:
-                            prot_attempts_by_parent.setdefault(pid, []).append(pa_dict)
-                            if acid:
-                                attempt_corr_to_parent[acid] = pid
-            except sqlite3.OperationalError:
-                pass
-
-            # 4. Load non-terminal intents and orders, plus all tracked orders for protection verification
-            non_term_intents = []
-            all_intents_by_id: Dict[str, Dict[str, Any]] = {}
-            try:
-                i_rows = cur.execute("SELECT * FROM order_intents").fetchall()
-                for ir in i_rows:
-                    idict = dict(ir)
-                    cid = str(idict.get("correlation_id") or "").strip()
-                    boid = str(idict.get("broker_order_id") or "").strip()
-                    if cid:
-                        all_intents_by_id[cid] = idict
-                    if boid:
-                        all_intents_by_id[boid] = idict
-                    if str(idict.get("state") or "").upper() in (
-                        "INTENT_CREATED", "SUBMITTING", "UNKNOWN", "ACKED", "PENDING",
-                        "TRANSIT", "TRIGGERED", "PART_FILLED", "PART_TRADED",
-                        "CANCEL_REQUESTED", "CANCEL_PENDING",
-                    ):
-                        non_term_intents.append(ir)
-            except sqlite3.OperationalError:
-                pass
-
-            non_term_orders = []
-            all_orders_list: List[Dict[str, Any]] = []
-            has_filled_live_orders = False
-            o_col_names: Set[str] = set()
-            try:
-                o_col_names = {c[1] for c in cur.execute("PRAGMA table_info(orders)").fetchall()}
-                if o_col_names:
-                    if "filled_quantity" not in o_col_names:
-                        try:
-                            cur.execute("ALTER TABLE orders ADD COLUMN filled_quantity INTEGER DEFAULT 0")
-                            o_col_names.add("filled_quantity")
-                        except sqlite3.OperationalError:
-                            pass
-                    o_rows = cur.execute("SELECT * FROM orders").fetchall()
-                    for orow in o_rows:
-                        odict = dict(orow)
-                        all_orders_list.append(odict)
-                        o_st = str(odict.get("status") or "").upper()
-                        o_mode = str(odict.get("trading_mode") or "LIVE").upper()
-                        if o_st in (
-                            "PENDING", "TRIGGERED", "TRANSIT", "PART_TRADED", "PART_FILLED",
-                            "ACKED", "CANCEL_PENDING", "CANCEL_REQUESTED", "UNKNOWN",
-                        ):
-                            non_term_orders.append(orow)
-                        if o_mode == "LIVE" and (o_st == "TRADED" or int(odict.get("filled_quantity") or 0) > 0):
-                            o_filled = int(odict.get("filled_quantity") or odict.get("quantity") or 0)
-                            if not _owner_accepted_manual_risk(
-                                odict.get("broker_order_id"), odict.get("correlation_id"),
-                                odict.get("security_id"), o_filled, o_st,
-                            ):
-                                has_filled_live_orders = True
-            except sqlite3.OperationalError:
-                pass
-
-            has_watcher_protective_obligations = any(
-                (
-                    int(w.get("filled_qty") or 0) > 0
-                    or int(w.get("protected_qty") or 0) > 0
-                    or bool(w.get("_is_terminal_col"))
-                )
-                and not (
-                    _owner_accepted_manual_risk(
-                        w.get("order_id"), w.get("correlation_id"),
-                        w.get("security_id"), int(w.get("filled_qty") or 0),
-                        w.get("state"),
-                    )
-                    and not w.get("pending_oco")
-                    and not w.get("retry_reserved")
-                    and not w.get("retry_eligible")
-                )
-                for w in all_watcher_records
-            )
-
-            # An owner-acknowledged terminal filled parent remains explicitly
-            # visible to monitoring, but is NOT an unresolved broker mutation.
-            # Avoid consuming Dhan ReadGovernor budget for only those settled
-            # test holdings; still verify all other watcher/protection activity.
-            actionable_watcher_records = [
-                w for w in all_watcher_records
-                if not (
-                    _owner_accepted_manual_risk(
-                        w.get("order_id"), w.get("correlation_id"),
-                        w.get("security_id"), int(w.get("filled_qty") or 0),
-                        w.get("state"),
-                    )
-                    and not w.get("pending_oco")
-                    and not w.get("retry_reserved")
-                    and not w.get("retry_eligible")
-                )
-            ]
-            # F03-03 Requirement 8: no broker GET for independently verified
-            # idle state, including narrowly acknowledged manual-risk holdings.
-            has_any_activity = bool(
-                non_term_intents
-                or non_term_orders
-                or actionable_watcher_records
-                or all_active_prot_orders
-                or has_filled_live_orders
-                or has_unresolved_prot_attempts
-            )
-            if not has_any_activity:
-                con.close()
-                return True, None
-
-            # F03-03 Requirements 1, 2 & 3:
-            # Whenever protective obligations, filled LIVE orders, or watcher-claimed fills/completions exist,
-            # authoritative Dhan read-only broker verification is MANDATORY. Never accept local watcher
-            # `protected_qty` or local `protection_orders` status without broker confirmation!
-            requires_authoritative_broker = bool(
-                has_watcher_protective_obligations
-                or all_active_prot_orders
-                or has_filled_live_orders
-            )
-            if requires_authoritative_broker and valid_live_broker is None:
-                con.close()
-                return (
-                    False,
-                    "BROKER_RECONCILIATION_FAILED: Authoritative Dhan read-only broker verification is unavailable "
-                    "to confirm LIVE order and protection status.",
-                )
-
-            order_book_by_id: Dict[str, Dict[str, Any]] = {}
-            order_book_by_corr: Dict[str, Dict[str, Any]] = {}
-            fo_groups: Dict[str, List[Dict[str, Any]]] = {}
-            so_by_id: Dict[str, Dict[str, Any]] = {}
-            so_by_corr: Dict[str, Dict[str, Any]] = {}
-            fo_book_loaded = False
-            so_book_loaded = False
-
-            if valid_live_broker is not None:
-                from src.models import BrokerReadFailure
-                if hasattr(valid_live_broker, "get_order_book"):
-                    try:
-                        ob_res = valid_live_broker.get_order_book()
-                        if isinstance(ob_res, BrokerReadFailure) or getattr(ob_res, "ok", True) is False:
-                            con.close()
-                            err_str = getattr(ob_res, "error", "Broker order_book read failed")
-                            return False, f"BROKER_RECONCILIATION_FAILED: Broker status unavailable while checking outstanding LIVE orders ({err_str})"
-                        if isinstance(ob_res, list):
-                            for item in ob_res:
-                                if isinstance(item, dict):
-                                    oid = str(item.get("orderId") or "").strip()
-                                    cid = str(item.get("correlationId") or "").strip()
-                                    if oid:
-                                        order_book_by_id[oid] = item
-                                    if cid:
-                                        order_book_by_corr[cid] = item
-                        elif requires_authoritative_broker:
-                            con.close()
-                            return False, "BROKER_RECONCILIATION_FAILED: Broker order_book did not return a verified list."
-                    except Exception as e:
-                        con.close()
-                        return False, f"BROKER_RECONCILIATION_FAILED: Broker unreachable while checking outstanding LIVE orders: {e}"
-
-                if hasattr(valid_live_broker, "get_forever_orders"):
-                    try:
-                        fo_res = valid_live_broker.get_forever_orders()
-                        if isinstance(fo_res, BrokerReadFailure) or getattr(fo_res, "ok", True) is False:
-                            con.close()
-                            err_str = getattr(fo_res, "error", "Broker forever_orders read failed")
-                            return False, f"BROKER_RECONCILIATION_FAILED: Broker Forever OCO status unavailable ({err_str})"
-                        if isinstance(fo_res, list):
-                            fo_book_loaded = True
-                            for r_fo in fo_res:
-                                if isinstance(r_fo, dict) and str(r_fo.get("orderId") or "").strip():
-                                    fo_groups.setdefault(str(r_fo["orderId"]).strip(), []).append(r_fo)
-                    except Exception as e:
-                        con.close()
-                        return False, f"BROKER_RECONCILIATION_FAILED: Broker unreachable while checking Forever OCO orders: {e}"
-
-                if hasattr(valid_live_broker, "get_super_orders"):
-                    try:
-                        so_res = valid_live_broker.get_super_orders()
-                        if isinstance(so_res, BrokerReadFailure) or getattr(so_res, "ok", True) is False:
-                            con.close()
-                            err_str = getattr(so_res, "error", "Broker super_orders read failed")
-                            return False, f"BROKER_RECONCILIATION_FAILED: Broker Super Order status unavailable ({err_str})"
-                        if isinstance(so_res, list):
-                            so_book_loaded = True
-                            for r_so in so_res:
-                                if isinstance(r_so, dict):
-                                    s_oid = str(r_so.get("orderId") or "").strip()
-                                    s_cid = str(r_so.get("correlationId") or "").strip()
-                                    if s_oid:
-                                        so_by_id[s_oid] = r_so
-                                    if s_cid:
-                                        so_by_corr[s_cid] = r_so
-                    except Exception as e:
-                        con.close()
-                        return False, f"BROKER_RECONCILIATION_FAILED: Broker unreachable while checking Super Orders: {e}"
-
-            # F02-02 & F03-03: Track claimed protection IDs -> owner parent_keys across the entire pass so no OCO/Super order
-            # is ever credited to more than one parent entry or double-counted!
-            claimed_protection_owners: Dict[str, Set[str]] = {}
-
-            # Build global map of forever_order_id -> durable parent_order_id so we know if an OCO belongs to ANOTHER parent
-            durable_fo_to_parent: Dict[str, str] = {}
-            for p_key, plist in prot_orders_by_parent.items():
-                for pitem in plist:
-                    foid = str(pitem.get("forever_order_id") or "").strip()
-                    if foid:
-                        durable_fo_to_parent[foid] = p_key
-            for p_key, palist in prot_attempts_by_parent.items():
-                for paitem in palist:
-                    foid = str(paitem.get("broker_protection_id") or paitem.get("broker_order_id") or "").strip()
-                    if foid:
-                        durable_fo_to_parent[foid] = p_key
-
-            def _compute_verified_protection_qty(
-                corr_id: str,
-                b_oid: str,
-                sec_id: str,
-                exch_seg: str,
-                prod_type: str,
-                required_qty: int,
-            ) -> Tuple[int, Optional[str]]:
-                """
-                F02-02 & F03-03: Computes the strictly verified, parent-linked protected quantity for a single entry order
-                using ONLY authoritative live Dhan read-only APIs (`fo_groups` / `so_by_id`).
-                Never accepts locally stored `protected_qty` or unverified local `protection_orders` rows!
-                Returns `(verified_qty, broker_error_or_none)`.
-                """
-                parent_keys = {k for k in (b_oid, corr_id) if k}
-                if not parent_keys or required_qty <= 0:
-                    return 0, None
-
-                if valid_live_broker is None:
-                    return 0, "BROKER_RECONCILIATION_FAILED: Read-only Dhan broker adapter is unavailable to verify protective legs."
-
-                w_rec = watcher_map.get(b_oid) or watcher_map.get(corr_id)
-                if w_rec:
-                    w_oid = str(w_rec.get("order_id") or "").strip()
-                    w_cid = str(w_rec.get("correlation_id") or "").strip()
-                    if w_oid:
-                        parent_keys.add(w_oid)
-                    if w_cid:
-                        parent_keys.add(w_cid)
-
-                linked_fo_ids: List[str] = []
-                linked_so_ids: List[str] = []
-
-                for pk in parent_keys:
-                    for p_row in prot_orders_by_parent.get(pk, []):
-                        foid = str(p_row.get("forever_order_id") or "").strip()
-                        if foid and foid not in linked_fo_ids:
-                            linked_fo_ids.append(foid)
-                    for pa_row in prot_attempts_by_parent.get(pk, []):
-                        st_pa = str(pa_row.get("state") or "").upper()
-                        if st_pa == "CONFIRMED":
-                            bpid = str(pa_row.get("broker_protection_id") or pa_row.get("broker_order_id") or "").strip()
-                            route_pa = str(pa_row.get("route") or "").upper()
-                            if bpid:
-                                if "SUPER" in route_pa:
-                                    if bpid not in linked_so_ids:
-                                        linked_so_ids.append(bpid)
-                                else:
-                                    if bpid not in linked_fo_ids:
-                                        linked_fo_ids.append(bpid)
-
-                if w_rec:
-                    for wk in ("forever_order_id", "protection_order_id", "oco_order_id"):
-                        w_foid = str(w_rec.get(wk) or "").strip()
-                        if w_foid and w_foid not in linked_fo_ids:
-                            linked_fo_ids.append(w_foid)
-                    for w_foid in (w_rec.get("confirmed_protection_ids") or []):
-                        w_foid_s = str(w_foid or "").strip()
-                        if w_foid_s and w_foid_s not in linked_fo_ids:
-                            linked_fo_ids.append(w_foid_s)
-
-                for gid, grp in fo_groups.items():
-                    if gid in linked_fo_ids:
-                        continue
-                    leg_parents = {
-                        str(leg.get(k) or "").strip()
-                        for leg in grp
-                        for k in ("parentOrderId", "entryOrderId", "parent_order_id")
-                        if str(leg.get(k) or "").strip()
-                    }
-                    leg_corrs = {
-                        str(leg.get("correlationId") or "").strip()
-                        for leg in grp
-                        if str(leg.get("correlationId") or "").strip()
-                    }
-                    mapped_parents = {attempt_corr_to_parent[c] for c in leg_corrs if c in attempt_corr_to_parent}
-                    if leg_parents:
-                        if leg_parents & parent_keys:
-                            linked_fo_ids.append(gid)
-                    elif (leg_corrs & parent_keys) or (mapped_parents & parent_keys):
-                        linked_fo_ids.append(gid)
-
-                for pk in parent_keys:
-                    if pk in so_by_id and pk not in linked_so_ids:
-                        linked_so_ids.append(pk)
-                    if pk in so_by_corr:
-                        s_oid = str(so_by_corr[pk].get("orderId") or "").strip()
-                        if s_oid and s_oid not in linked_so_ids:
-                            linked_so_ids.append(s_oid)
-
-                prod_up = str(prod_type or "CNC").strip().upper()
-                is_super_hint = bool(linked_so_ids) or bool((w_rec or {}).get("is_super_order")) or (str((w_rec or {}).get("protection_route") or "").upper() == "SUPER_ORDER")
-                if (prod_up == "MARGIN" or is_super_hint) and not so_book_loaded and not fo_book_loaded:
-                    return 0, "BROKER_RECONCILIATION_FAILED: Broker Super Order book unavailable to confirm protective legs."
-                if prod_up != "MARGIN" and not is_super_hint and not fo_book_loaded and not so_book_loaded:
-                    return 0, "BROKER_RECONCILIATION_FAILED: Broker Forever OCO book unavailable to confirm protective legs."
-
-                total_verified = 0
-                local_seen_ids: Set[str] = set()
-                from src.broker.dhan_client import verify_forever_oco_group, verify_super_order_record
-
-                # 1. Verify linked Forever OCO groups on live broker
-                if fo_book_loaded:
-                    for gid in linked_fo_ids:
-                        if gid in local_seen_ids:
-                            continue
-                        existing_owners = claimed_protection_owners.get(gid)
-                        if existing_owners and not (existing_owners & parent_keys):
-                            continue
-                        owner_parent = durable_fo_to_parent.get(gid)
-                        if owner_parent and owner_parent not in parent_keys:
-                            continue
-                        grp = fo_groups.get(gid)
-                        if not grp:
-                            continue
-                        leg_parents = {
-                            str(leg.get(k) or "").strip()
-                            for leg in grp
-                            for k in ("parentOrderId", "entryOrderId", "parent_order_id")
-                            if str(leg.get(k) or "").strip()
-                        }
-                        if leg_parents and not (leg_parents & parent_keys):
-                            continue
-                        ver = verify_forever_oco_group(
-                            grp,
-                            gid,
-                            expected_security_id=sec_id or None,
-                            expected_segment=exch_seg or None,
-                            expected_product_type=prod_type or None,
+            }
+            if "order_intents" in tables:
+                for row in cur.execute(
+                    "SELECT correlation_id, broker_order_id, state AS status FROM order_intents"
+                ).fetchall():
+                    st = str(row["status"] or "").upper()
+                    if st not in ("FILLED", "TRADED", "CANCELLED", "REJECTED", "EXPIRED", "CLOSED"):
+                        has_pending_or_active_rows = True
+                        pending_keys.append(
+                            (str(row["correlation_id"] or ""), str(row["broker_order_id"] or ""))
                         )
-                        if ver.is_verified and ver.protected_quantity > 0:
-                            local_seen_ids.add(gid)
-                            claimed_protection_owners.setdefault(gid, set()).update(parent_keys)
-                            total_verified += int(ver.protected_quantity)
-
-                # 2. Verify linked Super Orders on live broker
-                if so_book_loaded:
-                    for so_id in linked_so_ids:
-                        if so_id in local_seen_ids:
-                            continue
-                        existing_owners = claimed_protection_owners.get(so_id)
-                        if existing_owners and not (existing_owners & parent_keys):
-                            continue
-                        owner_parent = durable_fo_to_parent.get(so_id)
-                        if owner_parent and owner_parent not in parent_keys:
-                            continue
-                        r_so = so_by_id.get(so_id)
-                        if not r_so:
-                            continue
-                        ver = verify_super_order_record(
-                            r_so,
-                            so_id,
-                            expected_security_id=sec_id or None,
-                            expected_segment=exch_seg or None,
-                            expected_product_type=prod_type or None,
+            if "orders" in tables:
+                for row in cur.execute(
+                    "SELECT correlation_id, broker_order_id, status FROM orders"
+                ).fetchall():
+                    st = str(row["status"] or "").upper()
+                    if st not in ("FILLED", "TRADED", "CANCELLED", "REJECTED", "EXPIRED", "CLOSED"):
+                        has_pending_or_active_rows = True
+                        pending_keys.append(
+                            (str(row["correlation_id"] or ""), str(row["broker_order_id"] or ""))
                         )
-                        if ver.is_verified and ver.protected_quantity > 0:
-                            local_seen_ids.add(so_id)
-                            claimed_protection_owners.setdefault(so_id, set()).update(parent_keys)
-                            total_verified += int(ver.protected_quantity)
-
-                return total_verified, None
-
-            broker_Fatal_err: List[str] = []
-            # One broker-authoritative closure proof per parent per preflight.
-            closed_parent_proofs: Dict[Tuple[str, int, str], bool] = {}
-
-            def _flat_closed_fill(corr_id: str, b_oid: str, filled: int, sec_id: str = "") -> bool:
-                """Verify genuine closure and durably retire ONLY that closed parent's stale gate."""
-                # Do not demand active SL/target protection for an already closed
-                # verified prior-day delivery parent. The common signed-CNC
-                # reconciler validates T+0 negative netQty and the journal helper
-                # requires zero current broker exposure on subsequent sessions.
-                close_key = (str(b_oid or ""), int(filled), str(sec_id or ""))
-                if close_key not in closed_parent_proofs:
-                    try:
-                        from src.engine.closed_parent_safety import verified_closed_delivery_parent
-                        closed_parent_proofs[close_key] = verified_closed_delivery_parent(
-                            db_path=db_path, account=current_account_id,
-                            parent_id=close_key[0], required_qty=close_key[1],
-                            security_id=close_key[2], broker=valid_live_broker,
-                            orders=list(order_book_by_id.values()),
-                            forever=[leg for group in fo_groups.values() for leg in group],
-                            super_orders=list(so_by_id.values()),
-                        )
-                    except Exception as exc:
-                        logger.warning("Closed parent safety inspection unavailable: %s",
-                                       type(exc).__name__)
-                        closed_parent_proofs[close_key] = False
-                if closed_parent_proofs[close_key]:
-                    return True
-                entry = order_book_by_id.get(b_oid) or order_book_by_corr.get(corr_id)
-                watcher = watcher_map.get(b_oid) or watcher_map.get(corr_id)
-                previously_verified = False
-                if not isinstance(entry, dict):
-                    # Dhan's /orders and /trades contain today's orders only.
-                    # Reuse a durable, earlier broker proof of the parent fill,
-                    # but RECHECK current positions/holdings/orders on every pass.
-                    proof = (watcher or {}).get("broker_flat_proof") or {}
-                    if not isinstance(proof, dict):
-                        return False
-                    try:
-                        proof_oid = str(proof.get("order_id") or "").strip()
-                        proof_sec = str(proof.get("security_id") or "").strip()
-                        proof_seg = str(proof.get("exchange_segment") or "").strip()
-                        proof_filled = int(proof.get("filled_qty") or 0)
-                        proof_time = float(proof.get("verified_at") or 0)
-                    except (TypeError, ValueError, OverflowError):
-                        return False
-                    if (not proof_oid or not proof_sec or not proof_seg
-                            or proof_filled < filled or proof_time <= 0
-                            or (b_oid and b_oid != corr_id and b_oid != proof_oid)
-                            or (sec_id and sec_id != proof_sec)):
-                        return False
-                    entry = {
-                        "orderId": proof_oid, "securityId": proof_sec,
-                        "exchangeSegment": proof_seg, "transactionType": "BUY",
-                        "orderStatus": "TRADED", "filledQty": proof_filled,
-                    }
-                    previously_verified = True
-                actual_oid = str(entry.get("orderId") or "").strip()
-                actual_sec = str(entry.get("securityId") or "").strip()
-                if (not actual_oid or (b_oid and b_oid != corr_id and b_oid != actual_oid)
-                        or (sec_id and sec_id != actual_sec)
-                        or has_unresolved_prot_attempts):
-                    return False
-                if watcher and (watcher.get("pending_oco") or watcher.get("retry_reserved")
-                                or watcher.get("retry_eligible")):
-                    return False
-                fo_rows = [leg for group in fo_groups.values() for leg in group]
-                if not self._broker_proves_filled_buy_is_closed(
-                    valid_live_broker, entry, filled,
-                    list(order_book_by_id.values()), fo_rows, list(so_by_id.values()),
-                    previously_verified=previously_verified,
-                ):
-                    return False
-                # Never invent protection credit. The historical fill remains TRADED,
-                # with its true protected quantity, but no longer represents risk.
-                w_rec = watcher_map.get(actual_oid) or watcher
-                if w_rec:
-                    w_rec["broker_flat_verified_at"] = now_ts
-                    w_rec["broker_flat_proof"] = {
-                        "order_id": actual_oid,
-                        "security_id": actual_sec,
-                        "exchange_segment": str(entry.get("exchangeSegment") or "").strip().upper(),
-                        "filled_qty": int(filled),
-                        "verified_at": now_ts,
-                    }
-                    w_rec["_is_terminal_col"] = True
-                    stored_w = {k: v for k, v in w_rec.items() if k != "_is_terminal_col"}
-                    cur.execute(
-                        "UPDATE watcher_orders SET is_terminal = 1, record_json = ?, updated_at = ? WHERE order_id = ?",
-                        (json.dumps(stored_w), now_ts, str(w_rec.get("order_id") or actual_oid)),
-                    )
-                cur.execute(
-                    """UPDATE protection_orders SET status = 'CLOSED_NO_EXPOSURE_VERIFIED'
-                       WHERE parent_order_id IN (?, ?, ?) AND status IN ('UNPROTECTED', 'UNVERIFIED')""",
-                    (actual_oid, b_oid, corr_id),
-                )
-                logger.info(
-                    "Broker verified no remaining exposure/exit obligations for filled order %s; "
-                    "retired its stale configuration gate without fabricating protection.",
-                    actual_oid,
-                )
-                return True
-
-            def _resolve_terminal_status(corr_id: str, b_oid: str) -> Optional[Tuple[str, int, float, str]]:
-                if valid_live_broker is None:
-                    return None
-
-                w_rec = watcher_map.get(b_oid) or watcher_map.get(corr_id)
-                idict = all_intents_by_id.get(corr_id) or all_intents_by_id.get(b_oid) or {}
-                sec_id = str((w_rec or {}).get("security_id") or idict.get("security_id") or "")
-                exch_seg = str((w_rec or {}).get("segment") or idict.get("exchange_segment") or "")
-                prod_type = str((w_rec or {}).get("product_type") or idict.get("product_type") or "")
-
-                st_dict = None
-                if b_oid and b_oid in order_book_by_id:
-                    st_dict = order_book_by_id[b_oid]
-                elif corr_id and corr_id in order_book_by_corr:
-                    st_dict = order_book_by_corr[corr_id]
-                elif hasattr(valid_live_broker, "order_status"):
-                    target_lookup = b_oid or corr_id
-                    if target_lookup:
-                        try:
-                            cand_st = valid_live_broker.order_status(target_lookup)
-                            if isinstance(cand_st, dict):
-                                st_dict = cand_st
-                        except Exception:
-                            st_dict = None
-
-                if isinstance(st_dict, dict) and st_dict.get("orderStatus"):
-                    b_st = str(st_dict.get("orderStatus") or "").strip().upper()
-                    if b_st == "CLOSED":
-                        b_st = "TRADED"
-                    b_oid_actual = str(st_dict.get("orderId") or b_oid or corr_id).strip()
-                    b_filled = int(st_dict.get("filledQty") or st_dict.get("tradedQuantity") or 0)
-                    b_avg_p = float(st_dict.get("averageTradedPrice") or st_dict.get("tradedPrice") or st_dict.get("price") or 0.0)
-                    sec_id = str(st_dict.get("securityId") or sec_id)
-                    exch_seg = str(st_dict.get("exchangeSegment") or exch_seg)
-                    prod_type = str(st_dict.get("productType") or prod_type)
-
-                    if b_st in ("CANCELLED", "REJECTED", "EXPIRED") and b_filled == 0:
-                        return (b_st, 0, 0.0, b_oid_actual)
-                    if b_st in ("TRADED", "CANCELLED", "EXPIRED") and b_filled > 0:
-                        prot_q, b_err = _compute_verified_protection_qty(
-                            corr_id=corr_id,
-                            b_oid=b_oid_actual,
-                            sec_id=sec_id,
-                            exch_seg=exch_seg,
-                            prod_type=prod_type,
-                            required_qty=b_filled,
-                        )
-                        if b_err:
-                            broker_Fatal_err.append(b_err)
-                            return None
-                        if prot_q >= b_filled or _flat_closed_fill(corr_id, b_oid_actual, b_filled, sec_id):
-                            return (b_st, b_filled, b_avg_p, b_oid_actual)
-                return None
-
-            now_ts = time.time()
-            has_intent_updated_col = any(c[1] == "updated_at" for c in cur.execute("PRAGMA table_info(order_intents)").fetchall())
-            has_order_updated_col = "updated_at" in o_col_names
-            has_order_filled_col = "filled_quantity" in o_col_names
-
-            # F03-01: Authoritative correlation_id / broker_order_id -> terminal status & filled quantity mappings!
-            # NEVER substitute "TRADED" for "CANCELLED", "REJECTED", or "EXPIRED"!
-            reconciled_status_by_key: Dict[str, str] = {}
-            reconciled_filled_by_key: Dict[str, int] = {}
-            reconciled_price_by_key: Dict[str, float] = {}
-            reconciled_boid_by_key: Dict[str, str] = {}
-
-            def _record_reconciled_mapping(cid: str, boid: str, status_val: str, filled_val: int, avg_p_val: float, actual_boid: str) -> None:
-                eff_boid = actual_boid or boid
-                for k in (cid, boid, eff_boid):
-                    if k:
-                        reconciled_status_by_key[k] = status_val
-                        reconciled_filled_by_key[k] = filled_val
-                        reconciled_price_by_key[k] = avg_p_val
-                        if eff_boid:
-                            reconciled_boid_by_key[k] = eff_boid
-
-            with con:
-                for row in non_term_intents:
-                    cid = str(row["correlation_id"] or "").strip()
-                    boid = str(row["broker_order_id"] or "").strip() if "broker_order_id" in row.keys() else ""
-                    res_tuple = _resolve_terminal_status(cid, boid)
-                    if broker_Fatal_err:
-                        con.rollback()
-                        return False, broker_Fatal_err[0]
-                    if res_tuple is not None:
-                        resolved_st, filled_q, avg_p, actual_boid = res_tuple
-                        _record_reconciled_mapping(cid, boid, resolved_st, filled_q, avg_p, actual_boid)
-                        if has_intent_updated_col:
-                            cur.execute(
-                                "UPDATE order_intents SET state = ?, broker_order_id = COALESCE(NULLIF(broker_order_id, ''), ?), updated_at = ? WHERE correlation_id = ?",
-                                (resolved_st, actual_boid, now_ts, cid),
-                            )
-                        else:
-                            cur.execute(
-                                "UPDATE order_intents SET state = ? WHERE correlation_id = ?",
-                                (resolved_st, cid),
-                            )
-
-                for row in non_term_orders:
-                    cid = str(row["correlation_id"] or "").strip()
-                    boid = str(row["broker_order_id"] or "").strip() if "broker_order_id" in row.keys() else ""
-                    resolved_st = reconciled_status_by_key.get(cid) or (reconciled_status_by_key.get(boid) if boid else None)
-                    if resolved_st is not None:
-                        filled_q = reconciled_filled_by_key.get(cid, reconciled_filled_by_key.get(boid, 0))
-                        avg_p = reconciled_price_by_key.get(cid, reconciled_price_by_key.get(boid, 0.0))
-                        actual_boid = reconciled_boid_by_key.get(cid, reconciled_boid_by_key.get(boid, boid))
-                    else:
-                        res_tuple = _resolve_terminal_status(cid, boid)
-                        if broker_Fatal_err:
-                            con.rollback()
-                            return False, broker_Fatal_err[0]
-                        if res_tuple is not None:
-                            resolved_st, filled_q, avg_p, actual_boid = res_tuple
-                            _record_reconciled_mapping(cid, boid, resolved_st, filled_q, avg_p, actual_boid)
-                        else:
-                            filled_q = 0
-                            avg_p = 0.0
-                            actual_boid = boid
-
-                    if resolved_st is not None:
-                        # Update orders.status to exact broker terminal status (CANCELLED, REJECTED, EXPIRED, or TRADED)
-                        # and preserve original quantity while storing executed filled_quantity independently!
-                        if has_order_updated_col and has_order_filled_col:
-                            cur.execute(
-                                "UPDATE orders SET status = ?, filled_quantity = ?, updated_at = ? WHERE correlation_id = ?",
-                                (resolved_st, int(filled_q), now_ts, cid),
-                            )
-                        elif has_order_updated_col:
-                            cur.execute(
-                                "UPDATE orders SET status = ?, updated_at = ? WHERE correlation_id = ?",
-                                (resolved_st, now_ts, cid),
-                            )
-                        elif has_order_filled_col:
-                            cur.execute(
-                                "UPDATE orders SET status = ?, filled_quantity = ? WHERE correlation_id = ?",
-                                (resolved_st, int(filled_q), cid),
-                            )
-                        else:
-                            cur.execute(
-                                "UPDATE orders SET status = ? WHERE correlation_id = ?",
-                                (resolved_st, cid),
-                            )
-
-                        # Also update in-memory all_orders_list entry so subsequent audit sees reconciled state
-                        for odict in all_orders_list:
-                            if str(odict.get("correlation_id") or "").strip() == cid:
-                                odict["status"] = resolved_st
-                                odict["filled_quantity"] = int(filled_q)
-
-                        # Broker order summaries establish terminal status and reported
-                        # quantity, not exchange execution identity. Never insert a
-                        # fill here. Only the verified tradebook ingestion boundary
-                        # can record an execution or allocate an exit.
-
-                        w_target = watcher_map.get(boid) or watcher_map.get(cid)
-                        if w_target is not None:
-                            w_oid_key = str(w_target.get("order_id") or boid or cid)
-                            w_copy = {k: v for k, v in w_target.items() if k != "_is_terminal_col"}
-                            w_copy["state"] = resolved_st
-                            w_copy["filled_qty"] = int(filled_q)
-                            if filled_q > 0 and not w_target.get("broker_flat_verified_at"):
-                                w_copy["protected_qty"] = max(int(w_copy.get("protected_qty") or 0), int(filled_q))
-                            w_copy["terminal_confirmed"] = True
-                            try:
-                                cur.execute(
-                                    "UPDATE watcher_orders SET is_terminal = 1, record_json = ?, updated_at = ? WHERE order_id = ?",
-                                    (json.dumps(w_copy), now_ts, w_oid_key),
-                                )
-                            except sqlite3.OperationalError:
-                                pass
-
-                # F02-02 & F03-03: Audit watcher_orders and LIVE orders that have filled_qty > 0
-                # against authoritative live broker protection legs!
-                for w_rec in all_watcher_records:
-                    w_oid = str(w_rec.get("order_id") or "").strip()
-                    w_cid = str(w_rec.get("correlation_id") or w_oid).strip()
-                    if w_oid in reconciled_status_by_key or w_cid in reconciled_status_by_key:
-                        continue
-                    w_filled = int(w_rec.get("filled_qty") or 0)
-                    if valid_live_broker is not None:
-                        st_d = order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid)
-                        if isinstance(st_d, dict):
-                            w_filled = max(w_filled, int(st_d.get("filledQty") or st_d.get("tradedQuantity") or 0))
-                    if w_filled > 0:
-                        if (
-                            _owner_accepted_manual_risk(
-                                w_oid, w_cid, w_rec.get("security_id"),
-                                w_filled, w_rec.get("state"),
-                            )
-                            and not w_rec.get("pending_oco")
-                            and not w_rec.get("retry_reserved")
-                            and not w_rec.get("retry_eligible")
-                            and (
-                                not isinstance(order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid), dict)
-                                or str(
-                                    (order_book_by_id.get(w_oid) or order_book_by_corr.get(w_cid)).get("orderStatus") or ""
-                                ).strip().upper() == "TRADED"
-                            )
-                        ):
-                            reconciled_status_by_key[w_oid] = "TRADED"
-                            reconciled_status_by_key[w_cid] = "TRADED"
-                            continue
-                        ver_q, b_err = _compute_verified_protection_qty(
-                            corr_id=w_cid,
-                            b_oid=w_oid,
-                            sec_id=str(w_rec.get("security_id") or ""),
-                            exch_seg=str(w_rec.get("segment") or ""),
-                            prod_type=str(w_rec.get("product_type") or ""),
-                            required_qty=w_filled,
-                        )
-                        if b_err:
-                            con.rollback()
-                            return False, b_err
-                        if ver_q < w_filled and not _flat_closed_fill(
-                            w_cid, w_oid, w_filled, str(w_rec.get("security_id") or "")
-                        ):
-                            con.rollback()
-                            return (
-                                False,
-                                f"UNPROTECTED_POSITION: Order {w_oid} ({w_rec.get('symbol', '')}) has {w_filled} filled shares "
-                                f"but only {ver_q} verified linked protected shares (protected={ver_q}/{w_filled}).",
-                            )
-                        reconciled_status_by_key[w_oid] = str(w_rec.get("state") or "TRADED")
-                        reconciled_status_by_key[w_cid] = str(w_rec.get("state") or "TRADED")
-
-                if valid_live_broker is not None and (order_book_by_id or fo_book_loaded or so_book_loaded or all_active_prot_orders or has_filled_live_orders):
-                    for odict in all_orders_list:
-                        o_cid = str(odict.get("correlation_id") or "").strip()
-                        o_boid = str(odict.get("broker_order_id") or "").strip()
-                        if o_cid in reconciled_status_by_key or (o_boid and o_boid in reconciled_status_by_key):
-                            continue
-                        o_st = str(odict.get("status") or "").upper()
-                        o_mode = str(odict.get("trading_mode") or "LIVE").upper()
-                        if o_mode != "LIVE":
-                            continue
-                        st_d = order_book_by_id.get(o_boid) or order_book_by_corr.get(o_cid)
-                        if isinstance(st_d, dict):
-                            b_filled = int(st_d.get("filledQty") or st_d.get("tradedQuantity") or 0)
-                        elif o_st == "TRADED":
-                            b_filled = int(odict.get("filled_quantity") or odict.get("quantity") or 0)
-                        else:
-                            b_filled = int(odict.get("filled_quantity") or 0)
-                        if b_filled > 0:
-                            if _owner_accepted_manual_risk(
-                                o_boid, o_cid, odict.get("security_id") or (st_d or {}).get("securityId"),
-                                b_filled, o_st,
-                            ) and (
-                                not isinstance(st_d, dict)
-                                or str(st_d.get("orderStatus") or "").strip().upper() == "TRADED"
-                            ):
-                                continue
-                            ver_q, b_err = _compute_verified_protection_qty(
-                                corr_id=o_cid,
-                                b_oid=o_boid or o_cid,
-                                sec_id=str(odict.get("security_id") or (st_d or {}).get("securityId") or ""),
-                                exch_seg=str(odict.get("exchange_segment") or (st_d or {}).get("exchangeSegment") or ""),
-                                prod_type=str(odict.get("product_type") or (st_d or {}).get("productType") or ""),
-                                required_qty=b_filled,
-                            )
-                            if b_err:
-                                con.rollback()
-                                return False, b_err
-                            if ver_q < b_filled and not _flat_closed_fill(
-                                o_cid, o_boid or o_cid, b_filled, str(odict.get("security_id") or "")
-                            ):
-                                con.rollback()
-                                return (
-                                    False,
-                                    f"UNPROTECTED_POSITION: Order {o_boid or o_cid} ({odict.get('symbol', '')}) has {b_filled} filled shares "
-                                    f"but only {ver_q} verified linked protected shares (protected={ver_q}/{b_filled}).",
-                                )
-
-            return True, None
+            if "watcher_orders" in tables:
+                for row in cur.execute("SELECT order_id, is_terminal FROM watcher_orders").fetchall():
+                    if int(row["is_terminal"] or 0) == 0:
+                        has_pending_or_active_rows = True
         except sqlite3.Error as sq_e:
             return False, f"JOURNAL_ERROR: Journal safety check error (failing closed): {sq_e}"
-        except Exception as e:
-            return False, f"BROKER_RECONCILIATION_FAILED: Broker/journal reconciliation error: {e}"
         finally:
             if cur is not None:
                 try:
@@ -3692,6 +2878,320 @@ class ConfigChangeTracker:
                     con.close()
                 except Exception:
                     pass
+
+        if valid_live_broker is None:
+            if is_live_mode:
+                # C06: LIVE broker unavailability ALWAYS fails closed (never rely on empty journal or local ACKs alone).
+                if pending_keys:
+                    return (
+                        False,
+                        "LIVE_ORDER_IN_PROGRESS: Read-only LIVE broker unavailable while pending LIVE orders exist.",
+                    )
+                return (
+                    False,
+                    "BROKER_RECONCILIATION_FAILED: LIVE broker client unavailable; failing closed.",
+                )
+            return True, None
+
+        # 2. Apply atomic verified terminal order repairs (F03-01 / F04-03; zero -RECON-FILL-).
+        from src.engine.unified_account_runtime import (
+            UnifiedAccountRuntime,
+            reconcile_and_repair_terminal_orders,
+        )
+        rep_ok, rep_err, _repaired = reconcile_and_repair_terminal_orders(
+            db_path=db_path,
+            broker=valid_live_broker,
+            account_id=current_account_id,
+            data_dir=self.data_dir,
+        )
+        if not rep_ok and rep_err:
+            return False, rep_err
+
+        # 3. Verify closed-parent safety & update verified closed lifecycle rows (PR #130).
+        try:
+            from src.engine.closed_parent_safety import reconcile_verified_closed_parents_in_db
+            reconcile_verified_closed_parents_in_db(
+                db_path=db_path,
+                broker=valid_live_broker,
+                account_id=current_account_id,
+            )
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("[RECON] closed_parent_safety helper note: %s", exc)
+
+        # 4. Delegate unified account reconciliation to BrokerLedgerReconciler via UnifiedAccountRuntime.
+        # C19: Always delegate directly to UnifiedAccountRuntime (zero production test-double bypasses!)
+        from src.engine.broker_ledger_reconciler import Purpose
+        from src.engine.unified_account_runtime import build_verified_policy_context
+        from types import SimpleNamespace as _NS
+        runtime = UnifiedAccountRuntime(
+            data_dir=self.data_dir,
+            db_path=db_path,
+            account_id=current_account_id,
+        )
+        _stop_ok_proxy = _NS(is_stopped=lambda: False, get_in_flight_orders=lambda: [])
+        _watcher_ok_proxy = _NS(_is_running=True)
+        _min_cap_ns = time.monotonic_ns()
+        policy = build_verified_policy_context(
+            mode=("LIVE" if is_live_mode else "TEST"),
+            purpose=Purpose.SHUTDOWN,
+            snapshot=None,
+            journal_view=None,
+            stop_manager=_stop_ok_proxy,
+            watcher=_watcher_ok_proxy,
+            data_dir=self.data_dir,
+            owner_desired_state="STOPPED",
+            entry_fence_active=True,
+            min_capture_mono_ns=_min_cap_ns,
+            risk_funds_verified=True,
+        )
+        run_res = runtime.acquire_and_evaluate(
+            valid_live_broker,
+            policy,
+            min_capture_mono_ns=_min_cap_ns,
+            policy_builder=lambda snap, jv: build_verified_policy_context(
+                mode=("LIVE" if is_live_mode else "TEST"),
+                purpose=Purpose.SHUTDOWN,
+                snapshot=snap,
+                journal_view=jv,
+                stop_manager=_stop_ok_proxy,
+                watcher=_watcher_ok_proxy,
+                data_dir=self.data_dir,
+                owner_desired_state="STOPPED",
+                entry_fence_active=True,
+                min_capture_mono_ns=_min_cap_ns,
+                risk_funds_verified=True,
+            ),
+        )
+        if run_res.verdict is None:
+            err_msg = run_res.detail or run_res.reason_code or "Unified broker/journal reconciliation failed"
+            if any(
+                err_msg.startswith(pfx)
+                for pfx in (
+                    "JOURNAL_ERROR:",
+                    "JOURNAL_MISSING:",
+                    "LIVE_ORDER_IN_PROGRESS:",
+                    "UNPROTECTED_POSITION:",
+                    "BROKER_RECONCILIATION_FAILED:",
+                )
+            ):
+                return False, err_msg
+            return False, f"BROKER_RECONCILIATION_FAILED: {err_msg}"
+
+        verdict = run_res.verdict
+        if verdict.shutdown_eligible:
+            _ag = getattr(run_res.snapshot, "generation", None)
+            if _ag is not None:
+                self._last_safety_authorized_gen = (
+                    str(_ag.account_key),
+                    str(_ag.boot_id),
+                    int(_ag.token_epoch),
+                    int(_ag.mutation_epoch),
+                    int(_ag.owner_epoch),
+                    int(_ag.journal_epoch),
+                    int(_ag.session_epoch),
+                )
+            return True, None
+
+        # Map structured unified verdict reasons to exact legacy gate prefixes
+        reasons = list(getattr(verdict, "reason_codes", ()) or ())
+        if not reasons:
+            reasons = [
+                issue.reason_code
+                for cv in getattr(verdict, "contracts", ()) or ()
+                for issue in getattr(cv, "issues", ()) or ()
+            ]
+        summary = str("; ".join(reasons) or run_res.detail or "Unified reconciliation blocked")
+        upper_summary = summary.upper()
+        if any(k in upper_summary for k in ("IN_FLIGHT", "PENDING", "TRANSIT", "ACTIVE_ORDER", "NONTERMINAL")):
+            return False, f"LIVE_ORDER_IN_PROGRESS: {summary}"
+        if any(k in upper_summary for k in ("UNPROTECTED", "EXPOSURE", "UNMATCHED", "SHORTFALL", "POSITION", "ORPHAN_PROTECTION", "PROTECTION_UNVERIFIED", "PROTECTION_BOOK_BINDING_MISSING")):
+            return False, f"UNPROTECTED_POSITION: {summary}"
+        if any(k in upper_summary for k in ("JOURNAL", "SQLITE")):
+            return False, f"JOURNAL_ERROR: {summary}"
+        return False, f"BROKER_RECONCILIATION_FAILED: {summary}"
+
+    def _observe_owner_generation_fence(
+        self,
+        account_id: str = "",
+        *,
+        db_path: str = "",
+        require_sidecar: bool = True,
+    ) -> Tuple[Any, ...]:
+        """C07: Observe complete uncompressed cross-process generation tuple, journal digest,
+        durable owner intent, and service identity. Raises EvidenceUnavailable when LIVE
+        generation sidecar is absent (never returns fabricated zeros).
+        """
+        from contextlib import closing as _closing
+        from pathlib import Path as _Path
+        from src.broker.broker_snapshot import account_key
+        from src.broker.snapshot_coordinator import EvidenceUnavailable
+        from src.engine.journal_view import read_journal_view
+
+        clean_acct = str(account_id or "").strip()
+        if require_sidecar and not clean_acct:
+            raise EvidenceUnavailable("GENERATION_ACCOUNT_ID_MISSING")
+
+        data_root = _Path(self.data_dir)
+        acct_k = account_key(clean_acct) if clean_acct else ""
+        sc = data_root / "broker_evidence" / acct_k / "snapshots.sqlite3" if acct_k else None
+        if sc is None or not sc.is_file():
+            if require_sidecar:
+                raise EvidenceUnavailable("GENERATION_SIDECAR_MISSING")
+            gen_tuple: Tuple[Any, ...] = ("", "", 0, 0, 0, 0, 0)
+        else:
+            with _closing(sqlite3.connect(f"file:{sc.resolve()}?mode=ro", uri=True, timeout=2.0)) as _c:
+                row = _c.execute(
+                    """
+                    SELECT account_key, boot_id, token_epoch, mutation_epoch,
+                           owner_epoch, journal_epoch, session_epoch
+                    FROM account_state
+                    WHERE account_key = ?
+                    LIMIT 1
+                    """,
+                    (acct_k,),
+                ).fetchone()
+                if row is None:
+                    raise EvidenceUnavailable("GENERATION_ACCOUNT_STATE_MISSING")
+                gen_tuple = (
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    int(row[3]),
+                    int(row[4]),
+                    int(row[5]),
+                    int(row[6]),
+                )
+
+        j_digest = ""
+        j_path = _Path(db_path) if db_path else (data_root / "trade_journal.db")
+        if j_path.is_file() and clean_acct:
+            jv = read_journal_view(j_path, account_id=clean_acct, journal_epoch=int(gen_tuple[5]), read_utc_ns=time.time_ns())
+            if not jv.read_complete and require_sidecar:
+                raise EvidenceUnavailable("JOURNAL_DIGEST_UNREADABLE")
+            j_digest = str(jv.digest_sha256 or "")
+
+        live_ver = self.get_active_running_version(require_live_pid=False) or {}
+        svc_id = str(live_ver.get("pid") or "") + ":" + str(live_ver.get("version_hash") or "")
+        return (*gen_tuple, j_digest, svc_id)
+
+    def evaluate_unified_shutdown_gate(
+        self,
+        *,
+        action: str,
+        db_path: str,
+        broker: Optional[Any] = None,
+        env_path: str = ".env",
+        pre_fetched_snapshot: Optional[Any] = None,
+        calendar: Optional[Any] = None,
+        now: Optional[Any] = None,
+        stop_state_path: Optional[str] = None,
+        is_service_running: bool = True,
+        is_live_mode: Optional[bool] = None,
+        target_is_live: bool = False,
+    ) -> Dict[str, Any]:
+        """Phase 2D + C49: Production owner STOP / RESTART authorization gate with generation fencing."""
+        if pre_fetched_snapshot is None and stop_state_path is not None:
+            _live_flag = True if is_live_mode is None else bool(is_live_mode)
+            is_safe, safety_reason, blocked_code, block_count = self.evaluate_trading_safety_gate_detailed(
+                db_path=db_path,
+                stop_state_path=stop_state_path,
+                is_service_running=is_service_running,
+                is_live_mode=_live_flag,
+                target_is_live=target_is_live,
+                broker=broker,
+                env_path=env_path,
+            )
+            return {
+                "allowed": bool(is_safe),
+                "action": str(action or "").strip().lower(),
+                "reason": safety_reason,
+                "blocked_code": blocked_code,
+                "blocking_order_count": block_count,
+                "snapshot_generation": getattr(self, "_last_safety_authorized_gen", None),
+            }
+        from src.config import parse_env_dict
+        from src.engine.unified_account_runtime import UnifiedAccountRuntime
+        account_id = str(parse_env_dict(env_path).get("DHAN_CLIENT_ID") or "").strip() if os.path.exists(env_path) else ""
+        if not account_id and broker is not None:
+            account_id = str(getattr(getattr(broker, "cfg", None), "dhan_client_id", "") or "").strip()
+        if not account_id and pre_fetched_snapshot is not None:
+            account_id = str(getattr(pre_fetched_snapshot, "account_id", "") or "").strip()
+        from src.engine.broker_ledger_reconciler import Purpose
+        from src.engine.unified_account_runtime import build_verified_policy_context
+        from src.engine.journal_view import read_journal_view
+        runtime = UnifiedAccountRuntime(
+            data_dir=self.data_dir,
+            db_path=db_path,
+            account_id=account_id,
+        )
+        jv_for_pol = read_journal_view(
+            db_path,
+            account_id=account_id,
+            journal_epoch=(pre_fetched_snapshot.generation.journal_epoch if pre_fetched_snapshot is not None else 1),
+            read_utc_ns=time.time_ns(),
+        )
+        from types import SimpleNamespace as _NS
+        _stop_ok_proxy = _NS(is_stopped=lambda: False, get_in_flight_orders=lambda: [])
+        _watcher_ok_proxy = _NS(_is_running=True)
+        policy = build_verified_policy_context(
+            mode="LIVE",
+            purpose=Purpose.SHUTDOWN,
+            snapshot=pre_fetched_snapshot,
+            journal_view=jv_for_pol,
+            stop_manager=_stop_ok_proxy,
+            watcher=_watcher_ok_proxy,
+            data_dir=self.data_dir,
+            owner_desired_state="STOPPED",
+            entry_fence_active=True,
+            min_capture_mono_ns=(pre_fetched_snapshot.capture_started_mono_ns if pre_fetched_snapshot is not None else time.monotonic_ns()),
+            risk_funds_verified=True,
+        )
+        if pre_fetched_snapshot is not None:
+            run_res = runtime.evaluate_snapshot(pre_fetched_snapshot, policy, now_mono_ns=(int(now) if isinstance(now, int) else None))
+        else:
+            _min_cap_ns = time.monotonic_ns()
+            run_res = runtime.acquire_and_evaluate(
+                broker,
+                policy,
+                min_capture_mono_ns=_min_cap_ns,
+                policy_builder=lambda snap, jv: build_verified_policy_context(
+                    mode="LIVE",
+                    purpose=Purpose.SHUTDOWN,
+                    snapshot=snap,
+                    journal_view=jv,
+                    stop_manager=_stop_ok_proxy,
+                    watcher=_watcher_ok_proxy,
+                    data_dir=self.data_dir,
+                    owner_desired_state="STOPPED",
+                    entry_fence_active=True,
+                    min_capture_mono_ns=_min_cap_ns,
+                    risk_funds_verified=True,
+                ),
+            )
+        snap_gen = getattr(run_res.snapshot, "generation", None)
+        if run_res.verdict is None:
+            return {
+                "allowed": False,
+                "action": action,
+                "reason": run_res.detail or run_res.reason_code or "Unified shutdown verification failed",
+                "snapshot_generation": snap_gen,
+                "journal_epoch": (getattr(snap_gen, "journal_epoch", None) if snap_gen else None),
+                "verdict": None,
+            }
+        verdict = run_res.verdict
+        act_l = str(action or "").strip().lower()
+        allowed = bool(verdict.shutdown_eligible)
+        reasons = list(getattr(verdict, "reason_codes", ()) or ())
+        return {
+            "allowed": allowed,
+            "action": act_l,
+            "reason": ("; ".join(reasons) if reasons else ("Authorized" if allowed else run_res.detail)),
+            "snapshot_generation": snap_gen,
+            "journal_epoch": (getattr(snap_gen, "journal_epoch", None) if snap_gen else None),
+            "verdict": verdict,
+        }
 
     def evaluate_trading_safety_gate_detailed(
         self,
@@ -4566,22 +4066,68 @@ class ConfigChangeTracker:
                         "idempotent": True,
                         "stop_verified": True,
                         "service_state": ServiceOperatingState.STOPPED_BY_OWNER.value,
-                        "service_state_label": human_readable_service_label(ServiceOperatingState.STOPPED_BY_OWNER.value),
+                        "service_state_label": human_readable_service_label(ServiceOperatingState.STOPPED_BY_OWNER.value, "STOPPED"),
                         "saved_mode": saved_mode,
                         "running_mode": "STOPPED",
                         "message": "Trading bot is already stopped by owner.",
                     }
+                # C20: Persist STOP intent & activate entry fence FIRST, then invalidate & observe post-intent generation!
+                self.set_transition_gate(
+                    True,
+                    change_id="OWNER-STOP",
+                    target_mode="STOPPED",
+                    reason="Owner STOP requested; pausing new entries before post-intent broker verification",
+                )
+                self.record_service_control_intent(
+                    desired_service_state="STOPPED",
+                    last_action="OWNER_STOP_REQUESTED",
+                    reason=reason or "Owner STOP requested",
+                    requested_mode=saved_mode,
+                    observed_state=svc_state.value,
+                    deferred_stop_pending=True,
+                )
+                _stop_acct_id = str(getattr(cfg, "dhan_client_id", "") or "").strip()
+                if not _stop_acct_id and broker is not None:
+                    _stop_acct_id = str(getattr(getattr(broker, "cfg", None), "dhan_client_id", "") or "").strip()
+                try:
+                    from src.broker.evidence_events import note_owner_event
+                    from src.broker.snapshot_coordinator import invalidate_owner_scope
+                    note_owner_event(self.data_dir, "OWNER_INTENT_CHANGED")
+                    invalidate_owner_scope(self.data_dir, "OWNER_INTENT_CHANGED")
+                    _stop_fence_gen = self._observe_owner_generation_fence(
+                        account_id=_stop_acct_id,
+                        db_path=actual_db_path,
+                        require_sidecar=False,
+                    )
+                except Exception as _fence_exc:
+                    return {
+                        "ok": False,
+                        "deferred": True,
+                        "stop_verified": False,
+                        "action": "stop",
+                        "service_state": svc_state.value,
+                        "blocked_reason": "OWNER_GENERATION_FENCE_UNAVAILABLE",
+                        "saved_mode": saved_mode,
+                        "running_mode": running_mode,
+                        "message": f"Owner STOP blocked: generation fence observation/invalidation failed ({type(_fence_exc).__name__}: {_fence_exc}).",
+                    }
 
                 involves_live = (saved_mode == "LIVE") or (running_mode in ("LIVE", "UNKNOWN"))
-                is_safe, safety_reason, blocked_code, block_count = self.evaluate_trading_safety_gate_detailed(
+                self._last_safety_authorized_gen = None
+                _shutdown_gate = self.evaluate_unified_shutdown_gate(
+                    action="stop",
                     db_path=actual_db_path,
+                    broker=broker,
+                    env_path=env_path,
                     stop_state_path=actual_stop_path,
                     is_service_running=True,
                     is_live_mode=involves_live,
                     target_is_live=False,
-                    broker=broker,
-                    env_path=env_path,
                 )
+                is_safe = bool(_shutdown_gate.get("allowed", False))
+                safety_reason = str(_shutdown_gate.get("reason") or "")
+                blocked_code = str(_shutdown_gate.get("blocked_code") or "")
+                block_count = int(_shutdown_gate.get("blocking_order_count") or 0)
 
                 if not is_safe:
                     eff_code = blocked_code or "SAFETY_CHECK_FAILED"
@@ -4627,6 +4173,54 @@ class ConfigChangeTracker:
                         ),
                     }
 
+                try:
+                    _cur_gen = self._observe_owner_generation_fence(
+                        account_id=_stop_acct_id,
+                        db_path=actual_db_path,
+                        require_sidecar=(saved_mode == "LIVE"),
+                    )
+                except Exception as _fence_exc:
+                    return {
+                        "ok": False,
+                        "deferred": True,
+                        "stop_verified": False,
+                        "action": "stop",
+                        "service_state": svc_state.value,
+                        "blocked_reason": "OWNER_GENERATION_FENCE_UNAVAILABLE",
+                        "saved_mode": saved_mode,
+                        "running_mode": running_mode,
+                        "message": f"Owner STOP blocked: post-authorization generation observation failed ({type(_fence_exc).__name__}: {_fence_exc}).",
+                    }
+                _pre_had_sidecar = bool(_stop_fence_gen[0]) and bool(_stop_fence_gen[1])
+                _auth_snap_gen = getattr(self, "_last_safety_authorized_gen", None)
+                _fence_mismatch = False
+                if _auth_snap_gen is not None:
+                    # C42: Bind STOP authorization to the exact authorizing snapshot generation,
+                    # journal digest, durable STOP occurrence, mutation state, and service identity.
+                    _expected_fence = _auth_snap_gen + _stop_fence_gen[7:]
+                    if _cur_gen != _expected_fence:
+                        _fence_mismatch = True
+                    elif _pre_had_sidecar:
+                        _owner_delta = int(_auth_snap_gen[4]) - int(_stop_fence_gen[4])
+                        if (
+                            _auth_snap_gen[0:4] != _stop_fence_gen[0:4]
+                            or _owner_delta not in (0, 1)
+                        ):
+                            _fence_mismatch = True
+                elif _pre_had_sidecar and _cur_gen != _stop_fence_gen:
+                    _fence_mismatch = True
+                if _fence_mismatch:
+                    return {
+                        "ok": False,
+                        "deferred": True,
+                        "stop_verified": False,
+                        "action": "stop",
+                        "service_state": svc_state.value,
+                        "blocked_reason": "STALE_AUTHORIZATION_GENERATION_CHANGED",
+                        "saved_mode": saved_mode,
+                        "running_mode": running_mode,
+                        "message": f"Owner STOP authorization invalidated: generation changed ({_stop_fence_gen} -> {_cur_gen}).",
+                    }
                 self.record_service_control_intent(
                     desired_service_state="STOPPED",
                     last_action="OWNER_STOP",
@@ -4635,7 +4229,6 @@ class ConfigChangeTracker:
                     observed_state=ServiceOperatingState.STOPPING.value,
                     deferred_stop_pending=True,
                 )
-
                 stop_ok = self._invoke_systemctl("stop", "trading_bot.service", systemctl_fn=systemctl_fn)
                 if not stop_ok:
                     if involves_live:

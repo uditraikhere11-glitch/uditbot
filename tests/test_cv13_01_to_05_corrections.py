@@ -73,7 +73,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -240,7 +241,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -474,7 +476,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -550,7 +553,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -656,7 +660,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -736,7 +741,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -806,7 +812,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -853,7 +860,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -902,7 +910,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         gate = StartupReconciliationGate(client, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.db.db_path))
         gate.state = ReconciliationState.HEALTHY
         client.reconciliation_gate = gate
 
@@ -951,7 +960,12 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
             self.assertEqual(intent_row["state"], "NOT_SUBMITTED")
 
         # Re-open gate and test F&O local retrieval timestamp vs source timestamp + fresh success
-        gate._accepting_entries = True
+        gate.publish_unified_verdict(
+            gate._unified_verdict,
+            expected_halt_generation=gate._halt_generation,
+            snapshot_generation=gate._unified_verdict_generation,
+            ttl_sec=10.0,
+        )
         gate.state = ReconciliationState.HEALTHY
         client.get_fund_limits = Mock(return_value=(True, 100000.0, "OK"))
         client.get_ltp = Mock(return_value=(True, 100.4, "LTP retrieved from Dhan"))
@@ -1041,6 +1055,8 @@ class TestCV13ConfirmedCorrections(unittest.TestCase):
         """
         client = DhanClient(self.cfg, self.stop)
         watcher = self._make_watcher(client)
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+        attach_unified_live_evidence_to_stub_broker(client, db_path=self.db.db_path, data_dir=os.path.dirname(self.db.db_path))
         gate = StartupReconciliationGate(client, self.db, watcher, self.stop)
 
         client.get_fund_limits = Mock(return_value=(True, 100000.0, "OK"))

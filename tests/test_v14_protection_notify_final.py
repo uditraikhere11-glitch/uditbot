@@ -490,7 +490,8 @@ class TestV14ProtectionNotifyFinal(unittest.TestCase):
         broker = MagicMock()
         broker.cfg = self.cfg
         gate = StartupReconciliationGate(broker, self.db, None, self.stop)
-        gate._accepting_entries = True
+        from tests._phase2d_live_harness import seed_valid_unified_verdict_on_gate
+        seed_valid_unified_verdict_on_gate(gate, data_dir=os.path.dirname(self.pending_path))
         broker.reconciliation_gate = gate
         broker.trades_avg_price.return_value = 15.55
         broker.order_status.return_value = {"orderId": "SUP-MAN-1", "orderStatus": "TRADED", "filledQty": 50, "averageTradedPrice": 15.55}

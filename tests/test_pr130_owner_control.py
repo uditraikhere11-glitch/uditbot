@@ -370,7 +370,7 @@ class ThreePositionServiceControlTests(unittest.TestCase):
             ]
             with sqlite3.connect(path) as con:
                 for oid, symbol, security, price, state in parents:
-                    now = time.time()
+                    now = float(int(time.time()))
                     con.execute("""INSERT INTO order_intents (
                         correlation_id,account_id,symbol,security_id,exchange_segment,product_type,
                         order_type,price,quantity,state,broker_order_id,created_at,updated_at)
@@ -386,18 +386,20 @@ class ThreePositionServiceControlTests(unittest.TestCase):
                     watcher = dict(order_id=oid,correlation_id=oid,state="TRADED",symbol=symbol,
                         security_id=security,segment="NSE_EQ",product_type="CNC",
                         filled_qty=1,protected_qty=0,position_state=state,
-                        exit_filled_qty=1 if state=="POSITION_CLOSED" else 0)
+                        exit_filled_qty=1 if state=="POSITION_CLOSED" else 0,
+                        **({"tp_order_id":"32126112357408","forever_order_id":"23132611201560","triggered_leg":"TARGET_LEG","protection_route":"FOREVER_OCO","confirmed_position_open_qty":0,"confirmed_protection_ids":["23132611201560"]} if security=="750518" else {}))
                     con.execute("INSERT INTO watcher_orders VALUES (?,?,?,?)",
                                 (oid,1,json.dumps(watcher),now))
                     con.execute("""INSERT INTO positions_lifecycle (
                         parent_order_id,account_id,symbol,security_id,exchange_segment,
                         product_type,protection_route,position_state,entry_qty,buy_filled_qty,
-                        sell_filled_qty,confirmed_open_qty,updated_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        sell_filled_qty,confirmed_open_qty,triggered_leg,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (oid,"FAKE",symbol,security,"NSE_EQ","CNC",
                          "FOREVER_OCO" if security=="750518" else "MANUAL",
                          state,1,1,1 if security=="750518" else 0,
-                         0 if security=="750518" else 1,now))
+                         0 if security=="750518" else 1,
+                         "TARGET_LEG" if security=="750518" else "",now))
                     con.execute("""INSERT INTO fills (
                         broker_order_id,exchange_trade_id,symbol,traded_price,traded_quantity,
                         traded_at,transaction_type,security_id,exchange_segment,product_type,
@@ -415,7 +417,7 @@ class ThreePositionServiceControlTests(unittest.TestCase):
                     broker_order_id,exchange_trade_id,symbol,traded_price,traded_quantity,
                     traded_at,transaction_type,security_id,exchange_segment,product_type,
                     parent_order_id,is_verified_trade) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    ("32126112357408","600110497","VEDPOWER-EQ",35.06,1,time.time(),
+                    ("32126112357408","600110497","VEDPOWER-EQ",35.06,1,now,
                      "SELL","750518","NSE_EQ","CNC","321261120279408",1))
                 con.execute("""INSERT INTO protection_orders (
                     parent_order_id,forever_order_id,symbol,sl_trigger,sl_limit,target_price,
@@ -425,31 +427,57 @@ class ThreePositionServiceControlTests(unittest.TestCase):
                 before = con.execute("""SELECT parent_order_id,quantity,status
                     FROM manual_risk_acknowledgements ORDER BY parent_order_id""").fetchall()
 
-            exchange_time=datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+            exchange_time=datetime.fromtimestamp(now, ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
             child=dict(orderId="32126112357408",algoId="23132611201560",
                 dhanClientId="FAKE",exchangeSegment="NSE_EQ",productType="CNC",
                 securityId="750518",transactionType="SELL",orderStatus="TRADED",
-                quantity=1,filledQty=1,remainingQuantity=0)
+                quantity=1,filledQty=1,remainingQuantity=0,averageTradedPrice=35.06)
             forever=dict(orderId="23132611201560",orderStatus="TRIGGERED",
                 legName="TARGET_LEG",orderType="OCO",quantity=1,price=35.04,
                 transactionType="SELL",dhanClientId="FAKE",exchangeSegment="NSE_EQ",
-                productType="CNC",securityId="750518")
+                productType="CNC",securityId="750518",triggeredOrderId="32126112357408")
             trade=dict(orderId="32126112357408",exchangeTradeId="600110497",
+                exchangeOrderId="EXO-600110497",
                 dhanClientId="FAKE",securityId="750518",exchangeSegment="NSE_EQ",
                 productType="CNC",transactionType="SELL",tradedQuantity=1,
                 tradedPrice=35.06,exchangeTime=exchange_time)
+            prev_time=datetime.fromtimestamp(now-86400, ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+            hist_buys=[
+                dict(orderId=oid,exchangeTradeId=oid+"-BUY",exchangeOrderId="EXO-"+oid,
+                     dhanClientId="FAKE",securityId=security,exchangeSegment="NSE_EQ",
+                     productType="CNC",transactionType="BUY",tradedQuantity=1,
+                     tradedPrice=price,exchangeTime=prev_time)
+                for oid,symbol,security,price in (
+                    ("221261102657708","YESBANK-EQ","11915",15.52),
+                    ("23126110439808","YESBANK-EQ","11915",15.51),
+                    ("321261120279408","VEDPOWER-EQ","750518",34.69),
+                )
+            ]
             broker=MagicMock()
             broker.cfg=AppConfig(trading_mode=TradingMode.LIVE,dhan_client_id="FAKE",
                                  data_dir=str(data))
             broker.get_order_book.return_value=[child]
-            broker.get_forever_orders.return_value=[forever]
+            forever_sl=dict(orderId="23132611201560",orderStatus="CANCELLED",
+                legName="STOP_LOSS_LEG",orderType="OCO",quantity=1,price=33.99,triggerPrice=34.34,
+                transactionType="SELL",dhanClientId="FAKE",exchangeSegment="NSE_EQ",
+                productType="CNC",securityId="750518")
+            broker.get_forever_orders.return_value=[forever, forever_sl]
             broker.get_super_orders.return_value=[]
             broker.get_positions.return_value=[dict(dhanClientId="FAKE",securityId="750518",
-                exchangeSegment="NSE_EQ",productType="CNC",netQty=-1)]
-            broker.get_holdings.return_value=[dict(securityId="750518",
-                totalQty=1,availableQty=0,dpQty=0,t1Qty=0)]
+                exchangeSegment="NSE_EQ",productType="CNC",netQty=-1,
+                dayBuyQty=0,daySellQty=1,carryForwardBuyQty=0,carryForwardSellQty=0)]
+            broker.get_holdings.return_value=[
+                dict(dhanClientId="FAKE",securityId="750518",isin="INE000A01001",
+                     totalQty=1,availableQty=0,dpQty=1,t1Qty=0),
+                dict(dhanClientId="FAKE",securityId="11915",isin="INE528G01035",
+                     totalQty=2,availableQty=2,dpQty=2,t1Qty=0),
+            ]
             broker.get_trade_book.return_value=[trade]
+            broker.get_historical_trades.return_value=hist_buys
             broker.order_status.return_value=None
+            from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
+            broker.cfg.journal_db_path=str(path)
+            attach_unified_live_evidence_to_stub_broker(broker, db_path=path, data_dir=str(data), account_id="FAKE")
             tracker=ConfigChangeTracker(data_dir=str(data))
             outcome=tracker.reconcile_stale_journal_with_broker(
                 db_path=path,broker=broker,env_path=str(env),is_live_mode=True,

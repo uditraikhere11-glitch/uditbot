@@ -33,6 +33,7 @@ def _trade(oid, eid, side, qty, ts, price, *, sec_id="5264", seg="NSE_EQ", prod=
         "tradedQuantity": qty,
         "tradedPrice": price,
         "exchangeTime": ts.strftime("%Y-%m-%d %H:%M:%S"),
+        "exchangeOrderId": f"EXO-{oid}",
         "dhanClientId": ACCOUNT,
         "securityId": sec_id,
         "exchangeSegment": seg,
@@ -52,8 +53,9 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self.stop_mgr = NS(is_stopped=lambda: False)
 
     def _make_broker(self, *, trade_book, order_book, positions, holdings, forever=None, super_orders=None, hist_trades=None):
+        from tests._phase2d_live_harness import attach_unified_live_evidence_to_stub_broker
         b = NS(
-            cfg=NS(dhan_client_id=ACCOUNT, data_dir=self.tmp.name, trading_mode="LIVE"),
+            cfg=NS(dhan_client_id=ACCOUNT, data_dir=self.tmp.name, journal_db_path=self.db_path, trading_mode="LIVE"),
             get_authenticated_profile_id=Mock(return_value=ACCOUNT),
             _read_governor=self.gov,
             get_fund_limits=Mock(return_value=(True, 25000.0, "Funds retrieved successfully")),
@@ -66,6 +68,55 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
             get_trades_for_order=Mock(return_value=BrokerReadList([])),
             get_historical_trades=Mock(return_value=BrokerReadList(hist_trades or [])),
         )
+        for _r in order_book:
+            if isinstance(_r, dict):
+                _r.setdefault("dhanClientId", ACCOUNT)
+                if _r.get("orderStatus") == "TRADED" and "filledQty" in _r:
+                    _r.setdefault("quantity", _r["filledQty"])
+                    _r.setdefault("remainingQuantity", 0)
+        for _p in positions:
+            if isinstance(_p, dict):
+                _p.setdefault("dhanClientId", ACCOUNT)
+                _sec = str(_p.get("securityId") or "")
+                _seg = str(_p.get("exchangeSegment") or "NSE_EQ")
+                _prod = str(_p.get("productType") or "CNC")
+                _dbq = sum(int(t.get("tradedQuantity") or 0) for t in trade_book if isinstance(t, dict) and str(t.get("securityId") or "") == _sec and str(t.get("exchangeSegment") or "") == _seg and str(t.get("productType") or "") == _prod and str(t.get("transactionType") or "").upper() == "BUY")
+                _dsq = sum(int(t.get("tradedQuantity") or 0) for t in trade_book if isinstance(t, dict) and str(t.get("securityId") or "") == _sec and str(t.get("exchangeSegment") or "") == _seg and str(t.get("productType") or "") == _prod and str(t.get("transactionType") or "").upper() == "SELL")
+                _p.setdefault("dayBuyQty", _dbq)
+                _p.setdefault("daySellQty", _dsq)
+                _p.setdefault("carryForwardBuyQty", 0)
+                _p.setdefault("carryForwardSellQty", 0)
+        for _h in holdings:
+            if isinstance(_h, dict):
+                _h.setdefault("dhanClientId", ACCOUNT)
+                _h.setdefault("t1Qty", 0)
+                _h.setdefault("isin", f"ISIN-{_h.get('securityId', '0')}")
+        _hist_by_oid = {}
+        for _ht in (hist_trades or []):
+            if isinstance(_ht, dict) and _ht.get("orderId"):
+                _oid = str(_ht["orderId"])
+                _prev = _hist_by_oid.get(_oid)
+                _q = int(_ht.get("tradedQuantity") or 0)
+                if _prev is None:
+                    _hist_by_oid[_oid] = {
+                        "dhanClientId": ACCOUNT,
+                        "orderId": _oid,
+                        "exchangeOrderId": str(_ht.get("exchangeOrderId") or f"EXO-{_oid}"),
+                        "securityId": str(_ht.get("securityId") or ""),
+                        "exchangeSegment": str(_ht.get("exchangeSegment") or "NSE_EQ"),
+                        "productType": str(_ht.get("productType") or "CNC"),
+                        "transactionType": str(_ht.get("transactionType") or "SELL"),
+                        "orderStatus": "TRADED",
+                        "quantity": _q,
+                        "filledQty": _q,
+                        "remainingQuantity": 0,
+                    }
+                else:
+                    _prev["quantity"] += _q
+                    _prev["filledQty"] += _q
+        if _hist_by_oid:
+            b.order_status = Mock(side_effect=lambda oid: dict(_hist_by_oid[str(oid)]) if str(oid) in _hist_by_oid else None)
+        attach_unified_live_evidence_to_stub_broker(b, db_path=self.db_path, data_dir=self.tmp.name, account_id=ACCOUNT)
         return b
 
     def _seed_pdsl_open_buy(self, *, buy_oid="23126111920108", buy_ts=None, buy_qty=1, buy_price=402.5):
@@ -114,8 +165,10 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         return ts
 
     def test_real_stack_pdsl_same_day_manual_sell_recovers_on_second_independent_pass(self):
-        buy_ts = self._seed_pdsl_open_buy()
-        sell_ts = buy_ts + timedelta(minutes=15)
+        _now_sd = datetime.now(IST).replace(microsecond=0)
+        _sod_sd = _now_sd.replace(hour=0, minute=0, second=10)
+        buy_ts = self._seed_pdsl_open_buy(buy_ts=max(_sod_sd, _now_sd - timedelta(minutes=30)))
+        sell_ts = min(_now_sd - timedelta(seconds=5), buy_ts + timedelta(minutes=15))
         sell_oid = "331261119150608"
         broker = self._make_broker(
             trade_book=[
@@ -211,11 +264,14 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
                     """,
                     (yb_oid, ACCOUNT, time.time()),
                 )
-            fill = _trade(yb_oid, f"Y-{idx}", "BUY", 1, datetime.now(IST) - timedelta(minutes=3),
-                          18.0, sec_id="11915")
+            yb_ts = datetime.now(IST) - timedelta(days=2)
+            with self.db._get_conn() as conn:
+                conn.execute("UPDATE order_intents SET created_at=? WHERE broker_order_id=?", (yb_ts.timestamp(), yb_oid))
+            fill = _trade(yb_oid, f"Y-{idx}", "BUY", 1, yb_ts, 18.0, sec_id="11915")
             fill.update(isin="INE528G01035", exchangeOrderId=f"EX-{idx}")
             owner_trades.append(fill)
             self.db.record_fill(yb_oid, fill["exchangeTradeId"], "YESBANK", 18., 1,
+                                traded_at=int(yb_ts.timestamp()),
                                 security_id="11915", transaction_type="BUY", exchange_segment="NSE_EQ", product_type="CNC")
             self.db.acknowledge_manual_risk_holding(
                 parent_order_id=yb_oid,
@@ -228,13 +284,19 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
                 reason="Audited manual risk",
             )
 
+        pdsl_buy_hist = _trade("23126111920108", "B-23126111920108", "BUY", 1, buy_ts + timedelta(seconds=2), 402.5)
         broker = self._make_broker(
             trade_book=[],
             order_book=[],
             positions=[],
-            holdings=[{"securityId": "11915", "totalQty": 2, "isin": "INE528G01035", "dhanClientId": ACCOUNT}],
-            hist_trades=[*owner_trades, _trade("HIST-SELL-1", "S-HIST-1", "SELL", 1, hist_sell_ts, 420.0)],
+            holdings=[{"securityId": "11915", "totalQty": 2, "dpQty": 2, "t1Qty": 0, "availableQty": 2, "isin": "INE528G01035", "dhanClientId": ACCOUNT}],
+            hist_trades=[pdsl_buy_hist, *owner_trades, _trade("HIST-SELL-1", "S-HIST-1", "SELL", 1, hist_sell_ts, 420.0)],
         )
+        broker.get_order_status = lambda oid: {
+            "dhanClientId": ACCOUNT, "orderId": oid, "securityId": "5264",
+            "exchangeSegment": "NSE_EQ", "productType": "CNC", "transactionType": "SELL",
+            "orderStatus": "TRADED", "quantity": 1, "filledQty": 1, "remainingQuantity": 0,
+        } if oid == "HIST-SELL-1" else None
         watcher = ProtectionWatcher(broker=broker, path=self.watcher_path, dry_run=False, journal_db=self.db)
         gate = StartupReconciliationGate(broker=broker, journal_db=self.db, watcher=watcher, stop_manager=self.stop_mgr)
         broker.reconciliation_gate = gate
@@ -278,20 +340,26 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self._seed_pdsl_open_buy(buy_oid=parent, buy_ts=ts, buy_qty=qty)
         trades = [_trade(parent, f"B-{parent}", "BUY", qty, ts + timedelta(seconds=2), 402.5),
                   _trade(exit_order, f"S-{parent}", "SELL", qty, ts + timedelta(seconds=5), 415)]
-        return trades, [dict(row, orderStatus="TRADED", filledQty=qty) for row in trades]
+        return trades, [dict(row, orderStatus="TRADED", filledQty=qty, quantity=qty, remainingQuantity=0) for row in trades]
 
     def test_reentry_ignores_only_verified_closed_lot(self):
-        ts = datetime.now(IST).replace(hour=9, minute=0, second=0)
+        _now_ist = datetime.now(IST).replace(microsecond=0)
+        ts = _now_ist.replace(hour=9, minute=0, second=0) if _now_ist.hour >= 11 else (_now_ist - timedelta(minutes=2))
         trades, orders = self._round_trip("B1", ts, 2, "S1")
-        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
+        pos_row = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=0, dayBuyQty=2, daySellQty=2, carryForwardBuyQty=0, carryForwardSellQty=0, dhanClientId=ACCOUNT)
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[pos_row], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
         gate = self._gate(broker)
         self.assertEqual(gate.run_startup_reconciliation()[0], True)
-        t2, o2 = self._round_trip("B2", ts + timedelta(hours=1), 3, "S2")
+        t2, o2 = self._round_trip("B2", ts + timedelta(seconds=30), 3, "S2")
+        pos_row["dayBuyQty"] = 5
+        pos_row["daySellQty"] = 5
         broker.get_trade_book.return_value.extend(t2)
         broker.get_order_book.return_value.extend(o2)
         broker.get_trade_book.return_value.append(dict(t2[0], orderId="manual", exchangeTradeId="unknown"))
         self.assertFalse(gate.run_startup_reconciliation()[0])
         broker.get_trade_book.return_value.pop()
+        with self.db._get_conn() as conn:
+            conn.execute("DELETE FROM fills WHERE broker_order_id='manual' AND exchange_trade_id='unknown'")
         ok, reason = gate.run_startup_reconciliation()
         self.assertTrue(ok, reason)
         for oid in ("B1", "B2"):
@@ -299,7 +367,8 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
 
     def test_four_simultaneous_gate_checks_link_once(self):
         trades, orders = self._round_trip("CONCURRENT", datetime.now(IST) - timedelta(minutes=1), 2, "EXIT")
-        gate = self._gate(self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)]))
+        pos3 = [dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=0, dayBuyQty=2, daySellQty=2, carryForwardBuyQty=0, carryForwardSellQty=0, dhanClientId=ACCOUNT)]
+        gate = self._gate(self._make_broker(trade_book=trades, order_book=orders, positions=pos3, holdings=[dict(securityId="5264", totalQty=0, dpQty=0)]))
         barrier = Barrier(4)
 
         def check():
@@ -318,14 +387,33 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.db.get_position_accounting("CONCURRENT")["sell_filled_qty"], 2)
 
     def test_shared_super_id_requires_matching_terminal_leg(self):
-        trades, orders = self._round_trip("SUP1", datetime.now(IST) - timedelta(minutes=1), 1, "SUP1")
-        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
+        trades, orders = self._round_trip("SUP1", datetime.now(IST) - timedelta(minutes=1), 1, "SUP1-SL")
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE order_intents SET is_super_order=1 WHERE broker_order_id='SUP1'")
+            conn.execute("UPDATE positions_lifecycle SET protection_route='SUPER_ORDER', triggered_leg='STOP_LOSS_LEG' WHERE parent_order_id='SUP1'")
+            conn.execute(
+                "INSERT INTO protection_orders (parent_order_id, forever_order_id, symbol, quantity, status, created_at) VALUES ('SUP1', 'SUP1', 'PDSL', 1, 'POSITION_CLOSED_LOCAL', ?)",
+                (time.time(),),
+            )
+        pos4 = [dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=0, dayBuyQty=1, daySellQty=1, carryForwardBuyQty=0, carryForwardSellQty=0, dhanClientId=ACCOUNT)]
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=pos4, holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
         gate = self._gate(broker)
         self.assertFalse(gate.run_startup_reconciliation()[0])
-        broker.get_super_orders.return_value.append(dict(orders[0], orderStatus="CLOSED", legDetails=[
-            dict(orderId="SUP1", legName="STOP_LOSS_LEG", orderStatus="TRADED", quantity=1),
-            dict(orderId="SUP1", legName="TARGET_LEG", orderStatus="CANCELLED", quantity=1)]))
-        ok, reason = gate.run_startup_reconciliation()
+        super_row = dict(orders[0], orderStatus="CLOSED", legDetails=[
+            dict(orderId="SUP1-SL", legName="STOP_LOSS_LEG", orderStatus="TRADED", transactionType="SELL", quantity=1, remainingQuantity=0),
+            dict(orderId="SUP1-TP", legName="TARGET_LEG", orderStatus="CANCELLED", transactionType="SELL", quantity=1, remainingQuantity=0)])
+        with self.db._get_conn() as conn:
+            conn.execute("UPDATE positions_lifecycle SET protection_route='SUPER_ORDER', triggered_leg='STOP_LOSS_LEG' WHERE parent_order_id='SUP1'")
+            row_w = conn.execute("SELECT record_json FROM watcher_orders WHERE order_id='SUP1'").fetchone()
+            if row_w:
+                import json as _json
+                rw = _json.loads(row_w[0])
+                rw["is_super_order"] = True
+                rw["protection_route"] = "SUPER_ORDER"
+                conn.execute("UPDATE watcher_orders SET record_json=? WHERE order_id='SUP1'", (_json.dumps(rw),))
+        broker2 = self._make_broker(trade_book=trades, order_book=orders, positions=pos4, holdings=[dict(securityId="5264", totalQty=0, dpQty=0)], super_orders=[super_row])
+        (Path(self.tmp.name) / "snapshots.sqlite3").unlink(missing_ok=True)
+        ok, reason = self._gate(broker2).run_startup_reconciliation()
         self.assertTrue(ok, reason)
         self.assertEqual(self.db.get_position_lifecycle("SUP1")["sell_filled_qty"], 1)
 
@@ -333,8 +421,9 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         trades, orders = self._round_trip("PART", datetime.now(IST) - timedelta(minutes=1), 4, "SELL4")
         with self.db._get_conn() as conn:
             conn.execute("UPDATE order_intents SET quantity=10, state='CANCELLED' WHERE broker_order_id='PART'")
-        orders[0].update(orderStatus="CANCELLED", quantity=10)
-        broker = self._make_broker(trade_book=trades, order_book=orders, positions=[], holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
+        orders[0].update(orderStatus="CANCELLED", quantity=10, remainingQuantity=6)
+        pos5 = [dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=0, dayBuyQty=4, daySellQty=4, carryForwardBuyQty=0, carryForwardSellQty=0, dhanClientId=ACCOUNT)]
+        broker = self._make_broker(trade_book=trades, order_book=orders, positions=pos5, holdings=[dict(securityId="5264", totalQty=0, dpQty=0)])
         for _ in range(2):
             ok, reason = self._gate(broker).run_startup_reconciliation()
             self.assertTrue(ok, reason)
@@ -349,9 +438,15 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         with self.db._get_conn() as conn:
             for table in ("order_intents", "fills", "positions_lifecycle"):
                 conn.execute(f"UPDATE {table} SET product_type='MTF'")
-        sell = _trade("MTFS", "MTF-FILL", "SELL", 5, ts + timedelta(days=1), 410, prod="MTF")
+        buy_h = _trade("MTFB", "B-MTFB", "BUY", 5, ts + timedelta(seconds=2), 402.5, prod="MTF")
+        sell = _trade("MTFS", "MTF-EX1", "SELL", 5, ts + timedelta(days=1), 410, prod="MTF")
         row = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="MTF", netQty=0)
-        broker = self._make_broker(trade_book=[], order_book=[], positions=[row], holdings=[], hist_trades=[sell])
+        broker = self._make_broker(trade_book=[], order_book=[], positions=[row], holdings=[], hist_trades=[buy_h, sell])
+        broker.get_order_status = lambda oid: {
+            "dhanClientId": ACCOUNT, "orderId": oid, "securityId": "5264",
+            "exchangeSegment": "NSE_EQ", "productType": "MTF", "transactionType": "SELL",
+            "orderStatus": "TRADED", "quantity": 5, "filledQty": 5, "remainingQuantity": 0,
+        } if oid == "MTFS" else None
         gate = self._gate(broker)
         self.assertFalse(gate.run_startup_reconciliation()[0])
         broker.get_positions.return_value.clear()
@@ -361,10 +456,12 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
     def test_split_dp_and_t1_delivery_sale_on_second_pass(self):
         ts = datetime.now(IST) - timedelta(days=2)
         self._seed_pdsl_open_buy(buy_oid="B5", buy_ts=ts, buy_qty=5)
-        sell = _trade("S5", "S5-FILL", "SELL", 5, datetime.now(IST), 410)
-        position = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=-5)
+        buy5_h = _trade("B5", "B-B5", "BUY", 5, ts + timedelta(seconds=2), 402.5)
+        sell = _trade("S5", "S5EX1", "SELL", 5, datetime.now(IST), 410)
+        position = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC", netQty=-5, dayBuyQty=0, daySellQty=5, carryForwardBuyQty=0, carryForwardSellQty=0, dhanClientId=ACCOUNT)
         broker = self._make_broker(trade_book=[sell], order_book=[dict(sell, orderStatus="TRADED", filledQty=5)],
-                                   positions=[position], holdings=[dict(securityId="5264", dpQty=2, t1Qty=3)])
+                                   positions=[position], holdings=[dict(securityId="5264", dpQty=2, t1Qty=3, totalQty=5, availableQty=0, dhanClientId=ACCOUNT, isin="INE000P01001")],
+                                   hist_trades=[buy5_h])
         for _ in range(2):
             ok, reason = self._gate(broker).run_startup_reconciliation()
             self.assertTrue(ok, reason)
@@ -384,12 +481,14 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
             self.assertIn("exposure mismatch", reason)
 
     def test_delivery_sale_requires_sufficient_explicit_holdings_after_restart(self):
-        self._seed_pdsl_open_buy(buy_ts=datetime.now(IST) - timedelta(days=2))
+        buy_ts_d = datetime.now(IST) - timedelta(days=2)
+        self._seed_pdsl_open_buy(buy_ts=buy_ts_d)
+        buy_d_h = _trade("23126111920108", "B-23126111920108", "BUY", 1, buy_ts_d + timedelta(seconds=2), 402.5)
         sell = _trade("SELL-D", "EXEC-D", "SELL", 1, datetime.now(IST), 417.75)
         position = dict(securityId="5264", exchangeSegment="NSE_EQ", productType="CNC",
-                        netQty=-1, sellQty=1, buyQty=0, dhanClientId=ACCOUNT)
+                        netQty=-1, sellQty=1, buyQty=0, dayBuyQty=0, daySellQty=1, carryForwardBuyQty=0, carryForwardSellQty=0, dhanClientId=ACCOUNT)
         broker = self._make_broker(trade_book=[sell], order_book=[dict(sell, orderStatus="TRADED", filledQty=1)],
-                                   positions=[position], holdings=[])
+                                   positions=[position], holdings=[], hist_trades=[buy_d_h])
         watcher = ProtectionWatcher(broker, path=self.watcher_path, journal_db=self.db)
         gate = StartupReconciliationGate(broker, self.db, watcher, self.stop_mgr)
         broker.reconciliation_gate = gate
@@ -397,7 +496,7 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.db.get_position_lifecycle("23126111920108")["confirmed_open_qty"], 1)
         broker.get_holdings.return_value = BrokerReadList([dict(securityId="5264", totalQty=0, dpQty=0)])
         self.assertFalse(gate.run_startup_reconciliation()[0])
-        broker.get_holdings.return_value = BrokerReadList([dict(securityId="5264", dpQty=0, t1Qty=1)])
+        broker.get_holdings.return_value = BrokerReadList([dict(securityId="5264", dpQty=0, t1Qty=1, totalQty=1, availableQty=0, dhanClientId=ACCOUNT, isin="INE000P01001")])
         ok, reason = gate.run_startup_reconciliation()
         self.assertTrue(ok, reason)
         self.assertEqual(self.db.get_position_lifecycle("23126111920108")["confirmed_open_qty"], 0)
@@ -427,9 +526,11 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
 
 
     def test_real_stack_two_buy_lots_single_sell_restart_accounting_and_gate_healthy(self):
-        buy_ts1 = self._seed_pdsl_open_buy(buy_oid="BUY-PDSL-1", buy_ts=datetime.now(IST) - timedelta(minutes=40), buy_qty=3, buy_price=400.0)
-        buy_ts2 = self._seed_pdsl_open_buy(buy_oid="BUY-PDSL-2", buy_ts=datetime.now(IST) - timedelta(minutes=30), buy_qty=2, buy_price=405.0)
-        sell_ts = datetime.now(IST) - timedelta(minutes=10)
+        _n_ist = datetime.now(IST).replace(microsecond=0)
+        _sod = _n_ist.replace(hour=0, minute=0, second=10)
+        buy_ts1 = self._seed_pdsl_open_buy(buy_oid="BUY-PDSL-1", buy_ts=max(_sod, _n_ist - timedelta(minutes=40)), buy_qty=3, buy_price=400.0)
+        buy_ts2 = self._seed_pdsl_open_buy(buy_oid="BUY-PDSL-2", buy_ts=max(_sod + timedelta(seconds=10), _n_ist - timedelta(minutes=30)), buy_qty=2, buy_price=405.0)
+        sell_ts = max(buy_ts2 + timedelta(seconds=10), _n_ist - timedelta(minutes=10))
         sell_oid = "SELL-PDSL-ALL-5"
         with self.db._get_conn() as conn:
             conn.execute(
@@ -495,8 +596,8 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
 
     def test_real_stack_multi_lot_crash_after_partial_watcher_sync_recovers_after_rollover(self):
         """P0-1 real-stack: crash after BUY-1 syncs and before BUY-2 syncs recovers after restart + day rollover."""
-        self._seed_pdsl_open_buy(buy_oid="BUY-CR-1", buy_ts=datetime.now(IST) - timedelta(days=2, hours=2), buy_qty=3, buy_price=400.0)
-        self._seed_pdsl_open_buy(buy_oid="BUY-CR-2", buy_ts=datetime.now(IST) - timedelta(days=2, hours=1), buy_qty=2, buy_price=405.0)
+        cr_ts1 = self._seed_pdsl_open_buy(buy_oid="BUY-CR-1", buy_ts=datetime.now(IST) - timedelta(days=2, hours=2), buy_qty=3, buy_price=400.0)
+        cr_ts2 = self._seed_pdsl_open_buy(buy_oid="BUY-CR-2", buy_ts=datetime.now(IST) - timedelta(days=2, hours=1), buy_qty=2, buy_price=405.0)
         sell_ts = datetime.now(IST) - timedelta(days=1)
         sell_oid = "SELL-CR-ALL-5"
         with self.db._get_conn() as conn:
@@ -537,7 +638,19 @@ class UnifiedExitProductionIntegrationTests(unittest.TestCase):
 
         # Process restarts after day rollover: empty tradebook, empty orderbook, empty positions, empty holdings
         db2 = JournalDB(self.db_path, account_id=ACCOUNT)
-        broker_day2 = self._make_broker(trade_book=[], order_book=[], positions=[], holdings=[], hist_trades=[])
+        broker_day2 = self._make_broker(
+            trade_book=[], order_book=[], positions=[], holdings=[],
+            hist_trades=[
+                _trade("BUY-CR-1", "B-BUY-CR-1", "BUY", 3, cr_ts1 + timedelta(seconds=2), 400.0),
+                _trade("BUY-CR-2", "B-BUY-CR-2", "BUY", 2, cr_ts2 + timedelta(seconds=2), 405.0),
+                _trade(sell_oid, "S-CR-5", "SELL", 5, sell_ts, 420.0),
+            ],
+        )
+        broker_day2.get_order_status = lambda oid: {
+            "dhanClientId": ACCOUNT, "orderId": oid, "securityId": "5264",
+            "exchangeSegment": "NSE_EQ", "productType": "CNC", "transactionType": "SELL",
+            "orderStatus": "TRADED", "quantity": 5, "filledQty": 5, "remainingQuantity": 0,
+        } if oid == sell_oid else None
         watcher2 = ProtectionWatcher(broker=broker_day2, path=self.watcher_path, dry_run=False, journal_db=db2)
         gate2 = StartupReconciliationGate(broker=broker_day2, journal_db=db2, watcher=watcher2, stop_manager=self.stop_mgr)
         broker_day2.reconciliation_gate = gate2

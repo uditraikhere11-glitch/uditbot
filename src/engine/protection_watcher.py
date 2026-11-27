@@ -1089,6 +1089,14 @@ class ProtectionWatcher:
             else:
                 rec["position_state"] = PositionLifecycleState.ENTRY.value
 
+            # C38: Clear retry_eligible ONLY when verified execution/lifecycle proves
+            # this order is no longer eligible for retry (fully TRADED or POSITION_CLOSED).
+            if (
+                rec.get("state") == OrderLifecycleState.TRADED.value
+                or rec.get("position_state") == PositionLifecycleState.POSITION_CLOSED.value
+            ):
+                rec["retry_eligible"] = False
+
             if rec["terminal_confirmed"] and not rec.get("pending_oco"):
                 self.pending.pop(oid, None)
                 self.terminal_orders[oid] = rec
@@ -3189,10 +3197,14 @@ class ProtectionWatcher:
 
             if self.risk_manager is not None and hasattr(self.risk_manager, "validate_order_risk"):
                 if hasattr(self.risk_manager, "sync_from_journal_and_broker"):
+                    _pw_gate = getattr(self, "reconciliation_gate", None)
+                    _pw_snap = getattr(_pw_gate, "_unified_snapshot", None) if not self.dry_run else None
+                    _pw_req_unified = bool(getattr(_pw_gate, "_require_unified_verdict", False)) if not self.dry_run else False
                     self.risk_manager.sync_from_journal_and_broker(
                         journal_db=self.journal_db,
-                        broker=self.broker if not self.dry_run else None,
+                        broker=(None if (_pw_req_unified and _pw_snap is None) else (self.broker if not self.dry_run else None)),
                         watcher=self,
+                        broker_snapshot=_pw_snap,
                     )
                 r_ok, r_reason = self.risk_manager.validate_order_risk(retry_cost, avail_funds)
                 if not r_ok:
@@ -4937,6 +4949,33 @@ class ProtectionWatcher:
                 rec["broker_quantity_evidence"] = quantity_evidence
                 changed = True
 
+            # C55 + C61: Strict per-order, per-operation durable recovery lifecycle independent of
+            # quantity-evidence transitions. NEVER falls back to any globally shared snapshot slot.
+            _has_resolvable_risk = bool(
+                rec.get("cancel_uncertain")
+                or rec.get("protection_cancel_uncertain")
+                or rec.get("orphaned_legs_detected")
+                or rec.get("orphaned_leg_cancel_details")
+            )
+            if _has_resolvable_risk:
+                _op_scope = self._resolution_operation_scope(rec)
+                _paired = self._consume_bound_resolution_snapshots(
+                    rec, expected_account_id=expected_client_id, operation_scope=_op_scope
+                )
+                if _paired is None:
+                    _acquired_pair = self.acquire_paired_resolution_snapshots(
+                        rec, expected_account_id=expected_client_id, operation_scope=_op_scope
+                    )
+                    if _acquired_pair is not None:
+                        _paired = self._consume_bound_resolution_snapshots(
+                            rec, expected_account_id=expected_client_id, operation_scope=_op_scope
+                        ) or _acquired_pair
+                if isinstance(_paired, tuple) and len(_paired) == 2:
+                    self.reconcile_durable_risks_from_snapshots(
+                        rec, _paired[0], _paired[1], expected_account_id=expected_client_id
+                    )
+                    changed = True
+
             stale_manual_record = (
                 prev_pos_state == "RECONCILIATION_REQUIRED"
                 or (prev_pos_state == "UNPROTECTED_MANUAL_RISK" and any(
@@ -5511,7 +5550,22 @@ class ProtectionWatcher:
                 rec["confirmed_position_open_qty"] = effective_parent_open_qty
                 rec["manual_exit_detected"] = False
                 rec["manual_risk_acknowledged"] = True
-                rec["reconciliation_required"] = False
+                # Phase 2D: Respect 20-transient / 37-durable flag classification:
+                # only clear reconciliation_required if zero durable risks remain on this lot.
+                from src.engine.watcher_risk_classification import legacy_risks
+                _blocking_durable_flags = {
+                    "persistence_uncertain",
+                    "last_persistence_error",
+                    "orphan_leg_risk",
+                    "orphan_legs_detected",
+                    "protection_cancel_uncertain",
+                    "ambiguous_super_order",
+                }
+                _remaining_durable = [
+                    r for r in legacy_risks(rec)
+                    if str(r) in _blocking_durable_flags
+                ]
+                rec["reconciliation_required"] = bool(_remaining_durable)
                 rec["unreadable_broker_response"] = False
                 rec["broker_quantity_unverified"] = False
                 rec["broker_quantity_evidence"] = quantity_evidence
@@ -5918,3 +5972,375 @@ class ProtectionWatcher:
                     and getattr(gate, "_require_live_watcher_liveness", False)
                     and getattr(gate, "_accepting_entries", False)):
                 gate.halt_new_entries("Protection watcher task exited; independent broker recheck required")
+
+    # -------------------------------------------------------------------------
+    # Phase 2D: Unified Write-Side Durable Risk Resolution (C01/C02/C03/C05)
+    # -------------------------------------------------------------------------
+
+    def _resolve_journal_db_path(self) -> str:
+        db_path = str(getattr(self.journal_db, "db_path", "") or "")
+        if not db_path:
+            cfg = getattr(self.broker, "cfg", None)
+            data_dir = str(getattr(cfg, "data_dir", "") or "data")
+            db_path = os.path.join(data_dir, "trade_journal.db")
+        return db_path
+
+    def resolve_zero_fill_cancellation_durably(
+        self,
+        record: Dict[str, Any],
+        snapshot_1: Any,
+        snapshot_2: Any,
+        *,
+        expected_account_id: str,
+        now_mono_ns: Optional[int] = None,
+    ) -> Any:
+        """C03-safe durable resolution of ordinary zero-fill cancellation."""
+        from src.engine.durable_risk_resolution import resolve_ordinary_zero_fill_cancellation
+        return resolve_ordinary_zero_fill_cancellation(
+            record=record,
+            snap1=snapshot_1,
+            snap2=snapshot_2,
+            expected_account_id=expected_account_id,
+            now_mono_ns=(now_mono_ns if now_mono_ns is not None else time.monotonic_ns()),
+        )
+
+    def resolve_orphan_legs_durably(
+        self,
+        record: Dict[str, Any],
+        snapshot_1: Any,
+        snapshot_2: Any,
+        *,
+        expected_account_id: str,
+        now_mono_ns: Optional[int] = None,
+    ) -> Any:
+        """C02-safe durable resolution of orphan protection legs via two independent snapshots."""
+        from src.engine.durable_risk_resolution import resolve_durable_orphan_legs
+        return resolve_durable_orphan_legs(
+            record=record,
+            snap1=snapshot_1,
+            snap2=snapshot_2,
+            expected_account_id=expected_account_id,
+            now_mono_ns=(now_mono_ns if now_mono_ns is not None else time.monotonic_ns()),
+        )
+
+    def clear_persistence_risk_with_readback(
+        self,
+        record: Dict[str, Any],
+        *,
+        expected_order_id: str,
+        expected_position_state: str,
+        expected_filled_qty: int,
+        expected_account_id: Optional[str] = None,
+        expected_security_id: Optional[str] = None,
+        expected_segment: Optional[str] = None,
+        expected_product_type: Optional[str] = None,
+        expected_fill_ids: Optional[List[str]] = None,
+        expected_sell_filled_qty: Optional[int] = None,
+        expected_confirmed_open_qty: Optional[int] = None,
+        expected_protection_status: Optional[str] = None,
+        expected_event_type: Optional[str] = None,
+        expected_issue_id: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """C05 + C53 + C56: Persistence-risk clearance requiring complete operation-bound SQLite readback."""
+        from src.engine.durable_issue_writer import verify_operation_readback_and_clear_persistence_risk
+        _raw_acct = getattr(getattr(self.broker, "cfg", None), "dhan_client_id", None)
+        _acct = expected_account_id or (_raw_acct.strip() if isinstance(_raw_acct, str) and _raw_acct.strip() else None)
+        _sec = expected_security_id or str(record.get("security_id") or "").strip() or None
+        _seg = expected_segment or str(record.get("segment") or record.get("exchange_segment") or "").strip().upper() or None
+        _prod = expected_product_type or str(record.get("product_type") or "").strip().upper() or None
+        return verify_operation_readback_and_clear_persistence_risk(
+            db_path=self._resolve_journal_db_path(),
+            record=record,
+            expected_order_id=expected_order_id,
+            expected_position_state=expected_position_state,
+            expected_filled_qty=expected_filled_qty,
+            expected_account_id=_acct,
+            expected_security_id=_sec,
+            expected_segment=_seg,
+            expected_product_type=_prod,
+            expected_fill_ids=expected_fill_ids,
+            expected_sell_filled_qty=expected_sell_filled_qty,
+            expected_confirmed_open_qty=expected_confirmed_open_qty,
+            expected_protection_status=expected_protection_status,
+            expected_event_type=expected_event_type,
+            expected_issue_id=expected_issue_id,
+        )
+
+    @staticmethod
+    def _resolution_operation_scope(rec: Dict[str, Any]) -> str:
+        """C61: Deterministic operation scope key distinguishing independent recovery obligations."""
+        scopes = []
+        if rec.get("cancel_uncertain"):
+            scopes.append("CANCEL")
+        if rec.get("protection_cancel_uncertain"):
+            scopes.append("PROTECTION_CANCEL")
+        if rec.get("orphaned_legs_detected") or rec.get("orphaned_leg_cancel_details"):
+            scopes.append("ORPHAN_LEGS")
+        return "+".join(scopes) if scopes else "GENERIC"
+
+    def _resolution_binding_metadata(
+        self, rec: Dict[str, Any], *, expected_account_id: str, operation_scope: str
+    ) -> Dict[str, str]:
+        return {
+            "parent_order_id": str(rec.get("order_id") or "").strip(),
+            "operation_scope": str(operation_scope or "GENERIC").strip(),
+            "account_id": str(expected_account_id or "").strip(),
+            "security_id": str(rec.get("security_id") or "").strip(),
+            "exchange_segment": str(rec.get("segment") or rec.get("exchange_segment") or "").strip().upper(),
+            "product_type": str(rec.get("product_type") or "").strip().upper(),
+            "issue_id": str(rec.get("durable_issue_id") or rec.get("issue_id") or "").strip(),
+        }
+
+    def _consume_bound_resolution_snapshots(
+        self,
+        rec: Dict[str, Any],
+        *,
+        expected_account_id: str,
+        operation_scope: Optional[str] = None,
+        now_mono_ns: Optional[int] = None,
+    ) -> Optional[Tuple[Any, Any]]:
+        """C61: Consume a per-order paired snapshot ONLY if every binding attribute matches
+        (parent_order_id, operation_scope, account_id, contract, issue_id, generation, and <=10s freshness).
+        Always cleans up the consumed or invalidated entry.
+        """
+        _by_oid = getattr(self, "_pending_resolution_snapshots_by_order", None)
+        if not isinstance(_by_oid, dict):
+            return None
+        oid = str(rec.get("order_id") or "").strip()
+        op_sc = operation_scope or self._resolution_operation_scope(rec)
+        key = (oid, op_sc)
+        entry = _by_oid.pop(key, None)
+        if entry is None:
+            return None
+        if not isinstance(entry, dict):
+            return None
+        expected_meta = self._resolution_binding_metadata(
+            rec, expected_account_id=expected_account_id, operation_scope=op_sc
+        )
+        for _k, _v in expected_meta.items():
+            if str(entry.get(_k) or "") != _v:
+                return None
+        s1 = entry.get("snapshot_1")
+        s2 = entry.get("snapshot_2")
+        if s1 is None or s2 is None:
+            return None
+        # C67: Reject missing or identical capture identities
+        sid1 = str(getattr(s1, "snapshot_id", "") or "").strip()
+        sid2 = str(getattr(s2, "snapshot_id", "") or "").strip()
+        if not sid1 or not sid2 or sid1 == sid2:
+            return None
+        # Reject mismatched account identity on either snapshot when present
+        for _s in (s1, s2):
+            _sa = getattr(_s, "account_id", None)
+            if _sa is not None and str(_sa).strip() != str(expected_account_id or "").strip():
+                return None
+        # Reject generation rollover between s1, s2, or bound generation
+        g1 = getattr(s1, "generation", None)
+        g2 = getattr(s2, "generation", None)
+        if g1 != g2 or (entry.get("generation") is not None and entry.get("generation") != g2):
+            return None
+        # C67: Enforce 10-second freshness ceiling, non-future timestamps, and strict chronology on BOTH s1 and s2
+        _now = int(now_mono_ns) if now_mono_ns is not None else time.monotonic_ns()
+        s1_end = int(getattr(s1, "capture_finished_mono_ns", 0) or 0)
+        s2_end = int(getattr(s2, "capture_finished_mono_ns", 0) or 0)
+        if s1_end <= 0 or s2_end <= 0 or s2_end <= s1_end:
+            return None
+        if s1_end > _now or s2_end > _now:
+            return None
+        if (_now - s1_end) > 10_000_000_000 or (_now - s2_end) > 10_000_000_000:
+            return None
+        # C67: Reject reused durable issue occurrence
+        _iss = expected_meta.get("issue_id") or ""
+        if _iss:
+            if not hasattr(self, "_consumed_resolution_issue_ids"):
+                self._consumed_resolution_issue_ids = set()
+            _iss_key = (oid, op_sc, _iss)
+            if _iss_key in self._consumed_resolution_issue_ids:
+                return None
+            self._consumed_resolution_issue_ids.add(_iss_key)
+        return (s1, s2)
+
+    def clear_resolution_snapshot_state(self, order_id: Optional[str] = None) -> None:
+        """C61: Clean up per-order recovery snapshot state on resolution, invalidation, expiry, or restart."""
+        if order_id is None:
+            self._resolution_first_snapshots = {}
+            self._pending_resolution_snapshots_by_order = {}
+            return
+        oid = str(order_id).strip()
+        for attr in ("_resolution_first_snapshots", "_pending_resolution_snapshots_by_order"):
+            store = getattr(self, attr, None)
+            if isinstance(store, dict):
+                for k in [k for k in list(store.keys()) if k == oid or (isinstance(k, tuple) and k and k[0] == oid)]:
+                    store.pop(k, None)
+
+    def acquire_paired_resolution_snapshots(
+        self,
+        rec: Dict[str, Any],
+        *,
+        expected_account_id: str = "",
+        min_separation_ns: int = 2_000_000_000,
+        operation_scope: Optional[str] = None,
+    ) -> Optional[Tuple[Any, Any]]:
+        """C47 + C55 + C61: Production acquisition of two independent BrokerSnapshots strictly
+        isolated per (order_id, operation_scope) and bound to account, contract, issue_id,
+        generation, capture IDs, timestamps, and journal digests. Zero global fallback.
+        """
+        if self.broker is None or self.journal_db is None:
+            return None
+        cfg = getattr(self.broker, "cfg", None)
+        data_dir = str(getattr(cfg, "data_dir", "") or "") or os.path.dirname(os.path.abspath(self.path))
+        db_path = str(getattr(self.journal_db, "db_path", "") or "")
+        acct = str(expected_account_id or getattr(cfg, "dhan_client_id", "") or "").strip()
+        if not (data_dir and db_path and acct and os.path.isfile(db_path)):
+            return None
+        oid = str(rec.get("order_id") or "").strip()
+        if not oid:
+            return None
+        op_sc = operation_scope or self._resolution_operation_scope(rec)
+        key = (oid, op_sc)
+        meta = self._resolution_binding_metadata(rec, expected_account_id=acct, operation_scope=op_sc)
+
+        if not hasattr(self, "_resolution_first_snapshots"):
+            self._resolution_first_snapshots = {}
+
+        from src.broker.broker_snapshot import Purpose
+        from src.engine.unified_account_runtime import UnifiedAccountRuntime, build_verified_policy_context
+        runtime = UnifiedAccountRuntime(data_dir=data_dir, db_path=db_path, account_id=acct)
+        first_entry = self._resolution_first_snapshots.get(key)
+        now_m = runtime.mono_clock()
+
+        # Invalidate first_entry if binding metadata changed (account/contract/issue_id)
+        if isinstance(first_entry, dict):
+            if any(str(first_entry.get(_k) or "") != _v for _k, _v in meta.items()):
+                self._resolution_first_snapshots.pop(key, None)
+                first_entry = None
+        else:
+            first_entry = None
+
+        first_snap = first_entry.get("snapshot") if isinstance(first_entry, dict) else None
+
+        if first_snap is None:
+            res1 = runtime.acquire_and_evaluate(
+                self.broker,
+                policy=build_verified_policy_context(
+                    mode="LIVE", purpose=Purpose.WATCHER, data_dir=data_dir, watcher=self, risk_funds_verified=True
+                ),
+                policy_builder=lambda snap, jv: build_verified_policy_context(
+                    mode="LIVE", purpose=Purpose.WATCHER, snapshot=snap, journal_view=jv, data_dir=data_dir, watcher=self, risk_funds_verified=True
+                ),
+            )
+            if res1.snapshot is not None and getattr(res1.snapshot, "complete", False):
+                self._resolution_first_snapshots[key] = {
+                    **meta,
+                    "snapshot": res1.snapshot,
+                    "generation": getattr(res1.snapshot, "generation", None),
+                    "capture_id": str(getattr(res1.snapshot, "snapshot_id", "") or ""),
+                    "capture_mono_ns": int(getattr(res1.snapshot, "capture_finished_mono_ns", 0) or 0),
+                    "journal_digest": str(getattr(res1.snapshot, "journal_digest", "") or ""),
+                }
+            return None
+
+        # C55 + C61: Discard expired/stale first_snap (>10s live evidence ceiling)
+        first_end = int(getattr(first_snap, "capture_finished_mono_ns", 0) or 0)
+        if now_m - first_end > 10_000_000_000 or now_m < first_end:
+            self._resolution_first_snapshots.pop(key, None)
+            res_fresh = runtime.acquire_and_evaluate(
+                self.broker,
+                policy=build_verified_policy_context(
+                    mode="LIVE", purpose=Purpose.WATCHER, data_dir=data_dir, watcher=self, risk_funds_verified=True
+                ),
+                policy_builder=lambda snap, jv: build_verified_policy_context(
+                    mode="LIVE", purpose=Purpose.WATCHER, snapshot=snap, journal_view=jv, data_dir=data_dir, watcher=self, risk_funds_verified=True
+                ),
+            )
+            if res_fresh.snapshot is not None and getattr(res_fresh.snapshot, "complete", False):
+                self._resolution_first_snapshots[key] = {
+                    **meta,
+                    "snapshot": res_fresh.snapshot,
+                    "generation": getattr(res_fresh.snapshot, "generation", None),
+                    "capture_id": str(getattr(res_fresh.snapshot, "snapshot_id", "") or ""),
+                    "capture_mono_ns": int(getattr(res_fresh.snapshot, "capture_finished_mono_ns", 0) or 0),
+                    "journal_digest": str(getattr(res_fresh.snapshot, "journal_digest", "") or ""),
+                }
+            return None
+
+        if now_m - first_end < int(min_separation_ns):
+            return None
+
+        res2 = runtime.acquire_and_evaluate(
+            self.broker,
+            policy=build_verified_policy_context(
+                mode="LIVE", purpose=Purpose.WATCHER, data_dir=data_dir, watcher=self, risk_funds_verified=True
+            ),
+            policy_builder=lambda snap, jv: build_verified_policy_context(
+                mode="LIVE", purpose=Purpose.WATCHER, snapshot=snap, journal_view=jv, data_dir=data_dir, watcher=self, risk_funds_verified=True
+            ),
+            min_capture_mono_ns=first_end + int(min_separation_ns),
+            independent_after_snapshot_id=first_snap.snapshot_id,
+        )
+        if res2.snapshot is not None and getattr(res2.snapshot, "complete", False):
+            # C61: Generation rollover invalidates first_snap instead of pairing mismatched generations
+            if getattr(first_snap, "generation", None) != getattr(res2.snapshot, "generation", None):
+                self._resolution_first_snapshots[key] = {
+                    **meta,
+                    "snapshot": res2.snapshot,
+                    "generation": getattr(res2.snapshot, "generation", None),
+                    "capture_id": str(getattr(res2.snapshot, "snapshot_id", "") or ""),
+                    "capture_mono_ns": int(getattr(res2.snapshot, "capture_finished_mono_ns", 0) or 0),
+                    "journal_digest": str(getattr(res2.snapshot, "journal_digest", "") or ""),
+                }
+                return None
+            self._resolution_first_snapshots.pop(key, None)
+            if not hasattr(self, "_pending_resolution_snapshots_by_order"):
+                self._pending_resolution_snapshots_by_order = {}
+            self._pending_resolution_snapshots_by_order[key] = {
+                **meta,
+                "snapshot_1": first_snap,
+                "snapshot_2": res2.snapshot,
+                "generation": getattr(res2.snapshot, "generation", None),
+                "capture_id_1": str(getattr(first_snap, "snapshot_id", "") or ""),
+                "capture_id_2": str(getattr(res2.snapshot, "snapshot_id", "") or ""),
+                "capture_ts_1": first_end,
+                "capture_ts_2": int(getattr(res2.snapshot, "capture_finished_mono_ns", 0) or 0),
+                "journal_digest_1": str(getattr(first_snap, "journal_digest", "") or ""),
+                "journal_digest_2": str(getattr(res2.snapshot, "journal_digest", "") or ""),
+            }
+            return (first_snap, res2.snapshot)
+        return None
+
+    def reconcile_durable_risks_from_snapshots(
+        self,
+        rec: Dict[str, Any],
+        snapshot_1: Any,
+        snapshot_2: Any,
+        *,
+        expected_account_id: str,
+        now_mono_ns: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Phase 2D production caller wiring C02/C03/C05 write-side durable resolution into ProtectionWatcher."""
+        results: Dict[str, Any] = {"cancel": None, "orphan": None, "persistence": None}
+        if rec.get("protection_cancel_uncertain"):
+            out_c = self.resolve_zero_fill_cancellation_durably(
+                rec, snapshot_1, snapshot_2, expected_account_id=expected_account_id, now_mono_ns=now_mono_ns
+            )
+            results["cancel"] = out_c
+            if out_c.resolved:
+                rec.pop("protection_cancel_uncertain", None)
+        if rec.get("orphaned_leg_cancel_details"):
+            out_o = self.resolve_orphan_legs_durably(
+                rec, snapshot_1, snapshot_2, expected_account_id=expected_account_id, now_mono_ns=now_mono_ns
+            )
+            results["orphan"] = out_o
+            if out_o.resolved:
+                rec.pop("orphan_leg_risk", None)
+                rec.pop("orphan_legs_detected", None)
+        if any(rec.get(k) for k in ("persistence_uncertain", "last_persistence_error", "owner_readback_failed")):
+            oid = str(rec.get("order_id") or "")
+            pstate = str(rec.get("position_state") or "")
+            fqty = rec.get("filled_qty")
+            if oid and pstate and type(fqty) is int:
+                ok_p, msg_p = self.clear_persistence_risk_with_readback(
+                    rec, expected_order_id=oid, expected_position_state=pstate, expected_filled_qty=fqty
+                )
+                results["persistence"] = (ok_p, msg_p)
+        return results
